@@ -99,6 +99,18 @@ jobs:
           OCI_DEBUG: 0
           OCI_DELETE_MANIFEST_BEFORE_BLOBS: 1
 
+      - name: Stop registry (before skipped-branch conformance)
+        if: always()
+        shell: bash
+        run: |
+          kill "${OCI_REGISTRY_PID:-}" 2>/dev/null || true
+
+      - name: Run OCI conformance skipped branches (env + cross-mount + blob delete)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/oci-conformance-skipped.sh
+
       - name: Stop registry
         if: always()
         shell: bash

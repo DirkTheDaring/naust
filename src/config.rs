@@ -22,6 +22,9 @@ pub struct Config {
 
     pub allow_tag_overwrite: bool,
 
+    // When true, allow cross-mounting blobs without a `from` repository.
+    pub automatic_crossmount: bool,
+
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
     pub request_timeout_secs: u64,
@@ -101,6 +104,15 @@ impl Config {
             .to_ascii_lowercase();
         let allow_tag_overwrite = !(allow_tag_overwrite == "0" || allow_tag_overwrite == "false" || allow_tag_overwrite == "no");
 
+        let automatic_crossmount = std::env::var("REGISTRY_AUTOMATIC_CROSSMOUNT")
+            .ok()
+            .as_deref()
+            .unwrap_or("0")
+            .trim()
+            .to_ascii_lowercase();
+        let automatic_crossmount =
+            automatic_crossmount == "1" || automatic_crossmount == "true" || automatic_crossmount == "yes";
+
         let max_upload_bytes = std::env::var("MAX_UPLOAD_BYTES")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -154,6 +166,7 @@ impl Config {
             s3_bucket,
             s3_prefix,
             allow_tag_overwrite,
+            automatic_crossmount,
             max_upload_bytes,
             max_request_body_bytes,
             request_timeout_secs,

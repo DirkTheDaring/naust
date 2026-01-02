@@ -97,6 +97,9 @@ pub trait Storage: Send + Sync {
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError>;
 
+    // Content Management: blob deletion.
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError>;
+
     // Content Discovery: referrers API.
     async fn list_referrers(
         &self,

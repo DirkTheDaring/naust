@@ -542,6 +542,29 @@ impl Storage for S3Storage {
         Ok(BlobMeta { size: total })
     }
 
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+        let key = self.blob_key2(digest);
+
+        // S3 deletion is idempotent; treat missing objects as NotFound when we can
+        // detect it, otherwise return success.
+        if let Err(err) = client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            let msg = err.to_string();
+            if msg.contains("NoSuchKey") || msg.contains("NotFound") {
+                return Err(StorageError::NotFound);
+            }
+            return Err(StorageError::Internal(msg));
+        }
+        Ok(())
+    }
+
     async fn list_referrers(
         &self,
         name: &str,

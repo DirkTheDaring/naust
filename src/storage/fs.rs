@@ -345,6 +345,15 @@ impl Storage for FsStorage {
         Ok(BlobMeta { size: meta.len() })
     }
 
+    async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
+        let path = self.blob_path(digest);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
+            Err(err) => Err(StorageError::Internal(err.to_string())),
+        }
+    }
+
     async fn list_referrers(
         &self,
         name: &str,

@@ -413,7 +413,14 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
     };
 
     match method {
-        Method::DELETE => (StatusCode::METHOD_NOT_ALLOWED, registry_headers()).into_response(),
+        Method::DELETE => match state.storage.delete_blob(&digest).await {
+            Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
+            Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
+            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
+            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
+        },
         Method::HEAD => match state.storage.head_blob(&digest).await {
             Ok(meta) => {
                 let mut headers = registry_headers();
@@ -818,6 +825,34 @@ async fn upload_create(
 
     if method != Method::POST {
         return errors::not_implemented().into_response();
+    }
+
+    // Cross-repository blob mount:
+    //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
+    // If the blob exists, registry may respond 201 and skip upload.
+    if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
+        if body.is_empty() {
+            let digest = match Digest::parse(mount_str) {
+                Ok(d) => d,
+                Err(_) => return errors::digest_invalid().into_response(),
+            };
+
+            let has_from = query.get("from").is_some();
+            let allow_without_from = state.config.automatic_crossmount;
+
+            if has_from || allow_without_from {
+                if state.storage.head_blob(&digest).await.is_ok() {
+                    let mut headers = registry_headers();
+                    headers.insert(
+                        "Location",
+                        format!("/v2/{name}/blobs/{}", digest.as_str()).parse().unwrap(),
+                    );
+                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    headers.insert("Content-Length", "0".parse().unwrap());
+                    return (StatusCode::CREATED, headers).into_response();
+                }
+            }
+        }
     }
 
     // Monolithic upload (body on POST): POST /v2/<name>/blobs/uploads/?digest=<digest>
