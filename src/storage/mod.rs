@@ -28,6 +28,9 @@ pub enum StorageError {
     #[error("too large")]
     TooLarge,
 
+    #[error("insufficient storage")]
+    InsufficientStorage,
+
     #[error("internal error: {0}")]
     Internal(String),
 }

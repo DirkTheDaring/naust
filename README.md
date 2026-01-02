@@ -130,6 +130,8 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 - `MAX_UPLOAD_BYTES` (default `5368709120`)
 - `MAX_REQUEST_BODY_BYTES` (default `33554432`)
 - `REQUEST_TIMEOUT_SECS` (default `300`)
+- `UPLOAD_REQUEST_TIMEOUT_SECS` (default `3600`) — request timeout for blob upload endpoints only
+- `DISALLOW_MONOLITHIC_UPLOADS` (`1`/`0`; default `0`) — if enabled, rejects monolithic uploads (body on `POST ?digest` or `PUT .../uploads/<uuid>?digest=`) and forces PATCH-based chunked upload
 
 Inventory/listing endpoints:
 

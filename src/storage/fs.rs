@@ -186,6 +186,14 @@ impl FsStorage {
     }
 }
 
+fn map_fs_io_err(err: std::io::Error) -> StorageError {
+    // Prefer a clear signal for the common operational failure: disk full.
+    if err.raw_os_error() == Some(libc::ENOSPC) {
+        return StorageError::InsufficientStorage;
+    }
+    StorageError::Internal(err.to_string())
+}
+
 #[async_trait]
 impl Storage for FsStorage {
     fn kind(&self) -> &'static str {
@@ -333,7 +341,7 @@ impl Storage for FsStorage {
         let path = dir.join(digest.hex());
         tokio::fs::write(&path, &bytes)
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(map_fs_io_err)?;
 
         Ok(ManifestMeta {
             size: bytes.len() as u64,
@@ -347,7 +355,7 @@ impl Storage for FsStorage {
         let path = dir.join(tag);
         tokio::fs::write(&path, format!("{}\n", digest.as_str()))
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(map_fs_io_err)?;
         Ok(())
     }
 
@@ -360,7 +368,7 @@ impl Storage for FsStorage {
 
         tokio::fs::File::create(&path)
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(map_fs_io_err)?;
 
         Ok(super::UploadMeta { uuid, offset: 0 })
     }
@@ -399,10 +407,10 @@ impl Storage for FsStorage {
         };
         file.write_all(&chunk)
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(map_fs_io_err)?;
         file.flush()
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(map_fs_io_err)?;
 
         let meta = file
             .metadata()
@@ -452,7 +460,7 @@ impl Storage for FsStorage {
         let dest_path = dest_dir.join(digest.hex());
         tokio::fs::rename(&upload_path, &dest_path)
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(map_fs_io_err)?;
 
         let meta = tokio::fs::metadata(&dest_path)
             .await

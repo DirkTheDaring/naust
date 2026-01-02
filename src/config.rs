@@ -34,6 +34,13 @@ pub struct Config {
     pub max_request_body_bytes: usize,
     pub request_timeout_secs: u64,
 
+    // Longer timeout for upload endpoints (PATCH/PUT/POST blobs/uploads).
+    pub upload_request_timeout_secs: u64,
+
+    // If true, reject monolithic blob uploads (body on POST ?digest or PUT finalize).
+    // This forces clients to use PATCH-based chunked uploads.
+    pub disallow_monolithic_uploads: bool,
+
     // If true, repository/org listing endpoints require authentication.
     pub catalog_requires_auth: bool,
 
@@ -154,6 +161,20 @@ impl Config {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(300);
 
+        let upload_request_timeout_secs = std::env::var("UPLOAD_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(3600);
+
+        let disallow_monolithic_uploads = std::env::var("DISALLOW_MONOLITHIC_UPLOADS")
+            .ok()
+            .as_deref()
+            .unwrap_or("0")
+            .trim()
+            .to_ascii_lowercase();
+        let disallow_monolithic_uploads =
+            disallow_monolithic_uploads == "1" || disallow_monolithic_uploads == "true" || disallow_monolithic_uploads == "yes";
+
         let catalog_requires_auth = std::env::var("CATALOG_REQUIRES_AUTH")
             .ok()
             .as_deref()
@@ -208,6 +229,8 @@ impl Config {
             max_upload_bytes,
             max_request_body_bytes,
             request_timeout_secs,
+            upload_request_timeout_secs,
+            disallow_monolithic_uploads,
             catalog_requires_auth,
             public_url,
             token_service,

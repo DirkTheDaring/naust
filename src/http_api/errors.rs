@@ -25,6 +25,28 @@ pub fn not_implemented() -> impl IntoResponse {
     (StatusCode::NOT_IMPLEMENTED, Json(body))
 }
 
+pub fn insufficient_storage() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "INSUFFICIENT_STORAGE",
+            message: "insufficient storage".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::INSUFFICIENT_STORAGE, Json(body))
+}
+
+pub fn payload_too_large() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "TOO_LARGE",
+            message: "request body too large".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
+}
+
 pub fn name_invalid() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {

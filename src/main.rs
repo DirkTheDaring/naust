@@ -5,8 +5,10 @@ mod registry;
 mod storage;
 
 use axum::{
-    error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
+    http::Request,
+    middleware::Next,
+    response::IntoResponse,
     routing::{any, get},
     Router,
 };
@@ -14,9 +16,6 @@ use config::{Config, StorageBackend};
 use http_api::handlers;
 use std::sync::Arc;
 use std::time::Duration;
-use tower::ServiceBuilder;
-use tower::timeout::TimeoutLayer;
-use tower::BoxError;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -42,14 +41,10 @@ async fn main() {
         storage,
     };
 
-    let timeout = TimeoutLayer::new(Duration::from_secs(state.config.request_timeout_secs));
-    let body_limit = DefaultBodyLimit::max(state.config.max_request_body_bytes);
-
-    let hardening = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(|_err: BoxError| async {
-            axum::http::StatusCode::REQUEST_TIMEOUT
-        }))
-        .layer(timeout);
+    // For large blobs we stream request bodies; enforce blob size via MAX_UPLOAD_BYTES and
+    // enforce manifest size in-handler (read_body_limited). So we disable the default body
+    // limit on the registry API router.
+    let v2_body_limit = DefaultBodyLimit::disable();
 
     // `/v2/*rest` owns all registry API subpaths (repo names can contain `/`).
     // We gate write methods (push) via middleware; GET/HEAD stay anonymous.
@@ -57,7 +52,7 @@ async fn main() {
         .route("/v2", get(handlers::ping))
         .route("/v2/", get(handlers::ping))
         .route("/v2/*rest", any(handlers::v2_dispatch))
-        .layer(body_limit)
+        .layer(v2_body_limit)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_push_basic_auth,
@@ -79,8 +74,11 @@ async fn main() {
         .route("/token", get(handlers::token))
         .merge(meta)
         .merge(v2)
-        .with_state(state)
-        .layer(hardening)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_timeout_by_path,
+        ))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
 
@@ -111,6 +109,28 @@ async fn main() {
             .await
             .expect("serve http");
     }
+}
+
+async fn request_timeout_by_path(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let timeout_secs = if is_upload_path(path) {
+        state.config.upload_request_timeout_secs
+    } else {
+        state.config.request_timeout_secs
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
+}
+
+fn is_upload_path(path: &str) -> bool {
+    path.starts_with("/v2/") && path.contains("/blobs/uploads")
 }
 
 async fn shutdown_signal() {
