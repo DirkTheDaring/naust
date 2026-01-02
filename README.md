@@ -28,6 +28,9 @@ This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`regi
 
 Docker usually requires either TLS or marking the registry as insecure.
 
+Note: when auth is configured, `GET /v2/` may return `401` with `WWW-Authenticate: Bearer ...`.
+This is expected: Docker/Podman use it to discover the token endpoint.
+
 - For local dev, configure Docker daemon with an insecure registry entry for `127.0.0.1:5000`.
 - Then:
 
@@ -42,6 +45,17 @@ docker push 127.0.0.1:5000/myrepo:latest
 docker logout 127.0.0.1:5000
 # anonymous pull
 docker pull 127.0.0.1:5000/myrepo:latest
+```
+
+## Podman test
+
+If you're using Podman, pushes work via the Bearer token flow.
+
+```sh
+podman login --tls-verify=false 127.0.0.1:5000  # demo/demo from compose
+podman tag alpine:latest 127.0.0.1:5000/myrepo:latest
+podman push --tls-verify=false 127.0.0.1:5000/myrepo:latest
+podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 ```
 
 ## Environment variables

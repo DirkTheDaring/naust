@@ -6,6 +6,8 @@ services:
     environment:
       RUST_LOG: "info,tower_http=debug"
       PUBLIC_URL: "http://127.0.0.1:5000"
+      # Optional: set a stable signing key so tokens remain valid across restarts.
+      # TOKEN_SIGNING_KEY: "change-me"
       # Set credentials to enable pushes.
       REGISTRY_USERNAME: "demo"
       REGISTRY_PASSWORD: "demo"
@@ -24,6 +26,14 @@ services:
 
     volumes:
       - registry-data:/data
+
+    # S3 mode (backend is currently stubbed/not implemented):
+    # environment:
+    #   STORAGE_BACKEND: "s3"
+    #   STORAGE_S3_ENDPOINT: "https://s3.example.com"
+    #   STORAGE_S3_REGION: "us-east-1"
+    #   STORAGE_S3_BUCKET: "my-bucket"
+    #   STORAGE_S3_PREFIX: "registry"
 
 volumes:
   registry-data: {}

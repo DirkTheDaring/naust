@@ -10,6 +10,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
 use hmac::{Hmac, Mac};
+use serde::Deserialize;
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -70,15 +71,18 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
 
 pub async fn token(
     State(state): State<AppState>,
-    Query(query): Query<HashMap<String, String>>,
+    Query(query): Query<TokenQuery>,
     headers: HeaderMap,
 ) -> Response {
     // Docker/OCI token endpoint (very small subset).
     // Expected query params:
     //   service=<name>
     //   scope=repository:<repo>:pull,push
-    let requested_scopes = query.get("scope").map(String::as_str).unwrap_or("");
-    let scopes = parse_scopes(requested_scopes);
+    let scopes = query
+        .scope
+        .iter()
+        .flat_map(|s| parse_scopes(s))
+        .collect::<Vec<_>>();
 
     // If push is requested, require Basic auth and validate creds.
     let wants_push = scopes.iter().any(|s| s.actions.iter().any(|a| a == "push"));
@@ -142,6 +146,17 @@ pub async fn token(
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TokenQuery {
+    #[serde(default)]
+    scope: Vec<String>,
+    // Present in clients, but we don't need it for our minimal implementation.
+    #[allow(dead_code)]
+    service: Option<String>,
+    #[allow(dead_code)]
+    account: Option<String>,
 }
 
 fn token_unauthorized(state: &AppState) -> Response {
