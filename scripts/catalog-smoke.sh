@@ -8,6 +8,13 @@ ADDR="${ADDR:-127.0.0.1:5000}"
 USER="${REGISTRY_USERNAME:-demo}"
 PASS="${REGISTRY_PASSWORD:-demo}"
 
+# Optional: load registry configuration from a TOML file.
+# Note: this script intentionally toggles CATALOG_REQUIRES_AUTH via env between phases.
+if [[ -n "${CONFIG_PATH:-}" ]]; then
+  export CONFIG_PATH
+  log "Using CONFIG_PATH=$CONFIG_PATH"
+fi
+
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
 BIN="./$CARGO_TARGET_DIR/debug/registry-rust"
 

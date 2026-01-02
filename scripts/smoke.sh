@@ -10,6 +10,19 @@ PASS="${REGISTRY_PASSWORD:-demo}"
 REPO="${REPO:-myrepo}"
 TAG="${TAG:-latest}"
 
+log() { printf '%s\n' "$*"; }
+
+# Optional: load registry configuration from a TOML file.
+# In TOML mode, we avoid forcing push auth / allowlist via env vars,
+# so the TOML can control them. Curl still uses USER/PASS for auth.
+CONFIG_PATH="${CONFIG_PATH:-}"
+USE_TOML=0
+if [[ -n "$CONFIG_PATH" ]]; then
+  USE_TOML=1
+  export CONFIG_PATH
+  log "Using CONFIG_PATH=$CONFIG_PATH"
+fi
+
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
 
 export REGISTRY_USERNAME="$USER"
@@ -17,12 +30,14 @@ export REGISTRY_PASSWORD="$PASS"
 
 # Make the smoke test deterministic: force plain HTTP.
 unset TLS_CERT_PATH TLS_KEY_PATH
-export PUBLIC_URL="http://$ADDR"
+if [[ $USE_TOML -eq 0 ]]; then
+  export PUBLIC_URL="http://$ADDR"
+fi
 
 # Restrict pushes to this repo only for smoke test coverage.
-export REGISTRY_PUSH_ALLOW_REPOS="$REPO"
-
-log() { printf '%s\n' "$*"; }
+if [[ $USE_TOML -eq 0 ]]; then
+  export REGISTRY_PUSH_ALLOW_REPOS="$REPO"
+fi
 
 log "Starting registry on $ADDR (repo=$REPO tag=$TAG)"
 RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" >/tmp/registry-rust.log 2>&1 &

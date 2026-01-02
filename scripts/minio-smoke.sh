@@ -34,11 +34,33 @@ compose() {
 }
 
 log "Starting MinIO + registry (S3 backend)"
-compose -f docker-compose.yml -f docker-compose.minio.yml down -v >/dev/null 2>&1 || true
-compose -f docker-compose.yml -f docker-compose.minio.yml up -d --build
+
+# Optional: run registry configured via TOML.
+# Enable by setting REGISTRY_TOML_PATH (or CONFIG_PATH for compatibility).
+USE_TOML=0
+if [[ -n "${REGISTRY_TOML_PATH:-}" || -n "${CONFIG_PATH:-}" ]]; then
+  USE_TOML=1
+fi
+
+if [[ -n "${CONFIG_PATH:-}" && -z "${REGISTRY_TOML_PATH:-}" ]]; then
+  # In compose, CONFIG_PATH is the in-container path. Use REGISTRY_TOML_PATH for the host file.
+  # If the user provided CONFIG_PATH anyway, default to a sensible MinIO example.
+  export REGISTRY_TOML_PATH="${REGISTRY_TOML_PATH:-./configs/registry.minio.toml}"
+fi
+
+if [[ $USE_TOML -eq 1 ]]; then
+  export REGISTRY_TOML_PATH="${REGISTRY_TOML_PATH:-./configs/registry.minio.toml}"
+  log "Using TOML config: REGISTRY_TOML_PATH=$REGISTRY_TOML_PATH"
+  COMPOSE_FILES=( -f docker-compose.yml -f docker-compose.minio.yml -f docker-compose.config.yml )
+else
+  COMPOSE_FILES=( -f docker-compose.yml -f docker-compose.minio.yml )
+fi
+
+compose "${COMPOSE_FILES[@]}" down -v >/dev/null 2>&1 || true
+compose "${COMPOSE_FILES[@]}" up -d --build
 
 cleanup() {
-  compose -f docker-compose.yml -f docker-compose.minio.yml down -v >/dev/null 2>&1 || true
+  compose "${COMPOSE_FILES[@]}" down -v >/dev/null 2>&1 || true
 }
 
 interrupted=0
@@ -47,7 +69,7 @@ on_exit() {
   code=$?
   if [[ $code -ne 0 && $interrupted -eq 0 ]]; then
     log "FAILED (exit=$code). Dumping compose logs:"
-    compose -f docker-compose.yml -f docker-compose.minio.yml logs registry minio minio-init 2>/dev/null || true
+    compose "${COMPOSE_FILES[@]}" logs registry minio minio-init 2>/dev/null || true
   fi
   cleanup
 }

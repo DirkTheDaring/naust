@@ -11,6 +11,17 @@ PASS="${REGISTRY_PASSWORD:-demo}"
 REPO="${REPO:-myrepo}"
 TAG="${TAG:-latest}"
 
+# Optional: load registry configuration from a TOML file.
+# When set, the registry uses: defaults < config file < env vars.
+# This smoke script will still set TLS env vars (to use a temporary cert), but will not
+# force push auth/allowlist env vars in TOML mode.
+CONFIG_PATH="${CONFIG_PATH:-}"
+USE_TOML=0
+if [[ -n "$CONFIG_PATH" ]]; then
+  USE_TOML=1
+  export CONFIG_PATH
+fi
+
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
 
 # Registry TLS certs (self-signed is fine; podman will use --tls-verify=false).
@@ -63,7 +74,12 @@ podman build -t "$LOCAL_IMG" "$TMP_DIR" >/dev/null
 
 export REGISTRY_USERNAME="$USER"
 export REGISTRY_PASSWORD="$PASS"
-export REGISTRY_PUSH_ALLOW_REPOS="$REPO"
+
+if [[ $USE_TOML -eq 0 ]]; then
+  export REGISTRY_PUSH_ALLOW_REPOS="$REPO"
+fi
+
+# Always run this smoke under TLS (podman uses --tls-verify=false for self-signed).
 export PUBLIC_URL="https://$ADDR"
 export TLS_CERT_PATH="$CERT_PATH"
 export TLS_KEY_PATH="$KEY_PATH"

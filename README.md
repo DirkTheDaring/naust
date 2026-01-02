@@ -49,6 +49,15 @@ docker compose up --build
 
 This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`registry-data`).
 
+### Config file (optional)
+
+To run with a TOML config file via compose, use the overlay and set `REGISTRY_TOML_PATH`:
+
+```sh
+REGISTRY_TOML_PATH=./configs/registry.example.toml \
+  docker compose -f docker-compose.yml -f docker-compose.config.yml up --build
+```
+
 ### S3 (MinIO) backend (optional)
 
 Run the registry backed by a local MinIO instance:
@@ -64,6 +73,12 @@ chmod +x scripts/minio-smoke.sh
 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/minio-smoke.sh
 ```
 
+To run the MinIO smoke using a TOML config file:
+
+```sh
+REGISTRY_TOML_PATH=./configs/registry.minio.toml scripts/minio-smoke.sh
+```
+
 ### HTTPS (optional)
 
 Generate a local self-signed cert (SAN for `127.0.0.1` and `localhost`):
@@ -71,11 +86,11 @@ Generate a local self-signed cert (SAN for `127.0.0.1` and `localhost`):
 ```sh
 mkdir -p certs
 openssl req -x509 -nodes -newkey rsa:2048 \
-	-keyout certs/key.pem \
-	-out certs/cert.pem \
-	-days 365 \
-	-subj "/CN=127.0.0.1" \
-	-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+  -keyout certs/key.pem \
+  -out certs/cert.pem \
+  -days 365 \
+  -subj "/CN=127.0.0.1" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 ```
 
 Run with TLS enabled:
@@ -119,6 +134,79 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 ```
 
 ## Environment variables
+
+### Config file (TOML)
+
+You can optionally load configuration from a TOML file and still override any value via environment variables.
+
+- Enable: set `CONFIG_PATH` to a TOML file (see `configs/registry.example.toml` and `configs/registry.best_practice.toml`).
+- Precedence: defaults < config file < env vars
+- Best-practice profile:
+  - Set `BEST_PRACTICE=1`, or set `[profile].name = "best_practice"` in the TOML.
+  - In best-practice mode, `TOKEN_SIGNING_KEY` (or `token.signing_key` in the TOML) is required; the process fails fast if missing.
+
+Example:
+
+```sh
+CONFIG_PATH=./configs/registry.best_practice.toml \
+TOKEN_SIGNING_KEY='replace-me-with-a-long-random-secret' \
+CARGO_TARGET_DIR=target2 cargo run
+```
+
+### Canonical env var namespace
+
+All options also support a canonical `REGISTRY__...` env var namespace (double-underscore separators), for example:
+
+- `REGISTRY__SERVER__LISTEN_ADDR` (alias for `LISTEN_ADDR`)
+- `REGISTRY__TOKEN__SIGNING_KEY` (alias for `TOKEN_SIGNING_KEY`)
+- `REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS` (alias for `DISALLOW_MONOLITHIC_UPLOADS`)
+
+Existing env var names continue to work.
+
+### Config option inventory
+
+Precedence: defaults < config file < env vars
+
+Best-practice profile (`BEST_PRACTICE=1` or `[profile].name="best_practice"`) changes these defaults:
+
+- `features.allow_tag_overwrite`: default `false` (instead of `true`)
+- `uploads.disallow_monolithic_uploads`: default `true` (instead of `false`)
+- `catalog.requires_auth`: default `true` (instead of `false`)
+- `timeouts.request_timeout_secs`: default `60` (instead of `300`)
+- `timeouts.upload_request_timeout_secs`: default `7200` (instead of `3600`)
+- `token.signing_key`: required (no random fallback)
+
+| Purpose | TOML key | Canonical env | Legacy env | Default |
+| --- | --- | --- | --- | --- |
+| Config file path | (n/a) | `REGISTRY__CONFIG_PATH` | `CONFIG_PATH` | unset |
+| Best-practice profile | `profile.name` | (n/a) | `BEST_PRACTICE` | off |
+| Listen addr | `server.listen_addr` | `REGISTRY__SERVER__LISTEN_ADDR` | `LISTEN_ADDR` | `127.0.0.1:5000` |
+| Public URL | `server.public_url` | `REGISTRY__SERVER__PUBLIC_URL` | `PUBLIC_URL` | unset |
+| TLS cert path | `server.tls.cert_path` | `REGISTRY__SERVER__TLS__CERT_PATH` | `TLS_CERT_PATH` | unset |
+| TLS key path | `server.tls.key_path` | `REGISTRY__SERVER__TLS__KEY_PATH` | `TLS_KEY_PATH` | unset |
+| Push username | `auth.push.username` | `REGISTRY__AUTH__PUSH__USERNAME` | `REGISTRY_USERNAME` | unset |
+| Push password | `auth.push.password` | `REGISTRY__AUTH__PUSH__PASSWORD` | `REGISTRY_PASSWORD` | unset |
+| Push allowlist | `auth.push.allow_repos` | `REGISTRY__AUTH__PUSH__ALLOW_REPOS` | `REGISTRY_PUSH_ALLOW_REPOS` | unset |
+| Storage backend | `storage.backend` | `REGISTRY__STORAGE__BACKEND` | `STORAGE_BACKEND` | `fs` |
+| FS root | `storage.fs.root` | `REGISTRY__STORAGE__FS__ROOT` | `STORAGE_FS_ROOT` | `./data` |
+| S3 endpoint | `storage.s3.endpoint` | `REGISTRY__STORAGE__S3__ENDPOINT` | `STORAGE_S3_ENDPOINT` | unset |
+| S3 region | `storage.s3.region` | `REGISTRY__STORAGE__S3__REGION` | `STORAGE_S3_REGION` | unset |
+| S3 bucket | `storage.s3.bucket` | `REGISTRY__STORAGE__S3__BUCKET` | `STORAGE_S3_BUCKET` | unset |
+| S3 prefix | `storage.s3.prefix` | `REGISTRY__STORAGE__S3__PREFIX` | `STORAGE_S3_PREFIX` | `registry` |
+| Allow tag overwrite | `features.allow_tag_overwrite` | `REGISTRY__FEATURES__ALLOW_TAG_OVERWRITE` | `ALLOW_TAG_OVERWRITE` | `true` (best-practice: `false`) |
+| Automatic crossmount | `features.automatic_crossmount` | `REGISTRY__FEATURES__AUTOMATIC_CROSSMOUNT` | `REGISTRY_AUTOMATIC_CROSSMOUNT` | `false` |
+| Upload GC enabled | `uploads.gc_enabled` | `REGISTRY__UPLOADS__GC_ENABLED` | `UPLOAD_GC_ENABLED` | `true` |
+| Upload GC interval | `uploads.gc_interval_secs` | `REGISTRY__UPLOADS__GC_INTERVAL_SECS` | `UPLOAD_GC_INTERVAL_SECS` | `3600` |
+| Upload GC max age | `uploads.gc_max_age_secs` | `REGISTRY__UPLOADS__GC_MAX_AGE_SECS` | `UPLOAD_GC_MAX_AGE_SECS` | `86400` |
+| Max upload bytes | `limits.max_upload_bytes` | `REGISTRY__LIMITS__MAX_UPLOAD_BYTES` | `MAX_UPLOAD_BYTES` | `5368709120` |
+| Max request body bytes | `limits.max_request_body_bytes` | `REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES` | `MAX_REQUEST_BODY_BYTES` | `33554432` |
+| Request timeout | `timeouts.request_timeout_secs` | `REGISTRY__TIMEOUTS__REQUEST_TIMEOUT_SECS` | `REQUEST_TIMEOUT_SECS` | `300` (best-practice: `60`) |
+| Upload request timeout | `timeouts.upload_request_timeout_secs` | `REGISTRY__TIMEOUTS__UPLOAD_REQUEST_TIMEOUT_SECS` | `UPLOAD_REQUEST_TIMEOUT_SECS` | `3600` (best-practice: `7200`) |
+| Disallow monolithic uploads | `uploads.disallow_monolithic_uploads` | `REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS` | `DISALLOW_MONOLITHIC_UPLOADS` | `false` (best-practice: `true`) |
+| Catalog requires auth | `catalog.requires_auth` | `REGISTRY__CATALOG__REQUIRES_AUTH` | `CATALOG_REQUIRES_AUTH` | `false` (best-practice: `true`) |
+| Token service | `token.service` | `REGISTRY__TOKEN__SERVICE` | `TOKEN_SERVICE` | `registry-rust` |
+| Token signing key | `token.signing_key` | `REGISTRY__TOKEN__SIGNING_KEY` | `TOKEN_SIGNING_KEY` | random per-process (best-practice: required) |
+| Token TTL | `token.ttl_secs` | `REGISTRY__TOKEN__TTL_SECS` | `TOKEN_TTL_SECS` | `600` |
 
 - `LISTEN_ADDR` (default `127.0.0.1:5000`)
 - `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (if unset, pushes are rejected)

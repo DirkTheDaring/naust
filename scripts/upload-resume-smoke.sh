@@ -19,6 +19,13 @@ USER="${REGISTRY_USERNAME:-demo}"
 PASS="${REGISTRY_PASSWORD:-demo}"
 REPO="${REPO:-demoorg/demorepo}"
 
+# Optional: load registry configuration from a TOML file.
+# This script still forces a temp fs backend/root + LISTEN_ADDR via env for determinism.
+if [[ -n "${CONFIG_PATH:-}" ]]; then
+  export CONFIG_PATH
+  echo "using CONFIG_PATH=$CONFIG_PATH"
+fi
+
 require() {
   command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1" >&2; exit 1; }
 }
