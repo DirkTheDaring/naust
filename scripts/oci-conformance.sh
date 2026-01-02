@@ -134,11 +134,18 @@ log "Running conformance suite"
   export OCI_USERNAME
   export OCI_PASSWORD
 
-  export OCI_TEST_PULL=1
-  export OCI_TEST_PUSH=1
-  # Optional; requires support for tag pagination and referrers API.
-  # export OCI_TEST_CONTENT_DISCOVERY=1
-  unset OCI_TEST_CONTENT_MANAGEMENT
+  # Default to pull+push; allow callers to enable additional workflows.
+  : "${OCI_TEST_PULL:=1}"
+  : "${OCI_TEST_PUSH:=1}"
+  export OCI_TEST_PULL
+  export OCI_TEST_PUSH
+
+  if [[ -n "${OCI_TEST_CONTENT_DISCOVERY:-}" ]]; then
+    export OCI_TEST_CONTENT_DISCOVERY
+  fi
+  if [[ -n "${OCI_TEST_CONTENT_MANAGEMENT:-}" ]]; then
+    export OCI_TEST_CONTENT_MANAGEMENT
+  fi
 
   export OCI_HIDE_SKIPPED_WORKFLOWS=1
   export OCI_DEBUG=0

@@ -1,4 +1,8 @@
-use crate::{registry::digest::Digest, storage::StorageError, AppState};
+use crate::{
+    registry::digest::Digest,
+    storage::{ReferrerDescriptor, StorageError},
+    AppState,
+};
 use axum::{
     body::Body,
     extract::RawQuery,
@@ -289,7 +293,15 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 1] == "list"
     {
         let name = segments[..segments.len() - 2].join("/");
-        return tags_list(state, method, &name).await;
+        return tags_list(state, method, &name, &query).await;
+    }
+
+    // Referrers:
+    //   GET/HEAD /v2/<name>/referrers/<digest>
+    if segments.len() >= 2 && segments[segments.len() - 2] == "referrers" {
+        let digest_str = segments[segments.len() - 1];
+        let name = segments[..segments.len() - 2].join("/");
+        return referrers_list(state, method, &name, digest_str, &query).await;
     }
 
     if segments.len() >= 2 && segments[segments.len() - 2] == "manifests" {
@@ -315,14 +327,41 @@ pub async fn v2_dispatch(
     errors::not_implemented().into_response()
 }
 
-async fn tags_list(state: AppState, method: Method, name: &str) -> Response {
+async fn tags_list(
+    state: AppState,
+    method: Method,
+    name: &str,
+    query: &HashMap<String, String>,
+) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
     }
 
     match method {
         Method::GET | Method::HEAD => match state.storage.list_tags(name).await {
-            Ok(tags) => {
+            Ok(all_tags) => {
+                // Pagination per OCI/Docker distribution spec:
+                // - `n` limits the number of tags
+                // - `last` starts listing after the provided tag
+                let total = all_tags.len();
+                let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
+                let n = n_opt.unwrap_or(usize::MAX);
+
+                let start_idx = query
+                    .get("last")
+                    .and_then(|last| all_tags.iter().position(|t| t == last))
+                    .map(|i| i.saturating_add(1))
+                    .unwrap_or(0);
+
+                let end_idx = start_idx.saturating_add(n).min(total);
+                let tags: Vec<String> = all_tags
+                    .into_iter()
+                    .skip(start_idx)
+                    .take(end_idx.saturating_sub(start_idx))
+                    .collect();
+
+                let has_more = end_idx < total;
+
                 let payload = serde_json::json!({
                     "name": name,
                     "tags": tags,
@@ -335,6 +374,18 @@ async fn tags_list(state: AppState, method: Method, name: &str) -> Response {
                 let mut headers = registry_headers();
                 headers.insert("Content-Type", "application/json".parse().unwrap());
                 headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+
+                // Best-effort Link header for next page.
+                if has_more {
+                    if let (Some(n_raw), Some(last_tag)) = (query.get("n"), tags.last()) {
+                        let link = format!(
+                            "</v2/{name}/tags/list?n={n_raw}&last={last_tag}>; rel=\"next\""
+                        );
+                        if let Ok(v) = http::HeaderValue::from_str(&link) {
+                            headers.insert(http::header::LINK, v);
+                        }
+                    }
+                }
 
                 if method == Method::HEAD {
                     return (StatusCode::OK, headers).into_response();
@@ -422,7 +473,14 @@ async fn manifest_by_reference(
     };
 
     match method {
-        Method::DELETE => (StatusCode::METHOD_NOT_ALLOWED, registry_headers()).into_response(),
+        Method::DELETE => match state.storage.delete_manifest(name, &digest).await {
+            Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
+            Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
+            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
+            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
+        },
         Method::HEAD => match state.storage.head_manifest(name, &digest).await {
             Ok(meta) => {
                 let mut headers = registry_headers();
@@ -522,6 +580,8 @@ fn is_supported_manifest_media_type(media_type: &str) -> bool {
     matches!(
         media_type,
         "application/vnd.oci.image.manifest.v1+json"
+            | "application/vnd.oci.artifact.manifest.v1+json"
+            | "application/vnd.oci.image.index.v1+json"
             | "application/vnd.docker.distribution.manifest.v2+json"
     )
 }
@@ -539,6 +599,10 @@ async fn manifest_put(state: AppState, name: &str, reference: &str, bytes: Bytes
     if !is_supported_manifest_media_type(&media_type) {
         return errors::not_implemented().into_response();
     }
+
+    // Best-effort: pre-parse referrer info. We only persist it if the manifest is accepted.
+    let referrer_info = parse_referrer_info(&bytes);
+    let subject_for_headers = referrer_info.as_ref().map(|(s, _, _)| s.clone());
 
     // Compute manifest digest over the raw bytes.
     let mut hasher = sha2::Sha256::new();
@@ -591,11 +655,145 @@ async fn manifest_put(state: AppState, name: &str, reference: &str, bytes: Bytes
         }
     }
 
+    // If this manifest declares a `subject`, index it for the referrers API.
+    // Errors here should not fail the manifest push.
+    if let Some((subject, artifact_type, annotations)) = referrer_info {
+        let descriptor = ReferrerDescriptor {
+            media_type: meta.media_type.clone(),
+            digest: computed.as_str(),
+            size: meta.size,
+            artifact_type,
+            annotations,
+        };
+        let _ = state
+            .storage
+            .add_referrer(name, &subject, descriptor)
+            .await;
+    }
+
     let mut headers = registry_headers();
     headers.insert("Docker-Content-Digest", computed.as_str().parse().unwrap());
     headers.insert("Content-Type", meta.media_type.parse().unwrap());
     headers.insert("Location", format!("/v2/{name}/manifests/{}", reference).parse().unwrap());
+    if let Some(subject) = subject_for_headers {
+        headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
+    }
     (StatusCode::CREATED, headers).into_response()
+}
+
+fn parse_referrer_info(
+    manifest_bytes: &[u8],
+) -> Option<(Digest, Option<String>, Option<HashMap<String, String>>)> {
+    let v: serde_json::Value = serde_json::from_slice(manifest_bytes).ok()?;
+    let subject_digest = v
+        .get("subject")
+        .and_then(|s| s.get("digest"))
+        .and_then(|d| d.as_str())?;
+    let subject = Digest::parse(subject_digest).ok()?;
+
+    let artifact_type = v
+        .get("artifactType")
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            v.get("config")
+                .and_then(|c| c.get("mediaType"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        });
+
+    let annotations = v
+        .get("annotations")
+        .and_then(|a| a.as_object())
+        .and_then(|obj| {
+            let map = obj
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<HashMap<_, _>>();
+            if map.is_empty() { None } else { Some(map) }
+        });
+
+    Some((subject, artifact_type, annotations))
+}
+
+async fn referrers_list(
+    state: AppState,
+    method: Method,
+    name: &str,
+    digest_str: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    if !is_valid_repo_name(name) {
+        return errors::name_invalid().into_response();
+    }
+
+    let subject = match Digest::parse(digest_str) {
+        Ok(d) => d,
+        Err(_) => return errors::digest_invalid().into_response(),
+    };
+
+    match method {
+        Method::GET | Method::HEAD => {
+            let mut entries = match state.storage.list_referrers(name, &subject).await {
+                Ok(v) => v,
+                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
+                Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
+                Err(StorageError::DigestMismatch) => return errors::internal_error().into_response(),
+                Err(StorageError::NotFound) => Vec::new(),
+            };
+
+            let artifact_type_filter = query.get("artifactType").map(|s| s.as_str());
+            if let Some(filter) = artifact_type_filter {
+                entries.retain(|d| d.artifact_type.as_deref() == Some(filter));
+            }
+
+            // Return OCI index.
+            let manifests = entries
+                .into_iter()
+                .map(|d| {
+                    let mut obj = serde_json::json!({
+                        "mediaType": d.media_type,
+                        "digest": d.digest,
+                        "size": d.size,
+                    });
+                    if let Some(at) = d.artifact_type {
+                        obj["artifactType"] = serde_json::Value::String(at);
+                    }
+                    if let Some(ann) = d.annotations {
+                        obj["annotations"] = serde_json::to_value(ann).unwrap_or(serde_json::Value::Null);
+                    }
+                    obj
+                })
+                .collect::<Vec<_>>();
+
+            let payload = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": manifests,
+            });
+
+            let bytes = match serde_json::to_vec(&payload) {
+                Ok(b) => b,
+                Err(_) => return errors::internal_error().into_response(),
+            };
+            let mut headers = registry_headers();
+            headers.insert(
+                "Content-Type",
+                "application/vnd.oci.image.index.v1+json".parse().unwrap(),
+            );
+            headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+            if artifact_type_filter.is_some() {
+                headers.insert("OCI-Filters-Applied", "artifactType".parse().unwrap());
+            }
+
+            if method == Method::HEAD {
+                return (StatusCode::OK, headers).into_response();
+            }
+            (StatusCode::OK, headers, Body::from(bytes)).into_response()
+        }
+        _ => errors::not_implemented().into_response(),
+    }
 }
 
 fn registry_headers() -> HeaderMap {

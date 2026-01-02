@@ -1,4 +1,4 @@
-use super::{ensure_dir, BlobMeta, ManifestMeta, Storage, StorageError};
+use super::{ensure_dir, BlobMeta, ManifestMeta, ReferrerDescriptor, Storage, StorageError};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -48,6 +48,15 @@ impl FsStorage {
             .join(tag)
     }
 
+    fn referrers_path(&self, name: &str, subject: &Digest) -> PathBuf {
+        // data/repos/<name>/referrers/<hex>.json
+        self.root
+            .join("repos")
+            .join(name)
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()))
+    }
+
     fn uploads_dir(&self) -> PathBuf {
         self.root.join("uploads")
     }
@@ -64,6 +73,25 @@ impl FsStorage {
             .and_then(|v| v.as_str())
             .unwrap_or("application/vnd.oci.image.manifest.v1+json");
         Ok(media_type.to_string())
+    }
+
+    async fn list_tag_files(&self, name: &str) -> Result<Vec<PathBuf>, StorageError> {
+        let tags_dir = self.root.join("repos").join(name).join("tags");
+        let mut dir = match tokio::fs::read_dir(&tags_dir).await {
+            Ok(d) => d,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        };
+
+        let mut files = Vec::new();
+        loop {
+            match dir.next_entry().await {
+                Ok(Some(entry)) => files.push(entry.path()),
+                Ok(None) => break,
+                Err(err) => return Err(StorageError::Internal(err.to_string())),
+            }
+        }
+        Ok(files)
     }
 }
 
@@ -315,5 +343,70 @@ impl Storage for FsStorage {
             .await
             .map_err(|err| StorageError::Internal(err.to_string()))?;
         Ok(BlobMeta { size: meta.len() })
+    }
+
+    async fn list_referrers(
+        &self,
+        name: &str,
+        subject: &Digest,
+    ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
+        let path = self.referrers_path(name, subject);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        };
+        serde_json::from_slice::<Vec<ReferrerDescriptor>>(&bytes)
+            .map_err(|err| StorageError::Internal(err.to_string()))
+    }
+
+    async fn add_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        descriptor: ReferrerDescriptor,
+    ) -> Result<(), StorageError> {
+        let dir = self
+            .root
+            .join("repos")
+            .join(name)
+            .join("referrers");
+        ensure_dir(&dir);
+
+        let path = self.referrers_path(name, subject);
+        let mut existing = self.list_referrers(name, subject).await?;
+        if !existing.iter().any(|d| d.digest == descriptor.digest) {
+            existing.push(descriptor);
+        }
+
+        let bytes = serde_json::to_vec(&existing)
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
+        let manifest_path = self.manifest_path(name, digest);
+        match tokio::fs::remove_file(&manifest_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        }
+
+        // Remove any tags pointing to this digest.
+        let digest_str = digest.as_str();
+        for path in self.list_tag_files(name).await? {
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(s) => s,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(StorageError::Internal(err.to_string())),
+            };
+            if content.trim() == digest_str {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+        Ok(())
     }
 }

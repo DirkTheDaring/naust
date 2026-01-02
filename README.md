@@ -26,12 +26,19 @@ CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/p
 ## OCI Distribution conformance (integration test)
 
 This repo runs the OCI Distribution Spec conformance suite as a black-box CI job.
+CI is configured to run Pull + Push + Content Discovery + Content Management workflows.
 
 To run it locally (starts a local registry and writes reports to `./conformance-results`):
 
 ```sh
 chmod +x scripts/oci-conformance.sh
 scripts/oci-conformance.sh
+```
+
+To run with Content Discovery + Content Management enabled locally:
+
+```sh
+OCI_TEST_CONTENT_DISCOVERY=1 OCI_TEST_CONTENT_MANAGEMENT=1 scripts/oci-conformance.sh
 ```
 
 ## Run with Docker

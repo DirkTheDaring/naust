@@ -1,4 +1,4 @@
-use super::{BlobMeta, ManifestMeta, Storage, StorageError, UploadMeta};
+use super::{BlobMeta, ManifestMeta, ReferrerDescriptor, Storage, StorageError, UploadMeta};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
 use aws_config::Region;
@@ -94,6 +94,10 @@ impl S3Storage {
 
     fn tag_key(&self, name: &str, tag: &str) -> String {
         self.key(&format!("repos/{name}/tags/{tag}"))
+    }
+
+    fn referrers_key(&self, name: &str, subject: &Digest) -> String {
+        self.key(&format!("repos/{name}/referrers/{}.json", subject.hex()))
     }
 
     fn tags_prefix(&self, name: &str) -> String {
@@ -536,5 +540,102 @@ impl Storage for S3Storage {
             .await;
 
         Ok(BlobMeta { size: total })
+    }
+
+    async fn list_referrers(
+        &self,
+        name: &str,
+        subject: &Digest,
+    ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
+        let key = self.referrers_key(name, subject);
+        let bytes = match self.get_object_bytes(&key).await {
+            Ok(b) => b,
+            Err(StorageError::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        serde_json::from_slice::<Vec<ReferrerDescriptor>>(&bytes)
+            .map_err(|err| StorageError::Internal(err.to_string()))
+    }
+
+    async fn add_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        descriptor: ReferrerDescriptor,
+    ) -> Result<(), StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+        let key = self.referrers_key(name, subject);
+
+        let mut existing = self.list_referrers(name, subject).await?;
+        if !existing.iter().any(|d| d.digest == descriptor.digest) {
+            existing.push(descriptor);
+        }
+        let body = serde_json::to_vec(&existing)
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .map_err(|err| map_put_err(err))?;
+        Ok(())
+    }
+
+    async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+
+        let key = self.manifest_key(name, digest);
+        // If the object doesn't exist, S3 can still return 204; treat it as success
+        // unless we can clearly map it to NotFound.
+        if let Err(err) = client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            let msg = err.to_string();
+            if msg.contains("NoSuchKey") || msg.contains("NotFound") {
+                return Err(StorageError::NotFound);
+            }
+            return Err(StorageError::Internal(msg));
+        }
+
+        // Remove any tags pointing to this digest.
+        let digest_str = digest.as_str();
+        let prefix = self.tags_prefix(name);
+        let resp = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix.clone())
+            .send()
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+
+        for obj in resp.contents() {
+            let Some(tag_key) = obj.key() else { continue };
+            let bytes = match self.get_object_bytes(tag_key).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let s = match std::str::from_utf8(&bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if s.trim() == digest_str {
+                let _ = client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(tag_key)
+                    .send()
+                    .await;
+            }
+        }
+        Ok(())
     }
 }

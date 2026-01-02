@@ -1,6 +1,11 @@
-use crate::{config::{Config, StorageBackend}, registry::digest::Digest};
+use crate::{
+    config::{Config, StorageBackend},
+    registry::digest::Digest,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::{path::PathBuf, pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::io::AsyncRead;
@@ -43,6 +48,20 @@ pub struct UploadMeta {
     pub offset: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferrerDescriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<HashMap<String, String>>,
+}
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     fn kind(&self) -> &'static str;
@@ -77,6 +96,23 @@ pub trait Storage: Send + Sync {
     async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<UploadMeta, StorageError>;
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError>;
+
+    // Content Discovery: referrers API.
+    async fn list_referrers(
+        &self,
+        name: &str,
+        subject: &Digest,
+    ) -> Result<Vec<ReferrerDescriptor>, StorageError>;
+
+    async fn add_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        descriptor: ReferrerDescriptor,
+    ) -> Result<(), StorageError>;
+
+    // Content Management: manifest deletion.
+    async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError>;
 }
 
 pub fn from_config(config: &Config) -> Arc<dyn Storage> {
