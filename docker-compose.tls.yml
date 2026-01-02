@@ -1,0 +1,8 @@
+services:
+  registry:
+    environment:
+      PUBLIC_URL: "https://127.0.0.1:5000"
+      TLS_CERT_PATH: "/certs/cert.pem"
+      TLS_KEY_PATH: "/certs/key.pem"
+    volumes:
+      - ./certs:/certs:ro
