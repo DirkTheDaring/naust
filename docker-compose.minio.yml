@@ -17,9 +17,19 @@ services:
       - minio
     entrypoint: ["/bin/sh", "-lc"]
     command: >
-      "mc alias set local http://minio:9000 minio minio123 &&
-       mc mb -p local/registry || true &&
-       mc anonymous set download local/registry || true"
+      "i=0;
+       until mc alias set local http://minio:9000 minio minio123; do
+         i=$((i+1));
+         if [ "${i:-0}" -ge 60 ]; then
+           echo 'minio-init: timed out waiting for minio' >&2;
+           exit 1;
+         fi;
+         sleep 1;
+       done;
+       mc mb -p local/registry || true;
+       mc anonymous set download local/registry || true;
+       echo 'minio-init done';
+       tail -f /dev/null"
 
   registry:
     depends_on:

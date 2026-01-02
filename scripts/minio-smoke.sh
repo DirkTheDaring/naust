@@ -12,12 +12,33 @@ TAG="${TAG:-latest}"
 
 log() { printf '%s\n' "$*"; }
 
+compose() {
+  if command -v docker >/dev/null 2>&1; then
+    if docker compose version >/dev/null 2>&1; then
+      docker compose "$@"
+      return
+    fi
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    if podman compose version >/dev/null 2>&1; then
+      podman compose "$@"
+      return
+    fi
+  fi
+  if command -v podman-compose >/dev/null 2>&1; then
+    podman-compose "$@"
+    return
+  fi
+  echo "No compose implementation found (need 'docker compose', 'podman compose', or 'podman-compose')." >&2
+  exit 127
+}
+
 log "Starting MinIO + registry (S3 backend)"
-docker compose -f docker-compose.yml -f docker-compose.minio.yml down -v >/dev/null 2>&1 || true
-docker compose -f docker-compose.yml -f docker-compose.minio.yml up -d --build
+compose -f docker-compose.yml -f docker-compose.minio.yml down -v >/dev/null 2>&1 || true
+compose -f docker-compose.yml -f docker-compose.minio.yml up -d --build
 
 cleanup() {
-  docker compose -f docker-compose.yml -f docker-compose.minio.yml down -v >/dev/null 2>&1 || true
+  compose -f docker-compose.yml -f docker-compose.minio.yml down -v >/dev/null 2>&1 || true
 }
 
 interrupted=0
@@ -26,7 +47,7 @@ on_exit() {
   code=$?
   if [[ $code -ne 0 && $interrupted -eq 0 ]]; then
     log "FAILED (exit=$code). Dumping compose logs:"
-    docker compose -f docker-compose.yml -f docker-compose.minio.yml logs --no-color registry minio minio-init 2>/dev/null || true
+    compose -f docker-compose.yml -f docker-compose.minio.yml logs registry minio minio-init 2>/dev/null || true
   fi
   cleanup
 }
@@ -47,13 +68,45 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://$ADDR/v2/$REPO/bl
 [[ "$code" == "401" ]]
 
 log "Upload blob"
-resp=$(curl -isS -u "$USER:$PASS" -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
+resp=""
+for _ in {1..60}; do
+  resp=$(curl -sS -u "$USER:$PASS" -D - -o /dev/null -X POST "http://$ADDR/v2/$REPO/blobs/uploads/" || true)
+  status=$(printf '%s' "$resp" | awk 'NR==1{print $2}')
+  if [[ "$status" == "202" ]]; then
+    break
+  fi
+  if [[ "$status" == "401" ]]; then
+    echo "upload create unauthorized (check REGISTRY_USERNAME/REGISTRY_PASSWORD)" >&2
+    echo "$resp" >&2
+    exit 2
+  fi
+  sleep 1
+done
+
+status=$(printf '%s' "$resp" | awk 'NR==1{print $2}')
+if [[ "$status" != "202" ]]; then
+  echo "upload create did not succeed (status=${status:-<none>})" >&2
+  echo "$resp" >&2
+  exit 2
+fi
+
 loc=$(printf '%s' "$resp" | awk -F': ' 'tolower($1)=="location"{gsub("\r","",$2); print $2}')
 
+if [[ -z "$loc" ]]; then
+  echo "missing Location header from upload create" >&2
+  echo "$resp" >&2
+  exit 2
+fi
+
+upload_url="$loc"
+if [[ "$upload_url" != http://* && "$upload_url" != https://* ]]; then
+  upload_url="http://$ADDR$upload_url"
+fi
+
 blob_data='hello-layer-s3'
-_=$(curl -fsS -u "$USER:$PASS" -X PATCH --data-binary "$blob_data" "http://$ADDR$loc")
+_=$(curl -fsS -u "$USER:$PASS" -X PATCH --data-binary "$blob_data" "$upload_url")
 blob_digest=$(printf '%s' "$blob_data" | sha256sum | awk '{print $1}')
-_=$(curl -fsS -u "$USER:$PASS" -X PUT "http://$ADDR$loc?digest=sha256:$blob_digest")
+_=$(curl -fsS -u "$USER:$PASS" -X PUT "$upload_url?digest=sha256:$blob_digest")
 
 log "Push manifest (tag)"
 manifest=$(printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":0},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:%s","size":%d}]}' \

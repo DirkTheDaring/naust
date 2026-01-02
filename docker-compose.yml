@@ -27,7 +27,8 @@ services:
     volumes:
       - registry-data:/data
 
-    # S3 mode (backend is currently stubbed/not implemented):
+    # S3 mode (backend implemented). For local testing with MinIO, see
+    # docker-compose.minio.yml and scripts/minio-smoke.sh.
     # environment:
     #   STORAGE_BACKEND: "s3"
     #   STORAGE_S3_ENDPOINT: "https://s3.example.com"

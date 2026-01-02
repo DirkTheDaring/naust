@@ -622,7 +622,21 @@ async fn upload_create(state: AppState, method: Method, name: &str) -> Response 
             (StatusCode::ACCEPTED, headers).into_response()
         }
         Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-        Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) | Err(StorageError::NotFound) => {
+        Err(StorageError::Internal(msg)) => {
+            tracing::error!(
+                storage = state.storage.kind(),
+                error = %msg,
+                repo = name,
+                "create_upload failed"
+            );
+            errors::internal_error().into_response()
+        }
+        Err(StorageError::DigestMismatch) | Err(StorageError::NotFound) => {
+            tracing::error!(
+                storage = state.storage.kind(),
+                repo = name,
+                "create_upload failed"
+            );
             errors::internal_error().into_response()
         }
         Err(StorageError::TooLarge) => errors::internal_error().into_response(),
