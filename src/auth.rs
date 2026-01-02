@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{http_api::errors, AppState};
 use axum::{
     body::Body,
     extract::State,
@@ -7,6 +7,48 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
+
+fn extract_repo_from_v2_path(path: &str) -> Option<String> {
+    // Path is expected to look like:
+    //   /v2/<name>/blobs/...
+    //   /v2/<name>/manifests/...
+    //   /v2/<name>/tags/list
+    // where <name> may contain '/'.
+    if !path.starts_with("/v2/") {
+        return None;
+    }
+    let segments: Vec<&str> = path
+        .trim_start_matches("/v2/")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+
+    let marker_idx = segments
+        .iter()
+        .position(|s| *s == "blobs" || *s == "manifests" || *s == "tags");
+    let Some(marker_idx) = marker_idx else {
+        return None;
+    };
+    if marker_idx == 0 {
+        return None;
+    }
+    Some(segments[..marker_idx].join("/"))
+}
+
+fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
+    allowlist.iter().any(|pat| {
+        if pat == "*" {
+            return true;
+        }
+        if let Some(prefix) = pat.strip_suffix("/*") {
+            return repo == prefix || repo.starts_with(&format!("{prefix}/"));
+        }
+        pat == repo
+    })
+}
 
 pub async fn require_push_basic_auth(
     State(state): State<AppState>,
@@ -32,6 +74,13 @@ pub async fn require_push_basic_auth(
         let user_ok = basic.username() == expected_user;
         let pass_ok = basic.password() == expected_pass;
         if user_ok && pass_ok {
+            if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+                if let Some(repo) = extract_repo_from_v2_path(request.uri().path()) {
+                    if !repo_allowed(allowlist, &repo) {
+                        return errors::denied("push not allowed for this repository").into_response();
+                    }
+                }
+            }
             return next.run(request).await;
         }
     }

@@ -6,6 +6,7 @@ pub struct Config {
 
     pub push_username: Option<String>,
     pub push_password: Option<String>,
+    pub push_allow_repos: Option<Vec<String>>,
 
     pub storage_backend: StorageBackend,
 
@@ -38,6 +39,16 @@ impl Config {
 
         let push_username = std::env::var("REGISTRY_USERNAME").ok();
         let push_password = std::env::var("REGISTRY_PASSWORD").ok();
+
+        let push_allow_repos = std::env::var("REGISTRY_PUSH_ALLOW_REPOS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
 
         let storage_backend = match std::env::var("STORAGE_BACKEND")
             .ok()
@@ -90,6 +101,7 @@ impl Config {
             listen_addr,
             push_username,
             push_password,
+            push_allow_repos,
             storage_backend,
             fs_root,
             s3_endpoint,

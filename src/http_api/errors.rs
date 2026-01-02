@@ -124,6 +124,17 @@ pub fn blob_upload_invalid(message: &str) -> impl IntoResponse {
     (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
 }
 
+pub fn denied(message: &str) -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "DENIED",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::FORBIDDEN, Json(body))
+}
+
 pub fn internal_error() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {

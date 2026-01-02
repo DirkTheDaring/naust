@@ -15,6 +15,9 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
 export REGISTRY_USERNAME="$USER"
 export REGISTRY_PASSWORD="$PASS"
 
+# Restrict pushes to this repo only for smoke test coverage.
+export REGISTRY_PUSH_ALLOW_REPOS="$REPO"
+
 log() { printf '%s\n' "$*"; }
 
 log "Starting registry on $ADDR (repo=$REPO tag=$TAG)"
@@ -33,6 +36,10 @@ curl -fsS "http://$ADDR/v2/" >/dev/null
 log "Push denied without auth"
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
 [[ "$code" == "401" ]]
+
+log "Push denied by allowlist (wrong repo)"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -u "$USER:$PASS" -X POST "http://$ADDR/v2/notallowed/blobs/uploads/")
+[[ "$code" == "403" ]]
 
 log "Upload blob"
 resp=$(curl -isS -u "$USER:$PASS" -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
