@@ -53,6 +53,8 @@ pub trait Storage: Send + Sync {
 
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError>;
 
+    async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError>;
+
     async fn head_manifest(&self, name: &str, digest: &Digest) -> Result<ManifestMeta, StorageError>;
 
     async fn get_manifest(

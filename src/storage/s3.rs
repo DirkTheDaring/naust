@@ -51,6 +51,10 @@ impl Storage for S3Storage {
         Err(StorageError::Unsupported)
     }
 
+    async fn list_tags(&self, _name: &str) -> Result<Vec<String>, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
     async fn head_manifest(&self, _name: &str, _digest: &Digest) -> Result<ManifestMeta, StorageError> {
         Err(StorageError::Unsupported)
     }

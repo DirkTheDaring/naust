@@ -108,6 +108,38 @@ impl Storage for FsStorage {
         Digest::parse(reference).map_err(|_| StorageError::NotFound)
     }
 
+    async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+        let repo_dir = self.root.join("repos").join(name);
+        match tokio::fs::metadata(&repo_dir).await {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        }
+
+        let tags_dir = repo_dir.join("tags");
+        let mut dir = match tokio::fs::read_dir(&tags_dir).await {
+            Ok(d) => d,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        };
+
+        let mut tags = Vec::new();
+        loop {
+            match dir.next_entry().await {
+                Ok(Some(entry)) => {
+                    if let Some(file_name) = entry.file_name().to_str() {
+                        tags.push(file_name.to_string());
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => return Err(StorageError::Internal(err.to_string())),
+            }
+        }
+
+        tags.sort();
+        Ok(tags)
+    }
+
     async fn head_manifest(&self, name: &str, digest: &Digest) -> Result<ManifestMeta, StorageError> {
         let path = self.manifest_path(name, digest);
         let bytes = match tokio::fs::read(&path).await {

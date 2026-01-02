@@ -36,6 +36,17 @@ pub fn name_invalid() -> impl IntoResponse {
     (StatusCode::BAD_REQUEST, Json(body))
 }
 
+pub fn name_unknown() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "NAME_UNKNOWN",
+            message: "repository name unknown".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::NOT_FOUND, Json(body))
+}
+
 pub fn digest_invalid() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {

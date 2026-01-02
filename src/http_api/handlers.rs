@@ -50,6 +50,16 @@ pub async fn v2_dispatch(
         return upload_session(state, method, &name, uuid, query, body).await;
     }
 
+    // Tags list:
+    //   GET/HEAD /v2/<name>/tags/list
+    if segments.len() >= 2
+        && segments[segments.len() - 2] == "tags"
+        && segments[segments.len() - 1] == "list"
+    {
+        let name = segments[..segments.len() - 2].join("/");
+        return tags_list(state, method, &name).await;
+    }
+
     if segments.len() >= 2 && segments[segments.len() - 2] == "manifests" {
         let reference = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
@@ -71,6 +81,41 @@ pub async fn v2_dispatch(
     }
 
     errors::not_implemented().into_response()
+}
+
+async fn tags_list(state: AppState, method: Method, name: &str) -> Response {
+    if !is_valid_repo_name(name) {
+        return errors::name_invalid().into_response();
+    }
+
+    match method {
+        Method::GET | Method::HEAD => match state.storage.list_tags(name).await {
+            Ok(tags) => {
+                let payload = serde_json::json!({
+                    "name": name,
+                    "tags": tags,
+                });
+                let bytes = match serde_json::to_vec(&payload) {
+                    Ok(b) => b,
+                    Err(_) => return errors::internal_error().into_response(),
+                };
+
+                let mut headers = registry_headers();
+                headers.insert("Content-Type", "application/json".parse().unwrap());
+                headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+
+                if method == Method::HEAD {
+                    return (StatusCode::OK, headers).into_response();
+                }
+                (StatusCode::OK, headers, Body::from(bytes)).into_response()
+            }
+            Err(StorageError::NotFound) => errors::name_unknown().into_response(),
+            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
+        },
+        _ => errors::not_implemented().into_response(),
+    }
 }
 
 async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str: &str) -> Response {
