@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod http_api;
+mod registry;
 mod storage;
 
 use axum::{
@@ -28,7 +29,7 @@ async fn main() {
 
     let config = Arc::new(Config::from_env());
     let addr = config.listen_addr;
-    let storage = Arc::new(storage::from_config(&config));
+    let storage = storage::from_config(config.as_ref());
     let state = AppState {
         config,
         storage,
@@ -37,7 +38,8 @@ async fn main() {
     // Anonymous pull routes (MVP will expand these).
     let pull = Router::new()
         .route("/v2", get(handlers::ping))
-        .route("/v2/", get(handlers::ping));
+        .route("/v2/", get(handlers::ping))
+        .route("/v2/*rest", any(handlers::v2_dispatch));
 
     // Authenticated push routes (handlers stubbed for now).
     let push = Router::new()
