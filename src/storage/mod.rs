@@ -1,5 +1,6 @@
 use crate::{config::{Config, StorageBackend}, registry::digest::Digest};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::{path::PathBuf, pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::io::AsyncRead;
@@ -11,6 +12,9 @@ pub mod s3;
 pub enum StorageError {
     #[error("not found")]
     NotFound,
+
+    #[error("digest mismatch")]
+    DigestMismatch,
 
     #[error("unsupported")]
     Unsupported,
@@ -24,6 +28,18 @@ pub struct BlobMeta {
     pub size: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ManifestMeta {
+    pub size: u64,
+    pub media_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadMeta {
+    pub uuid: String,
+    pub offset: u64,
+}
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     fn kind(&self) -> &'static str;
@@ -34,6 +50,24 @@ pub trait Storage: Send + Sync {
         &self,
         digest: &Digest,
     ) -> Result<(BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError>;
+
+    async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError>;
+
+    async fn head_manifest(&self, name: &str, digest: &Digest) -> Result<ManifestMeta, StorageError>;
+
+    async fn get_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<(ManifestMeta, Bytes), StorageError>;
+
+    async fn create_upload(&self) -> Result<UploadMeta, StorageError>;
+
+    async fn upload_status(&self, uuid: &str) -> Result<UploadMeta, StorageError>;
+
+    async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<UploadMeta, StorageError>;
+
+    async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError>;
 }
 
 pub fn from_config(config: &Config) -> Arc<dyn Storage> {

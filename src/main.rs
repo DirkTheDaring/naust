@@ -35,30 +35,18 @@ async fn main() {
         storage,
     };
 
-    // Anonymous pull routes (MVP will expand these).
-    let pull = Router::new()
+    // `/v2/*rest` owns all registry API subpaths (repo names can contain `/`).
+    // We gate write methods (push) via middleware; GET/HEAD stay anonymous.
+    let v2 = Router::new()
         .route("/v2", get(handlers::ping))
         .route("/v2/", get(handlers::ping))
-        .route("/v2/*rest", any(handlers::v2_dispatch));
+        .route("/v2/*rest", any(handlers::v2_dispatch))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_push_basic_auth,
+        ));
 
-    // Authenticated push routes (handlers stubbed for now).
-    let push = Router::new()
-        .route("/v2/:name/blobs/uploads/", any(handlers::not_implemented))
-        .route(
-            "/v2/:name/blobs/uploads/:uuid",
-            any(handlers::not_implemented),
-        )
-        .route("/v2/:name/manifests/:reference", any(handlers::not_implemented));
-
-    let app = pull
-        .merge(
-            push.layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                auth::require_push_basic_auth,
-            )),
-        )
-        .with_state(state)
-        .layer(TraceLayer::new_for_http());
+    let app = v2.with_state(state).layer(TraceLayer::new_for_http());
 
     tracing::info!(%addr, "registry listening");
 

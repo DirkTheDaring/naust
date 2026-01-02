@@ -58,6 +58,28 @@ pub fn blob_unknown() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(body))
 }
 
+pub fn manifest_unknown() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "MANIFEST_UNKNOWN",
+            message: "manifest unknown".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::NOT_FOUND, Json(body))
+}
+
+pub fn blob_upload_unknown() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "BLOB_UPLOAD_UNKNOWN",
+            message: "blob upload unknown".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::NOT_FOUND, Json(body))
+}
+
 pub fn internal_error() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
