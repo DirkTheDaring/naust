@@ -45,8 +45,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| ([127, 0, 0, 1], 5000).into());
 
-        let tls_cert_path = std::env::var("TLS_CERT_PATH").ok().map(PathBuf::from);
-        let tls_key_path = std::env::var("TLS_KEY_PATH").ok().map(PathBuf::from);
+        let tls_cert_path = std::env::var("TLS_CERT_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let tls_key_path = std::env::var("TLS_KEY_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         let push_username = std::env::var("REGISTRY_USERNAME").ok();
         let push_password = std::env::var("REGISTRY_PASSWORD").ok();

@@ -23,6 +23,17 @@ Podman (real client) smoke test:
 CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/podman-smoke.sh
 ```
 
+## OCI Distribution conformance (integration test)
+
+This repo runs the OCI Distribution Spec conformance suite as a black-box CI job.
+
+To run it locally (starts a local registry and writes reports to `./conformance-results`):
+
+```sh
+chmod +x scripts/oci-conformance.sh
+scripts/oci-conformance.sh
+```
+
 ## Run with Docker
 
 ```sh

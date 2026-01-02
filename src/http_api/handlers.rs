@@ -256,6 +256,7 @@ fn format_rfc3339(unix_secs: u64) -> String {
 pub async fn v2_dispatch(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     Path(rest): Path<String>,
     body: Bytes,
@@ -269,7 +270,7 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 2] == "blobs"
     {
         let name = segments[..segments.len() - 2].join("/");
-        return upload_create(state, method, &name).await;
+        return upload_create(state, method, &name, &query, body).await;
     }
 
     if segments.len() >= 3
@@ -278,7 +279,7 @@ pub async fn v2_dispatch(
     {
         let uuid = segments[segments.len() - 1];
         let name = segments[..segments.len() - 3].join("/");
-        return upload_session(state, method, &name, uuid, query, body).await;
+        return upload_session(state, method, &headers, &name, uuid, query, body).await;
     }
 
     // Tags list:
@@ -361,6 +362,7 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
     };
 
     match method {
+        Method::DELETE => (StatusCode::METHOD_NOT_ALLOWED, registry_headers()).into_response(),
         Method::HEAD => match state.storage.head_blob(&digest).await {
             Ok(meta) => {
                 let mut headers = registry_headers();
@@ -420,6 +422,7 @@ async fn manifest_by_reference(
     };
 
     match method {
+        Method::DELETE => (StatusCode::METHOD_NOT_ALLOWED, registry_headers()).into_response(),
         Method::HEAD => match state.storage.head_manifest(name, &digest).await {
             Ok(meta) => {
                 let mut headers = registry_headers();
@@ -604,13 +607,95 @@ fn registry_headers() -> HeaderMap {
     headers
 }
 
-async fn upload_create(state: AppState, method: Method, name: &str) -> Response {
+async fn upload_create(
+    state: AppState,
+    method: Method,
+    name: &str,
+    query: &HashMap<String, String>,
+    body: Bytes,
+) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
     }
 
     if method != Method::POST {
         return errors::not_implemented().into_response();
+    }
+
+    // Monolithic upload (body on POST): POST /v2/<name>/blobs/uploads/?digest=<digest>
+    // Conformance allows this to either create an upload session (202) or create the blob (201).
+    // If the blob already exists, we return 201.
+    if let Some(digest_str) = query.get("digest").map(|s| s.as_str()) {
+        if !body.is_empty() {
+            let digest = match Digest::parse(digest_str) {
+                Ok(d) => d,
+                Err(_) => return errors::digest_invalid().into_response(),
+            };
+
+            if state.storage.head_blob(&digest).await.is_ok() {
+                let mut headers = registry_headers();
+                headers.insert(
+                    "Location",
+                    format!("/v2/{name}/blobs/{}", digest.as_str()).parse().unwrap(),
+                );
+                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                headers.insert("Content-Length", "0".parse().unwrap());
+                return (StatusCode::CREATED, headers).into_response();
+            }
+
+            // Create a session, append the body, and finalize.
+            let meta = match state.storage.create_upload().await {
+                Ok(meta) => meta,
+                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                Err(StorageError::Internal(msg)) => {
+                    tracing::error!(
+                        storage = state.storage.kind(),
+                        error = %msg,
+                        repo = name,
+                        "create_upload failed"
+                    );
+                    return errors::internal_error().into_response();
+                }
+                Err(StorageError::DigestMismatch) | Err(StorageError::NotFound) => {
+                    tracing::error!(storage = state.storage.kind(), repo = name, "create_upload failed");
+                    return errors::internal_error().into_response();
+                }
+                Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
+            };
+
+            if let Err(err) = state.storage.append_upload(&meta.uuid, body).await {
+                return match err {
+                    StorageError::NotFound => errors::blob_upload_unknown().into_response(),
+                    StorageError::TooLarge => {
+                        errors::blob_upload_invalid("upload too large").into_response()
+                    }
+                    StorageError::Unsupported => errors::not_implemented().into_response(),
+                    StorageError::Internal(_) | StorageError::DigestMismatch => {
+                        errors::internal_error().into_response()
+                    }
+                };
+            }
+
+            return match state.storage.finalize_upload(&meta.uuid, &digest).await {
+                Ok(final_meta) => {
+                    let mut headers = registry_headers();
+                    headers.insert(
+                        "Location",
+                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                            .parse()
+                            .unwrap(),
+                    );
+                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    headers.insert("Content-Length", final_meta.size.to_string().parse().unwrap());
+                    (StatusCode::CREATED, headers).into_response()
+                }
+                Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
+                Err(StorageError::DigestMismatch) => errors::digest_invalid().into_response(),
+                Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+                Err(StorageError::TooLarge) => errors::internal_error().into_response(),
+                Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
+            };
+        }
     }
 
     match state.storage.create_upload().await {
@@ -646,6 +731,7 @@ async fn upload_create(state: AppState, method: Method, name: &str) -> Response 
 async fn upload_session(
     state: AppState,
     method: Method,
+    req_headers: &HeaderMap,
     name: &str,
     uuid: &str,
     query: HashMap<String, String>,
@@ -673,21 +759,45 @@ async fn upload_session(
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
         },
-        Method::PATCH => match state.storage.append_upload(uuid, body).await {
-            Ok(meta) => {
-                let mut headers = registry_headers();
-                headers.insert("Location", location.parse().unwrap());
-                headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
-                if meta.offset > 0 {
-                    headers.insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
+        Method::PATCH => {
+            // Chunked uploads: enforce that Content-Range starts at the current offset.
+            if let Some((start, _end)) = parse_content_range(req_headers) {
+                match state.storage.upload_status(uuid).await {
+                    Ok(meta) if meta.offset == start => {}
+                    Ok(_) => {
+                        return (
+                            StatusCode::RANGE_NOT_SATISFIABLE,
+                            registry_headers(),
+                        )
+                            .into_response();
+                    }
+                    Err(StorageError::NotFound) => {
+                        return errors::blob_upload_unknown().into_response();
+                    }
+                    Err(_) => return errors::internal_error().into_response(),
                 }
-                (StatusCode::ACCEPTED, headers).into_response()
             }
-            Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::TooLarge) => errors::blob_upload_invalid("upload too large").into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-        },
+
+            match state.storage.append_upload(uuid, body).await {
+                Ok(meta) => {
+                    let mut headers = registry_headers();
+                    headers.insert("Location", location.parse().unwrap());
+                    headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
+                    if meta.offset > 0 {
+                        headers.insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
+                    }
+                    (StatusCode::ACCEPTED, headers).into_response()
+                }
+                Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
+                Err(StorageError::TooLarge) => {
+                    errors::blob_upload_invalid("upload too large").into_response()
+                }
+                Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+                Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
+                    errors::internal_error().into_response()
+                }
+            }
+        }
         Method::PUT => {
             let Some(digest_str) = query.get("digest").map(|s| s.as_str()) else {
                 return errors::digest_invalid().into_response();
@@ -696,6 +806,42 @@ async fn upload_session(
                 Ok(d) => d,
                 Err(_) => return errors::digest_invalid().into_response(),
             };
+
+            // Monolithic upload: some clients send the full blob body on the PUT.
+            // If a body is present, append it before finalizing.
+            if !body.is_empty() {
+                // Best-effort Content-Range enforcement (optional for monolithic), matching the PATCH behavior.
+                if let Some((start, _end)) = parse_content_range(req_headers) {
+                    match state.storage.upload_status(uuid).await {
+                        Ok(meta) if meta.offset == start => {}
+                        Ok(_) => {
+                            return (
+                                StatusCode::RANGE_NOT_SATISFIABLE,
+                                registry_headers(),
+                            )
+                                .into_response();
+                        }
+                        Err(StorageError::NotFound) => {
+                            return errors::blob_upload_unknown().into_response();
+                        }
+                        Err(_) => return errors::internal_error().into_response(),
+                    }
+                }
+
+                if let Err(err) = state.storage.append_upload(uuid, body).await {
+                    return match err {
+                        StorageError::NotFound => errors::blob_upload_unknown().into_response(),
+                        StorageError::TooLarge => {
+                            errors::blob_upload_invalid("upload too large").into_response()
+                        }
+                        StorageError::Unsupported => errors::not_implemented().into_response(),
+                        StorageError::Internal(_) | StorageError::DigestMismatch => {
+                            errors::internal_error().into_response()
+                        }
+                    };
+                }
+            }
+
             match state.storage.finalize_upload(uuid, &digest).await {
                 Ok(meta) => {
                     let mut headers = registry_headers();
@@ -713,4 +859,18 @@ async fn upload_session(
         }
         _ => errors::not_implemented().into_response(),
     }
+}
+
+fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64)> {
+    let raw = headers
+        .get(http::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())?
+        .trim();
+    // Accept: "0-21" or "bytes 0-21/42".
+    let raw = raw.strip_prefix("bytes ").unwrap_or(raw);
+    let (range, _total) = raw.split_once('/').unwrap_or((raw, ""));
+    let (start_s, end_s) = range.split_once('-')?;
+    let start = start_s.trim().parse::<u64>().ok()?;
+    let end = end_s.trim().parse::<u64>().ok()?;
+    Some((start, end))
 }
