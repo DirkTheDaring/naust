@@ -26,3 +26,15 @@ jobs:
           REGISTRY_USERNAME: demo
           REGISTRY_PASSWORD: demo
         run: scripts/smoke.sh
+
+      - name: MinIO (S3 backend) smoke test
+        env:
+          REGISTRY_USERNAME: demo
+          REGISTRY_PASSWORD: demo
+        run: scripts/minio-smoke.sh
+
+      - name: Podman smoke test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman openssl
+          CARGO_TARGET_DIR=target REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/podman-smoke.sh

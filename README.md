@@ -16,6 +16,13 @@ Smoke test:
 CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/smoke.sh
 ```
 
+Podman (real client) smoke test:
+
+```sh
+# Generates a temporary self-signed TLS cert if needed.
+CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/podman-smoke.sh
+```
+
 ## Run with Docker
 
 ```sh
@@ -23,6 +30,41 @@ docker compose up --build
 ```
 
 This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`registry-data`).
+
+### S3 (MinIO) backend (optional)
+
+Run the registry backed by a local MinIO instance:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.minio.yml up --build
+```
+
+End-to-end smoke test (starts/stops the compose stack):
+
+```sh
+chmod +x scripts/minio-smoke.sh
+REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/minio-smoke.sh
+```
+
+### HTTPS (optional)
+
+Generate a local self-signed cert (SAN for `127.0.0.1` and `localhost`):
+
+```sh
+mkdir -p certs
+openssl req -x509 -nodes -newkey rsa:2048 \
+	-keyout certs/key.pem \
+	-out certs/cert.pem \
+	-days 365 \
+	-subj "/CN=127.0.0.1" \
+	-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+Run with TLS enabled:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up --build
+```
 
 ## Docker CLI test
 
@@ -63,7 +105,7 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 - `LISTEN_ADDR` (default `127.0.0.1:5000`)
 - `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (if unset, pushes are rejected)
 - `REGISTRY_PUSH_ALLOW_REPOS` (optional, comma-separated; supports `org/*` prefixes and `*`)
-- `STORAGE_BACKEND` (`fs` or `s3` — S3 is stubbed)
+- `STORAGE_BACKEND` (`fs` or `s3`)
 - `STORAGE_FS_ROOT` (default `./data`)
 - `ALLOW_TAG_OVERWRITE` (`1`/`0`)
 - `MAX_UPLOAD_BYTES` (default `5368709120`)
@@ -80,3 +122,9 @@ Auth/token (for Docker/Podman clients):
 TLS:
 
 - `TLS_CERT_PATH`, `TLS_KEY_PATH` (if both set, the server listens with HTTPS)
+
+S3 backend:
+
+- `STORAGE_S3_ENDPOINT` (optional; for S3-compatible endpoints like MinIO)
+- `STORAGE_S3_REGION`, `STORAGE_S3_BUCKET`, `STORAGE_S3_PREFIX`
+- Credentials are read from standard AWS env vars (e.g. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).

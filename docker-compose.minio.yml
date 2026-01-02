@@ -1,0 +1,41 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "minio"
+      MINIO_ROOT_PASSWORD: "minio123"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-lc"]
+    command: >
+      "mc alias set local http://minio:9000 minio minio123 &&
+       mc mb -p local/registry || true &&
+       mc anonymous set download local/registry || true"
+
+  registry:
+    depends_on:
+      - minio-init
+    environment:
+      STORAGE_BACKEND: "s3"
+      STORAGE_S3_ENDPOINT: "http://minio:9000"
+      STORAGE_S3_REGION: "us-east-1"
+      STORAGE_S3_BUCKET: "registry"
+      STORAGE_S3_PREFIX: "registry"
+
+      AWS_EC2_METADATA_DISABLED: "true"
+
+      # MinIO uses static credentials; AWS SDK reads these env vars.
+      AWS_ACCESS_KEY_ID: "minio"
+      AWS_SECRET_ACCESS_KEY: "minio123"
+
+volumes:
+  minio-data: {}

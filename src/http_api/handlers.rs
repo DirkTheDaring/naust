@@ -1,6 +1,7 @@
 use crate::{registry::digest::Digest, storage::StorageError, AppState};
 use axum::{
     body::Body,
+    extract::RawQuery,
     extract::Query,
     extract::{Path, State},
     http::{HeaderMap, Method, StatusCode},
@@ -10,7 +11,6 @@ use base64::Engine as _;
 use bytes::Bytes;
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio_util::io::ReaderStream;
+use url::form_urlencoded;
 
 use super::errors;
 
@@ -71,15 +72,21 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
 
 pub async fn token(
     State(state): State<AppState>,
-    Query(query): Query<TokenQuery>,
+    raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Response {
     // Docker/OCI token endpoint (very small subset).
     // Expected query params:
     //   service=<name>
     //   scope=repository:<repo>:pull,push
-    let scopes = query
-        .scope
+    let mut scopes_raw: Vec<String> = Vec::new();
+    let raw = raw_query.0.unwrap_or_default();
+    for (k, v) in form_urlencoded::parse(raw.as_bytes()) {
+        if k == "scope" {
+            scopes_raw.push(v.into_owned());
+        }
+    }
+    let scopes = scopes_raw
         .iter()
         .flat_map(|s| parse_scopes(s))
         .collect::<Vec<_>>();
@@ -146,17 +153,6 @@ pub async fn token(
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct TokenQuery {
-    #[serde(default)]
-    scope: Vec<String>,
-    // Present in clients, but we don't need it for our minimal implementation.
-    #[allow(dead_code)]
-    service: Option<String>,
-    #[allow(dead_code)]
-    account: Option<String>,
 }
 
 fn token_unauthorized(state: &AppState) -> Response {

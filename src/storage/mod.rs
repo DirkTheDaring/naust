@@ -90,6 +90,7 @@ pub fn from_config(config: &Config) -> Arc<dyn Storage> {
             config.s3_region.clone(),
             config.s3_bucket.clone(),
             config.s3_prefix.clone(),
+            config.max_upload_bytes,
         )),
     }
 }

@@ -5,9 +5,12 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+aws-config = "1"
+aws-sdk-s3 = "1"
 axum = "0.7"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
+futures-util = "0.3"
 bytes = "1"
 headers = "0.4"
 hex = "0.4"
@@ -25,6 +28,7 @@ tower = { version = "0.5", features = ["timeout"] }
 tower-http = { version = "0.5", features = ["trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [features]
