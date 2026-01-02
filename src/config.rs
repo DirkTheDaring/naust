@@ -15,6 +15,8 @@ pub struct Config {
     pub s3_region: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
+
+    pub allow_tag_overwrite: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +59,14 @@ impl Config {
         let s3_bucket = std::env::var("STORAGE_S3_BUCKET").ok();
         let s3_prefix = std::env::var("STORAGE_S3_PREFIX").unwrap_or_else(|_| "registry".to_string());
 
+        let allow_tag_overwrite = std::env::var("ALLOW_TAG_OVERWRITE")
+            .ok()
+            .as_deref()
+            .unwrap_or("1")
+            .trim()
+            .to_ascii_lowercase();
+        let allow_tag_overwrite = !(allow_tag_overwrite == "0" || allow_tag_overwrite == "false" || allow_tag_overwrite == "no");
+
         Self {
             listen_addr,
             push_username,
@@ -67,6 +77,7 @@ impl Config {
             s3_region,
             s3_bucket,
             s3_prefix,
+            allow_tag_overwrite,
         }
     }
 

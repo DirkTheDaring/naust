@@ -47,6 +47,28 @@ pub fn digest_invalid() -> impl IntoResponse {
     (StatusCode::BAD_REQUEST, Json(body))
 }
 
+pub fn tag_invalid() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "TAG_INVALID",
+            message: "invalid tag".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::BAD_REQUEST, Json(body))
+}
+
+pub fn manifest_invalid() -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "MANIFEST_INVALID",
+            message: "invalid manifest".to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::BAD_REQUEST, Json(body))
+}
+
 pub fn blob_unknown() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {

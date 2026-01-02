@@ -63,6 +63,19 @@ impl Storage for S3Storage {
         Err(StorageError::Unsupported)
     }
 
+    async fn put_manifest(
+        &self,
+        _name: &str,
+        _digest: &Digest,
+        _bytes: Bytes,
+    ) -> Result<ManifestMeta, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn set_tag(&self, _name: &str, _tag: &str, _digest: &Digest) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
     async fn create_upload(&self) -> Result<super::UploadMeta, StorageError> {
         Err(StorageError::Unsupported)
     }

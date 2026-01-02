@@ -61,6 +61,10 @@ pub trait Storage: Send + Sync {
         digest: &Digest,
     ) -> Result<(ManifestMeta, Bytes), StorageError>;
 
+    async fn put_manifest(&self, name: &str, digest: &Digest, bytes: Bytes) -> Result<ManifestMeta, StorageError>;
+
+    async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError>;
+
     async fn create_upload(&self) -> Result<UploadMeta, StorageError>;
 
     async fn upload_status(&self, uuid: &str) -> Result<UploadMeta, StorageError>;

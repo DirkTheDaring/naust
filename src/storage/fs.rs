@@ -141,6 +141,37 @@ impl Storage for FsStorage {
         Ok((meta, bytes::Bytes::from(bytes)))
     }
 
+    async fn put_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+        bytes: Bytes,
+    ) -> Result<ManifestMeta, StorageError> {
+        let dir = self.root.join("repos").join(name).join("manifests");
+        ensure_dir(&dir);
+
+        let media_type = self.detect_manifest_media_type(&bytes).await?;
+        let path = dir.join(digest.hex());
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+
+        Ok(ManifestMeta {
+            size: bytes.len() as u64,
+            media_type,
+        })
+    }
+
+    async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
+        let dir = self.root.join("repos").join(name).join("tags");
+        ensure_dir(&dir);
+        let path = dir.join(tag);
+        tokio::fs::write(&path, format!("{}\n", digest.as_str()))
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
     async fn create_upload(&self) -> Result<super::UploadMeta, StorageError> {
         let dir = self.uploads_dir();
         ensure_dir(&dir);
