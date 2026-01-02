@@ -113,6 +113,17 @@ pub fn blob_upload_unknown() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(body))
 }
 
+pub fn blob_upload_invalid(message: &str) -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "BLOB_UPLOAD_INVALID",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
+}
+
 pub fn internal_error() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {

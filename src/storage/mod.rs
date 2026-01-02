@@ -19,6 +19,9 @@ pub enum StorageError {
     #[error("unsupported")]
     Unsupported,
 
+    #[error("too large")]
+    TooLarge,
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -78,7 +81,10 @@ pub trait Storage: Send + Sync {
 
 pub fn from_config(config: &Config) -> Arc<dyn Storage> {
     match config.storage_backend {
-        StorageBackend::Filesystem => Arc::new(fs::FsStorage::new(config.fs_root.clone())),
+        StorageBackend::Filesystem => Arc::new(fs::FsStorage::new(
+            config.fs_root.clone(),
+            config.max_upload_bytes,
+        )),
         StorageBackend::S3 => Arc::new(s3::S3Storage::new(
             config.s3_endpoint.clone(),
             config.s3_region.clone(),

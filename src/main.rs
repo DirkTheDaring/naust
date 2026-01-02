@@ -5,12 +5,18 @@ mod registry;
 mod storage;
 
 use axum::{
+    error_handling::HandleErrorLayer,
+    extract::DefaultBodyLimit,
     routing::{any, get},
     Router,
 };
 use config::Config;
 use http_api::handlers;
 use std::sync::Arc;
+use std::time::Duration;
+use tower::ServiceBuilder;
+use tower::timeout::TimeoutLayer;
+use tower::BoxError;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -35,18 +41,31 @@ async fn main() {
         storage,
     };
 
+    let timeout = TimeoutLayer::new(Duration::from_secs(state.config.request_timeout_secs));
+    let body_limit = DefaultBodyLimit::max(state.config.max_request_body_bytes);
+
+    let hardening = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(|_err: BoxError| async {
+            axum::http::StatusCode::REQUEST_TIMEOUT
+        }))
+        .layer(timeout);
+
     // `/v2/*rest` owns all registry API subpaths (repo names can contain `/`).
     // We gate write methods (push) via middleware; GET/HEAD stay anonymous.
     let v2 = Router::new()
         .route("/v2", get(handlers::ping))
         .route("/v2/", get(handlers::ping))
         .route("/v2/*rest", any(handlers::v2_dispatch))
+        .layer(body_limit)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_push_basic_auth,
         ));
 
-    let app = v2.with_state(state).layer(TraceLayer::new_for_http());
+    let app = v2
+        .with_state(state)
+        .layer(hardening)
+        .layer(TraceLayer::new_for_http());
 
     tracing::info!(%addr, "registry listening");
 

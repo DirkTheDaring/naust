@@ -111,6 +111,7 @@ async fn tags_list(state: AppState, method: Method, name: &str) -> Response {
             }
             Err(StorageError::NotFound) => errors::name_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
@@ -139,6 +140,7 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
             }
             Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
@@ -155,6 +157,7 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
             }
             Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
@@ -179,6 +182,7 @@ async fn manifest_by_reference(
             Ok(d) => d,
             Err(StorageError::NotFound) => return errors::manifest_unknown().into_response(),
             Err(StorageError::DigestMismatch) => return errors::internal_error().into_response(),
+            Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
             Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
         },
@@ -195,6 +199,7 @@ async fn manifest_by_reference(
             }
             Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
@@ -208,6 +213,7 @@ async fn manifest_by_reference(
             }
             Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
@@ -294,6 +300,7 @@ async fn manifest_put(state: AppState, name: &str, reference: &str, bytes: Bytes
                 Ok(_) => return (StatusCode::CONFLICT, registry_headers(), Body::empty()).into_response(),
                 Err(StorageError::NotFound) => {}
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
                 Err(StorageError::DigestMismatch) | Err(StorageError::Internal(_)) => {
                     return errors::internal_error().into_response();
                 }
@@ -306,6 +313,7 @@ async fn manifest_put(state: AppState, name: &str, reference: &str, bytes: Bytes
         Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
         Err(StorageError::NotFound) => return errors::internal_error().into_response(),
         Err(StorageError::DigestMismatch) => return errors::digest_invalid().into_response(),
+        Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
         Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
     };
 
@@ -316,6 +324,7 @@ async fn manifest_put(state: AppState, name: &str, reference: &str, bytes: Bytes
                 StorageError::Unsupported => errors::not_implemented().into_response(),
                 StorageError::NotFound => errors::internal_error().into_response(),
                 StorageError::DigestMismatch => errors::internal_error().into_response(),
+                StorageError::TooLarge => errors::internal_error().into_response(),
                 StorageError::Internal(_) => errors::internal_error().into_response(),
             };
         }
@@ -358,6 +367,7 @@ async fn upload_create(state: AppState, method: Method, name: &str) -> Response 
         Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) | Err(StorageError::NotFound) => {
             errors::internal_error().into_response()
         }
+        Err(StorageError::TooLarge) => errors::internal_error().into_response(),
     }
 }
 
@@ -388,6 +398,7 @@ async fn upload_session(
             }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
         },
         Method::PATCH => match state.storage.append_upload(uuid, body).await {
@@ -401,6 +412,7 @@ async fn upload_session(
                 (StatusCode::ACCEPTED, headers).into_response()
             }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
+            Err(StorageError::TooLarge) => errors::blob_upload_invalid("upload too large").into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
         },
@@ -423,6 +435,7 @@ async fn upload_session(
                 Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
                 Err(StorageError::DigestMismatch) => errors::digest_invalid().into_response(),
                 Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+                Err(StorageError::TooLarge) => errors::internal_error().into_response(),
                 Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
             }
         }

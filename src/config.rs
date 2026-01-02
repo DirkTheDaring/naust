@@ -17,6 +17,10 @@ pub struct Config {
     pub s3_prefix: String,
 
     pub allow_tag_overwrite: bool,
+
+    pub max_upload_bytes: u64,
+    pub max_request_body_bytes: usize,
+    pub request_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +71,21 @@ impl Config {
             .to_ascii_lowercase();
         let allow_tag_overwrite = !(allow_tag_overwrite == "0" || allow_tag_overwrite == "false" || allow_tag_overwrite == "no");
 
+        let max_upload_bytes = std::env::var("MAX_UPLOAD_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(5 * 1024 * 1024 * 1024);
+
+        let max_request_body_bytes = std::env::var("MAX_REQUEST_BODY_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(32 * 1024 * 1024);
+
+        let request_timeout_secs = std::env::var("REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(300);
+
         Self {
             listen_addr,
             push_username,
@@ -78,6 +97,9 @@ impl Config {
             s3_bucket,
             s3_prefix,
             allow_tag_overwrite,
+            max_upload_bytes,
+            max_request_body_bytes,
+            request_timeout_secs,
         }
     }
 

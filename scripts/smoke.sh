@@ -30,6 +30,10 @@ sleep 0.3
 log "Ping /v2/"
 curl -fsS "http://$ADDR/v2/" >/dev/null
 
+log "Push denied without auth"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
+[[ "$code" == "401" ]]
+
 log "Upload blob"
 resp=$(curl -isS -u "$USER:$PASS" -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
 loc=$(printf '%s' "$resp" | awk -F': ' 'tolower($1)=="location"{gsub("\r","",$2); print $2}')

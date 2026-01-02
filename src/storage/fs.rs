@@ -9,12 +9,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 #[derive(Debug)]
 pub struct FsStorage {
     root: PathBuf,
+    max_upload_bytes: u64,
 }
 
 impl FsStorage {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, max_upload_bytes: u64) -> Self {
         ensure_dir(&root);
-        Self { root }
+        Self {
+            root,
+            max_upload_bytes,
+        }
     }
 
     fn blob_path(&self, digest: &Digest) -> PathBuf {
@@ -233,6 +237,18 @@ impl Storage for FsStorage {
 
     async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<super::UploadMeta, StorageError> {
         let path = self.upload_path(uuid);
+
+        let current_len = match tokio::fs::metadata(&path).await {
+            Ok(m) => m.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        };
+
+        let next_len = current_len.saturating_add(chunk.len() as u64);
+        if next_len > self.max_upload_bytes {
+            return Err(StorageError::TooLarge);
+        }
+
         let mut file = match tokio::fs::OpenOptions::new().append(true).open(&path).await {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
