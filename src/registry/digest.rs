@@ -48,3 +48,36 @@ impl Digest {
         &self.hex[..2]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_valid_sha256() {
+        let d = Digest::parse("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .expect("valid digest");
+        assert_eq!(d.hex(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert_eq!(d.prefix2(), "01");
+        assert_eq!(d.as_str(), "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn parse_rejects_non_sha256() {
+        let err = Digest::parse("sha1:abcd").unwrap_err();
+        matches!(err, DigestParseError::UnsupportedAlgorithm | DigestParseError::InvalidFormat);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_length() {
+        let err = Digest::parse("sha256:abcd").unwrap_err();
+        assert!(matches!(err, DigestParseError::InvalidFormat));
+    }
+
+    #[test]
+    fn parse_rejects_non_hex() {
+        let err = Digest::parse("sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+            .unwrap_err();
+        assert!(matches!(err, DigestParseError::InvalidHex));
+    }
+}

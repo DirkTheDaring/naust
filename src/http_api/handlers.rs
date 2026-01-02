@@ -249,6 +249,33 @@ fn is_valid_tag(tag: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_repo_name, is_valid_tag};
+
+    #[test]
+    fn repo_name_validation() {
+        assert!(is_valid_repo_name("library/alpine"));
+        assert!(is_valid_repo_name("org.name/repo_name-1"));
+        assert!(!is_valid_repo_name(""));
+        assert!(!is_valid_repo_name("/leading"));
+        assert!(!is_valid_repo_name(".."));
+        assert!(!is_valid_repo_name("a/../b"));
+        assert!(!is_valid_repo_name("a b"));
+    }
+
+    #[test]
+    fn tag_validation() {
+        assert!(is_valid_tag("latest"));
+        assert!(is_valid_tag("v1.2.3"));
+        assert!(is_valid_tag("_start_ok"));
+        assert!(!is_valid_tag(""));
+        assert!(!is_valid_tag("has space"));
+        assert!(!is_valid_tag("has/slash"));
+        assert!(!is_valid_tag("-badstart"));
+    }
+}
+
 fn detect_media_type_from_manifest(bytes: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     value
