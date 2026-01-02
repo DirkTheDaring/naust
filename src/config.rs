@@ -25,9 +25,17 @@ pub struct Config {
     // When true, allow cross-mounting blobs without a `from` repository.
     pub automatic_crossmount: bool,
 
+    // Filesystem backend maintenance: clean up stale upload temp files.
+    pub upload_gc_enabled: bool,
+    pub upload_gc_interval_secs: u64,
+    pub upload_gc_max_age_secs: u64,
+
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
     pub request_timeout_secs: u64,
+
+    // If true, repository/org listing endpoints require authentication.
+    pub catalog_requires_auth: bool,
 
     pub public_url: Option<String>,
     pub token_service: String,
@@ -113,6 +121,24 @@ impl Config {
         let automatic_crossmount =
             automatic_crossmount == "1" || automatic_crossmount == "true" || automatic_crossmount == "yes";
 
+        let upload_gc_enabled = std::env::var("UPLOAD_GC_ENABLED")
+            .ok()
+            .as_deref()
+            .unwrap_or("1")
+            .trim()
+            .to_ascii_lowercase();
+        let upload_gc_enabled = !(upload_gc_enabled == "0" || upload_gc_enabled == "false" || upload_gc_enabled == "no");
+
+        let upload_gc_interval_secs = std::env::var("UPLOAD_GC_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(3600);
+
+        let upload_gc_max_age_secs = std::env::var("UPLOAD_GC_MAX_AGE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(24 * 3600);
+
         let max_upload_bytes = std::env::var("MAX_UPLOAD_BYTES")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -127,6 +153,15 @@ impl Config {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(300);
+
+        let catalog_requires_auth = std::env::var("CATALOG_REQUIRES_AUTH")
+            .ok()
+            .as_deref()
+            .unwrap_or("0")
+            .trim()
+            .to_ascii_lowercase();
+        let catalog_requires_auth =
+            catalog_requires_auth == "1" || catalog_requires_auth == "true" || catalog_requires_auth == "yes";
 
         let public_url = std::env::var("PUBLIC_URL")
             .ok()
@@ -167,9 +202,13 @@ impl Config {
             s3_prefix,
             allow_tag_overwrite,
             automatic_crossmount,
+            upload_gc_enabled,
+            upload_gc_interval_secs,
+            upload_gc_max_age_secs,
             max_upload_bytes,
             max_request_body_bytes,
             request_timeout_secs,
+            catalog_requires_auth,
             public_url,
             token_service,
             token_signing_key,

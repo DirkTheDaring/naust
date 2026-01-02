@@ -1,9 +1,10 @@
-use super::{ensure_dir, BlobMeta, ManifestMeta, ReferrerDescriptor, Storage, StorageError};
+use super::{ensure_dir, BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use bytes::Bytes;
 use sha2::Digest as _;
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug)]
@@ -93,12 +94,126 @@ impl FsStorage {
         }
         Ok(files)
     }
+
+    async fn list_repo_names(&self) -> Result<Vec<String>, StorageError> {
+        let repos_root = self.root.join("repos");
+        let mut repos = Vec::new();
+
+        let mut stack: Vec<(PathBuf, String)> = vec![(repos_root.clone(), String::new())];
+        while let Some((dir_path, rel)) = stack.pop() {
+            let mut dir = match tokio::fs::read_dir(&dir_path).await {
+                Ok(d) => d,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(StorageError::Internal(err.to_string())),
+            };
+
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let file_type = match entry.file_type().await {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+
+                let name = match entry.file_name().to_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+
+                // Do not descend into internal leaf dirs.
+                if name == "tags" || name == "manifests" || name == "referrers" {
+                    continue;
+                }
+
+                let child_path = entry.path();
+                let child_rel = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+
+                // Consider this a repo if it has tags/ or manifests/ directories.
+                let tags_dir = child_path.join("tags");
+                let manifests_dir = child_path.join("manifests");
+                let has_tags = tokio::fs::metadata(&tags_dir)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                let has_manifests = tokio::fs::metadata(&manifests_dir)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if has_tags || has_manifests {
+                    repos.push(child_rel.clone());
+                }
+
+                stack.push((child_path, child_rel));
+            }
+        }
+
+        repos.sort();
+        repos.dedup();
+        Ok(repos)
+    }
+
+    async fn max_mtime_in_dir(&self, dir: &PathBuf) -> Result<Option<SystemTime>, StorageError> {
+        let mut rd = match tokio::fs::read_dir(dir).await {
+            Ok(d) => d,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        };
+
+        let mut max_time: Option<SystemTime> = None;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = match meta.modified() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            max_time = Some(match max_time {
+                Some(cur) if cur >= modified => cur,
+                _ => modified,
+            });
+        }
+        Ok(max_time)
+    }
 }
 
 #[async_trait]
 impl Storage for FsStorage {
     fn kind(&self) -> &'static str {
         "fs"
+    }
+
+    async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+        self.list_repo_names().await
+    }
+
+    async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
+        let repo_dir = self.root.join("repos").join(name);
+        match tokio::fs::metadata(&repo_dir).await {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
+        }
+
+        let tags_dir = repo_dir.join("tags");
+        let manifests_dir = repo_dir.join("manifests");
+
+        let last_tag_update = self.max_mtime_in_dir(&tags_dir).await?;
+        let last_manifest_update = self.max_mtime_in_dir(&manifests_dir).await?;
+
+        Ok(RepoTimestamps {
+            last_tag_update,
+            last_manifest_update,
+        })
     }
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {

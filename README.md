@@ -126,9 +126,30 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 - `STORAGE_BACKEND` (`fs` or `s3`)
 - `STORAGE_FS_ROOT` (default `./data`)
 - `ALLOW_TAG_OVERWRITE` (`1`/`0`)
+- `REGISTRY_AUTOMATIC_CROSSMOUNT` (`1`/`0`; default `0`)
 - `MAX_UPLOAD_BYTES` (default `5368709120`)
 - `MAX_REQUEST_BODY_BYTES` (default `33554432`)
 - `REQUEST_TIMEOUT_SECS` (default `300`)
+
+Inventory/listing endpoints:
+
+- `CATALOG_REQUIRES_AUTH` (`1`/`0`; default `0`) — if enabled, `/v2/_catalog` and `/_meta/*` require Basic or Bearer auth.
+
+Endpoints:
+
+- `GET /v2/_catalog?n=<N>&last=<repo>` — standard registry catalog listing (best-effort).
+- `GET /_meta/catalog?n=<N>&last=<repo>[&org=<org>]` — one-call repo listing with timestamp metadata.
+- `GET /_meta/orgs?n=<N>&last=<org>` — list org names (derived from `org/repo`).
+- `GET /_meta/orgs/<org>/repos?n=<N>&last=<repo>` — list repos under an org with timestamps.
+- `GET /_meta/repos/<org>/<repo>` — timestamp metadata for a single repo.
+
+Long-running robustness (filesystem backend only):
+
+- `UPLOAD_GC_ENABLED` (`1`/`0`; default `1`)
+- `UPLOAD_GC_INTERVAL_SECS` (default `3600`)
+- `UPLOAD_GC_MAX_AGE_SECS` (default `86400`)
+
+The server performs graceful shutdown on SIGTERM/SIGINT.
 
 Auth/token (for Docker/Podman clients):
 

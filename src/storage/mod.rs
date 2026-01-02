@@ -7,6 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::time::SystemTime;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
@@ -48,6 +49,12 @@ pub struct UploadMeta {
     pub offset: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RepoTimestamps {
+    pub last_tag_update: Option<SystemTime>,
+    pub last_manifest_update: Option<SystemTime>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferrerDescriptor {
@@ -65,6 +72,15 @@ pub struct ReferrerDescriptor {
 #[async_trait]
 pub trait Storage: Send + Sync {
     fn kind(&self) -> &'static str;
+
+    // Best-effort listing of repositories known to the backend.
+    // Returned names are in canonical OCI/Docker form, e.g. "org/repo".
+    async fn list_repositories(&self) -> Result<Vec<String>, StorageError>;
+
+    // Best-effort timestamp metadata for a repository.
+    // - last_tag_update: latest modification in repo's tag pointers (often correlates with last push/tag)
+    // - last_manifest_update: latest modification in repo's manifest blobs
+    async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError>;
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError>;
 

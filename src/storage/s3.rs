@@ -1,4 +1,4 @@
-use super::{BlobMeta, ManifestMeta, ReferrerDescriptor, Storage, StorageError, UploadMeta};
+use super::{BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
 use aws_config::Region;
@@ -9,7 +9,9 @@ use aws_sdk_s3::Client;
 use base64::Engine as _;
 use bytes::Bytes;
 use sha2::Digest as _;
+use std::collections::HashSet;
 use std::pin::Pin;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::OnceCell;
 
@@ -153,6 +155,55 @@ impl S3Storage {
             .unwrap_or("application/vnd.oci.image.manifest.v1+json");
         Ok(media_type.to_string())
     }
+
+    async fn max_last_modified_under_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<Option<std::time::SystemTime>, StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+
+        let mut token: Option<String> = None;
+        let mut max_time: Option<std::time::SystemTime> = None;
+
+        loop {
+            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix.clone());
+            if let Some(t) = token.as_deref() {
+                req = req.continuation_token(t);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|err| StorageError::Internal(err.to_string()))?;
+
+            for obj in resp.contents() {
+                if let Some(dt) = obj.last_modified() {
+                    // aws_sdk_s3::primitives::DateTime exposes seconds + nanos.
+                    // Only handle non-negative timestamps.
+                    let secs = dt.secs();
+                    if secs >= 0 {
+                        let nanos = dt.subsec_nanos();
+                        let st = UNIX_EPOCH + Duration::new(secs as u64, nanos);
+                        max_time = Some(match max_time {
+                            Some(cur) if cur >= st => cur,
+                            _ => st,
+                        });
+                    }
+                }
+            }
+
+            if resp.is_truncated().unwrap_or(false) {
+                token = resp.next_continuation_token().map(|s| s.to_string());
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(max_time)
+    }
 }
 
 fn map_s3_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>) -> StorageError {
@@ -195,6 +246,79 @@ fn map_put_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_objec
 impl Storage for S3Storage {
     fn kind(&self) -> &'static str {
         "s3"
+    }
+
+    async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+
+        let repos_prefix = self.key("repos/");
+        let mut token: Option<String> = None;
+        let mut set: HashSet<String> = HashSet::new();
+
+        loop {
+            let mut req = client.list_objects_v2().bucket(bucket).prefix(repos_prefix.clone());
+            if let Some(t) = token.as_deref() {
+                req = req.continuation_token(t);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|err| StorageError::Internal(err.to_string()))?;
+
+            for obj in resp.contents() {
+                let Some(key) = obj.key() else { continue };
+                let Some(rest) = key.strip_prefix(&repos_prefix) else { continue };
+                let repo = if let Some((repo, _)) = rest.split_once("/tags/") {
+                    Some(repo)
+                } else if let Some((repo, _)) = rest.split_once("/manifests/") {
+                    Some(repo)
+                } else if let Some((repo, _)) = rest.split_once("/referrers/") {
+                    Some(repo)
+                } else {
+                    None
+                };
+                if let Some(repo) = repo {
+                    if !repo.is_empty() {
+                        set.insert(repo.to_string());
+                    }
+                }
+            }
+
+            if resp.is_truncated().unwrap_or(false) {
+                token = resp.next_continuation_token().map(|s| s.to_string());
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let mut repos: Vec<String> = set.into_iter().collect();
+        repos.sort();
+        Ok(repos)
+    }
+
+    async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
+        // Best-effort: compute from S3 LastModified times of tag pointers and manifests.
+        // NotFound is returned if we see neither tags nor manifests objects.
+        let tags_prefix = self.tags_prefix(name);
+        let manifests_prefix = self.key(&format!("repos/{name}/manifests/"));
+
+        let last_tag_update = self.max_last_modified_under_prefix(tags_prefix).await?;
+        let last_manifest_update = self
+            .max_last_modified_under_prefix(manifests_prefix)
+            .await?;
+
+        if last_tag_update.is_none() && last_manifest_update.is_none() {
+            return Err(StorageError::NotFound);
+        }
+
+        Ok(RepoTimestamps {
+            last_tag_update,
+            last_manifest_update,
+        })
     }
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {

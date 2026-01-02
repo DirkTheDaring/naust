@@ -2,6 +2,7 @@ use crate::{http_api::errors, AppState};
 use axum::{
     body::Body,
     extract::State,
+    http::HeaderMap,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -139,6 +140,39 @@ fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Resp
         http::HeaderValue::from_static("registry/2.0"),
     );
     resp
+}
+
+pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
+    unauthorized_registry_challenge(state, None)
+}
+
+pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    // If auth isn't configured, treat as unauthenticated.
+    let Some(expected_user) = state.config.push_username.as_deref() else {
+        return false;
+    };
+    let Some(expected_pass) = state.config.push_password.as_deref() else {
+        return false;
+    };
+
+    // Bearer: accept any valid, unexpired token minted by this registry.
+    if let Some(authz) = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(token) = authz.strip_prefix("Bearer ") {
+            if verify_bearer_token(&state.config.token_signing_key, token.trim()).is_some() {
+                return true;
+            }
+        }
+    }
+
+    // Basic: accept configured push credentials.
+    if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
+        return basic.username() == expected_user && basic.password() == expected_pass;
+    }
+
+    false
 }
 
 pub async fn require_push_basic_auth(
