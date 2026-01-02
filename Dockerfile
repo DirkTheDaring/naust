@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.76-bookworm AS build
+# NOTE: This repo targets Rust 2024 edition.
+# We use Alpine images here because this environment's Podman setup cannot run glibc-based images.
+FROM rust:1.85-alpine AS build
 WORKDIR /app
+
+RUN apk add --no-cache build-base musl-dev
 
 # Cache deps first.
 COPY Cargo.toml Cargo.lock ./
@@ -9,12 +13,11 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM alpine:3.20
 
-RUN adduser --system --uid 10001 --group registry \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+RUN addgroup -S -g 10001 registry \
+  && adduser -S -u 10001 -G registry registry \
+  && apk add --no-cache ca-certificates
 
 WORKDIR /srv
 COPY --from=build /app/target/release/registry-rust /usr/local/bin/registry-rust

@@ -22,7 +22,7 @@ CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/s
 docker compose up --build
 ```
 
-This listens on `127.0.0.1:5000` (host) and stores data in `./data`.
+This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`registry-data`).
 
 ## Docker CLI test
 
@@ -55,3 +55,14 @@ docker pull 127.0.0.1:5000/myrepo:latest
 - `MAX_UPLOAD_BYTES` (default `5368709120`)
 - `MAX_REQUEST_BODY_BYTES` (default `33554432`)
 - `REQUEST_TIMEOUT_SECS` (default `300`)
+
+Auth/token (for Docker/Podman clients):
+
+- `PUBLIC_URL` (recommended; e.g. `http://127.0.0.1:5000` or `https://127.0.0.1:5000`)
+- `TOKEN_SERVICE` (default `registry-rust`)
+- `TOKEN_SIGNING_KEY` (default: random per process; set a fixed secret for stable long-running deployments)
+- `TOKEN_TTL_SECS` (default `600`)
+
+TLS:
+
+- `TLS_CERT_PATH`, `TLS_KEY_PATH` (if both set, the server listens with HTTPS)

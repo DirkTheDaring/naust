@@ -4,6 +4,9 @@ use std::{net::SocketAddr, path::PathBuf};
 pub struct Config {
     pub listen_addr: SocketAddr,
 
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+
     pub push_username: Option<String>,
     pub push_password: Option<String>,
     pub push_allow_repos: Option<Vec<String>>,
@@ -22,6 +25,11 @@ pub struct Config {
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
     pub request_timeout_secs: u64,
+
+    pub public_url: Option<String>,
+    pub token_service: String,
+    pub token_signing_key: String,
+    pub token_ttl_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +44,9 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| ([127, 0, 0, 1], 5000).into());
+
+        let tls_cert_path = std::env::var("TLS_CERT_PATH").ok().map(PathBuf::from);
+        let tls_key_path = std::env::var("TLS_KEY_PATH").ok().map(PathBuf::from);
 
         let push_username = std::env::var("REGISTRY_USERNAME").ok();
         let push_password = std::env::var("REGISTRY_PASSWORD").ok();
@@ -97,8 +108,34 @@ impl Config {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(300);
 
+        let public_url = std::env::var("PUBLIC_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let token_service = std::env::var("TOKEN_SERVICE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "registry-rust".to_string());
+
+        // NOTE: for real deployments set TOKEN_SIGNING_KEY to a random secret.
+        // We fall back to a process-local random-ish value so dev works out-of-the-box.
+        let token_signing_key = std::env::var("TOKEN_SIGNING_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let token_ttl_secs = std::env::var("TOKEN_TTL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(600);
+
         Self {
             listen_addr,
+            tls_cert_path,
+            tls_key_path,
             push_username,
             push_password,
             push_allow_repos,
@@ -112,6 +149,10 @@ impl Config {
             max_upload_bytes,
             max_request_body_bytes,
             request_timeout_secs,
+            public_url,
+            token_service,
+            token_signing_key,
+            token_ttl_secs,
         }
     }
 

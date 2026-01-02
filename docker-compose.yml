@@ -4,6 +4,8 @@ services:
     ports:
       - "5000:5000"
     environment:
+      RUST_LOG: "info,tower_http=debug"
+      PUBLIC_URL: "http://127.0.0.1:5000"
       # Set credentials to enable pushes.
       REGISTRY_USERNAME: "demo"
       REGISTRY_PASSWORD: "demo"
@@ -21,4 +23,7 @@ services:
       REQUEST_TIMEOUT_SECS: "300"
 
     volumes:
-      - ./data:/data
+      - registry-data:/data
+
+volumes:
+  registry-data: {}

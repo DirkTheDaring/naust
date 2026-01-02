@@ -62,15 +62,30 @@ async fn main() {
             auth::require_push_basic_auth,
         ));
 
-    let app = v2
+    let tls_cert_path = state.config.tls_cert_path.clone();
+    let tls_key_path = state.config.tls_key_path.clone();
+
+    let app = Router::new()
+        .route("/token", get(handlers::token))
+        .merge(v2)
         .with_state(state)
         .layer(hardening)
         .layer(TraceLayer::new_for_http());
 
     tracing::info!(%addr, "registry listening");
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind listen addr");
-    axum::serve(listener, app).await.expect("serve");
+    if let (Some(cert), Some(key)) = (tls_cert_path, tls_key_path) {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .expect("load TLS cert/key");
+        axum_server::bind_rustls(addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .expect("serve https");
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("bind listen addr");
+        axum::serve(listener, app).await.expect("serve http");
+    }
 }

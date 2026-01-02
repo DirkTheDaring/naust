@@ -6,20 +6,240 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use base64::Engine as _;
 use bytes::Bytes;
+use headers::{authorization::Basic, Authorization, HeaderMapExt};
+use hmac::{Hmac, Mac};
 use sha2::Digest as _;
+use sha2::Sha256;
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio_util::io::ReaderStream;
 
 use super::errors;
 
-pub async fn ping() -> impl IntoResponse {
+pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Response {
+    // Many clients (Docker/Podman) perform auth negotiation via GET /v2/.
+    // For "anonymous pull + authenticated push" we still advertise auth here so
+    // clients learn the Bearer realm and can fetch an anonymous pull token or an
+    // authenticated push token.
+    let auth_scheme = req_headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap_or("<none>");
+    tracing::info!(auth_scheme = auth_scheme, "v2 ping");
+    let has_auth = auth_scheme != "<none>";
+
+    if state.config.push_auth_configured() && !has_auth {
+        let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+
+        let realm = state
+            .config
+            .public_url
+            .as_deref()
+            .unwrap_or("http://127.0.0.1:5000")
+            .trim_end_matches('/');
+        let bearer = format!(
+            "Bearer realm=\"{realm}/token\",service=\"{}\"",
+            state.config.token_service
+        );
+        if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+            resp.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
+        }
+        resp.headers_mut().append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Basic realm=\"registry\""),
+        );
+        resp.headers_mut().insert(
+            http::header::HeaderName::from_static("docker-distribution-api-version"),
+            http::HeaderValue::from_static("registry/2.0"),
+        );
+        return resp;
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(
         "Docker-Distribution-API-Version",
         "registry/2.0".parse().unwrap(),
     );
-    (StatusCode::OK, headers)
+    (StatusCode::OK, headers).into_response()
+}
+
+pub async fn token(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    // Docker/OCI token endpoint (very small subset).
+    // Expected query params:
+    //   service=<name>
+    //   scope=repository:<repo>:pull,push
+    let requested_scopes = query.get("scope").map(String::as_str).unwrap_or("");
+    let scopes = parse_scopes(requested_scopes);
+
+    // If push is requested, require Basic auth and validate creds.
+    let wants_push = scopes.iter().any(|s| s.actions.iter().any(|a| a == "push"));
+    let subject = if wants_push {
+        let Some(expected_user) = state.config.push_username.as_deref() else {
+            return token_unauthorized(&state);
+        };
+        let Some(expected_pass) = state.config.push_password.as_deref() else {
+            return token_unauthorized(&state);
+        };
+
+        match headers.typed_get::<Authorization<Basic>>() {
+            Some(Authorization(basic))
+                if basic.username() == expected_user && basic.password() == expected_pass =>
+            {
+                Some(basic.username().to_string())
+            }
+            _ => return token_unauthorized(&state),
+        }
+    } else {
+        None
+    };
+
+    // Enforce repo allowlist for push tokens too.
+    if wants_push {
+        if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+            for scope in &scopes {
+                if scope.typ == "repository" {
+                    if !crate::auth::repo_allowed(allowlist, &scope.name) {
+                        return errors::denied("push not allowed for this repository").into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    let exp = now.saturating_add(state.config.token_ttl_secs);
+
+    let token = match issue_token(&state, subject.as_deref(), &scopes, now, exp) {
+        Ok(t) => t,
+        Err(_) => return errors::internal_error().into_response(),
+    };
+
+    let body = serde_json::json!({
+        "token": token,
+        "access_token": token,
+        "expires_in": state.config.token_ttl_secs,
+        "issued_at": format_rfc3339(now),
+    });
+
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(_) => return errors::internal_error().into_response(),
+    };
+
+    let mut resp_headers = registry_headers();
+    resp_headers.insert("Content-Type", "application/json".parse().unwrap());
+    resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+    (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
+}
+
+fn token_unauthorized(state: &AppState) -> Response {
+    let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+    // Challenge so the client knows it can present Basic creds to obtain a token.
+    resp.headers_mut().insert(
+        http::header::WWW_AUTHENTICATE,
+        http::HeaderValue::from_static("Basic realm=\"registry\""),
+    );
+    resp.headers_mut().insert(
+        http::header::HeaderName::from_static("docker-distribution-api-version"),
+        http::HeaderValue::from_static("registry/2.0"),
+    );
+    // Also include Bearer parameters for completeness.
+    let realm = state
+        .config
+        .public_url
+        .as_deref()
+        .unwrap_or("http://127.0.0.1:5000")
+        .trim_end_matches('/');
+    if let Ok(v) = http::HeaderValue::from_str(&format!(
+        "Bearer realm=\"{realm}/token\",service=\"{}\"",
+        state.config.token_service
+    )) {
+        resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
+    }
+    resp
+}
+
+#[derive(Clone, Debug)]
+struct Scope {
+    typ: String,
+    name: String,
+    actions: Vec<String>,
+}
+
+fn parse_scopes(scope: &str) -> Vec<Scope> {
+    // scope can be repeated in the URL; many clients send exactly one.
+    // We accept a single comma-separated action list.
+    // Example: repository:myrepo:pull,push
+    if scope.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // Some clients include multiple scopes separated by spaces.
+    scope
+        .split_whitespace()
+        .filter_map(|item| {
+            let mut parts = item.splitn(3, ':');
+            let typ = parts.next()?.to_string();
+            let name = parts.next()?.to_string();
+            let actions = parts
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect::<Vec<_>>();
+            Some(Scope { typ, name, actions })
+        })
+        .collect()
+}
+
+fn issue_token(
+    state: &AppState,
+    subject: Option<&str>,
+    scopes: &[Scope],
+    iat: u64,
+    exp: u64,
+) -> Result<String, ()> {
+    let payload = serde_json::json!({
+        "sub": subject,
+        "iat": iat,
+        "exp": exp,
+        "scopes": scopes.iter().map(|s| serde_json::json!({
+            "type": s.typ,
+            "name": s.name,
+            "actions": s.actions,
+        })).collect::<Vec<_>>(),
+    });
+
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|_| ())?;
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(state.config.token_signing_key.as_bytes())
+        .map_err(|_| ())?;
+    mac.update(payload_b64.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+
+    Ok(format!("{payload_b64}.{sig_b64}"))
+}
+
+fn format_rfc3339(unix_secs: u64) -> String {
+    OffsetDateTime::from_unix_timestamp(unix_secs as i64)
+        .ok()
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
 pub async fn v2_dispatch(

@@ -2,7 +2,5 @@ target
 target2
 .git
 .gitignore
-Dockerfile
-docker-compose.yml
 data
 scripts

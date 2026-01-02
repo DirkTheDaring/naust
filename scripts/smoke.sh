@@ -15,6 +15,10 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
 export REGISTRY_USERNAME="$USER"
 export REGISTRY_PASSWORD="$PASS"
 
+# Make the smoke test deterministic: force plain HTTP.
+unset TLS_CERT_PATH TLS_KEY_PATH
+export PUBLIC_URL="http://$ADDR"
+
 # Restrict pushes to this repo only for smoke test coverage.
 export REGISTRY_PUSH_ALLOW_REPOS="$REPO"
 
@@ -31,7 +35,8 @@ trap cleanup EXIT
 sleep 0.3
 
 log "Ping /v2/"
-curl -fsS "http://$ADDR/v2/" >/dev/null
+code=$(curl -sS -o /dev/null -w '%{http_code}' "http://$ADDR/v2/")
+[[ "$code" == "200" || "$code" == "401" ]]
 
 log "Push denied without auth"
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
