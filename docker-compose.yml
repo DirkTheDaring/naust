@@ -1,0 +1,24 @@
+services:
+  registry:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      # Set credentials to enable pushes.
+      REGISTRY_USERNAME: "demo"
+      REGISTRY_PASSWORD: "demo"
+
+      # Optional: allow pushes only to specific repos (comma-separated).
+      # Examples: "myrepo", "org/*", "*"
+      REGISTRY_PUSH_ALLOW_REPOS: "myrepo"
+
+      # Data/config
+      STORAGE_BACKEND: "fs"
+      STORAGE_FS_ROOT: "/data"
+      ALLOW_TAG_OVERWRITE: "1"
+      MAX_UPLOAD_BYTES: "5368709120"
+      MAX_REQUEST_BODY_BYTES: "33554432"
+      REQUEST_TIMEOUT_SECS: "300"
+
+    volumes:
+      - ./data:/data
