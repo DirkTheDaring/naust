@@ -71,11 +71,45 @@ enabled = false
 mode = "allowlist" # "allowlist" (default) or "any"
 
 [proxy.upstream]
+# Single-upstream mode (legacy): configure ONE upstream here.
+# If you configure `[[proxy.upstreams]]` below, this section is ignored.
 base_url = "https://registry-1.docker.io"
 # Optional: Docker Hub credentials to raise rate limits.
 # Use your Docker ID as username and a Personal Access Token (recommended) or password.
 # username = "my-docker-id"
 # password = "my-dockerhub-pat"
+
+# Multiple upstream registries / isolated caches (single process)
+#
+# Use `[[proxy.upstreams]]` to proxy multiple upstream registries in ONE running process.
+# Each upstream is selected by request Host and has its own cache location, so repos/tags
+# from different upstream registries cannot collide.
+#
+# Example (filesystem backend):
+#
+# [[proxy.upstreams]]
+# hosts = ["dockerhub-cache.example.com"]
+# [proxy.upstreams.upstream]
+# base_url = "https://registry-1.docker.io"
+# # Optional: Docker Hub credentials to raise rate limits.
+# # username = "my-docker-id"
+# # password = "my-dockerhub-pat"
+# [proxy.upstreams.cache]
+# # Optional: fs_root and index_path default to a stable per-upstream path derived from base_url,
+# # e.g. ./data/cache/registry-1.docker.io/ (filesystem backend)
+# # fs_root = "./data/cache-dockerhub"
+# # index_path = "./data/cache-dockerhub/proxy-index"
+# max_cache_bytes = 10737418240
+#
+# [[proxy.upstreams]]
+# hosts = ["ghcr-cache.example.com"]
+# [proxy.upstreams.upstream]
+# base_url = "https://ghcr.io"
+# [proxy.upstreams.cache]
+# # Optional: fs_root and index_path default to a stable per-upstream path derived from base_url.
+# # fs_root = "./data/cache-ghcr"
+# # index_path = "./data/cache-ghcr/proxy-index"
+# max_cache_bytes = 10737418240
 
 [proxy.routing]
 # Optional: route requests by Host header.
@@ -84,7 +118,9 @@ base_url = "https://registry-1.docker.io"
 # - writes are rejected (405)
 # Patterns support a minimal '*' glob.
 proxy_hosts = []
-# If running behind a reverse proxy, set true and it will use X-Forwarded-Host.
+# If running behind a reverse proxy, you usually can keep this false as long as it preserves the
+# original Host header. Set true only if the registry is reachable *only* via that trusted proxy
+# and the proxy overwrites/normalizes X-Forwarded-Host (clients must not be able to spoof it).
 trust_x_forwarded_host = false
 
 [proxy.safety]

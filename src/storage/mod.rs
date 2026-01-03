@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::{path::PathBuf, pin::Pin, sync::Arc};
 use std::time::SystemTime;
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
@@ -96,7 +96,11 @@ pub trait Storage: Send + Sync {
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError>;
 
-    async fn head_manifest(&self, name: &str, digest: &Digest) -> Result<ManifestMeta, StorageError>;
+    async fn head_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<ManifestMeta, StorageError>;
 
     async fn get_manifest(
         &self,
@@ -104,7 +108,12 @@ pub trait Storage: Send + Sync {
         digest: &Digest,
     ) -> Result<(ManifestMeta, Bytes), StorageError>;
 
-    async fn put_manifest(&self, name: &str, digest: &Digest, bytes: Bytes) -> Result<ManifestMeta, StorageError>;
+    async fn put_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+        bytes: Bytes,
+    ) -> Result<ManifestMeta, StorageError>;
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError>;
 

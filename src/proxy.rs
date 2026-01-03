@@ -4,15 +4,15 @@ use crate::{
     storage::StorageError,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::redirect::Policy;
+use sha2::Digest as _;
 use std::{
     collections::HashMap,
     net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use futures_util::StreamExt;
-use sha2::Digest as _;
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
@@ -221,7 +221,11 @@ impl Proxy {
         "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.artifact.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
     }
 
-    pub async fn head_blob_upstream(&self, decision: &RepoDecision, digest: &Digest) -> Result<u64, ProxyError> {
+    pub async fn head_blob_upstream(
+        &self,
+        decision: &RepoDecision,
+        digest: &Digest,
+    ) -> Result<u64, ProxyError> {
         let _permit = self
             .upstream_sem
             .clone()
@@ -230,7 +234,11 @@ impl Proxy {
             .map_err(|e| ProxyError::Internal(e.to_string()))?;
 
         let mut url = self.upstream_base_url()?;
-        url.set_path(&format!("/v2/{}/blobs/{}", decision.upstream_repo, digest.as_str()));
+        url.set_path(&format!(
+            "/v2/{}/blobs/{}",
+            decision.upstream_repo,
+            digest.as_str()
+        ));
         self.ensure_upstream_allowed(&url).await?;
 
         let resp = self
@@ -241,7 +249,10 @@ impl Proxy {
             return Err(ProxyError::NotFound);
         }
         if !resp.status().is_success() {
-            return Err(ProxyError::Upstream(format!("HEAD blob status {}", resp.status())));
+            return Err(ProxyError::Upstream(format!(
+                "HEAD blob status {}",
+                resp.status()
+            )));
         }
 
         let len = resp
@@ -276,7 +287,11 @@ impl Proxy {
                 .map_err(|e| ProxyError::Internal(e.to_string()))?;
 
             let mut url = self.upstream_base_url()?;
-            url.set_path(&format!("/v2/{}/blobs/{}", decision.upstream_repo, digest.as_str()));
+            url.set_path(&format!(
+                "/v2/{}/blobs/{}",
+                decision.upstream_repo,
+                digest.as_str()
+            ));
             self.ensure_upstream_allowed(&url).await?;
 
             let resp = self
@@ -334,15 +349,16 @@ impl Proxy {
 
         let result = async {
             let mut url = self.upstream_base_url()?;
-            url.set_path(&format!("/v2/{}/manifests/{}", decision.upstream_repo, reference));
+            url.set_path(&format!(
+                "/v2/{}/manifests/{}",
+                decision.upstream_repo, reference
+            ));
             self.ensure_upstream_allowed(&url).await?;
 
-            let mut extra_headers = vec![
-                (
-                    reqwest::header::ACCEPT,
-                    Self::accept_manifest_header_value().to_string(),
-                ),
-            ];
+            let mut extra_headers = vec![(
+                reqwest::header::ACCEPT,
+                Self::accept_manifest_header_value().to_string(),
+            )];
             if let Some(etag) = if_none_match {
                 extra_headers.push((reqwest::header::IF_NONE_MATCH, etag));
             }
@@ -601,7 +617,10 @@ impl Proxy {
             }
         }
 
-        let resp = req.send().await.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
         if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
@@ -617,10 +636,12 @@ impl Proxy {
         };
 
         // Compute scope if not present (Docker Hub usually includes it).
-        let scope = challenge.scope.or_else(|| {
-            decision.map(|d| format!("repository:{}:pull", d.upstream_repo))
-        });
-        let token = self.get_token(&challenge.realm, &challenge.service, scope.as_deref()).await?;
+        let scope = challenge
+            .scope
+            .or_else(|| decision.map(|d| format!("repository:{}:pull", d.upstream_repo)));
+        let token = self
+            .get_token(&challenge.realm, &challenge.service, scope.as_deref())
+            .await?;
 
         let mut req2 = self.client.request(method, url);
         if let Some(hs) = extra_headers_retry.as_ref() {
@@ -653,7 +674,8 @@ impl Proxy {
             }
         }
 
-        let realm_url = Url::parse(realm).map_err(|_| ProxyError::Upstream("invalid token realm".to_string()))?;
+        let realm_url = Url::parse(realm)
+            .map_err(|_| ProxyError::Upstream("invalid token realm".to_string()))?;
         self.ensure_upstream_allowed(&realm_url).await?;
 
         let mut req = self.client.get(realm_url);
@@ -670,9 +692,15 @@ impl Proxy {
             req = req.basic_auth(user, Some(pass));
         }
 
-        let resp = req.send().await.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(ProxyError::Upstream(format!("token endpoint status {}", resp.status())));
+            return Err(ProxyError::Upstream(format!(
+                "token endpoint status {}",
+                resp.status()
+            )));
         }
         let v: serde_json::Value = resp
             .json()
@@ -684,10 +712,7 @@ impl Proxy {
             .and_then(|t| t.as_str())
             .ok_or_else(|| ProxyError::Upstream("missing token in response".to_string()))?
             .to_string();
-        let expires_in = v
-            .get("expires_in")
-            .and_then(|e| e.as_u64())
-            .unwrap_or(300);
+        let expires_in = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(300);
 
         let mut cache = self.token_cache.lock().await;
         if cache.len() >= MAX_TOKEN_CACHE_ENTRIES {
@@ -734,7 +759,11 @@ impl SingleFlight {
     async fn lock_key(
         &self,
         key: &str,
-    ) -> (String, Arc<tokio::sync::Mutex<()>>, tokio::sync::OwnedMutexGuard<()>) {
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<()>>,
+        tokio::sync::OwnedMutexGuard<()>,
+    ) {
         let key_string = key.to_string();
         let arc = {
             let mut map = self.locks.lock().await;
@@ -846,7 +875,9 @@ fn map_storage_err(err: StorageError) -> ProxyError {
         StorageError::NotFound => ProxyError::NotFound,
         StorageError::DigestMismatch => ProxyError::DigestMismatch,
         StorageError::TooLarge => ProxyError::TooLarge,
-        StorageError::InsufficientStorage => ProxyError::Upstream("insufficient storage".to_string()),
+        StorageError::InsufficientStorage => {
+            ProxyError::Upstream("insufficient storage".to_string())
+        }
         StorageError::Unsupported => ProxyError::Internal("storage unsupported".to_string()),
         StorageError::Internal(e) => ProxyError::Internal(e),
     }

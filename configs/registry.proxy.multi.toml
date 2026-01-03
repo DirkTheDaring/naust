@@ -1,0 +1,89 @@
+# Multi-upstream pull-through cache example (single process)
+#
+# This runs ONE registry-rust instance that proxies multiple upstream registries.
+# Requests are routed by Host header to select the upstream and its isolated cache.
+#
+# Example routing (reverse proxy / DNS):
+# - dockerhub-cache.example.com -> this registry instance
+# - ghcr-cache.example.com      -> this registry instance
+#
+# Then:
+#   docker pull dockerhub-cache.example.com/library/alpine:latest
+#   docker pull ghcr-cache.example.com/OWNER/IMAGE:TAG
+
+[server]
+listen_addr = "0.0.0.0:5000"
+public_url = "http://127.0.0.1:5000"
+
+[auth.push]
+# Configure if you also want to allow pushes to local storage on other hostnames.
+# Proxy-only hosts (matching [[proxy.upstreams]].hosts) always reject writes.
+username = "demo"
+password = "demo"
+allow_repos = ["myrepo"]
+
+[token]
+service = "registry-rust"
+signing_key = "change-me"
+ttl_secs = 600
+
+[storage]
+backend = "fs"
+
+[storage.fs]
+root = "./data"
+
+[limits]
+max_upload_bytes = 5368709120
+max_request_body_bytes = 33554432
+max_concurrent_buffered_requests = 8
+max_concurrent_requests = 256
+
+[proxy]
+enabled = true
+mode = "allowlist"
+
+[proxy.routing]
+# Standalone: keep false (uses Host header).
+# Behind a trusted reverse proxy (nginx/traefik/caddy): you can usually keep false if it preserves
+# Host; set true only if the registry is reachable *only* via that proxy and it overwrites/normalizes
+# X-Forwarded-Host (so clients cannot spoof it).
+trust_x_forwarded_host = false
+
+[proxy.safety]
+# Defaults are conservative; these apply unless overridden per-upstream.
+allowed_upstream_hosts = []
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+# Docker Hub upstream (proxy-only by Host)
+[[proxy.upstreams]]
+hosts = ["dockerhub-cache.example.com"]
+
+[proxy.upstreams.upstream]
+base_url = "https://registry-1.docker.io"
+# Optional: Docker Hub credentials (use a PAT to raise rate limits)
+# username = "my-docker-id"
+# password = "my-dockerhub-pat"
+
+[proxy.upstreams.cache]
+# fs_root and index_path are optional; defaults are derived from upstream.base_url.
+max_cache_bytes = 10737418240
+
+# GHCR upstream (proxy-only by Host)
+[[proxy.upstreams]]
+hosts = ["ghcr-cache.example.com"]
+
+[proxy.upstreams.upstream]
+base_url = "https://ghcr.io"
+
+[proxy.upstreams.cache]
+# fs_root and index_path are optional; defaults are derived from upstream.base_url.
+max_cache_bytes = 10737418240
+
+# Per-repo policies are shared (apply to all upstreams). If you need different
+# policies per upstream, run separate instances.
+[[proxy.repos]]
+match = "library/alpine"
+tag_policy = { ttl_seconds = 3600 }

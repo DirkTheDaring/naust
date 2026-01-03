@@ -1,5 +1,38 @@
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
+use url::Url;
+
+fn sanitize_for_path_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "upstream".to_string()
+    } else {
+        out
+    }
+}
+
+fn cache_key_from_base_url(base_url: &str) -> String {
+    let base_url = base_url.trim();
+    if let Ok(u) = Url::parse(base_url) {
+        if let Some(host) = u.host_str() {
+            // Include port if present to avoid collisions.
+            if let Some(port) = u.port() {
+                return sanitize_for_path_component(&format!("{host}_{port}"));
+            }
+            return sanitize_for_path_component(host);
+        }
+    }
+    sanitize_for_path_component(base_url)
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -135,9 +168,37 @@ pub struct ProxyConfig {
     // Repo-specific policies (TOML only, for now).
     pub repo_rules: Vec<ProxyRepoRule>,
 
+    // Multi-upstream routing (TOML only): route by Host (or X-Forwarded-Host) to select an
+    // upstream + isolated cache. If non-empty, this instance can serve multiple upstream registries
+    // without cache collisions.
+    pub upstreams: Vec<ProxyUpstreamRoute>,
+
     // Request routing: select proxy behavior based on Host (or X-Forwarded-Host).
     pub routing_proxy_hosts: Vec<String>,
     pub routing_trust_x_forwarded_host: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyUpstreamRoute {
+    // Host patterns (minimal '*' glob). If the effective request host matches, this upstream is
+    // selected and the request runs in proxy-only mode.
+    pub hosts: Vec<String>,
+
+    pub upstream_base_url: String,
+    pub upstream_username: Option<String>,
+    pub upstream_password: Option<String>,
+
+    // Safety settings (can be different per upstream).
+    pub allowed_upstream_hosts: Vec<String>,
+    pub allowed_repo_prefixes: Vec<String>,
+    pub block_private_networks: bool,
+    pub max_concurrent_upstream: usize,
+
+    // Cache settings (must be unique per upstream to avoid collisions).
+    pub index_path: PathBuf,
+    pub cache_fs_root: Option<PathBuf>,
+    pub cache_s3_prefix: Option<String>,
+    pub max_cache_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,7 +287,38 @@ struct FileProxy {
     routing: FileProxyRouting,
 
     #[serde(default)]
+    upstreams: Vec<FileProxyUpstreamRoute>,
+
+    #[serde(default)]
     repos: Vec<FileProxyRepoRule>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyUpstreamRoute {
+    // Host patterns (minimal '*' glob).
+    #[serde(default)]
+    hosts: Vec<String>,
+
+    #[serde(default)]
+    upstream: FileProxyUpstream,
+
+    #[serde(default)]
+    safety: FileProxySafety,
+
+    #[serde(default)]
+    cache: FileProxyRouteCache,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyRouteCache {
+    #[serde(default)]
+    index_path: Option<String>,
+    #[serde(default)]
+    fs_root: Option<String>,
+    #[serde(default)]
+    s3_prefix: Option<String>,
+    #[serde(default)]
+    max_cache_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -479,12 +571,13 @@ impl Config {
                 .map(|s| s.eq_ignore_ascii_case("best_practice"))
                 .unwrap_or(false);
 
-        let listen_addr = env_socket_addr(&["REGISTRY__SERVER__LISTEN_ADDR", "LISTEN_ADDR"]).unwrap_or_else(|| {
-            file_cfg
-                .server
-                .listen_addr
-                .unwrap_or_else(|| ([127, 0, 0, 1], 5000).into())
-        });
+        let listen_addr = env_socket_addr(&["REGISTRY__SERVER__LISTEN_ADDR", "LISTEN_ADDR"])
+            .unwrap_or_else(|| {
+                file_cfg
+                    .server
+                    .listen_addr
+                    .unwrap_or_else(|| ([127, 0, 0, 1], 5000).into())
+            });
 
         let tls_cert_path = env_str_any(&["REGISTRY__SERVER__TLS__CERT_PATH", "TLS_CERT_PATH"])
             .or_else(|| file_cfg.server.tls.cert_path.clone())
@@ -545,33 +638,50 @@ impl Config {
             .or_else(|| file_cfg.storage.s3.prefix.clone())
             .unwrap_or_else(|| "registry".to_string());
 
-        let allow_tag_overwrite = env_bool_opt(&["REGISTRY__FEATURES__ALLOW_TAG_OVERWRITE", "ALLOW_TAG_OVERWRITE"])
-            .or(file_cfg.features.allow_tag_overwrite)
-            .unwrap_or_else(|| !best_practice);
+        let allow_tag_overwrite = env_bool_opt(&[
+            "REGISTRY__FEATURES__ALLOW_TAG_OVERWRITE",
+            "ALLOW_TAG_OVERWRITE",
+        ])
+        .or(file_cfg.features.allow_tag_overwrite)
+        .unwrap_or_else(|| !best_practice);
 
-        let automatic_crossmount = env_bool_opt(&["REGISTRY__FEATURES__AUTOMATIC_CROSSMOUNT", "REGISTRY_AUTOMATIC_CROSSMOUNT"])
-            .or(file_cfg.features.automatic_crossmount)
-            .unwrap_or(false);
+        let automatic_crossmount = env_bool_opt(&[
+            "REGISTRY__FEATURES__AUTOMATIC_CROSSMOUNT",
+            "REGISTRY_AUTOMATIC_CROSSMOUNT",
+        ])
+        .or(file_cfg.features.automatic_crossmount)
+        .unwrap_or(false);
 
-        let upload_gc_enabled = env_bool_opt(&["REGISTRY__UPLOADS__GC_ENABLED", "UPLOAD_GC_ENABLED"])
-            .or(file_cfg.uploads.gc_enabled)
-            .unwrap_or(true);
+        let upload_gc_enabled =
+            env_bool_opt(&["REGISTRY__UPLOADS__GC_ENABLED", "UPLOAD_GC_ENABLED"])
+                .or(file_cfg.uploads.gc_enabled)
+                .unwrap_or(true);
 
-        let upload_gc_interval_secs = env_u64_any(&["REGISTRY__UPLOADS__GC_INTERVAL_SECS", "UPLOAD_GC_INTERVAL_SECS"])
-            .or(file_cfg.uploads.gc_interval_secs)
-            .unwrap_or(3600);
+        let upload_gc_interval_secs = env_u64_any(&[
+            "REGISTRY__UPLOADS__GC_INTERVAL_SECS",
+            "UPLOAD_GC_INTERVAL_SECS",
+        ])
+        .or(file_cfg.uploads.gc_interval_secs)
+        .unwrap_or(3600);
 
-        let upload_gc_max_age_secs = env_u64_any(&["REGISTRY__UPLOADS__GC_MAX_AGE_SECS", "UPLOAD_GC_MAX_AGE_SECS"])
-            .or(file_cfg.uploads.gc_max_age_secs)
-            .unwrap_or(24 * 3600);
+        let upload_gc_max_age_secs = env_u64_any(&[
+            "REGISTRY__UPLOADS__GC_MAX_AGE_SECS",
+            "UPLOAD_GC_MAX_AGE_SECS",
+        ])
+        .or(file_cfg.uploads.gc_max_age_secs)
+        .unwrap_or(24 * 3600);
 
-        let max_upload_bytes = env_u64_any(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])
-            .or(file_cfg.limits.max_upload_bytes)
-            .unwrap_or(5 * 1024 * 1024 * 1024);
+        let max_upload_bytes =
+            env_u64_any(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])
+                .or(file_cfg.limits.max_upload_bytes)
+                .unwrap_or(5 * 1024 * 1024 * 1024);
 
-        let max_request_body_bytes = env_usize_any(&["REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES", "MAX_REQUEST_BODY_BYTES"])
-            .or(file_cfg.limits.max_request_body_bytes)
-            .unwrap_or(32 * 1024 * 1024);
+        let max_request_body_bytes = env_usize_any(&[
+            "REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES",
+            "MAX_REQUEST_BODY_BYTES",
+        ])
+        .or(file_cfg.limits.max_request_body_bytes)
+        .unwrap_or(32 * 1024 * 1024);
 
         let max_concurrent_buffered_requests = env_usize_any(&[
             "REGISTRY__LIMITS__MAX_CONCURRENT_BUFFERED_REQUESTS",
@@ -589,27 +699,37 @@ impl Config {
         .unwrap_or(if best_practice { 64 } else { 256 })
         .max(1);
 
-        let request_timeout_secs = env_u64_any(&["REGISTRY__TIMEOUTS__REQUEST_TIMEOUT_SECS", "REQUEST_TIMEOUT_SECS"])
-            .or(file_cfg.timeouts.request_timeout_secs)
-            .unwrap_or(if best_practice { 60 } else { 300 });
+        let request_timeout_secs = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__REQUEST_TIMEOUT_SECS",
+            "REQUEST_TIMEOUT_SECS",
+        ])
+        .or(file_cfg.timeouts.request_timeout_secs)
+        .unwrap_or(if best_practice { 60 } else { 300 });
 
-        let upload_request_timeout_secs =
-            env_u64_any(&["REGISTRY__TIMEOUTS__UPLOAD_REQUEST_TIMEOUT_SECS", "UPLOAD_REQUEST_TIMEOUT_SECS"])
-                .or(file_cfg.timeouts.upload_request_timeout_secs)
-                .unwrap_or(if best_practice { 7200 } else { 3600 });
+        let upload_request_timeout_secs = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__UPLOAD_REQUEST_TIMEOUT_SECS",
+            "UPLOAD_REQUEST_TIMEOUT_SECS",
+        ])
+        .or(file_cfg.timeouts.upload_request_timeout_secs)
+        .unwrap_or(if best_practice { 7200 } else { 3600 });
 
-        let disallow_monolithic_uploads =
-            env_bool_opt(&["REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS", "DISALLOW_MONOLITHIC_UPLOADS"])
-                .or(file_cfg.uploads.disallow_monolithic_uploads)
-                .unwrap_or(best_practice);
+        let disallow_monolithic_uploads = env_bool_opt(&[
+            "REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS",
+            "DISALLOW_MONOLITHIC_UPLOADS",
+        ])
+        .or(file_cfg.uploads.disallow_monolithic_uploads)
+        .unwrap_or(best_practice);
 
-        let uploads_abort_on_error = env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_ERROR", "UPLOAD_ABORT_ON_ERROR"])
-            .or(file_cfg.uploads.abort_on_error)
-            .unwrap_or(false);
-        let uploads_abort_on_digest_mismatch =
-            env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_DIGEST_MISMATCH", "UPLOAD_ABORT_ON_DIGEST_MISMATCH"])
-                .or(file_cfg.uploads.abort_on_digest_mismatch)
+        let uploads_abort_on_error =
+            env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_ERROR", "UPLOAD_ABORT_ON_ERROR"])
+                .or(file_cfg.uploads.abort_on_error)
                 .unwrap_or(false);
+        let uploads_abort_on_digest_mismatch = env_bool_opt(&[
+            "REGISTRY__UPLOADS__ABORT_ON_DIGEST_MISMATCH",
+            "UPLOAD_ABORT_ON_DIGEST_MISMATCH",
+        ])
+        .or(file_cfg.uploads.abort_on_digest_mismatch)
+        .unwrap_or(false);
 
         let upload_policy = UploadPolicyConfig {
             abort_on_error: uploads_abort_on_error,
@@ -626,9 +746,10 @@ impl Config {
                 .collect(),
         };
 
-        let catalog_requires_auth = env_bool_opt(&["REGISTRY__CATALOG__REQUIRES_AUTH", "CATALOG_REQUIRES_AUTH"])
-            .or(file_cfg.catalog.requires_auth)
-            .unwrap_or(best_practice);
+        let catalog_requires_auth =
+            env_bool_opt(&["REGISTRY__CATALOG__REQUIRES_AUTH", "CATALOG_REQUIRES_AUTH"])
+                .or(file_cfg.catalog.requires_auth)
+                .unwrap_or(best_practice);
 
         let public_url = env_str_any(&["REGISTRY__SERVER__PUBLIC_URL", "PUBLIC_URL"])
             .or_else(|| file_cfg.server.public_url.clone())
@@ -662,7 +783,8 @@ impl Config {
             .or(file_cfg.proxy.enabled)
             .unwrap_or(false);
 
-        let proxy_mode_raw = env_str_any(&["REGISTRY__PROXY__MODE", "PROXY_MODE"]).or(file_cfg.proxy.mode.clone());
+        let proxy_mode_raw =
+            env_str_any(&["REGISTRY__PROXY__MODE", "PROXY_MODE"]).or(file_cfg.proxy.mode.clone());
         let proxy_mode = match proxy_mode_raw
             .as_deref()
             .unwrap_or("allowlist")
@@ -744,30 +866,32 @@ impl Config {
         .or(file_cfg.proxy.safety.max_concurrent_upstream)
         .unwrap_or(16);
 
-        let cache_fs_root = env_str_any(&["REGISTRY__PROXY__CACHE__FS_ROOT", "PROXY_CACHE_FS_ROOT"])
-            .or_else(|| file_cfg.proxy.cache.fs_root.clone())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                if storage_backend == StorageBackend::Filesystem {
-                    Some(fs_root.join("cache"))
-                } else {
-                    None
-                }
-            });
+        let cache_fs_root =
+            env_str_any(&["REGISTRY__PROXY__CACHE__FS_ROOT", "PROXY_CACHE_FS_ROOT"])
+                .or_else(|| file_cfg.proxy.cache.fs_root.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    if storage_backend == StorageBackend::Filesystem {
+                        Some(fs_root.join("cache"))
+                    } else {
+                        None
+                    }
+                });
 
-        let cache_s3_prefix = env_str_any(&["REGISTRY__PROXY__CACHE__S3_PREFIX", "PROXY_CACHE_S3_PREFIX"])
-            .or_else(|| file_cfg.proxy.cache.s3_prefix.clone())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if storage_backend == StorageBackend::S3 {
-                    Some(format!("{}/cache", s3_prefix.trim_end_matches('/')))
-                } else {
-                    None
-                }
-            });
+        let cache_s3_prefix =
+            env_str_any(&["REGISTRY__PROXY__CACHE__S3_PREFIX", "PROXY_CACHE_S3_PREFIX"])
+                .or_else(|| file_cfg.proxy.cache.s3_prefix.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    if storage_backend == StorageBackend::S3 {
+                        Some(format!("{}/cache", s3_prefix.trim_end_matches('/')))
+                    } else {
+                        None
+                    }
+                });
 
         let index_path = env_str_any(&["REGISTRY__PROXY__CACHE__INDEX_PATH", "PROXY_INDEX_PATH"])
             .or_else(|| file_cfg.proxy.cache.index_path.clone())
@@ -777,8 +901,11 @@ impl Config {
             .or_else(|| cache_fs_root.as_ref().map(|p| p.join("proxy-index")))
             .unwrap_or_else(|| PathBuf::from("./data/cache/proxy-index"));
 
-        let max_cache_bytes = env_u64_any(&["REGISTRY__PROXY__CACHE__MAX_CACHE_BYTES", "PROXY_MAX_CACHE_BYTES"])
-            .or(file_cfg.proxy.cache.max_cache_bytes);
+        let max_cache_bytes = env_u64_any(&[
+            "REGISTRY__PROXY__CACHE__MAX_CACHE_BYTES",
+            "PROXY_MAX_CACHE_BYTES",
+        ])
+        .or(file_cfg.proxy.cache.max_cache_bytes);
 
         let gc_interval_secs = env_u64_any(&[
             "REGISTRY__PROXY__CACHE__GC_INTERVAL_SECS",
@@ -840,6 +967,157 @@ impl Config {
             })
             .collect::<Vec<_>>();
 
+        let upstreams = file_cfg
+            .proxy
+            .upstreams
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let hosts = r
+                    .hosts
+                    .iter()
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty())
+                    .collect::<Vec<_>>();
+
+                let upstream_base_url = r
+                    .upstream
+                    .base_url
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                let cache_key = cache_key_from_base_url(&upstream_base_url);
+                let derived_cache_fs_root = fs_root.join("cache").join(&cache_key);
+                let derived_index_path = derived_cache_fs_root.join("proxy-index");
+                let derived_cache_s3_prefix =
+                    format!("{}/cache/{}", s3_prefix.trim_end_matches('/'), cache_key);
+
+                let upstream_username = r
+                    .upstream
+                    .username
+                    .clone()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let upstream_password = r
+                    .upstream
+                    .password
+                    .clone()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                let cache_fs_root = r
+                    .cache
+                    .fs_root
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
+                let cache_s3_prefix = r
+                    .cache
+                    .s3_prefix
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                let max_cache_bytes = r.cache.max_cache_bytes.unwrap_or(0);
+
+                // Per-upstream safety: if fields are not set, fall back to global proxy.safety.
+                let allowed_upstream_hosts = r
+                    .safety
+                    .allowed_upstream_hosts
+                    .clone()
+                    .or_else(|| file_cfg.proxy.safety.allowed_upstream_hosts.clone())
+                    .unwrap_or_default();
+                let allowed_repo_prefixes = r
+                    .safety
+                    .allowed_repo_prefixes
+                    .clone()
+                    .or_else(|| file_cfg.proxy.safety.allowed_repo_prefixes.clone())
+                    .unwrap_or_default();
+                let block_private_networks = r
+                    .safety
+                    .block_private_networks
+                    .or(file_cfg.proxy.safety.block_private_networks)
+                    .unwrap_or(true);
+                let max_concurrent_upstream = r
+                    .safety
+                    .max_concurrent_upstream
+                    .or(file_cfg.proxy.safety.max_concurrent_upstream)
+                    .unwrap_or(16);
+
+                // Validate (fail fast) when the feature is used.
+                if !hosts.is_empty() {
+                    if upstream_base_url.is_empty() {
+                        panic!("proxy.upstreams[{i}] requires [proxy.upstreams.upstream].base_url");
+                    }
+                    if max_cache_bytes == 0 {
+                        panic!(
+                            "proxy.upstreams[{i}] requires [proxy.upstreams.cache].max_cache_bytes"
+                        );
+                    }
+
+                    match storage_backend {
+                        StorageBackend::Filesystem => {
+                            // cache fs_root is optional; derived from base_url when omitted.
+                        }
+                        StorageBackend::S3 => {
+                            // cache s3_prefix and index_path are optional; derived from base_url when omitted.
+                        }
+                    }
+                }
+
+                let cache_fs_root = match storage_backend {
+                    StorageBackend::Filesystem => {
+                        Some(cache_fs_root.unwrap_or_else(|| derived_cache_fs_root.clone()))
+                    }
+                    StorageBackend::S3 => None,
+                };
+
+                let cache_s3_prefix = match storage_backend {
+                    StorageBackend::Filesystem => None,
+                    StorageBackend::S3 => Some(
+                        cache_s3_prefix
+                            .clone()
+                            .unwrap_or_else(|| derived_cache_s3_prefix.clone()),
+                    ),
+                };
+
+                let index_path = r
+                    .cache
+                    .index_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| match storage_backend {
+                        StorageBackend::Filesystem => cache_fs_root
+                            .as_ref()
+                            .expect("filesystem cache fs_root")
+                            .join("proxy-index"),
+                        StorageBackend::S3 => derived_index_path.clone(),
+                    });
+
+                ProxyUpstreamRoute {
+                    hosts,
+                    upstream_base_url,
+                    upstream_username,
+                    upstream_password,
+                    allowed_upstream_hosts,
+                    allowed_repo_prefixes,
+                    block_private_networks,
+                    max_concurrent_upstream,
+                    index_path,
+                    cache_fs_root,
+                    cache_s3_prefix,
+                    max_cache_bytes,
+                }
+            })
+            .filter(|r| !r.hosts.is_empty())
+            .collect::<Vec<_>>();
+
         let routing_proxy_hosts = env_str_any(&[
             "REGISTRY__PROXY__ROUTING__PROXY_HOSTS",
             "PROXY_ROUTING_PROXY_HOSTS",
@@ -862,11 +1140,17 @@ impl Config {
         .unwrap_or(false);
 
         if proxy_enabled {
-            if upstream_base_url.is_none() {
-                panic!("proxy.enabled requires proxy.upstream.base_url (or PROXY_UPSTREAM_BASE_URL)");
+            // Either single-upstream mode (proxy.upstream.*) or multi-upstream mode (proxy.upstreams).
+            if upstream_base_url.is_none() && upstreams.is_empty() {
+                panic!(
+                    "proxy.enabled requires proxy.upstream.base_url (or PROXY_UPSTREAM_BASE_URL) OR proxy.upstreams[]"
+                );
             }
-            if max_cache_bytes.is_none() {
-                panic!("proxy.enabled requires proxy.cache.max_cache_bytes (or PROXY_MAX_CACHE_BYTES) to be set");
+            // In single-upstream mode, keep the existing requirement.
+            if upstreams.is_empty() && max_cache_bytes.is_none() {
+                panic!(
+                    "proxy.enabled requires proxy.cache.max_cache_bytes (or PROXY_MAX_CACHE_BYTES) to be set"
+                );
             }
         }
 
@@ -889,6 +1173,7 @@ impl Config {
             scrub_max_files_per_run,
             max_cache_bytes,
             repo_rules,
+            upstreams,
             routing_proxy_hosts,
             routing_trust_x_forwarded_host,
         };

@@ -153,7 +153,8 @@ This registry can act as a pull-through cache for selected upstream repositories
 Important: cached pull-through content is stored in a separate storage root/prefix (filesystem default: `./data/cache`).
 This prevents pushed images from being mixed into the cache and makes cache cleanup as simple as removing the cache directory.
 
-See `configs/registry.example.toml` for an example `proxy` configuration.
+See `configs/registry.example.toml` for an annotated `proxy` configuration template.
+For a full working multi-upstream example (Docker Hub + GHCR in one process), see `configs/registry.proxy.multi.toml`.
 
 ### Unambiguous local vs cache behavior (route by Host)
 
@@ -175,7 +176,10 @@ proxy_hosts = ["cache.example.com"]
 trust_x_forwarded_host = true
 ```
 
-If you run behind a reverse proxy, set `trust_x_forwarded_host=true` and make sure your proxy sets `X-Forwarded-Host`.
+If you run behind a reverse proxy (e.g. Traefik), you have two options:
+
+- Prefer: keep `trust_x_forwarded_host=false` (default) if your proxy preserves the original `Host` header when forwarding.
+- Use `trust_x_forwarded_host=true` only when the registry is reachable *only* via that trusted proxy (so clients cannot spoof `X-Forwarded-Host`). Make sure the proxy overwrites/normalizes any incoming forwarded headers.
 
 ### Docker Hub credentials (optional)
 
@@ -197,6 +201,45 @@ export REGISTRY__PROXY__UPSTREAM__BASE_URL="https://registry-1.docker.io"
 export REGISTRY__PROXY__UPSTREAM__USERNAME="my-docker-id"
 export REGISTRY__PROXY__UPSTREAM__PASSWORD="my-dockerhub-pat"
 ```
+
+### Multiple upstream registries (and separate caches)
+
+One `registry-rust` process can proxy multiple upstream registries using `[[proxy.upstreams]]` (TOML-only).
+
+Each upstream route has:
+- `hosts`: host patterns (minimal `*` glob) that select the upstream
+- `upstream.*`: base URL + optional credentials
+- `cache.*`: an isolated cache location (filesystem root or S3 prefix) + per-upstream `index_path`
+
+When the request Host matches an upstream route, the registry runs in proxy-only mode for that request (unambiguous reads; writes rejected).
+
+Example (single process, Docker Hub + GHCR, filesystem caches):
+
+```toml
+[proxy]
+enabled = true
+
+[[proxy.upstreams]]
+hosts = ["dockerhub-cache.example.com"]
+[proxy.upstreams.upstream]
+base_url = "https://registry-1.docker.io"
+username = "my-docker-id"         # optional
+password = "my-dockerhub-pat"     # optional
+[proxy.upstreams.cache]
+# fs_root and index_path are optional; by default they are derived from upstream.base_url,
+# e.g. ./data/cache/registry-1.docker.io/ (filesystem backend)
+max_cache_bytes = 10737418240
+
+[[proxy.upstreams]]
+hosts = ["ghcr-cache.example.com"]
+[proxy.upstreams.upstream]
+base_url = "https://ghcr.io"
+[proxy.upstreams.cache]
+# fs_root and index_path are optional; defaults are derived from upstream.base_url.
+max_cache_bytes = 10737418240
+```
+
+Full config example: `configs/registry.proxy.multi.toml`.
 
 - Enable: set `CONFIG_PATH` to a TOML file (see `configs/registry.example.toml` and `configs/registry.best_practice.toml`).
 - Precedence: defaults < config file < env vars

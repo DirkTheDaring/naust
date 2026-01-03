@@ -2,14 +2,15 @@ mod auth;
 mod config;
 mod http_api;
 mod proxy;
-mod request_routing;
 mod registry;
+mod request_routing;
 mod security;
 mod storage;
 
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    http::HeaderMap,
     http::Request,
     middleware::Next,
     response::IntoResponse,
@@ -33,8 +34,38 @@ pub struct AppState {
     pub storage: Arc<dyn storage::Storage>,
     pub proxy: Option<Arc<proxy::Proxy>>,
     pub proxy_cache: Option<Arc<dyn storage::Storage>>,
+    // Multi-upstream: proxy/cache selected per request host.
+    pub proxy_upstreams: Vec<ProxyContext>,
     pub buffered_body_sem: Arc<Semaphore>,
     pub request_sem: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+pub struct ProxyContext {
+    pub proxy: Arc<proxy::Proxy>,
+    pub cache: Arc<dyn storage::Storage>,
+}
+
+impl AppState {
+    pub fn proxy_context_for_request(&self, headers: &HeaderMap) -> Option<ProxyContext> {
+        // Multi-upstream mode: choose the upstream by request host.
+        if !self.config.proxy.upstreams.is_empty() {
+            let idx = crate::request_routing::proxy_upstream_index_for_request(
+                &self.config.proxy,
+                headers,
+            )?;
+            return self.proxy_upstreams.get(idx).cloned();
+        }
+
+        // Single-upstream mode.
+        match (self.proxy.as_ref(), self.proxy_cache.as_ref()) {
+            (Some(proxy), Some(cache)) => Some(ProxyContext {
+                proxy: proxy.clone(),
+                cache: cache.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[tokio::main]
@@ -47,56 +78,125 @@ async fn main() {
     let config = Arc::new(Config::from_env());
     let addr = config.listen_addr;
     let storage = storage::from_config(config.as_ref());
-    let proxy = match proxy::Proxy::new(&config.proxy) {
-        Ok(p) => p.map(Arc::new),
-        Err(err) => {
-            // Fail fast: proxy config errors should not start the server in a surprising state.
-            panic!("proxy init failed: {err}");
-        }
-    };
 
-    let proxy_cache: Option<Arc<dyn storage::Storage>> = if config.proxy.enabled {
-        match config.storage_backend {
-            StorageBackend::Filesystem => {
-                let root = config
-                    .proxy
-                    .cache_fs_root
-                    .clone()
-                    .unwrap_or_else(|| config.fs_root.join("cache"));
-                Some(Arc::new(storage::fs::FsStorage::new(
-                    root,
-                    config.max_upload_bytes,
-                )))
-            }
-            StorageBackend::S3 => {
-                let endpoint = config
-                    .s3_endpoint
-                    .clone()
-                    .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
-                let region = config
-                    .s3_region
-                    .clone()
-                    .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
-                let bucket = config
-                    .s3_bucket
-                    .clone()
-                    .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
-                let prefix =
-                    config.proxy.cache_s3_prefix.clone().unwrap_or_else(|| {
-                        format!("{}/cache", config.s3_prefix.trim_end_matches('/'))
-                    });
-                Some(Arc::new(storage::s3::S3Storage::new(
-                    Some(endpoint),
-                    Some(region),
-                    Some(bucket),
-                    prefix,
-                    config.max_upload_bytes,
-                )))
+    let mut proxy_upstreams: Vec<ProxyContext> = Vec::new();
+
+    // Multi-upstream mode: create one Proxy + cache Storage per configured upstream.
+    if config.proxy.enabled && !config.proxy.upstreams.is_empty() {
+        for (i, up) in config.proxy.upstreams.iter().enumerate() {
+            let mut per = config.proxy.clone();
+            per.upstreams = vec![];
+            per.upstream_base_url = Some(up.upstream_base_url.clone());
+            per.upstream_username = up.upstream_username.clone();
+            per.upstream_password = up.upstream_password.clone();
+            per.allowed_upstream_hosts = up.allowed_upstream_hosts.clone();
+            per.allowed_repo_prefixes = up.allowed_repo_prefixes.clone();
+            per.block_private_networks = up.block_private_networks;
+            per.max_concurrent_upstream = up.max_concurrent_upstream;
+            per.index_path = up.index_path.clone();
+            per.cache_fs_root = up.cache_fs_root.clone();
+            per.cache_s3_prefix = up.cache_s3_prefix.clone();
+            per.max_cache_bytes = Some(up.max_cache_bytes);
+
+            let proxy = match proxy::Proxy::new(&per) {
+                Ok(p) => p.map(Arc::new).expect("proxy enabled"),
+                Err(err) => panic!("proxy upstream[{i}] init failed: {err}"),
+            };
+
+            let cache: Arc<dyn storage::Storage> = match config.storage_backend {
+                StorageBackend::Filesystem => {
+                    let root = up
+                        .cache_fs_root
+                        .clone()
+                        .expect("validated: filesystem cache fs_root");
+                    Arc::new(storage::fs::FsStorage::new(root, config.max_upload_bytes))
+                }
+                StorageBackend::S3 => {
+                    let endpoint = config
+                        .s3_endpoint
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
+                    let region = config
+                        .s3_region
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
+                    let bucket = config
+                        .s3_bucket
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
+                    let prefix = up
+                        .cache_s3_prefix
+                        .clone()
+                        .expect("validated: S3 cache s3_prefix");
+                    Arc::new(storage::s3::S3Storage::new(
+                        Some(endpoint),
+                        Some(region),
+                        Some(bucket),
+                        prefix,
+                        config.max_upload_bytes,
+                    ))
+                }
+            };
+
+            proxy_upstreams.push(ProxyContext { proxy, cache });
+        }
+    }
+
+    // Single-upstream mode (legacy).
+    let proxy = if config.proxy.enabled && config.proxy.upstreams.is_empty() {
+        match proxy::Proxy::new(&config.proxy) {
+            Ok(p) => p.map(Arc::new),
+            Err(err) => {
+                // Fail fast: proxy config errors should not start the server in a surprising state.
+                panic!("proxy init failed: {err}");
             }
         }
     } else {
         None
     };
+
+    let proxy_cache: Option<Arc<dyn storage::Storage>> =
+        if config.proxy.enabled && config.proxy.upstreams.is_empty() {
+            match config.storage_backend {
+                StorageBackend::Filesystem => {
+                    let root = config
+                        .proxy
+                        .cache_fs_root
+                        .clone()
+                        .unwrap_or_else(|| config.fs_root.join("cache"));
+                    Some(Arc::new(storage::fs::FsStorage::new(
+                        root,
+                        config.max_upload_bytes,
+                    )))
+                }
+                StorageBackend::S3 => {
+                    let endpoint = config
+                        .s3_endpoint
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
+                    let region = config
+                        .s3_region
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
+                    let bucket = config
+                        .s3_bucket
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
+                    let prefix = config.proxy.cache_s3_prefix.clone().unwrap_or_else(|| {
+                        format!("{}/cache", config.s3_prefix.trim_end_matches('/'))
+                    });
+                    Some(Arc::new(storage::s3::S3Storage::new(
+                        Some(endpoint),
+                        Some(region),
+                        Some(bucket),
+                        prefix,
+                        config.max_upload_bytes,
+                    )))
+                }
+            }
+        } else {
+            None
+        };
     let buffered_body_sem = Arc::new(Semaphore::new(
         config.max_concurrent_buffered_requests.max(1),
     ));
@@ -107,6 +207,7 @@ async fn main() {
         storage,
         proxy,
         proxy_cache,
+        proxy_upstreams,
         buffered_body_sem,
         request_sem,
     };
@@ -191,6 +292,50 @@ fn spawn_proxy_gc(state: AppState) {
     if !state.config.proxy.enabled {
         return;
     }
+
+    // Multi-upstream mode: run GC per upstream cache.
+    if !state.config.proxy.upstreams.is_empty() {
+        if state.config.storage_backend != StorageBackend::Filesystem {
+            tracing::warn!("proxy gc: only filesystem backend is supported for eviction currently");
+            return;
+        }
+
+        let interval = Duration::from_secs(state.config.proxy.gc_interval_secs.max(1));
+        let repo_rules = state.config.proxy.repo_rules.clone();
+
+        for (i, up) in state.config.proxy.upstreams.iter().enumerate() {
+            let Some(ctx) = state.proxy_upstreams.get(i).cloned() else {
+                continue;
+            };
+            let fs_root = up
+                .cache_fs_root
+                .clone()
+                .unwrap_or_else(|| state.config.fs_root.join(format!("cache-upstream-{i}")));
+            let max_cache_bytes = up.max_cache_bytes;
+            let storage = ctx.cache;
+            let proxy_for_gc = ctx.proxy;
+            let repo_rules_for_gc = repo_rules.clone();
+
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    ticker.tick().await;
+                    if let Err(err) = proxy_gc_once(
+                        &storage,
+                        &fs_root,
+                        max_cache_bytes,
+                        &repo_rules_for_gc,
+                        &proxy_for_gc,
+                    )
+                    .await
+                    {
+                        tracing::warn!(upstream_index = i, error = %err, "proxy gc failed");
+                    }
+                }
+            });
+        }
+        return;
+    }
     if state.config.storage_backend != StorageBackend::Filesystem {
         tracing::warn!("proxy gc: only filesystem backend is supported for eviction currently");
         return;
@@ -243,6 +388,47 @@ fn spawn_proxy_scrub(state: AppState) {
         return;
     }
     if !state.config.proxy.scrub_enabled {
+        return;
+    }
+
+    // Multi-upstream mode: scrub per upstream cache.
+    if !state.config.proxy.upstreams.is_empty() {
+        if state.config.storage_backend != StorageBackend::Filesystem {
+            tracing::warn!("proxy scrub: only filesystem backend is supported currently");
+            return;
+        }
+
+        let interval = Duration::from_secs(state.config.proxy.scrub_interval_secs.max(1));
+        let max_files = state.config.proxy.scrub_max_files_per_run.max(1);
+
+        for (i, up) in state.config.proxy.upstreams.iter().enumerate() {
+            let fs_root = up
+                .cache_fs_root
+                .clone()
+                .unwrap_or_else(|| state.config.fs_root.join(format!("cache-upstream-{i}")));
+
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    ticker.tick().await;
+                    match proxy_scrub_once(&fs_root, max_files).await {
+                        Ok((scanned, removed)) => {
+                            if removed > 0 {
+                                tracing::info!(
+                                    upstream_index = i,
+                                    scanned,
+                                    removed,
+                                    "proxy scrub: removed corrupt cache files"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(upstream_index = i, error = %err, "proxy scrub failed");
+                        }
+                    }
+                }
+            });
+        }
         return;
     }
     if state.config.storage_backend != StorageBackend::Filesystem {

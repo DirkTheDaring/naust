@@ -1,11 +1,13 @@
-use super::{BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta};
+use super::{
+    BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta,
+};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
 use aws_config::Region;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use aws_sdk_s3::Client;
 use base64::Engine as _;
 use bytes::Bytes;
 use sha2::Digest as _;
@@ -59,9 +61,8 @@ impl S3Storage {
         let c = self
             .client
             .get_or_try_init(|| async {
-                let loader = aws_config::defaults(BehaviorVersion::latest()).region(Region::new(
-                    self.region()?.to_string(),
-                ));
+                let loader = aws_config::defaults(BehaviorVersion::latest())
+                    .region(Region::new(self.region()?.to_string()));
                 // Credentials are loaded from the standard AWS env/metadata chain.
                 let shared = loader.load().await;
 
@@ -87,7 +88,11 @@ impl S3Storage {
     }
 
     fn blob_key2(&self, digest: &Digest) -> String {
-        self.key(&format!("blobs/sha256/{}/{}", digest.prefix2(), digest.hex()))
+        self.key(&format!(
+            "blobs/sha256/{}/{}",
+            digest.prefix2(),
+            digest.hex()
+        ))
     }
 
     fn manifest_key(&self, name: &str, digest: &Digest) -> String {
@@ -122,8 +127,7 @@ impl S3Storage {
         let upload_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(b64.as_bytes())
             .map_err(|_| StorageError::NotFound)?;
-        let upload_id = String::from_utf8(upload_id_bytes)
-            .map_err(|_| StorageError::NotFound)?;
+        let upload_id = String::from_utf8(upload_id_bytes).map_err(|_| StorageError::NotFound)?;
         Ok((base.to_string(), upload_id))
     }
 
@@ -147,8 +151,8 @@ impl S3Storage {
     }
 
     async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|err| StorageError::Internal(err.to_string()))?;
         let media_type = value
             .get("mediaType")
             .and_then(|v| v.as_str())
@@ -167,7 +171,10 @@ impl S3Storage {
         let mut max_time: Option<std::time::SystemTime> = None;
 
         loop {
-            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix.clone());
+            let mut req = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix.clone());
             if let Some(t) = token.as_deref() {
                 req = req.continuation_token(t);
             }
@@ -206,7 +213,9 @@ impl S3Storage {
     }
 }
 
-fn map_s3_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>) -> StorageError {
+fn map_s3_err(
+    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+) -> StorageError {
     // Basic mapping for our usage.
     match err {
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
@@ -221,7 +230,9 @@ fn map_s3_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object
     }
 }
 
-fn map_head_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError>) -> StorageError {
+fn map_head_err(
+    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError>,
+) -> StorageError {
     match err {
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
             let code = se.err().meta().code().unwrap_or("");
@@ -235,9 +246,13 @@ fn map_head_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_obj
     }
 }
 
-fn map_put_err(err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>) -> StorageError {
+fn map_put_err(
+    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+) -> StorageError {
     match err {
-        aws_sdk_s3::error::SdkError::ServiceError(se) => StorageError::Internal(se.err().to_string()),
+        aws_sdk_s3::error::SdkError::ServiceError(se) => {
+            StorageError::Internal(se.err().to_string())
+        }
         other => StorageError::Internal(other.to_string()),
     }
 }
@@ -257,7 +272,10 @@ impl Storage for S3Storage {
         let mut set: HashSet<String> = HashSet::new();
 
         loop {
-            let mut req = client.list_objects_v2().bucket(bucket).prefix(repos_prefix.clone());
+            let mut req = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(repos_prefix.clone());
             if let Some(t) = token.as_deref() {
                 req = req.continuation_token(t);
             }
@@ -268,7 +286,9 @@ impl Storage for S3Storage {
 
             for obj in resp.contents() {
                 let Some(key) = obj.key() else { continue };
-                let Some(rest) = key.strip_prefix(&repos_prefix) else { continue };
+                let Some(rest) = key.strip_prefix(&repos_prefix) else {
+                    continue;
+                };
                 let repo = if let Some((repo, _)) = rest.split_once("/tags/") {
                     Some(repo)
                 } else if let Some((repo, _)) = rest.split_once("/manifests/") {
@@ -354,9 +374,7 @@ impl Storage for S3Storage {
 
         let size = resp.content_length().unwrap_or(0) as u64;
         // ByteStream provides an AsyncRead adapter.
-        let reader = resp
-            .body
-            .into_async_read();
+        let reader = resp.body.into_async_read();
         Ok((BlobMeta { size }, Box::pin(reader)))
     }
 
@@ -394,7 +412,11 @@ impl Storage for S3Storage {
         Ok(tags)
     }
 
-    async fn head_manifest(&self, name: &str, digest: &Digest) -> Result<ManifestMeta, StorageError> {
+    async fn head_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<ManifestMeta, StorageError> {
         let key = self.manifest_key(name, digest);
         let bytes = self.get_object_bytes(&key).await?;
         let media_type = self.detect_manifest_media_type(&bytes).await?;
@@ -693,13 +715,7 @@ impl Storage for S3Storage {
 
         // S3 deletion is idempotent; treat missing objects as NotFound when we can
         // detect it, otherwise return success.
-        if let Err(err) = client
-            .delete_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
+        if let Err(err) = client.delete_object().bucket(bucket).key(key).send().await {
             let msg = err.to_string();
             if msg.contains("NoSuchKey") || msg.contains("NotFound") {
                 return Err(StorageError::NotFound);
@@ -738,8 +754,8 @@ impl Storage for S3Storage {
         if !existing.iter().any(|d| d.digest == descriptor.digest) {
             existing.push(descriptor);
         }
-        let body = serde_json::to_vec(&existing)
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        let body =
+            serde_json::to_vec(&existing).map_err(|err| StorageError::Internal(err.to_string()))?;
 
         client
             .put_object()
@@ -759,13 +775,7 @@ impl Storage for S3Storage {
         let key = self.manifest_key(name, digest);
         // If the object doesn't exist, S3 can still return 204; treat it as success
         // unless we can clearly map it to NotFound.
-        if let Err(err) = client
-            .delete_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        {
+        if let Err(err) = client.delete_object().bucket(bucket).key(key).send().await {
             let msg = err.to_string();
             if msg.contains("NoSuchKey") || msg.contains("NotFound") {
                 return Err(StorageError::NotFound);

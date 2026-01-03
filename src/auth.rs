@@ -200,8 +200,7 @@ pub async fn require_push_basic_auth(
         if user_ok && pass_ok {
             if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
                 if !repo_allowed(allowlist, repo_name) {
-                    return errors::denied("push not allowed for this repository")
-                        .into_response();
+                    return errors::denied("push not allowed for this repository").into_response();
                 }
             }
             return next.run(request).await;
@@ -262,8 +261,9 @@ mod tests {
         let claims_anon = security::verify_bearer_token(signing_key, &anon).expect("verify");
         assert!(!bearer_claims_are_authenticated(&claims_anon));
 
-        let user = security::issue_bearer_token(signing_key, Some("user"), &scopes, now, now + 3600)
-            .expect("issue token");
+        let user =
+            security::issue_bearer_token(signing_key, Some("user"), &scopes, now, now + 3600)
+                .expect("issue token");
         let claims_user = security::verify_bearer_token(signing_key, &user).expect("verify");
         assert!(bearer_claims_are_authenticated(&claims_user));
     }

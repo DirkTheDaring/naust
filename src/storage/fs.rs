@@ -1,10 +1,12 @@
-use super::{ensure_dir, BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError};
+use super::{
+    BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, ensure_dir,
+};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
-use std::path::Path;
-use std::path::PathBuf;
 use bytes::Bytes;
 use sha2::Digest as _;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -43,11 +45,7 @@ impl FsStorage {
 
     fn tag_path(&self, name: &str, tag: &str) -> PathBuf {
         // data/repos/<name>/tags/<tag>
-        self.root
-            .join("repos")
-            .join(name)
-            .join("tags")
-            .join(tag)
+        self.root.join("repos").join(name).join("tags").join(tag)
     }
 
     fn referrers_path(&self, name: &str, subject: &Digest) -> PathBuf {
@@ -68,8 +66,8 @@ impl FsStorage {
     }
 
     async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|err| StorageError::Internal(err.to_string()))?;
         let media_type = value
             .get("mediaType")
             .and_then(|v| v.as_str())
@@ -215,10 +213,7 @@ async fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError
     };
     ensure_dir(&parent.to_path_buf());
 
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let tmp_name = format!(".tmp.{file_name}.{}", uuid::Uuid::new_v4());
     let tmp_path = parent.join(tmp_name);
 
@@ -258,7 +253,9 @@ impl Storage for FsStorage {
         let repo_dir = self.root.join("repos").join(name);
         match tokio::fs::metadata(&repo_dir).await {
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         }
 
@@ -277,9 +274,7 @@ impl Storage for FsStorage {
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
         let path = self.blob_path(digest);
         match tokio::fs::metadata(&path).await {
-            Ok(meta) => Ok(BlobMeta {
-                size: meta.len(),
-            }),
+            Ok(meta) => Ok(BlobMeta { size: meta.len() }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
             Err(err) => Err(StorageError::Internal(err.to_string())),
         }
@@ -292,7 +287,9 @@ impl Storage for FsStorage {
         let path = self.blob_path(digest);
         let file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
         let meta = match file.metadata().await {
@@ -306,7 +303,9 @@ impl Storage for FsStorage {
         let path = self.tag_path(name, tag);
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(s) => s,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
         let reference = content.trim();
@@ -317,7 +316,9 @@ impl Storage for FsStorage {
         let repo_dir = self.root.join("repos").join(name);
         match tokio::fs::metadata(&repo_dir).await {
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         }
 
@@ -345,11 +346,17 @@ impl Storage for FsStorage {
         Ok(tags)
     }
 
-    async fn head_manifest(&self, name: &str, digest: &Digest) -> Result<ManifestMeta, StorageError> {
+    async fn head_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<ManifestMeta, StorageError> {
         let path = self.manifest_path(name, digest);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
         let media_type = self.detect_manifest_media_type(&bytes).await?;
@@ -367,7 +374,9 @@ impl Storage for FsStorage {
         let path = self.manifest_path(name, digest);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
         let media_type = self.detect_manifest_media_type(&bytes).await?;
@@ -424,7 +433,9 @@ impl Storage for FsStorage {
         let path = self.upload_path(uuid);
         let meta = match tokio::fs::metadata(&path).await {
             Ok(m) => m,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
         Ok(super::UploadMeta {
@@ -433,12 +444,18 @@ impl Storage for FsStorage {
         })
     }
 
-    async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<super::UploadMeta, StorageError> {
+    async fn append_upload(
+        &self,
+        uuid: &str,
+        chunk: Bytes,
+    ) -> Result<super::UploadMeta, StorageError> {
         let path = self.upload_path(uuid);
 
         let current_len = match tokio::fs::metadata(&path).await {
             Ok(m) => m.len(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
 
@@ -449,15 +466,13 @@ impl Storage for FsStorage {
 
         let mut file = match tokio::fs::OpenOptions::new().append(true).open(&path).await {
             Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
-        file.write_all(&chunk)
-            .await
-            .map_err(map_fs_io_err)?;
-        file.flush()
-            .await
-            .map_err(map_fs_io_err)?;
+        file.write_all(&chunk).await.map_err(map_fs_io_err)?;
+        file.flush().await.map_err(map_fs_io_err)?;
 
         let meta = file
             .metadata()
@@ -473,7 +488,9 @@ impl Storage for FsStorage {
         let upload_path = self.upload_path(uuid);
         let mut file = match tokio::fs::File::open(&upload_path).await {
             Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
 
@@ -562,11 +579,7 @@ impl Storage for FsStorage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
-        let dir = self
-            .root
-            .join("repos")
-            .join(name)
-            .join("referrers");
+        let dir = self.root.join("repos").join(name).join("referrers");
         ensure_dir(&dir);
 
         let path = self.referrers_path(name, subject);
@@ -575,8 +588,8 @@ impl Storage for FsStorage {
             existing.push(descriptor);
         }
 
-        let bytes = serde_json::to_vec(&existing)
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&existing).map_err(|err| StorageError::Internal(err.to_string()))?;
         atomic_write_file(&path, &bytes).await?;
         Ok(())
     }
@@ -585,7 +598,9 @@ impl Storage for FsStorage {
         let manifest_path = self.manifest_path(name, digest);
         match tokio::fs::remove_file(&manifest_path).await {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         }
 
