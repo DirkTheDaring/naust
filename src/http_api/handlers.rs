@@ -324,7 +324,7 @@ pub async fn v2_dispatch(
         let reference = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
         if method == Method::PUT {
-            return manifest_put(state, &name, reference, body).await;
+            return manifest_put(state, &headers, &name, reference, body).await;
         }
         return manifest_by_reference(state, method, &name, reference).await;
     }
@@ -915,6 +915,10 @@ async fn manifest_by_reference(
                             if let Ok(decision) = proxy.decision_for_repo(name) {
                                 match decision.tag_policy.clone() {
                                     crate::config::TagPolicy::DigestOnly => {
+                                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                                            Ok(p) => p,
+                                            Err(_) => return errors::internal_error().into_response(),
+                                        };
                                         match proxy
                                             .fetch_manifest_and_cache(
                                                 &decision,
@@ -1052,6 +1056,10 @@ async fn manifest_by_reference(
                         return errors::internal_error().into_response();
                     };
                     if let Ok(decision) = proxy.decision_for_repo(name) {
+                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return errors::internal_error().into_response(),
+                        };
                         let digest_ref;
                         let upstream_ref: &str = if is_digest_ref {
                             digest_ref = digest.as_str();
@@ -1129,6 +1137,10 @@ async fn manifest_by_reference(
                         return errors::internal_error().into_response();
                     };
                     if let Ok(decision) = proxy.decision_for_repo(name) {
+                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return errors::internal_error().into_response(),
+                        };
                         let digest_ref;
                         let upstream_ref: &str = if is_digest_ref {
                             digest_ref = digest.as_str();
@@ -1293,6 +1305,12 @@ async fn ensure_tag_fresh(
                     .await
                     .is_err()
             {
+                let _permit = state
+                    .buffered_body_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| errors::internal_error().into_response())?;
                 let _ = proxy
                     .fetch_manifest_and_cache(
                         decision,
@@ -1333,6 +1351,12 @@ async fn ensure_tag_fresh(
             };
 
             if needs_get {
+                let _permit = state
+                    .buffered_body_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| errors::internal_error().into_response())?;
                 let fetched = proxy
                     .fetch_manifest_and_cache(
                         decision,
@@ -1383,8 +1407,26 @@ async fn ensure_tag_fresh(
     }
 }
 
-async fn manifest_put(state: AppState, name: &str, reference: &str, body: Body) -> Response {
-    let bytes = match read_body_limited(body, state.config.max_request_body_bytes).await {
+async fn manifest_put(
+    state: AppState,
+    headers: &HeaderMap,
+    name: &str,
+    reference: &str,
+    body: Body,
+) -> Response {
+    // This endpoint buffers the full manifest into memory for hashing and validation.
+    // Limit concurrency so memory usage stays bounded under load.
+    let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return errors::internal_error().into_response(),
+    };
+
+    let content_length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+
+    let bytes = match read_body_limited(body, content_length, state.config.max_request_body_bytes).await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
@@ -1611,8 +1653,22 @@ fn registry_headers() -> HeaderMap {
     headers
 }
 
-async fn read_body_limited(body: Body, limit: usize) -> Result<Bytes, Response> {
-    let mut buf: Vec<u8> = Vec::new();
+async fn read_body_limited(
+    body: Body,
+    content_length: Option<usize>,
+    limit: usize,
+) -> Result<Bytes, Response> {
+    if let Some(len) = content_length {
+        if len > limit {
+            return Err(errors::payload_too_large().into_response());
+        }
+    }
+
+    let initial_capacity = content_length
+        .unwrap_or(0)
+        .min(limit)
+        .min(1024 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
     let mut stream = body.into_data_stream();
     while let Some(next) = stream.next().await {
         let chunk = match next {

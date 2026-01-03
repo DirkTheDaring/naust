@@ -19,6 +19,7 @@ use semver::Version;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -29,6 +30,8 @@ pub struct AppState {
     pub storage: Arc<dyn storage::Storage>,
     pub proxy: Option<Arc<proxy::Proxy>>,
     pub proxy_cache: Option<Arc<dyn storage::Storage>>,
+    pub buffered_body_sem: Arc<Semaphore>,
+    pub request_sem: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -92,11 +95,18 @@ async fn main() {
     } else {
         None
     };
+    let buffered_body_sem = Arc::new(Semaphore::new(
+        config.max_concurrent_buffered_requests.max(1),
+    ));
+    let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
+
     let state = AppState {
         config,
         storage,
         proxy,
         proxy_cache,
+        buffered_body_sem,
+        request_sem,
     };
 
     // For large blobs we stream request bodies; enforce blob size via MAX_UPLOAD_BYTES and
@@ -114,6 +124,10 @@ async fn main() {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_push_basic_auth,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            concurrency_limit_v2_non_upload,
         ));
 
     // Operational metadata / inventory endpoints (non-standard).
@@ -512,6 +526,28 @@ async fn request_timeout_by_path(
         Ok(resp) => resp,
         Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
     }
+}
+
+async fn concurrency_limit_v2_non_upload(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let _permit: Option<OwnedSemaphorePermit> = if is_upload_path(path) {
+        None
+    } else {
+        Some(
+            state
+                .request_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("request semaphore unexpectedly closed"),
+        )
+    };
+
+    next.run(req).await
 }
 
 fn is_upload_path(path: &str) -> bool {

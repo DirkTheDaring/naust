@@ -41,6 +41,8 @@ gc_max_age_secs = 86400
 [limits]
 max_upload_bytes = 5368709120
 max_request_body_bytes = 33554432
+max_concurrent_buffered_requests = 8
+max_concurrent_requests = 256
 
 [timeouts]
 request_timeout_secs = 300

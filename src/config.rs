@@ -33,6 +33,12 @@ pub struct Config {
 
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
+    // Concurrency guard for endpoints that buffer full bodies into memory (e.g. manifest PUT,
+    // proxy manifest GET when caching). Caps worst-case RAM to ~N * max_request_body_bytes.
+    pub max_concurrent_buffered_requests: usize,
+    // Concurrency guard for total in-flight /v2 requests (caps tasks, open files, sockets).
+    // Upload endpoints are long-lived and streaming; we typically do not want to count them here.
+    pub max_concurrent_requests: usize,
     pub request_timeout_secs: u64,
 
     // Longer timeout for upload endpoints (PATCH/PUT/POST blobs/uploads).
@@ -402,6 +408,10 @@ struct FileLimits {
     max_upload_bytes: Option<u64>,
     #[serde(default)]
     max_request_body_bytes: Option<usize>,
+    #[serde(default)]
+    max_concurrent_buffered_requests: Option<usize>,
+    #[serde(default)]
+    max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -525,6 +535,22 @@ impl Config {
         let max_request_body_bytes = env_usize_any(&["REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES", "MAX_REQUEST_BODY_BYTES"])
             .or(file_cfg.limits.max_request_body_bytes)
             .unwrap_or(32 * 1024 * 1024);
+
+        let max_concurrent_buffered_requests = env_usize_any(&[
+            "REGISTRY__LIMITS__MAX_CONCURRENT_BUFFERED_REQUESTS",
+            "MAX_CONCURRENT_BUFFERED_REQUESTS",
+        ])
+        .or(file_cfg.limits.max_concurrent_buffered_requests)
+        .unwrap_or(if best_practice { 4 } else { 8 })
+        .max(1);
+
+        let max_concurrent_requests = env_usize_any(&[
+            "REGISTRY__LIMITS__MAX_CONCURRENT_REQUESTS",
+            "MAX_CONCURRENT_REQUESTS",
+        ])
+        .or(file_cfg.limits.max_concurrent_requests)
+        .unwrap_or(if best_practice { 64 } else { 256 })
+        .max(1);
 
         let request_timeout_secs = env_u64_any(&["REGISTRY__TIMEOUTS__REQUEST_TIMEOUT_SECS", "REQUEST_TIMEOUT_SECS"])
             .or(file_cfg.timeouts.request_timeout_secs)
@@ -783,6 +809,8 @@ impl Config {
             upload_gc_max_age_secs,
             max_upload_bytes,
             max_request_body_bytes,
+            max_concurrent_buffered_requests,
+            max_concurrent_requests,
             request_timeout_secs,
             upload_request_timeout_secs,
             disallow_monolithic_uploads,

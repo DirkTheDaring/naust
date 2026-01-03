@@ -216,6 +216,8 @@ Best-practice profile (`BEST_PRACTICE=1` or `[profile].name="best_practice"`) ch
 | Upload GC max age | `uploads.gc_max_age_secs` | `REGISTRY__UPLOADS__GC_MAX_AGE_SECS` | `UPLOAD_GC_MAX_AGE_SECS` | `86400` |
 | Max upload bytes | `limits.max_upload_bytes` | `REGISTRY__LIMITS__MAX_UPLOAD_BYTES` | `MAX_UPLOAD_BYTES` | `5368709120` |
 | Max request body bytes | `limits.max_request_body_bytes` | `REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES` | `MAX_REQUEST_BODY_BYTES` | `33554432` |
+| Max buffered requests | `limits.max_concurrent_buffered_requests` | `REGISTRY__LIMITS__MAX_CONCURRENT_BUFFERED_REQUESTS` | `MAX_CONCURRENT_BUFFERED_REQUESTS` | `8` (best-practice: `4`) |
+| Max in-flight requests | `limits.max_concurrent_requests` | `REGISTRY__LIMITS__MAX_CONCURRENT_REQUESTS` | `MAX_CONCURRENT_REQUESTS` | `256` (best-practice: `64`) |
 | Request timeout | `timeouts.request_timeout_secs` | `REGISTRY__TIMEOUTS__REQUEST_TIMEOUT_SECS` | `REQUEST_TIMEOUT_SECS` | `300` (best-practice: `60`) |
 | Upload request timeout | `timeouts.upload_request_timeout_secs` | `REGISTRY__TIMEOUTS__UPLOAD_REQUEST_TIMEOUT_SECS` | `UPLOAD_REQUEST_TIMEOUT_SECS` | `3600` (best-practice: `7200`) |
 | Disallow monolithic uploads | `uploads.disallow_monolithic_uploads` | `REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS` | `DISALLOW_MONOLITHIC_UPLOADS` | `false` (best-practice: `true`) |

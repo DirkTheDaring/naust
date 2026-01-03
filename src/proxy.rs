@@ -27,6 +27,8 @@ pub struct Proxy {
     singleflight: Arc<SingleFlight>,
 }
 
+const MAX_TOKEN_CACHE_ENTRIES: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub struct RepoDecision {
     pub local_repo: String,
@@ -259,55 +261,62 @@ impl Proxy {
     ) -> Result<(), ProxyError> {
         // Singleflight per digest to avoid thundering herd.
         let key = format!("blob:{}", digest.as_str());
-        let _guard = self.singleflight.lock(&key).await;
+        let (sf_key, sf_arc, sf_guard) = self.singleflight.lock_key(&key).await;
 
-        if storage.head_blob(digest).await.is_ok() {
-            return Ok(());
-        }
-
-        let _permit = self
-            .upstream_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| ProxyError::Internal(e.to_string()))?;
-
-        let mut url = self.upstream_base_url()?;
-        url.set_path(&format!("/v2/{}/blobs/{}", decision.upstream_repo, digest.as_str()));
-        self.ensure_upstream_allowed(&url).await?;
-
-        let resp = self
-            .send_with_bearer(reqwest::Method::GET, url, None, Some(decision))
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ProxyError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(ProxyError::Upstream(format!("GET blob status {}", resp.status())));
-        }
-
-        let upload = storage
-            .create_upload()
-            .await
-            .map_err(map_storage_err)?;
-
-        let mut stream = resp.bytes_stream();
-        while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| ProxyError::Upstream(e.to_string()))?;
-            if chunk.is_empty() {
-                continue;
+        let result = async {
+            if storage.head_blob(digest).await.is_ok() {
+                return Ok(());
             }
-            if let Err(e) = storage.append_upload(&upload.uuid, chunk).await {
+
+            let _permit = self
+                .upstream_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| ProxyError::Internal(e.to_string()))?;
+
+            let mut url = self.upstream_base_url()?;
+            url.set_path(&format!("/v2/{}/blobs/{}", decision.upstream_repo, digest.as_str()));
+            self.ensure_upstream_allowed(&url).await?;
+
+            let resp = self
+                .send_with_bearer(reqwest::Method::GET, url, None, Some(decision))
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(ProxyError::NotFound);
+            }
+            if !resp.status().is_success() {
+                return Err(ProxyError::Upstream(format!(
+                    "GET blob status {}",
+                    resp.status()
+                )));
+            }
+
+            let upload = storage.create_upload().await.map_err(map_storage_err)?;
+
+            let mut stream = resp.bytes_stream();
+            while let Some(next) = stream.next().await {
+                let chunk = next.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+                if chunk.is_empty() {
+                    continue;
+                }
+                if let Err(e) = storage.append_upload(&upload.uuid, chunk).await {
+                    let _ = storage.abort_upload(&upload.uuid).await;
+                    return Err(map_storage_err(e));
+                }
+            }
+
+            if let Err(e) = storage.finalize_upload(&upload.uuid, digest).await {
                 let _ = storage.abort_upload(&upload.uuid).await;
                 return Err(map_storage_err(e));
             }
-        }
+            Ok(())
+        };
 
-        if let Err(e) = storage.finalize_upload(&upload.uuid, digest).await {
-            let _ = storage.abort_upload(&upload.uuid).await;
-            return Err(map_storage_err(e));
-        }
-        Ok(())
+        let out = result.await;
+        drop(sf_guard);
+        self.singleflight.unlock_key(sf_key, sf_arc).await;
+        out
     }
 
     pub async fn fetch_manifest_and_cache(
@@ -321,125 +330,135 @@ impl Proxy {
     ) -> Result<FetchManifestResult, ProxyError> {
         // Singleflight per repo+reference.
         let key = format!("manifest:{}:{}", decision.local_repo, reference);
-        let _guard = self.singleflight.lock(&key).await;
+        let (sf_key, sf_arc, sf_guard) = self.singleflight.lock_key(&key).await;
 
-        let mut url = self.upstream_base_url()?;
-        url.set_path(&format!("/v2/{}/manifests/{}", decision.upstream_repo, reference));
-        self.ensure_upstream_allowed(&url).await?;
+        let result = async {
+            let mut url = self.upstream_base_url()?;
+            url.set_path(&format!("/v2/{}/manifests/{}", decision.upstream_repo, reference));
+            self.ensure_upstream_allowed(&url).await?;
 
-        let mut extra_headers = vec![
-            (reqwest::header::ACCEPT, Self::accept_manifest_header_value().to_string()),
-        ];
-        if let Some(etag) = if_none_match {
-            extra_headers.push((reqwest::header::IF_NONE_MATCH, etag));
-        }
+            let mut extra_headers = vec![
+                (
+                    reqwest::header::ACCEPT,
+                    Self::accept_manifest_header_value().to_string(),
+                ),
+            ];
+            if let Some(etag) = if_none_match {
+                extra_headers.push((reqwest::header::IF_NONE_MATCH, etag));
+            }
 
-        let method = if revalidate_only {
-            reqwest::Method::HEAD
-        } else {
-            reqwest::Method::GET
-        };
+            let method = if revalidate_only {
+                reqwest::Method::HEAD
+            } else {
+                reqwest::Method::GET
+            };
 
-        let resp = self
-            .send_with_bearer(method, url, Some(extra_headers), Some(decision))
-            .await?;
+            let resp = self
+                .send_with_bearer(method, url, Some(extra_headers), Some(decision))
+                .await?;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ProxyError::NotFound);
-        }
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(ProxyError::NotFound);
+            }
 
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+                let etag = resp
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let digest = resp
+                    .headers()
+                    .get("docker-content-digest")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| Digest::parse(s).ok());
+                return Ok(FetchManifestResult::NotModified { etag, digest });
+            }
+
+            if !resp.status().is_success() {
+                return Err(ProxyError::Upstream(format!(
+                    "{} manifest status {}",
+                    if revalidate_only { "HEAD" } else { "GET" },
+                    resp.status()
+                )));
+            }
+
+            let media_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
             let etag = resp
                 .headers()
                 .get(reqwest::header::ETAG)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let digest = resp
+            let upstream_digest = resp
                 .headers()
                 .get("docker-content-digest")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| Digest::parse(s).ok());
-            return Ok(FetchManifestResult::NotModified { etag, digest });
-        }
 
-        if !resp.status().is_success() {
-            return Err(ProxyError::Upstream(format!(
-                "{} manifest status {}",
-                if revalidate_only { "HEAD" } else { "GET" },
-                resp.status()
-            )));
-        }
-
-        let media_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
-        let etag = resp
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let upstream_digest = resp
-            .headers()
-            .get("docker-content-digest")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| Digest::parse(s).ok());
-
-        if revalidate_only {
-            return Ok(FetchManifestResult::HeadOk {
-                media_type,
-                etag,
-                digest: upstream_digest,
-            });
-        }
-
-        let bytes = read_response_limited(resp, max_bytes).await?;
-        if bytes.is_empty() {
-            return Err(ProxyError::Upstream("empty manifest body".to_string()));
-        }
-
-        // Compute digest of the raw bytes.
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&bytes);
-        let digest_hex = hex::encode(hasher.finalize());
-        let computed = Digest::parse(&format!("sha256:{digest_hex}"))
-            .map_err(|_| ProxyError::Internal("failed to parse computed digest".to_string()))?;
-
-        if let Ok(ref_digest) = Digest::parse(reference) {
-            if ref_digest.hex() != computed.hex() {
-                return Err(ProxyError::DigestMismatch);
+            if revalidate_only {
+                return Ok(FetchManifestResult::HeadOk {
+                    media_type,
+                    etag,
+                    digest: upstream_digest,
+                });
             }
-        }
-        if let Some(up) = upstream_digest {
-            if up.hex() != computed.hex() {
-                // Should not happen with a correct upstream.
-                return Err(ProxyError::DigestMismatch);
+
+            let bytes = read_response_limited(resp, max_bytes).await?;
+            if bytes.is_empty() {
+                return Err(ProxyError::Upstream("empty manifest body".to_string()));
             }
-        }
 
-        storage
-            .put_manifest(&decision.local_repo, &computed, bytes.clone())
-            .await
-            .map_err(map_storage_err)?;
+            // Compute digest of the raw bytes.
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&bytes);
+            let digest_hex = hex::encode(hasher.finalize());
+            let computed = Digest::parse(&format!("sha256:{digest_hex}"))
+                .map_err(|_| ProxyError::Internal("failed to parse computed digest".to_string()))?;
 
-        self.index_manifest(&decision.local_repo, &computed, &bytes);
-        self.note_manifest_access(&decision.local_repo, &computed);
+            if let Ok(ref_digest) = Digest::parse(reference) {
+                if ref_digest.hex() != computed.hex() {
+                    return Err(ProxyError::DigestMismatch);
+                }
+            }
+            if let Some(up) = upstream_digest {
+                if up.hex() != computed.hex() {
+                    // Should not happen with a correct upstream.
+                    return Err(ProxyError::DigestMismatch);
+                }
+            }
 
-        if Digest::parse(reference).is_err() {
             storage
-                .set_tag(&decision.local_repo, reference, &computed)
+                .put_manifest(&decision.local_repo, &computed, bytes.clone())
                 .await
                 .map_err(map_storage_err)?;
-        }
 
-        Ok(FetchManifestResult::Fetched {
-            digest: computed,
-            media_type,
-            etag,
-            bytes,
-        })
+            self.index_manifest(&decision.local_repo, &computed, &bytes);
+            self.note_manifest_access(&decision.local_repo, &computed);
+
+            if Digest::parse(reference).is_err() {
+                storage
+                    .set_tag(&decision.local_repo, reference, &computed)
+                    .await
+                    .map_err(map_storage_err)?;
+            }
+
+            Ok(FetchManifestResult::Fetched {
+                digest: computed,
+                media_type,
+                etag,
+                bytes,
+            })
+        };
+
+        let out = result.await;
+        drop(sf_guard);
+        self.singleflight.unlock_key(sf_key, sf_arc).await;
+        out
     }
 
     pub fn get_tag_meta(&self, repo: &str, tag: &str) -> Option<TagMeta> {
@@ -662,6 +681,12 @@ impl Proxy {
             .unwrap_or(300);
 
         let mut cache = self.token_cache.lock().await;
+        if cache.len() >= MAX_TOKEN_CACHE_ENTRIES {
+            cache.retain(|_, t| t.expires_at_unix > now.saturating_add(5));
+            if cache.len() >= MAX_TOKEN_CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
         cache.insert(
             cache_key,
             CachedToken {
@@ -697,14 +722,32 @@ struct SingleFlight {
 }
 
 impl SingleFlight {
-    async fn lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn lock_key(
+        &self,
+        key: &str,
+    ) -> (String, Arc<tokio::sync::Mutex<()>>, tokio::sync::OwnedMutexGuard<()>) {
+        let key_string = key.to_string();
         let arc = {
             let mut map = self.locks.lock().await;
-            map.entry(key.to_string())
+            map.entry(key_string.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        arc.lock_owned().await
+        let guard = arc.clone().lock_owned().await;
+        (key_string, arc, guard)
+    }
+
+    async fn unlock_key(&self, key: String, arc: Arc<tokio::sync::Mutex<()>>) {
+        // If no other tasks are waiting/running for this key, drop it from the map.
+        // We remove when the only remaining strong refs should be: map entry + this call.
+        if Arc::strong_count(&arc) == 2 {
+            let mut map = self.locks.lock().await;
+            if let Some(existing) = map.get(&key) {
+                if Arc::ptr_eq(existing, &arc) {
+                    map.remove(&key);
+                }
+            }
+        }
     }
 }
 
@@ -763,7 +806,18 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 async fn read_response_limited(resp: reqwest::Response, limit: usize) -> Result<Bytes, ProxyError> {
-    let mut buf: Vec<u8> = Vec::new();
+    if let Some(len) = resp.content_length() {
+        if len > limit as u64 {
+            return Err(ProxyError::TooLarge);
+        }
+    }
+
+    let initial_capacity = resp
+        .content_length()
+        .unwrap_or(0)
+        .min(limit as u64)
+        .min(1024 * 1024) as usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
     let mut stream = resp.bytes_stream();
     while let Some(next) = stream.next().await {
         let chunk = next.map_err(|e| ProxyError::Upstream(e.to_string()))?;
