@@ -4,6 +4,11 @@
 # Precedence:
 #   defaults < config file < env vars
 
+[profile]
+# Optional: "best_practice" changes defaults and makes token.signing_key required.
+# name = "best_practice"
+name = ""
+
 [server]
 listen_addr = "127.0.0.1:5000"
 # Recommended for token realm and external URLs (especially behind proxies)
@@ -19,7 +24,7 @@ key_path  = ""
 username = "demo"
 password = "demo"
 # Optional allowlist; supports "org/*" and "*".
-allow_repos = ["myrepo"]
+allow_repos = ["*"]
 
 [token]
 service = "registry-rust"
@@ -47,6 +52,16 @@ automatic_crossmount = false
 # Zero-trust-ish operators often set this to true.
 disallow_monolithic_uploads = false
 
+# Upload failure handling defaults (clients may resume uploads unless aborted).
+abort_on_error = false
+abort_on_digest_mismatch = false
+
+# Optional per-repo upload behavior overrides.
+[[uploads.repos]]
+match = "myrepo"
+abort_on_error = false
+abort_on_digest_mismatch = true
+
 # Filesystem backend maintenance: clean up stale upload temp files.
 gc_enabled = true
 gc_interval_secs = 3600
@@ -67,76 +82,43 @@ requires_auth = false
 
 # Pull-through cache / proxy (optional)
 [proxy]
-enabled = false
-mode = "allowlist" # "allowlist" (default) or "any"
+enabled = true
+mode = "any" # "allowlist" or "any"
 
-[proxy.upstream]
-# Single-upstream mode (legacy): configure ONE upstream here.
-# If you configure `[[proxy.upstreams]]` below, this section is ignored.
-base_url = "https://registry-1.docker.io"
-# Optional: Docker Hub credentials to raise rate limits.
-# Use your Docker ID as username and a Personal Access Token (recommended) or password.
-# username = "my-docker-id"
-# password = "my-dockerhub-pat"
-
-# Multiple upstream registries / isolated caches (single process)
-#
-# Use `[[proxy.upstreams]]` to proxy multiple upstream registries in ONE running process.
-# Each upstream is selected by request Host and has its own cache location, so repos/tags
-# from different upstream registries cannot collide.
-#
-# Example (filesystem backend):
-#
-# [[proxy.upstreams]]
-# hosts = ["dockerhub-cache.example.com"]
-# [proxy.upstreams.upstream]
-# base_url = "https://registry-1.docker.io"
-# # Optional: Docker Hub credentials to raise rate limits.
-# # username = "my-docker-id"
-# # password = "my-dockerhub-pat"
-# [proxy.upstreams.cache]
-# # Optional: fs_root and index_path default to a stable per-upstream path derived from base_url,
-# # e.g. ./data/cache/registry-1.docker.io/ (filesystem backend)
-# # fs_root = "./data/cache-dockerhub"
-# # index_path = "./data/cache-dockerhub/proxy-index"
-# max_cache_bytes = 10737418240
-#
-# [[proxy.upstreams]]
-# hosts = ["ghcr-cache.example.com"]
-# [proxy.upstreams.upstream]
-# base_url = "https://ghcr.io"
-# [proxy.upstreams.cache]
-# # Optional: fs_root and index_path default to a stable per-upstream path derived from base_url.
-# # fs_root = "./data/cache-ghcr"
-# # index_path = "./data/cache-ghcr/proxy-index"
-# max_cache_bytes = 10737418240
-
+# Request routing (global / single-upstream mode)
 [proxy.routing]
-# Optional: route requests by Host header.
 # If the request Host matches any of these patterns, the registry runs in "proxy-only" mode:
-# - reads never consult local storage (no ambiguity)
+# - reads never consult local storage (cache/upstream only)
 # - writes are rejected (405)
 # Patterns support a minimal '*' glob.
 proxy_hosts = []
-# If running behind a reverse proxy, you usually can keep this false as long as it preserves the
-# original Host header. Set true only if the registry is reachable *only* via that trusted proxy
-# and the proxy overwrites/normalizes X-Forwarded-Host (clients must not be able to spoof it).
+# Set true only when behind a trusted reverse proxy and clients cannot spoof forwarded headers.
 trust_x_forwarded_host = false
 
+# Proxy safety settings (global defaults, used unless overridden per-upstream)
 [proxy.safety]
 # If empty, defaults to allowing only the configured upstream host (plus auth.docker.io for Docker Hub).
 allowed_upstream_hosts = []
-# Even in proxy-any mode, this is a safety net.
-allowed_repo_prefixes = ["library/"]
+# If empty, all repos are allowed by this *safety* check; allowlist/any mode still applies.
+allowed_repo_prefixes = []
 block_private_networks = true
 max_concurrent_upstream = 16
 
+# Single-upstream mode (optional / legacy): configure ONE upstream here.
+# If you configure `[[proxy.upstreams]]` below, this is typically left unused.
+[proxy.upstream]
+base_url = ""
+username = ""
+password = ""
+
+# Single-upstream cache settings (used only when proxy.upstreams is empty)
 [proxy.cache]
 # Separate cache storage root to avoid mixing push content with cached pull-through content.
-fs_root = "./data/cache"
-# Local metadata DB for tag freshness (TTL/ETag).
-index_path = "./data/cache/proxy-index"
-# Required when proxy.enabled=true
+fs_root = ""
+s3_prefix = ""
+# Local metadata DB for tag freshness (TTL/ETag). Defaults to <fs_root>/proxy-index.
+index_path = ""
+# Required when proxy.enabled=true AND using single-upstream mode.
 max_cache_bytes = 10737418240 # 10 GiB
 gc_interval_secs = 3600
 
@@ -145,11 +127,72 @@ scrub_enabled = false
 scrub_interval_secs = 3600
 scrub_max_files_per_run = 2000
 
+# Multiple upstream registries / isolated caches (single process)
+
+[[proxy.upstreams]]
+hosts = ["dockerhub-cache.local"]
+base_url = "https://registry-1.docker.io"
+max_cache_bytes = 10737418240
+
+# Optional: per-upstream routing behavior (behind trusted reverse proxies)
+# trust_x_forwarded_host = true
+
+# Optional: per-upstream credentials
+# username = "my-docker-id"
+# password = "my-dockerhub-pat"
+
+# Optional: per-upstream safety overrides (otherwise proxy.safety.* defaults apply)
+[proxy.upstreams.safety]
+allowed_upstream_hosts = []
+allowed_repo_prefixes = ["library/"]
+block_private_networks = true
+max_concurrent_upstream = 16
+
+# Optional: per-upstream cache location overrides
+[proxy.upstreams.cache]
+# Filesystem backend: fs_root/index_path are optional; defaults are derived from base_url,
+# e.g. ./data/cache/registry-1.docker.io/ (filesystem backend)
+fs_root = ""
+index_path = ""
+# S3 backend: s3_prefix is optional; defaults are derived from base_url.
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
+[[proxy.upstreams]]
+hosts = ["ghcr-cache.local"]
+base_url = "https://ghcr.io"
+max_cache_bytes = 10737418240
+
+# Optional: per-upstream cache overrides (same keys as above)
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
 # Per-repo policies (TOML-only)
+# These apply to proxy behavior (cache freshness + eviction) and are shared across upstreams.
+
 [[proxy.repos]]
 match = "library/alpine"
 # tag_policy = "digest_only" | { ttl_seconds = 3600 } | "always_revalidate"
+tag_policy = "digest_only"
+eviction = { type = "default" }
+
+[[proxy.repos]]
+match = "library/nginx"
 tag_policy = { ttl_seconds = 3600 }
-# eviction policy examples:
-# eviction = { type = "keep_tags", tags = ["latest"] }
-# eviction = { type = "keep_latest_cached_semver", tag_regex = "^v?\\d+\\.\\d+\\.\\d+$", allow_prerelease = false }
+eviction = { type = "keep_tags", tags = ["latest"] }
+
+[[proxy.repos]]
+match = "myorg/*"
+tag_policy = "always_revalidate"
+# Keep highest SemVer tag among cached tags (optionally filter by regex)
+eviction = { type = "keep_latest_cached_semver", tag_regex = "^v?\\d+\\.\\d+\\.\\d+$", allow_prerelease = false }
+
+# Optional: rewrite local repo -> upstream repo name (useful for mirroring)
+[[proxy.repos]]
+match = "myrepo"
+upstream_repo = "library/alpine"
+tag_policy = { ttl_seconds = 600 }
+eviction = { type = "default" }

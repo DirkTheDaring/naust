@@ -184,6 +184,10 @@ pub struct ProxyUpstreamRoute {
     // selected and the request runs in proxy-only mode.
     pub hosts: Vec<String>,
 
+    // Whether to use X-Forwarded-Host when matching hosts for this upstream route.
+    // Only enable this if the registry is reachable only via a trusted reverse proxy.
+    pub trust_x_forwarded_host: bool,
+
     pub upstream_base_url: String,
     pub upstream_username: Option<String>,
     pub upstream_password: Option<String>,
@@ -299,6 +303,22 @@ struct FileProxyUpstreamRoute {
     #[serde(default)]
     hosts: Vec<String>,
 
+    // Shorthand form (optional): allow flat keys in [[proxy.upstreams]] entries.
+    // These are equivalent to the nested [proxy.upstreams.routing]/[proxy.upstreams.upstream]/[proxy.upstreams.cache] blocks.
+    #[serde(default)]
+    trust_x_forwarded_host: Option<bool>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    max_cache_bytes: Option<u64>,
+
+    #[serde(default)]
+    routing: FileProxyUpstreamRouting,
+
     #[serde(default)]
     upstream: FileProxyUpstream,
 
@@ -307,6 +327,14 @@ struct FileProxyUpstreamRoute {
 
     #[serde(default)]
     cache: FileProxyRouteCache,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyUpstreamRouting {
+    #[serde(default)]
+    hosts: Option<Vec<String>>,
+    #[serde(default)]
+    trust_x_forwarded_host: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -967,157 +995,6 @@ impl Config {
             })
             .collect::<Vec<_>>();
 
-        let upstreams = file_cfg
-            .proxy
-            .upstreams
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let hosts = r
-                    .hosts
-                    .iter()
-                    .map(|h| h.trim().to_string())
-                    .filter(|h| !h.is_empty())
-                    .collect::<Vec<_>>();
-
-                let upstream_base_url = r
-                    .upstream
-                    .base_url
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-
-                let cache_key = cache_key_from_base_url(&upstream_base_url);
-                let derived_cache_fs_root = fs_root.join("cache").join(&cache_key);
-                let derived_index_path = derived_cache_fs_root.join("proxy-index");
-                let derived_cache_s3_prefix =
-                    format!("{}/cache/{}", s3_prefix.trim_end_matches('/'), cache_key);
-
-                let upstream_username = r
-                    .upstream
-                    .username
-                    .clone()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                let upstream_password = r
-                    .upstream
-                    .password
-                    .clone()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-
-                let cache_fs_root = r
-                    .cache
-                    .fs_root
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from);
-                let cache_s3_prefix = r
-                    .cache
-                    .s3_prefix
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
-
-                let max_cache_bytes = r.cache.max_cache_bytes.unwrap_or(0);
-
-                // Per-upstream safety: if fields are not set, fall back to global proxy.safety.
-                let allowed_upstream_hosts = r
-                    .safety
-                    .allowed_upstream_hosts
-                    .clone()
-                    .or_else(|| file_cfg.proxy.safety.allowed_upstream_hosts.clone())
-                    .unwrap_or_default();
-                let allowed_repo_prefixes = r
-                    .safety
-                    .allowed_repo_prefixes
-                    .clone()
-                    .or_else(|| file_cfg.proxy.safety.allowed_repo_prefixes.clone())
-                    .unwrap_or_default();
-                let block_private_networks = r
-                    .safety
-                    .block_private_networks
-                    .or(file_cfg.proxy.safety.block_private_networks)
-                    .unwrap_or(true);
-                let max_concurrent_upstream = r
-                    .safety
-                    .max_concurrent_upstream
-                    .or(file_cfg.proxy.safety.max_concurrent_upstream)
-                    .unwrap_or(16);
-
-                // Validate (fail fast) when the feature is used.
-                if !hosts.is_empty() {
-                    if upstream_base_url.is_empty() {
-                        panic!("proxy.upstreams[{i}] requires [proxy.upstreams.upstream].base_url");
-                    }
-                    if max_cache_bytes == 0 {
-                        panic!(
-                            "proxy.upstreams[{i}] requires [proxy.upstreams.cache].max_cache_bytes"
-                        );
-                    }
-
-                    match storage_backend {
-                        StorageBackend::Filesystem => {
-                            // cache fs_root is optional; derived from base_url when omitted.
-                        }
-                        StorageBackend::S3 => {
-                            // cache s3_prefix and index_path are optional; derived from base_url when omitted.
-                        }
-                    }
-                }
-
-                let cache_fs_root = match storage_backend {
-                    StorageBackend::Filesystem => {
-                        Some(cache_fs_root.unwrap_or_else(|| derived_cache_fs_root.clone()))
-                    }
-                    StorageBackend::S3 => None,
-                };
-
-                let cache_s3_prefix = match storage_backend {
-                    StorageBackend::Filesystem => None,
-                    StorageBackend::S3 => Some(
-                        cache_s3_prefix
-                            .clone()
-                            .unwrap_or_else(|| derived_cache_s3_prefix.clone()),
-                    ),
-                };
-
-                let index_path = r
-                    .cache
-                    .index_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| match storage_backend {
-                        StorageBackend::Filesystem => cache_fs_root
-                            .as_ref()
-                            .expect("filesystem cache fs_root")
-                            .join("proxy-index"),
-                        StorageBackend::S3 => derived_index_path.clone(),
-                    });
-
-                ProxyUpstreamRoute {
-                    hosts,
-                    upstream_base_url,
-                    upstream_username,
-                    upstream_password,
-                    allowed_upstream_hosts,
-                    allowed_repo_prefixes,
-                    block_private_networks,
-                    max_concurrent_upstream,
-                    index_path,
-                    cache_fs_root,
-                    cache_s3_prefix,
-                    max_cache_bytes,
-                }
-            })
-            .filter(|r| !r.hosts.is_empty())
-            .collect::<Vec<_>>();
-
         let routing_proxy_hosts = env_str_any(&[
             "REGISTRY__PROXY__ROUTING__PROXY_HOSTS",
             "PROXY_ROUTING_PROXY_HOSTS",
@@ -1138,6 +1015,15 @@ impl Config {
         ])
         .or(file_cfg.proxy.routing.trust_x_forwarded_host)
         .unwrap_or(false);
+
+        let upstreams = resolve_proxy_upstreams(
+            &storage_backend,
+            &fs_root,
+            &s3_prefix,
+            routing_trust_x_forwarded_host,
+            &file_cfg.proxy.safety,
+            &file_cfg.proxy.upstreams,
+        );
 
         if proxy_enabled {
             // Either single-upstream mode (proxy.upstream.*) or multi-upstream mode (proxy.upstreams).
@@ -1234,6 +1120,286 @@ impl Config {
     }
     pub fn push_auth_configured(&self) -> bool {
         self.push_username.is_some() && self.push_password.is_some()
+    }
+}
+
+fn resolve_proxy_upstreams(
+    storage_backend: &StorageBackend,
+    fs_root: &PathBuf,
+    s3_prefix: &str,
+    routing_trust_x_forwarded_host: bool,
+    global_safety: &FileProxySafety,
+    file_upstreams: &[FileProxyUpstreamRoute],
+) -> Vec<ProxyUpstreamRoute> {
+    let upstreams = file_upstreams
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut hosts = Vec::new();
+            hosts.extend(
+                r.hosts
+                    .iter()
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty()),
+            );
+            if let Some(extra) = r.routing.hosts.as_ref() {
+                hosts.extend(
+                    extra
+                        .iter()
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty()),
+                );
+            }
+            hosts.sort();
+            hosts.dedup();
+
+            let upstream_base_url = r
+                .upstream
+                .base_url
+                .as_deref()
+                .or(r.base_url.as_deref())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            let cache_key = cache_key_from_base_url(&upstream_base_url);
+
+            let trust_x_forwarded_host = r
+                .routing
+                .trust_x_forwarded_host
+                .or(r.trust_x_forwarded_host)
+                .unwrap_or(routing_trust_x_forwarded_host);
+
+            let derived_cache_fs_root = fs_root.join("cache").join(&cache_key);
+            let derived_index_path = derived_cache_fs_root.join("proxy-index");
+            let derived_cache_s3_prefix =
+                format!("{}/cache/{}", s3_prefix.trim_end_matches('/'), cache_key);
+
+            let upstream_username = r
+                .upstream
+                .username
+                .clone()
+                .or_else(|| r.username.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let upstream_password = r
+                .upstream
+                .password
+                .clone()
+                .or_else(|| r.password.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let cache_fs_root = r
+                .cache
+                .fs_root
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            let cache_s3_prefix = r
+                .cache
+                .s3_prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            let max_cache_bytes = r.cache.max_cache_bytes.or(r.max_cache_bytes).unwrap_or(0);
+
+            // Per-upstream safety: if fields are not set, fall back to global proxy.safety.
+            let allowed_upstream_hosts = r
+                .safety
+                .allowed_upstream_hosts
+                .clone()
+                .or_else(|| global_safety.allowed_upstream_hosts.clone())
+                .unwrap_or_default();
+            let allowed_repo_prefixes = r
+                .safety
+                .allowed_repo_prefixes
+                .clone()
+                .or_else(|| global_safety.allowed_repo_prefixes.clone())
+                .unwrap_or_default();
+            let block_private_networks = r
+                .safety
+                .block_private_networks
+                .or(global_safety.block_private_networks)
+                .unwrap_or(true);
+            let max_concurrent_upstream = r
+                .safety
+                .max_concurrent_upstream
+                .or(global_safety.max_concurrent_upstream)
+                .unwrap_or(16);
+
+            // Validate (fail fast) when the feature is used.
+            if !hosts.is_empty() {
+                if upstream_base_url.is_empty() {
+                    panic!("proxy.upstreams[{i}] requires [proxy.upstreams.upstream].base_url");
+                }
+                if max_cache_bytes == 0 {
+                    panic!("proxy.upstreams[{i}] requires [proxy.upstreams.cache].max_cache_bytes");
+                }
+
+                match storage_backend {
+                    StorageBackend::Filesystem => {
+                        // cache fs_root is optional; derived from base_url when omitted.
+                    }
+                    StorageBackend::S3 => {
+                        // cache s3_prefix and index_path are optional; derived from base_url when omitted.
+                    }
+                }
+            }
+
+            let cache_fs_root = match storage_backend {
+                StorageBackend::Filesystem => {
+                    Some(cache_fs_root.unwrap_or_else(|| derived_cache_fs_root.clone()))
+                }
+                StorageBackend::S3 => None,
+            };
+
+            let cache_s3_prefix = match storage_backend {
+                StorageBackend::Filesystem => None,
+                StorageBackend::S3 => Some(
+                    cache_s3_prefix
+                        .clone()
+                        .unwrap_or_else(|| derived_cache_s3_prefix.clone()),
+                ),
+            };
+
+            let index_path = r
+                .cache
+                .index_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| match storage_backend {
+                    StorageBackend::Filesystem => cache_fs_root
+                        .as_ref()
+                        .expect("filesystem cache fs_root")
+                        .join("proxy-index"),
+                    StorageBackend::S3 => derived_index_path.clone(),
+                });
+
+            ProxyUpstreamRoute {
+                hosts,
+                trust_x_forwarded_host,
+                upstream_base_url,
+                upstream_username,
+                upstream_password,
+                allowed_upstream_hosts,
+                allowed_repo_prefixes,
+                block_private_networks,
+                max_concurrent_upstream,
+                index_path,
+                cache_fs_root,
+                cache_s3_prefix,
+                max_cache_bytes,
+            }
+        })
+        .filter(|r| !r.hosts.is_empty())
+        .collect::<Vec<_>>();
+
+    // Validate: upstream host patterns must be unique across routes.
+    // (If the same host pattern appears in more than one upstream route, routing would be
+    // ambiguous because we select the first match.)
+    {
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (idx, up) in upstreams.iter().enumerate() {
+            for host_pat in &up.hosts {
+                let key = host_pat.trim().to_ascii_lowercase();
+                if key.is_empty() {
+                    continue;
+                }
+                if let Some(prev) = seen.insert(key.clone(), idx) {
+                    panic!(
+                        "proxy.upstreams has duplicate host pattern '{}' (indices {} and {})",
+                        host_pat, prev, idx
+                    );
+                }
+            }
+        }
+    }
+
+    upstreams
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_upstreams_shorthand_parses_and_resolves() {
+        let cfg = r#"
+[storage]
+backend = "fs"
+[storage.fs]
+root = "./data"
+
+[proxy]
+enabled = true
+mode = "any"
+
+[[proxy.upstreams]]
+hosts = ["dockerhub-cache.local"]
+base_url = "https://registry-1.docker.io"
+max_cache_bytes = 123
+
+[[proxy.upstreams]]
+hosts = ["ghcr-cache.local"]
+base_url = "https://ghcr.io"
+max_cache_bytes = 456
+"#;
+
+        let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
+
+        let upstreams = resolve_proxy_upstreams(
+            &StorageBackend::Filesystem,
+            &PathBuf::from("./data"),
+            "registry",
+            false,
+            &file_cfg.proxy.safety,
+            &file_cfg.proxy.upstreams,
+        );
+
+        assert_eq!(upstreams.len(), 2);
+
+        let dockerhub = upstreams
+            .iter()
+            .find(|u| u.upstream_base_url == "https://registry-1.docker.io")
+            .expect("dockerhub upstream");
+        assert_eq!(dockerhub.hosts, vec!["dockerhub-cache.local".to_string()]);
+        assert_eq!(dockerhub.max_cache_bytes, 123);
+        assert_eq!(
+            dockerhub
+                .cache_fs_root
+                .as_ref()
+                .expect("fs cache root")
+                .to_string_lossy(),
+            "./data/cache/registry-1.docker.io"
+        );
+        assert_eq!(
+            dockerhub.index_path.to_string_lossy(),
+            "./data/cache/registry-1.docker.io/proxy-index"
+        );
+
+        let ghcr = upstreams
+            .iter()
+            .find(|u| u.upstream_base_url == "https://ghcr.io")
+            .expect("ghcr upstream");
+        assert_eq!(ghcr.hosts, vec!["ghcr-cache.local".to_string()]);
+        assert_eq!(ghcr.max_cache_bytes, 456);
+        assert_eq!(
+            ghcr.cache_fs_root
+                .as_ref()
+                .expect("fs cache root")
+                .to_string_lossy(),
+            "./data/cache/ghcr.io"
+        );
+        assert_eq!(
+            ghcr.index_path.to_string_lossy(),
+            "./data/cache/ghcr.io/proxy-index"
+        );
     }
 }
 

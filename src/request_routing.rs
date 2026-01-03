@@ -105,11 +105,26 @@ pub fn proxy_upstream_index_for_request(proxy: &ProxyConfig, headers: &HeaderMap
     if proxy.upstreams.is_empty() {
         return None;
     }
-    let host = effective_host_for_request(headers, proxy.routing_trust_x_forwarded_host)?;
-    proxy
-        .upstreams
-        .iter()
-        .position(|r| host_matches_any(&r.hosts, &host))
+
+    // We compute both variants once and then select per-route.
+    let host_direct = effective_host_for_request(headers, false);
+    let host_forwarded = effective_host_for_request(headers, true);
+
+    for (idx, r) in proxy.upstreams.iter().enumerate() {
+        let host = if r.trust_x_forwarded_host {
+            host_forwarded.as_deref()
+        } else {
+            host_direct.as_deref()
+        };
+
+        if let Some(host) = host {
+            if host_matches_any(&r.hosts, host) {
+                return Some(idx);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn v2_route_mode_for_request(proxy: &ProxyConfig, headers: &HeaderMap) -> V2RouteMode {
@@ -220,6 +235,7 @@ mod tests {
         cfg.upstreams = vec![
             crate::config::ProxyUpstreamRoute {
                 hosts: vec!["dockerhub-cache.example.com".to_string()],
+                trust_x_forwarded_host: false,
                 upstream_base_url: "https://registry-1.docker.io".to_string(),
                 upstream_username: None,
                 upstream_password: None,
@@ -234,6 +250,7 @@ mod tests {
             },
             crate::config::ProxyUpstreamRoute {
                 hosts: vec!["ghcr-cache.example.com".to_string()],
+                trust_x_forwarded_host: false,
                 upstream_base_url: "https://ghcr.io".to_string(),
                 upstream_username: None,
                 upstream_password: None,

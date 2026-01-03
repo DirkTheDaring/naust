@@ -60,25 +60,17 @@ max_concurrent_upstream = 16
 # Docker Hub upstream (proxy-only by Host)
 [[proxy.upstreams]]
 hosts = ["dockerhub-cache.example.com"]
-
-[proxy.upstreams.upstream]
 base_url = "https://registry-1.docker.io"
 # Optional: Docker Hub credentials (use a PAT to raise rate limits)
 # username = "my-docker-id"
 # password = "my-dockerhub-pat"
-
-[proxy.upstreams.cache]
 # fs_root and index_path are optional; defaults are derived from upstream.base_url.
 max_cache_bytes = 10737418240
 
 # GHCR upstream (proxy-only by Host)
 [[proxy.upstreams]]
 hosts = ["ghcr-cache.example.com"]
-
-[proxy.upstreams.upstream]
 base_url = "https://ghcr.io"
-
-[proxy.upstreams.cache]
 # fs_root and index_path are optional; defaults are derived from upstream.base_url.
 max_cache_bytes = 10737418240
 

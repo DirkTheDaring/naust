@@ -208,8 +208,8 @@ One `registry-rust` process can proxy multiple upstream registries using `[[prox
 
 Each upstream route has:
 - `hosts`: host patterns (minimal `*` glob) that select the upstream
-- `upstream.*`: base URL + optional credentials
-- `cache.*`: an isolated cache location (filesystem root or S3 prefix) + per-upstream `index_path`
+- `base_url`: upstream base URL (+ optional `username`/`password`)
+- `max_cache_bytes`: per-upstream cache limit (plus optional cache location overrides)
 
 When the request Host matches an upstream route, the registry runs in proxy-only mode for that request (unambiguous reads; writes rejected).
 
@@ -221,20 +221,16 @@ enabled = true
 
 [[proxy.upstreams]]
 hosts = ["dockerhub-cache.example.com"]
-[proxy.upstreams.upstream]
 base_url = "https://registry-1.docker.io"
 username = "my-docker-id"         # optional
 password = "my-dockerhub-pat"     # optional
-[proxy.upstreams.cache]
 # fs_root and index_path are optional; by default they are derived from upstream.base_url,
 # e.g. ./data/cache/registry-1.docker.io/ (filesystem backend)
 max_cache_bytes = 10737418240
 
 [[proxy.upstreams]]
 hosts = ["ghcr-cache.example.com"]
-[proxy.upstreams.upstream]
 base_url = "https://ghcr.io"
-[proxy.upstreams.cache]
 # fs_root and index_path are optional; defaults are derived from upstream.base_url.
 max_cache_bytes = 10737418240
 ```
