@@ -155,6 +155,49 @@ This prevents pushed images from being mixed into the cache and makes cache clea
 
 See `configs/registry.example.toml` for an example `proxy` configuration.
 
+### Unambiguous local vs cache behavior (route by Host)
+
+By default, the registry serves reads from local storage first and may fall back to the proxy cache/upstream.
+If you want this to be unambiguous, you can configure a separate hostname that is **proxy-only**.
+
+In proxy-only mode:
+- reads never consult local storage (cache/upstream only)
+- writes (push/delete/upload) are rejected with `405`
+
+Example (TOML):
+
+```toml
+[proxy]
+enabled = true
+
+[proxy.routing]
+proxy_hosts = ["cache.example.com"]
+trust_x_forwarded_host = true
+```
+
+If you run behind a reverse proxy, set `trust_x_forwarded_host=true` and make sure your proxy sets `X-Forwarded-Host`.
+
+### Docker Hub credentials (optional)
+
+To raise Docker Hub pull rate limits, configure upstream credentials. Prefer a Docker Hub Personal Access Token (PAT).
+
+TOML:
+
+```toml
+[proxy.upstream]
+base_url = "https://registry-1.docker.io"
+username = "my-docker-id"
+password = "my-dockerhub-pat"
+```
+
+Or env vars:
+
+```sh
+export REGISTRY__PROXY__UPSTREAM__BASE_URL="https://registry-1.docker.io"
+export REGISTRY__PROXY__UPSTREAM__USERNAME="my-docker-id"
+export REGISTRY__PROXY__UPSTREAM__PASSWORD="my-dockerhub-pat"
+```
+
 - Enable: set `CONFIG_PATH` to a TOML file (see `configs/registry.example.toml` and `configs/registry.best_practice.toml`).
 - Precedence: defaults < config file < env vars
 - Best-practice profile:

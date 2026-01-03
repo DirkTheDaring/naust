@@ -94,6 +94,10 @@ pub struct ProxyConfig {
     // Upstream base URL, e.g. https://registry-1.docker.io
     pub upstream_base_url: Option<String>,
 
+    // Optional upstream credentials (used for Bearer token exchange, e.g. Docker Hub).
+    pub upstream_username: Option<String>,
+    pub upstream_password: Option<String>,
+
     // Safety net: explicit allowlist of upstream hosts.
     pub allowed_upstream_hosts: Vec<String>,
 
@@ -130,6 +134,10 @@ pub struct ProxyConfig {
 
     // Repo-specific policies (TOML only, for now).
     pub repo_rules: Vec<ProxyRepoRule>,
+
+    // Request routing: select proxy behavior based on Host (or X-Forwarded-Host).
+    pub routing_proxy_hosts: Vec<String>,
+    pub routing_trust_x_forwarded_host: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,6 +223,9 @@ struct FileProxy {
     cache: FileProxyCache,
 
     #[serde(default)]
+    routing: FileProxyRouting,
+
+    #[serde(default)]
     repos: Vec<FileProxyRepoRule>,
 }
 
@@ -222,6 +233,19 @@ struct FileProxy {
 struct FileProxyUpstream {
     #[serde(default)]
     base_url: Option<String>,
+
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyRouting {
+    #[serde(default)]
+    proxy_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    trust_x_forwarded_host: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -662,6 +686,22 @@ impl Config {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+        let upstream_username = env_str_any(&[
+            "REGISTRY__PROXY__UPSTREAM__USERNAME",
+            "PROXY_UPSTREAM_USERNAME",
+        ])
+        .or_else(|| file_cfg.proxy.upstream.username.clone())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+        let upstream_password = env_str_any(&[
+            "REGISTRY__PROXY__UPSTREAM__PASSWORD",
+            "PROXY_UPSTREAM_PASSWORD",
+        ])
+        .or_else(|| file_cfg.proxy.upstream.password.clone())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
         let allowed_upstream_hosts = env_str_any(&[
             "REGISTRY__PROXY__SAFETY__ALLOWED_UPSTREAM_HOSTS",
             "PROXY_ALLOWED_UPSTREAM_HOSTS",
@@ -800,6 +840,27 @@ impl Config {
             })
             .collect::<Vec<_>>();
 
+        let routing_proxy_hosts = env_str_any(&[
+            "REGISTRY__PROXY__ROUTING__PROXY_HOSTS",
+            "PROXY_ROUTING_PROXY_HOSTS",
+        ])
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .or_else(|| file_cfg.proxy.routing.proxy_hosts.clone())
+        .unwrap_or_default();
+
+        let routing_trust_x_forwarded_host = env_bool_opt(&[
+            "REGISTRY__PROXY__ROUTING__TRUST_X_FORWARDED_HOST",
+            "PROXY_ROUTING_TRUST_X_FORWARDED_HOST",
+        ])
+        .or(file_cfg.proxy.routing.trust_x_forwarded_host)
+        .unwrap_or(false);
+
         if proxy_enabled {
             if upstream_base_url.is_none() {
                 panic!("proxy.enabled requires proxy.upstream.base_url (or PROXY_UPSTREAM_BASE_URL)");
@@ -813,6 +874,8 @@ impl Config {
             enabled: proxy_enabled,
             mode: proxy_mode,
             upstream_base_url,
+            upstream_username,
+            upstream_password,
             allowed_upstream_hosts,
             allowed_repo_prefixes,
             block_private_networks,
@@ -826,6 +889,8 @@ impl Config {
             scrub_max_files_per_run,
             max_cache_bytes,
             repo_rules,
+            routing_proxy_hosts,
+            routing_trust_x_forwarded_host,
         };
 
         Self {

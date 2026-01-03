@@ -661,6 +661,15 @@ impl Proxy {
         if let Some(scope) = scope {
             req = req.query(&[("scope", scope)]);
         }
+
+        // Optional upstream credentials (e.g. Docker Hub requires authentication to raise rate limits).
+        if let (Some(user), Some(pass)) = (
+            self.cfg.upstream_username.as_deref(),
+            self.cfg.upstream_password.as_deref(),
+        ) {
+            req = req.basic_auth(user, Some(pass));
+        }
+
         let resp = req.send().await.map_err(|e| ProxyError::Upstream(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(ProxyError::Upstream(format!("token endpoint status {}", resp.status())));

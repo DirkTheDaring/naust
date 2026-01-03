@@ -25,6 +25,7 @@ use url::form_urlencoded;
 
 use super::errors;
 use crate::security;
+use crate::request_routing::{V2RouteMode, v2_route_mode_for_request};
 
 pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Response {
     // Many clients (Docker/Podman) perform auth negotiation via GET /v2/.
@@ -312,6 +313,8 @@ pub async fn v2_dispatch(
     Path(rest): Path<String>,
     body: Body,
 ) -> Response {
+    let route_mode = v2_route_mode_for_request(&state.config.proxy, &headers);
+
     let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
 
     // Registry catalog:
@@ -321,7 +324,7 @@ pub async fn v2_dispatch(
         if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
             return crate::auth::unauthorized_catalog_challenge(&state).into_response();
         }
-        return catalog_list(state, method, &query).await;
+        return catalog_list(state, method, &query, route_mode).await;
     }
     // Uploads:
     //   POST /v2/<name>/blobs/uploads/
@@ -350,7 +353,7 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 1] == "list"
     {
         let name = segments[..segments.len() - 2].join("/");
-        return tags_list(state, method, &name, &query).await;
+        return tags_list(state, method, &name, &query, route_mode).await;
     }
 
     // Referrers:
@@ -358,7 +361,7 @@ pub async fn v2_dispatch(
     if segments.len() >= 2 && segments[segments.len() - 2] == "referrers" {
         let digest_str = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
-        return referrers_list(state, method, &name, digest_str, &query).await;
+        return referrers_list(state, method, &name, digest_str, &query, route_mode).await;
     }
 
     if segments.len() >= 2 && segments[segments.len() - 2] == "manifests" {
@@ -367,7 +370,7 @@ pub async fn v2_dispatch(
         if method == Method::PUT {
             return manifest_put(state, &headers, &name, reference, body).await;
         }
-        return manifest_by_reference(state, method, &name, reference).await;
+        return manifest_by_reference(state, method, &name, reference, route_mode).await;
     }
 
     // /v2/<name>/blobs/<digest>
@@ -378,7 +381,7 @@ pub async fn v2_dispatch(
     {
         let digest_str = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
-        return blob_by_digest(state, method, &name, digest_str).await;
+        return blob_by_digest(state, method, &name, digest_str, route_mode).await;
     }
 
     errors::not_implemented().into_response()
@@ -388,9 +391,19 @@ async fn catalog_list(
     state: AppState,
     method: Method,
     query: &HashMap<String, String>,
+    route_mode: V2RouteMode,
 ) -> Response {
     match method {
-        Method::GET | Method::HEAD => match state.storage.list_repositories().await {
+        Method::GET | Method::HEAD => {
+            let storage = match route_mode {
+                V2RouteMode::Default => state.storage.clone(),
+                V2RouteMode::ProxyOnly => match state.proxy_cache.as_ref() {
+                    Some(s) => s.clone(),
+                    None => return errors::internal_error().into_response(),
+                },
+            };
+
+            match storage.list_repositories().await {
             Ok(all) => {
                 let total = all.len();
                 let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
@@ -447,7 +460,8 @@ async fn catalog_list(
             }
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(_) => errors::internal_error().into_response(),
-        },
+            }
+        }
         _ => errors::not_implemented().into_response(),
     }
 }
@@ -732,13 +746,29 @@ async fn tags_list(
     method: Method,
     name: &str,
     query: &HashMap<String, String>,
+    route_mode: V2RouteMode,
 ) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
     }
 
+    if route_mode == V2RouteMode::ProxyOnly {
+        match method {
+            Method::GET | Method::HEAD => {}
+            _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    let storage = match route_mode {
+        V2RouteMode::Default => state.storage.clone(),
+        V2RouteMode::ProxyOnly => match state.proxy_cache.as_ref() {
+            Some(s) => s.clone(),
+            None => return errors::internal_error().into_response(),
+        },
+    };
+
     match method {
-        Method::GET | Method::HEAD => match state.storage.list_tags(name).await {
+        Method::GET | Method::HEAD => match storage.list_tags(name).await {
             Ok(all_tags) => {
                 // Pagination per OCI/Docker distribution spec:
                 // - `n` limits the number of tags
@@ -806,7 +836,13 @@ async fn tags_list(
     }
 }
 
-async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str: &str) -> Response {
+async fn blob_by_digest(
+    state: AppState,
+    method: Method,
+    name: &str,
+    digest_str: &str,
+    route_mode: V2RouteMode,
+) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
     }
@@ -815,6 +851,10 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
         Ok(d) => d,
         Err(_) => return errors::digest_invalid().into_response(),
     };
+
+    if route_mode == V2RouteMode::ProxyOnly {
+        return blob_by_digest_proxy_only(state, method, name, digest).await;
+    }
 
     match method {
         Method::DELETE => match state.storage.delete_blob(&digest).await {
@@ -966,11 +1006,118 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
     }
 }
 
+async fn blob_by_digest_proxy_only(
+    state: AppState,
+    method: Method,
+    name: &str,
+    digest: Digest,
+) -> Response {
+    let Some(cache) = state.proxy_cache.as_ref() else {
+        return errors::internal_error().into_response();
+    };
+
+    match method {
+        Method::GET => {
+            if let Ok((meta, reader)) = cache.open_blob(&digest).await {
+                if let Some(proxy) = state.proxy.as_ref() {
+                    proxy.note_blob_access(&digest);
+                }
+                let stream = ReaderStream::new(reader);
+                let body = Body::from_stream(stream);
+
+                let mut headers = registry_headers();
+                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                return (StatusCode::OK, headers, body).into_response();
+            }
+
+            if let Some(proxy) = state.proxy.as_ref() {
+                if let Ok(decision) = proxy.decision_for_repo(name) {
+                    match proxy.fetch_blob_into_storage(&decision, &digest, cache).await {
+                        Ok(()) => {
+                            if let Ok((meta, reader)) = cache.open_blob(&digest).await {
+                                proxy.note_blob_access(&digest);
+                                let stream = ReaderStream::new(reader);
+                                let body = Body::from_stream(stream);
+
+                                let mut headers = registry_headers();
+                                headers.insert(
+                                    "Docker-Content-Digest",
+                                    digest.as_str().parse().unwrap(),
+                                );
+                                headers.insert(
+                                    "Content-Type",
+                                    "application/octet-stream".parse().unwrap(),
+                                );
+                                headers.insert(
+                                    "Content-Length",
+                                    meta.size.to_string().parse().unwrap(),
+                                );
+                                return (StatusCode::OK, headers, body).into_response();
+                            }
+                        }
+                        Err(crate::proxy::ProxyError::NotFound) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: fetch blob failed");
+                            return errors::internal_error().into_response();
+                        }
+                    }
+                }
+            }
+
+            errors::blob_unknown().into_response()
+        }
+        Method::HEAD => {
+            if let Ok(meta) = cache.head_blob(&digest).await {
+                if let Some(proxy) = state.proxy.as_ref() {
+                    proxy.note_blob_access(&digest);
+                }
+                let mut headers = registry_headers();
+                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                return (StatusCode::OK, headers).into_response();
+            }
+
+            if let Some(proxy) = state.proxy.as_ref() {
+                if let Ok(decision) = proxy.decision_for_repo(name) {
+                    match proxy.head_blob_upstream(&decision, &digest).await {
+                        Ok(size) => {
+                            let mut headers = registry_headers();
+                            headers.insert(
+                                "Docker-Content-Digest",
+                                digest.as_str().parse().unwrap(),
+                            );
+                            headers.insert(
+                                "Content-Type",
+                                "application/octet-stream".parse().unwrap(),
+                            );
+                            headers.insert("Content-Length", size.to_string().parse().unwrap());
+                            return (StatusCode::OK, headers).into_response();
+                        }
+                        Err(crate::proxy::ProxyError::NotFound) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: head blob failed");
+                            return errors::internal_error().into_response();
+                        }
+                    }
+                }
+            }
+
+            errors::blob_unknown().into_response()
+        }
+        // Proxy-only host: never mutate local storage.
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
 async fn manifest_by_reference(
     state: AppState,
     method: Method,
     name: &str,
     reference: &str,
+    route_mode: V2RouteMode,
 ) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
@@ -978,6 +1125,11 @@ async fn manifest_by_reference(
 
     // Reference can be a digest or a tag.
     let is_digest_ref = Digest::parse(reference).is_ok();
+
+    if route_mode == V2RouteMode::ProxyOnly {
+        return manifest_by_reference_proxy_only(state, method, name, reference, is_digest_ref)
+            .await;
+    }
 
     // Resolve tag references to a digest (with optional proxying).
     let digest = if let Ok(d) = Digest::parse(reference) {
@@ -1297,6 +1449,266 @@ async fn manifest_by_reference(
             }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
+        _ => errors::not_implemented().into_response(),
+    }
+}
+
+async fn manifest_by_reference_proxy_only(
+    state: AppState,
+    method: Method,
+    name: &str,
+    reference: &str,
+    is_digest_ref: bool,
+) -> Response {
+    match method {
+        Method::GET | Method::HEAD => {}
+        _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+
+    let Some(cache) = state.proxy_cache.as_ref() else {
+        return errors::internal_error().into_response();
+    };
+
+    // Resolve tag references to a digest using cache/upstream only.
+    let digest = if let Ok(d) = Digest::parse(reference) {
+        d
+    } else {
+        match cache.resolve_tag(name, reference).await {
+            Ok(d) => d,
+            Err(StorageError::NotFound) => {
+                let Some(proxy) = state.proxy.as_ref() else {
+                    return errors::manifest_unknown().into_response();
+                };
+                let Ok(decision) = proxy.decision_for_repo(name) else {
+                    return errors::manifest_unknown().into_response();
+                };
+
+                match decision.tag_policy.clone() {
+                    crate::config::TagPolicy::DigestOnly => {
+                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return errors::internal_error().into_response(),
+                        };
+                        match proxy
+                            .fetch_manifest_and_cache(
+                                &decision,
+                                reference,
+                                cache,
+                                state.config.max_request_body_bytes,
+                                false,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(crate::proxy::FetchManifestResult::Fetched { digest, .. }) => digest,
+                            Ok(_) => return errors::internal_error().into_response(),
+                            Err(crate::proxy::ProxyError::NotFound) => {
+                                return errors::manifest_unknown().into_response();
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, repo = name, tag = reference, "proxy: resolve tag failed");
+                                return errors::internal_error().into_response();
+                            }
+                        }
+                    }
+                    crate::config::TagPolicy::TtlSeconds(ttl) => {
+                        if let Err(resp) = ensure_tag_fresh(
+                            &state,
+                            proxy,
+                            &decision,
+                            cache,
+                            reference,
+                            ttl,
+                            false,
+                        )
+                        .await
+                        {
+                            return resp;
+                        }
+                        match cache.resolve_tag(name, reference).await {
+                            Ok(d) => d,
+                            Err(StorageError::NotFound) => {
+                                return errors::manifest_unknown().into_response();
+                            }
+                            Err(_) => return errors::internal_error().into_response(),
+                        }
+                    }
+                    crate::config::TagPolicy::AlwaysRevalidate => {
+                        if let Err(resp) = ensure_tag_fresh(
+                            &state,
+                            proxy,
+                            &decision,
+                            cache,
+                            reference,
+                            0,
+                            true,
+                        )
+                        .await
+                        {
+                            return resp;
+                        }
+                        match cache.resolve_tag(name, reference).await {
+                            Ok(d) => d,
+                            Err(StorageError::NotFound) => {
+                                return errors::manifest_unknown().into_response();
+                            }
+                            Err(_) => return errors::internal_error().into_response(),
+                        }
+                    }
+                }
+            }
+            Err(_) => return errors::internal_error().into_response(),
+        }
+    };
+
+    // Record tag access for eviction/observability (best-effort).
+    if Digest::parse(reference).is_err() {
+        if let Some(proxy) = state.proxy.as_ref() {
+            proxy.note_tag_access(name, reference);
+        }
+    }
+
+    match method {
+        Method::HEAD => {
+            if let Ok(meta) = cache.head_manifest(name, &digest).await {
+                if let Some(proxy) = state.proxy.as_ref() {
+                    proxy.note_manifest_access(name, &digest);
+                    if let Some(refs) = proxy.get_manifest_refs(name, &digest) {
+                        for blob in refs.blobs {
+                            if let Ok(d) = crate::registry::digest::Digest::parse(&blob) {
+                                proxy.note_blob_access(&d);
+                            }
+                        }
+                    }
+                }
+                let mut headers = registry_headers();
+                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                return (StatusCode::OK, headers).into_response();
+            }
+
+            if let Some(proxy) = state.proxy.as_ref() {
+                if let Ok(decision) = proxy.decision_for_repo(name) {
+                    let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return errors::internal_error().into_response(),
+                    };
+                    let digest_ref;
+                    let upstream_ref: &str = if is_digest_ref {
+                        digest_ref = digest.as_str();
+                        digest_ref.as_str()
+                    } else {
+                        reference
+                    };
+
+                    match proxy
+                        .fetch_manifest_and_cache(
+                            &decision,
+                            upstream_ref,
+                            cache,
+                            state.config.max_request_body_bytes,
+                            false,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Ok(meta) = cache.head_manifest(name, &digest).await {
+                                let mut headers = registry_headers();
+                                headers.insert(
+                                    "Docker-Content-Digest",
+                                    digest.as_str().parse().unwrap(),
+                                );
+                                headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                                headers.insert(
+                                    "Content-Length",
+                                    meta.size.to_string().parse().unwrap(),
+                                );
+                                return (StatusCode::OK, headers).into_response();
+                            }
+                        }
+                        Err(crate::proxy::ProxyError::NotFound) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
+                            return errors::internal_error().into_response();
+                        }
+                    }
+                }
+            }
+
+            errors::manifest_unknown().into_response()
+        }
+        Method::GET => {
+            if let Ok((meta, bytes)) = cache.get_manifest(name, &digest).await {
+                if let Some(proxy) = state.proxy.as_ref() {
+                    proxy.note_manifest_access(name, &digest);
+                    if let Some(refs) = proxy.get_manifest_refs(name, &digest) {
+                        for blob in refs.blobs {
+                            if let Ok(d) = crate::registry::digest::Digest::parse(&blob) {
+                                proxy.note_blob_access(&d);
+                            }
+                        }
+                    }
+                }
+                let mut headers = registry_headers();
+                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                return (StatusCode::OK, headers, Body::from(bytes)).into_response();
+            }
+
+            if let Some(proxy) = state.proxy.as_ref() {
+                if let Ok(decision) = proxy.decision_for_repo(name) {
+                    let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return errors::internal_error().into_response(),
+                    };
+                    let digest_ref;
+                    let upstream_ref: &str = if is_digest_ref {
+                        digest_ref = digest.as_str();
+                        digest_ref.as_str()
+                    } else {
+                        reference
+                    };
+
+                    match proxy
+                        .fetch_manifest_and_cache(
+                            &decision,
+                            upstream_ref,
+                            cache,
+                            state.config.max_request_body_bytes,
+                            false,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Ok((meta, bytes)) = cache.get_manifest(name, &digest).await {
+                                let mut headers = registry_headers();
+                                headers.insert(
+                                    "Docker-Content-Digest",
+                                    digest.as_str().parse().unwrap(),
+                                );
+                                headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                                headers.insert(
+                                    "Content-Length",
+                                    meta.size.to_string().parse().unwrap(),
+                                );
+                                return (StatusCode::OK, headers, Body::from(bytes)).into_response();
+                            }
+                        }
+                        Err(crate::proxy::ProxyError::NotFound) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
+                            return errors::internal_error().into_response();
+                        }
+                    }
+                }
+            }
+
+            errors::manifest_unknown().into_response()
+        }
         _ => errors::not_implemented().into_response(),
     }
 }
@@ -1808,6 +2220,7 @@ async fn referrers_list(
     name: &str,
     digest_str: &str,
     query: &HashMap<String, String>,
+    route_mode: V2RouteMode,
 ) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
@@ -1820,7 +2233,15 @@ async fn referrers_list(
 
     match method {
         Method::GET | Method::HEAD => {
-            let mut entries = match state.storage.list_referrers(name, &subject).await {
+            let storage = match route_mode {
+                V2RouteMode::Default => state.storage.clone(),
+                V2RouteMode::ProxyOnly => match state.proxy_cache.as_ref() {
+                    Some(s) => s.clone(),
+                    None => return errors::internal_error().into_response(),
+                },
+            };
+
+            let mut entries = match storage.list_referrers(name, &subject).await {
                 Ok(v) => v,
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
                 Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),

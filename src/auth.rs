@@ -143,6 +143,18 @@ pub async fn require_push_basic_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // If this request is routed to proxy-only mode, disallow all write methods.
+    // This prevents ambiguous behavior where a push could populate local storage while pulls
+    // on the same repo are expected to come from proxy/cache.
+    if crate::request_routing::v2_route_mode_for_request(&state.config.proxy, request.headers())
+        == crate::request_routing::V2RouteMode::ProxyOnly
+    {
+        match *request.method() {
+            http::Method::GET | http::Method::HEAD => {}
+            _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
     // Policy: anonymous pull. Only gate push (write) methods.
     // This keeps `/v2/` ping and all GET/HEAD endpoints anonymous.
     match *request.method() {

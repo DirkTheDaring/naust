@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod http_api;
 mod proxy;
+mod request_routing;
 mod registry;
 mod security;
 mod storage;

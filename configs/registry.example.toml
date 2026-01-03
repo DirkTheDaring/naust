@@ -72,6 +72,20 @@ mode = "allowlist" # "allowlist" (default) or "any"
 
 [proxy.upstream]
 base_url = "https://registry-1.docker.io"
+# Optional: Docker Hub credentials to raise rate limits.
+# Use your Docker ID as username and a Personal Access Token (recommended) or password.
+# username = "my-docker-id"
+# password = "my-dockerhub-pat"
+
+[proxy.routing]
+# Optional: route requests by Host header.
+# If the request Host matches any of these patterns, the registry runs in "proxy-only" mode:
+# - reads never consult local storage (no ambiguity)
+# - writes are rejected (405)
+# Patterns support a minimal '*' glob.
+proxy_hosts = []
+# If running behind a reverse proxy, set true and it will use X-Forwarded-Host.
+trust_x_forwarded_host = false
 
 [proxy.safety]
 # If empty, defaults to allowing only the configured upstream host (plus auth.docker.io for Docker Hub).
