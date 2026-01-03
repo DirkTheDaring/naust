@@ -1,32 +1,30 @@
 use crate::{
+    AppState,
     registry::digest::Digest,
     storage::{ReferrerDescriptor, RepoTimestamps, StorageError},
-    AppState,
 };
 use axum::{
     body::Body,
-    extract::RawQuery,
     extract::Query,
+    extract::RawQuery,
     extract::{Path, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use headers::{authorization::Basic, Authorization, HeaderMapExt};
-use hmac::{Hmac, Mac};
+use headers::{Authorization, HeaderMapExt, authorization::Basic};
 use sha2::Digest as _;
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 
 use super::errors;
+use crate::security;
 
 pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Response {
     // Many clients (Docker/Podman) perform auth negotiation via GET /v2/.
@@ -97,8 +95,14 @@ pub async fn token(
         .flat_map(|s| parse_scopes(s))
         .collect::<Vec<_>>();
 
+    // Be lenient in parsing, but never mint unexpected permissions.
+    // We only mint repository scopes and only the actions we understand.
+    let token_scopes = sanitize_token_scopes(&scopes);
+
     // If push is requested, require Basic auth and validate creds.
-    let wants_push = scopes.iter().any(|s| s.actions.iter().any(|a| a == "push"));
+    let wants_push = token_scopes
+        .iter()
+        .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Push));
     let subject = if wants_push {
         let Some(expected_user) = state.config.push_username.as_deref() else {
             return token_unauthorized(&state);
@@ -122,10 +126,11 @@ pub async fn token(
     // Enforce repo allowlist for push tokens too.
     if wants_push {
         if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-            for scope in &scopes {
+            for scope in &token_scopes {
                 if scope.typ == "repository" {
                     if !crate::auth::repo_allowed(allowlist, &scope.name) {
-                        return errors::denied("push not allowed for this repository").into_response();
+                        return errors::denied("push not allowed for this repository")
+                            .into_response();
                     }
                 }
             }
@@ -138,7 +143,7 @@ pub async fn token(
         .as_secs();
     let exp = now.saturating_add(state.config.token_ttl_secs);
 
-    let token = match issue_token(&state, subject.as_deref(), &scopes, now, exp) {
+    let token = match issue_token(&state, subject.as_deref(), &token_scopes, now, exp) {
         Ok(t) => t,
         Err(_) => return errors::internal_error().into_response(),
     };
@@ -195,6 +200,44 @@ struct Scope {
     actions: Vec<String>,
 }
 
+fn token_scope_requests_repo_action(scope: &security::TokenScope, action: security::RepoAction) -> bool {
+    if scope.typ != "repository" {
+        return false;
+    }
+    let action = action.as_str();
+    scope.actions.iter().any(|a| a == action)
+}
+
+fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
+    let mut out: Vec<security::TokenScope> = Vec::new();
+    for s in scopes {
+        if s.typ != "repository" {
+            continue;
+        }
+
+        let mut actions: Vec<String> = Vec::new();
+        for a in &s.actions {
+            if a == security::RepoAction::Pull.as_str() || a == security::RepoAction::Push.as_str() {
+                actions.push(a.clone());
+            }
+        }
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        actions.retain(|a| seen.insert(a.clone()));
+
+        if actions.is_empty() {
+            continue;
+        }
+
+        out.push(security::TokenScope {
+            typ: s.typ.clone(),
+            name: s.name.clone(),
+            actions,
+        });
+    }
+    out
+}
+
 fn parse_scopes(scope: &str) -> Vec<Scope> {
     // scope can be repeated in the URL; many clients send exactly one.
     // We accept a single comma-separated action list.
@@ -208,15 +251,18 @@ fn parse_scopes(scope: &str) -> Vec<Scope> {
         .split_whitespace()
         .filter_map(|item| {
             let mut parts = item.splitn(3, ':');
-            let typ = parts.next()?.to_string();
+            let typ = parts.next()?.trim().to_ascii_lowercase();
             let name = parts.next()?.to_string();
-            let actions = parts
+            let mut actions = parts
                 .next()
                 .unwrap_or("")
                 .split(',')
-                .map(|a| a.trim().to_string())
+                .map(|a| a.trim().to_ascii_lowercase())
                 .filter(|a| !a.is_empty())
                 .collect::<Vec<_>>();
+
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            actions.retain(|a| seen.insert(a.clone()));
             Some(Scope { typ, name, actions })
         })
         .collect()
@@ -225,31 +271,18 @@ fn parse_scopes(scope: &str) -> Vec<Scope> {
 fn issue_token(
     state: &AppState,
     subject: Option<&str>,
-    scopes: &[Scope],
+    scopes: &[security::TokenScope],
     iat: u64,
     exp: u64,
 ) -> Result<String, ()> {
-    let payload = serde_json::json!({
-        "sub": subject,
-        "iat": iat,
-        "exp": exp,
-        "scopes": scopes.iter().map(|s| serde_json::json!({
-            "type": s.typ,
-            "name": s.name,
-            "actions": s.actions,
-        })).collect::<Vec<_>>(),
-    });
-
-    let payload_bytes = serde_json::to_vec(&payload).map_err(|_| ())?;
-    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(state.config.token_signing_key.as_bytes())
-        .map_err(|_| ())?;
-    mac.update(payload_b64.as_bytes());
-    let sig = mac.finalize().into_bytes();
-    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
-
-    Ok(format!("{payload_b64}.{sig_b64}"))
+    security::issue_bearer_token(
+        &state.config.token_signing_key,
+        subject,
+        scopes,
+        iat,
+        exp,
+    )
+    .map_err(|_| ())
 }
 
 fn format_rfc3339(unix_secs: u64) -> String {
@@ -343,7 +376,11 @@ pub async fn v2_dispatch(
     errors::not_implemented().into_response()
 }
 
-async fn catalog_list(state: AppState, method: Method, query: &HashMap<String, String>) -> Response {
+async fn catalog_list(
+    state: AppState,
+    method: Method,
+    query: &HashMap<String, String>,
+) -> Response {
     match method {
         Method::GET | Method::HEAD => match state.storage.list_repositories().await {
             Ok(all) => {
@@ -378,9 +415,17 @@ async fn catalog_list(state: AppState, method: Method, query: &HashMap<String, S
                 headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
                 if has_more {
-                    if let (Some(n_raw), Some(last_repo)) = (query.get("n"), payload.get("repositories").and_then(|v| v.as_array()).and_then(|a| a.last()).and_then(|x| x.as_str())) {
+                    if let (Some(n_raw), Some(last_repo)) = (
+                        query.get("n"),
+                        payload
+                            .get("repositories")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.last())
+                            .and_then(|x| x.as_str()),
+                    ) {
                         let last_repo = url_encode_component(last_repo);
-                        let link = format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
+                        let link =
+                            format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
                         if let Ok(v) = http::HeaderValue::from_str(&link) {
                             headers.insert(http::header::LINK, v);
                         }
@@ -478,7 +523,14 @@ pub async fn meta_orgs(
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
     if has_more {
-        if let (Some(n_raw), Some(last_org)) = (query.get("n"), payload.get("orgs").and_then(|v| v.as_array()).and_then(|a| a.last()).and_then(|x| x.as_str())) {
+        if let (Some(n_raw), Some(last_org)) = (
+            query.get("n"),
+            payload
+                .get("orgs")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.last())
+                .and_then(|x| x.as_str()),
+        ) {
             let last_org = url_encode_component(last_org);
             let link = format!("</_meta/orgs?n={n_raw}&last={last_org}>; rel=\"next\"");
             if let Ok(v) = http::HeaderValue::from_str(&link) {
@@ -553,7 +605,8 @@ pub async fn meta_org_repos(
     if has_more {
         if let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
             let last_repo = url_encode_component(last_repo);
-            let link = format!("</_meta/orgs/{org}/repos?n={n_raw}&last={last_repo}>; rel=\"next\"");
+            let link =
+                format!("</_meta/orgs/{org}/repos?n={n_raw}&last={last_repo}>; rel=\"next\"");
             if let Ok(v) = http::HeaderValue::from_str(&link) {
                 resp_headers.insert(http::header::LINK, v);
             }
@@ -734,7 +787,9 @@ async fn tags_list(
             }
             Err(StorageError::NotFound) => errors::name_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
@@ -758,7 +813,9 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
             Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
             Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
@@ -790,8 +847,14 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
                         match proxy.head_blob_upstream(&decision, &digest).await {
                             Ok(size) => {
                                 let mut headers = registry_headers();
-                                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                                headers.insert(
+                                    "Docker-Content-Digest",
+                                    digest.as_str().parse().unwrap(),
+                                );
+                                headers.insert(
+                                    "Content-Type",
+                                    "application/octet-stream".parse().unwrap(),
+                                );
                                 headers.insert("Content-Length", size.to_string().parse().unwrap());
                                 return (StatusCode::OK, headers).into_response();
                             }
@@ -808,7 +871,9 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         Method::GET => match state.storage.open_blob(&digest).await {
@@ -856,9 +921,18 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
                                     let body = Body::from_stream(stream);
 
                                     let mut headers = registry_headers();
-                                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                                    headers.insert(
+                                        "Docker-Content-Digest",
+                                        digest.as_str().parse().unwrap(),
+                                    );
+                                    headers.insert(
+                                        "Content-Type",
+                                        "application/octet-stream".parse().unwrap(),
+                                    );
+                                    headers.insert(
+                                        "Content-Length",
+                                        meta.size.to_string().parse().unwrap(),
+                                    );
                                     return (StatusCode::OK, headers, body).into_response();
                                 }
                             }
@@ -875,7 +949,9 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         _ => errors::not_implemented().into_response(),
@@ -915,9 +991,16 @@ async fn manifest_by_reference(
                             if let Ok(decision) = proxy.decision_for_repo(name) {
                                 match decision.tag_policy.clone() {
                                     crate::config::TagPolicy::DigestOnly => {
-                                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
+                                        let _permit = match state
+                                            .buffered_body_sem
+                                            .clone()
+                                            .acquire_owned()
+                                            .await
+                                        {
                                             Ok(p) => p,
-                                            Err(_) => return errors::internal_error().into_response(),
+                                            Err(_) => {
+                                                return errors::internal_error().into_response();
+                                            }
                                         };
                                         match proxy
                                             .fetch_manifest_and_cache(
@@ -930,7 +1013,10 @@ async fn manifest_by_reference(
                                             )
                                             .await
                                         {
-                                            Ok(crate::proxy::FetchManifestResult::Fetched { digest, .. }) => digest,
+                                            Ok(crate::proxy::FetchManifestResult::Fetched {
+                                                digest,
+                                                ..
+                                            }) => digest,
                                             Ok(_) => {
                                                 return errors::internal_error().into_response();
                                             }
@@ -945,13 +1031,7 @@ async fn manifest_by_reference(
                                     }
                                     crate::config::TagPolicy::TtlSeconds(ttl) => {
                                         if let Err(resp) = ensure_tag_fresh(
-                                            &state,
-                                            proxy,
-                                            &decision,
-                                            cache,
-                                            reference,
-                                            ttl,
-                                            false,
+                                            &state, proxy, &decision, cache, reference, ttl, false,
                                         )
                                         .await
                                         {
@@ -959,19 +1039,17 @@ async fn manifest_by_reference(
                                         }
                                         match cache.resolve_tag(name, reference).await {
                                             Ok(d) => d,
-                                            Err(StorageError::NotFound) => return errors::manifest_unknown().into_response(),
-                                            Err(_) => return errors::internal_error().into_response(),
+                                            Err(StorageError::NotFound) => {
+                                                return errors::manifest_unknown().into_response();
+                                            }
+                                            Err(_) => {
+                                                return errors::internal_error().into_response();
+                                            }
                                         }
                                     }
                                     crate::config::TagPolicy::AlwaysRevalidate => {
                                         if let Err(resp) = ensure_tag_fresh(
-                                            &state,
-                                            proxy,
-                                            &decision,
-                                            cache,
-                                            reference,
-                                            0,
-                                            true,
+                                            &state, proxy, &decision, cache, reference, 0, true,
                                         )
                                         .await
                                         {
@@ -979,8 +1057,12 @@ async fn manifest_by_reference(
                                         }
                                         match cache.resolve_tag(name, reference).await {
                                             Ok(d) => d,
-                                            Err(StorageError::NotFound) => return errors::manifest_unknown().into_response(),
-                                            Err(_) => return errors::internal_error().into_response(),
+                                            Err(StorageError::NotFound) => {
+                                                return errors::manifest_unknown().into_response();
+                                            }
+                                            Err(_) => {
+                                                return errors::internal_error().into_response();
+                                            }
                                         }
                                     }
                                 }
@@ -999,7 +1081,9 @@ async fn manifest_by_reference(
             Err(StorageError::DigestMismatch) => return errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                return errors::insufficient_storage().into_response();
+            }
             Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
         }
     };
@@ -1016,7 +1100,9 @@ async fn manifest_by_reference(
             Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
             Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
@@ -1081,9 +1167,16 @@ async fn manifest_by_reference(
                             Ok(_) => {
                                 if let Ok(meta) = cache.head_manifest(name, &digest).await {
                                     let mut headers = registry_headers();
-                                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                                    headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                                    headers.insert(
+                                        "Docker-Content-Digest",
+                                        digest.as_str().parse().unwrap(),
+                                    );
+                                    headers
+                                        .insert("Content-Type", meta.media_type.parse().unwrap());
+                                    headers.insert(
+                                        "Content-Length",
+                                        meta.size.to_string().parse().unwrap(),
+                                    );
                                     return (StatusCode::OK, headers).into_response();
                                 }
                             }
@@ -1100,7 +1193,9 @@ async fn manifest_by_reference(
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         Method::GET => match state.storage.get_manifest(name, &digest).await {
@@ -1162,10 +1257,18 @@ async fn manifest_by_reference(
                             Ok(_) => {
                                 if let Ok((meta, bytes)) = cache.get_manifest(name, &digest).await {
                                     let mut headers = registry_headers();
-                                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                                    headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                                    return (StatusCode::OK, headers, Body::from(bytes)).into_response();
+                                    headers.insert(
+                                        "Docker-Content-Digest",
+                                        digest.as_str().parse().unwrap(),
+                                    );
+                                    headers
+                                        .insert("Content-Type", meta.media_type.parse().unwrap());
+                                    headers.insert(
+                                        "Content-Length",
+                                        meta.size.to_string().parse().unwrap(),
+                                    );
+                                    return (StatusCode::OK, headers, Body::from(bytes))
+                                        .into_response();
                                 }
                             }
                             Err(crate::proxy::ProxyError::NotFound) => {}
@@ -1181,7 +1284,9 @@ async fn manifest_by_reference(
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         _ => errors::not_implemented().into_response(),
@@ -1197,7 +1302,8 @@ fn is_valid_repo_name(name: &str) -> bool {
             return false;
         }
     }
-    name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
 }
 
 fn is_valid_tag(tag: &str) -> bool {
@@ -1208,7 +1314,9 @@ fn is_valid_tag(tag: &str) -> bool {
         return false;
     }
     let mut chars = tag.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphanumeric() || first == '_') {
         return false;
     }
@@ -1218,7 +1326,11 @@ fn is_valid_tag(tag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_repo_name, is_valid_tag};
+    use super::{
+        is_valid_repo_name, is_valid_tag, parse_scopes, sanitize_token_scopes,
+        token_scope_requests_repo_action,
+    };
+    use crate::security;
 
     #[test]
     fn repo_name_validation() {
@@ -1240,6 +1352,52 @@ mod tests {
         assert!(!is_valid_tag("has space"));
         assert!(!is_valid_tag("has/slash"));
         assert!(!is_valid_tag("-badstart"));
+    }
+
+    #[test]
+    fn parse_scopes_normalizes_typ_and_actions() {
+        let scopes = parse_scopes("RePoSiToRy:org/repo:PUSH,Pull");
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].typ, "repository");
+        assert_eq!(scopes[0].name, "org/repo");
+        assert_eq!(scopes[0].actions, vec!["push".to_string(), "pull".to_string()]);
+    }
+
+    #[test]
+    fn parse_scopes_deduplicates_actions_preserving_order() {
+        let scopes = parse_scopes("repository:org/repo:pull,pull,push,pull");
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].actions, vec!["pull".to_string(), "push".to_string()]);
+    }
+
+    #[test]
+    fn scope_requests_repo_action_requires_repository_type() {
+        let scopes = parse_scopes("registry:catalog:*:push repository:org/repo:pull");
+        assert_eq!(scopes.len(), 2);
+
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert_eq!(token_scopes.len(), 1);
+
+        // Only repository scopes are minted, and this one is pull-only.
+        assert!(!token_scope_requests_repo_action(
+            &token_scopes[0],
+            security::RepoAction::Push
+        ));
+    }
+
+    #[test]
+    fn sanitize_token_scopes_drops_unknown_actions() {
+        let scopes = parse_scopes("repository:org/repo:pull,delete,push");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert_eq!(token_scopes.len(), 1);
+        assert_eq!(token_scopes[0].actions, vec!["pull".to_string(), "push".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_token_scopes_drops_empty_scopes() {
+        let scopes = parse_scopes("repository:org/repo:delete");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert!(token_scopes.is_empty());
     }
 }
 
@@ -1335,7 +1493,11 @@ async fn ensure_tag_fresh(
             {
                 let m = crate::proxy::TagMeta {
                     digest: d.as_str(),
-                    expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                    expires_at_unix: if always_revalidate {
+                        now
+                    } else {
+                        crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                    },
                     etag,
                 };
                 proxy.put_tag_meta(&decision.local_repo, tag, &m);
@@ -1344,9 +1506,10 @@ async fn ensure_tag_fresh(
         }
         Ok(crate::proxy::FetchManifestResult::HeadOk { etag, digest, .. }) => {
             let needs_get = match (&current_digest, &digest) {
-                (Some(local), Some(up)) if local.hex() == up.hex() => {
-                    storage.head_manifest(&decision.local_repo, local).await.is_err()
-                }
+                (Some(local), Some(up)) if local.hex() == up.hex() => storage
+                    .head_manifest(&decision.local_repo, local)
+                    .await
+                    .is_err(),
                 _ => true,
             };
 
@@ -1374,7 +1537,11 @@ async fn ensure_tag_fresh(
                 if let crate::proxy::FetchManifestResult::Fetched { digest, etag, .. } = fetched {
                     let m = crate::proxy::TagMeta {
                         digest: digest.as_str(),
-                        expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                        expires_at_unix: if always_revalidate {
+                            now
+                        } else {
+                            crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                        },
                         etag,
                     };
                     proxy.put_tag_meta(&decision.local_repo, tag, &m);
@@ -1382,7 +1549,11 @@ async fn ensure_tag_fresh(
             } else if let Some(d) = current_digest {
                 let m = crate::proxy::TagMeta {
                     digest: d.as_str(),
-                    expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                    expires_at_unix: if always_revalidate {
+                        now
+                    } else {
+                        crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                    },
                     etag,
                 };
                 proxy.put_tag_meta(&decision.local_repo, tag, &m);
@@ -1392,7 +1563,11 @@ async fn ensure_tag_fresh(
         Ok(crate::proxy::FetchManifestResult::Fetched { digest, etag, .. }) => {
             let m = crate::proxy::TagMeta {
                 digest: digest.as_str(),
-                expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                expires_at_unix: if always_revalidate {
+                    now
+                } else {
+                    crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                },
                 etag,
             };
             proxy.put_tag_meta(&decision.local_repo, tag, &m);
@@ -1426,10 +1601,11 @@ async fn manifest_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
 
-    let bytes = match read_body_limited(body, content_length, state.config.max_request_body_bytes).await {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
+    let bytes =
+        match read_body_limited(body, content_length, state.config.max_request_body_bytes).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
 
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
@@ -1452,7 +1628,8 @@ async fn manifest_put(
     let mut hasher = sha2::Sha256::new();
     hasher.update(&bytes);
     let digest_hex = hex::encode(hasher.finalize());
-    let computed = Digest::parse(&format!("sha256:{digest_hex}")).expect("computed sha256 is valid");
+    let computed =
+        Digest::parse(&format!("sha256:{digest_hex}")).expect("computed sha256 is valid");
 
     // If reference is a digest, it must match the computed digest.
     if let Ok(ref_digest) = Digest::parse(reference) {
@@ -1466,10 +1643,15 @@ async fn manifest_put(
         }
         if !state.config.allow_tag_overwrite {
             match state.storage.resolve_tag(name, reference).await {
-                Ok(_) => return (StatusCode::CONFLICT, registry_headers(), Body::empty()).into_response(),
+                Ok(_) => {
+                    return (StatusCode::CONFLICT, registry_headers(), Body::empty())
+                        .into_response();
+                }
                 Err(StorageError::NotFound) => {}
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    return errors::insufficient_storage().into_response();
+                }
                 Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
                 Err(StorageError::DigestMismatch) | Err(StorageError::Internal(_)) => {
                     return errors::internal_error().into_response();
@@ -1484,7 +1666,9 @@ async fn manifest_put(
         Err(StorageError::NotFound) => return errors::internal_error().into_response(),
         Err(StorageError::DigestMismatch) => return errors::digest_invalid().into_response(),
         Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
-        Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+        Err(StorageError::InsufficientStorage) => {
+            return errors::insufficient_storage().into_response();
+        }
         Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
     };
 
@@ -1512,16 +1696,18 @@ async fn manifest_put(
             artifact_type,
             annotations,
         };
-        let _ = state
-            .storage
-            .add_referrer(name, &subject, descriptor)
-            .await;
+        let _ = state.storage.add_referrer(name, &subject, descriptor).await;
     }
 
     let mut headers = registry_headers();
     headers.insert("Docker-Content-Digest", computed.as_str().parse().unwrap());
     headers.insert("Content-Type", meta.media_type.parse().unwrap());
-    headers.insert("Location", format!("/v2/{name}/manifests/{}", reference).parse().unwrap());
+    headers.insert(
+        "Location",
+        format!("/v2/{name}/manifests/{}", reference)
+            .parse()
+            .unwrap(),
+    );
     if let Some(subject) = subject_for_headers {
         headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
     }
@@ -1586,9 +1772,13 @@ async fn referrers_list(
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
                 Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
                 Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
-                Err(StorageError::DigestMismatch) => return errors::internal_error().into_response(),
+                Err(StorageError::DigestMismatch) => {
+                    return errors::internal_error().into_response();
+                }
                 Err(StorageError::NotFound) => Vec::new(),
-                Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    return errors::insufficient_storage().into_response();
+                }
             };
 
             let artifact_type_filter = query.get("artifactType").map(|s| s.as_str());
@@ -1609,7 +1799,8 @@ async fn referrers_list(
                         obj["artifactType"] = serde_json::Value::String(at);
                     }
                     if let Some(ann) = d.annotations {
-                        obj["annotations"] = serde_json::to_value(ann).unwrap_or(serde_json::Value::Null);
+                        obj["annotations"] =
+                            serde_json::to_value(ann).unwrap_or(serde_json::Value::Null);
                     }
                     obj
                 })
@@ -1664,10 +1855,7 @@ async fn read_body_limited(
         }
     }
 
-    let initial_capacity = content_length
-        .unwrap_or(0)
-        .min(limit)
-        .min(1024 * 1024);
+    let initial_capacity = content_length.unwrap_or(0).min(limit).min(1024 * 1024);
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
     let mut stream = body.into_data_stream();
     while let Some(next) = stream.next().await {
@@ -1718,7 +1906,9 @@ async fn upload_create(
                 let mut headers = registry_headers();
                 headers.insert(
                     "Location",
-                    format!("/v2/{name}/blobs/{}", digest.as_str()).parse().unwrap(),
+                    format!("/v2/{name}/blobs/{}", digest.as_str())
+                        .parse()
+                        .unwrap(),
                 );
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                 headers.insert("Content-Length", "0".parse().unwrap());
@@ -1742,7 +1932,9 @@ async fn upload_create(
             let mut headers = registry_headers();
             headers.insert(
                 "Location",
-                format!("/v2/{name}/blobs/{}", digest.as_str()).parse().unwrap(),
+                format!("/v2/{name}/blobs/{}", digest.as_str())
+                    .parse()
+                    .unwrap(),
             );
             headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
             headers.insert("Content-Length", "0".parse().unwrap());
@@ -1763,22 +1955,32 @@ async fn upload_create(
                     return (StatusCode::ACCEPTED, headers).into_response();
                 }
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    return errors::insufficient_storage().into_response();
+                }
                 Err(_) => return errors::internal_error().into_response(),
             }
         };
 
         // We saw a request body on POST ?digest => this is a monolithic upload.
         // Some clients do this; operators might want to forbid it for robustness.
-        tracing::warn!(repo = name, "monolithic blob upload detected (POST ?digest with body)");
+        tracing::warn!(
+            repo = name,
+            "monolithic blob upload detected (POST ?digest with body)"
+        );
         if state.config.disallow_monolithic_uploads {
-            return errors::blob_upload_invalid("monolithic uploads are disabled; use PATCH-based chunked upload").into_response();
+            return errors::blob_upload_invalid(
+                "monolithic uploads are disabled; use PATCH-based chunked upload",
+            )
+            .into_response();
         }
 
         let meta = match state.storage.create_upload().await {
             Ok(meta) => meta,
             Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                return errors::insufficient_storage().into_response();
+            }
             Err(StorageError::Internal(msg)) => {
                 tracing::error!(storage = state.storage.kind(), error = %msg, repo = name, "create_upload failed");
                 return errors::internal_error().into_response();
@@ -1805,10 +2007,16 @@ async fn upload_create(
                 }
                 return match err {
                     StorageError::NotFound => errors::blob_upload_unknown().into_response(),
-                    StorageError::TooLarge => errors::blob_upload_invalid("upload too large").into_response(),
-                    StorageError::InsufficientStorage => errors::insufficient_storage().into_response(),
+                    StorageError::TooLarge => {
+                        errors::blob_upload_invalid("upload too large").into_response()
+                    }
+                    StorageError::InsufficientStorage => {
+                        errors::insufficient_storage().into_response()
+                    }
                     StorageError::Unsupported => errors::not_implemented().into_response(),
-                    StorageError::Internal(_) | StorageError::DigestMismatch => errors::internal_error().into_response(),
+                    StorageError::Internal(_) | StorageError::DigestMismatch => {
+                        errors::internal_error().into_response()
+                    }
                 };
             }
         }
@@ -1834,10 +2042,16 @@ async fn upload_create(
                 }
                 return match err {
                     StorageError::NotFound => errors::blob_upload_unknown().into_response(),
-                    StorageError::TooLarge => errors::blob_upload_invalid("upload too large").into_response(),
-                    StorageError::InsufficientStorage => errors::insufficient_storage().into_response(),
+                    StorageError::TooLarge => {
+                        errors::blob_upload_invalid("upload too large").into_response()
+                    }
+                    StorageError::InsufficientStorage => {
+                        errors::insufficient_storage().into_response()
+                    }
                     StorageError::Unsupported => errors::not_implemented().into_response(),
-                    StorageError::Internal(_) | StorageError::DigestMismatch => errors::internal_error().into_response(),
+                    StorageError::Internal(_) | StorageError::DigestMismatch => {
+                        errors::internal_error().into_response()
+                    }
                 };
             }
         }
@@ -1847,10 +2061,15 @@ async fn upload_create(
                 let mut headers = registry_headers();
                 headers.insert(
                     "Location",
-                    format!("/v2/{name}/blobs/{}", digest.as_str()).parse().unwrap(),
+                    format!("/v2/{name}/blobs/{}", digest.as_str())
+                        .parse()
+                        .unwrap(),
                 );
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Length", final_meta.size.to_string().parse().unwrap());
+                headers.insert(
+                    "Content-Length",
+                    final_meta.size.to_string().parse().unwrap(),
+                );
                 (StatusCode::CREATED, headers).into_response()
             }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
@@ -1862,7 +2081,9 @@ async fn upload_create(
             }
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         };
     }
@@ -1929,8 +2150,12 @@ async fn upload_session(
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
-            Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::InsufficientStorage) => {
+                errors::insufficient_storage().into_response()
+            }
+            Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
+                errors::internal_error().into_response()
+            }
         },
         Method::PATCH => {
             // Enforce that Content-Range starts at the current offset.
@@ -1938,10 +2163,7 @@ async fn upload_session(
                 match state.storage.upload_status(uuid).await {
                     Ok(meta) if meta.offset == start => {}
                     Ok(_) => {
-                        return (
-                            StatusCode::RANGE_NOT_SATISFIABLE,
-                            registry_headers(),
-                        )
+                        return (StatusCode::RANGE_NOT_SATISFIABLE, registry_headers())
                             .into_response();
                     }
                     Err(StorageError::NotFound) => {
@@ -1954,9 +2176,13 @@ async fn upload_session(
             let mut stream = body.into_data_stream();
             let mut last_meta = match state.storage.upload_status(uuid).await {
                 Ok(m) => m,
-                Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
+                Err(StorageError::NotFound) => {
+                    return errors::blob_upload_unknown().into_response();
+                }
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    return errors::insufficient_storage().into_response();
+                }
                 Err(_) => return errors::internal_error().into_response(),
             };
 
@@ -1975,12 +2201,14 @@ async fn upload_session(
                 }
                 last_meta = match state.storage.append_upload(uuid, chunk).await {
                     Ok(m) => m,
-                    Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
+                    Err(StorageError::NotFound) => {
+                        return errors::blob_upload_unknown().into_response();
+                    }
                     Err(StorageError::TooLarge) => {
                         if policy.abort_on_error {
                             let _ = state.storage.abort_upload(uuid).await;
                         }
-                        return errors::blob_upload_invalid("upload too large").into_response()
+                        return errors::blob_upload_invalid("upload too large").into_response();
                     }
                     Err(StorageError::InsufficientStorage) => {
                         if policy.abort_on_error {
@@ -1988,12 +2216,14 @@ async fn upload_session(
                         }
                         return errors::insufficient_storage().into_response();
                     }
-                    Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                    Err(StorageError::Unsupported) => {
+                        return errors::not_implemented().into_response();
+                    }
                     Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
                         if policy.abort_on_error {
                             let _ = state.storage.abort_upload(uuid).await;
                         }
-                        return errors::internal_error().into_response()
+                        return errors::internal_error().into_response();
                     }
                 };
             }
@@ -2002,7 +2232,10 @@ async fn upload_session(
             headers.insert("Location", location.parse().unwrap());
             headers.insert("Docker-Upload-UUID", last_meta.uuid.parse().unwrap());
             if last_meta.offset > 0 {
-                headers.insert("Range", format!("0-{}", last_meta.offset - 1).parse().unwrap());
+                headers.insert(
+                    "Range",
+                    format!("0-{}", last_meta.offset - 1).parse().unwrap(),
+                );
             }
             (StatusCode::ACCEPTED, headers).into_response()
         }
@@ -2020,10 +2253,7 @@ async fn upload_session(
                 match state.storage.upload_status(uuid).await {
                     Ok(meta) if meta.offset == start => {}
                     Ok(_) => {
-                        return (
-                            StatusCode::RANGE_NOT_SATISFIABLE,
-                            registry_headers(),
-                        )
+                        return (StatusCode::RANGE_NOT_SATISFIABLE, registry_headers())
                             .into_response();
                     }
                     Err(StorageError::NotFound) => {
@@ -2037,7 +2267,11 @@ async fn upload_session(
             let mut stream = body.into_data_stream();
             let first = stream.next().await;
             if let Some(first) = first {
-                tracing::warn!(repo = name, uuid = uuid, "monolithic upload detected (PUT finalize with body)");
+                tracing::warn!(
+                    repo = name,
+                    uuid = uuid,
+                    "monolithic upload detected (PUT finalize with body)"
+                );
                 if state.config.disallow_monolithic_uploads {
                     return errors::blob_upload_invalid(
                         "monolithic uploads are disabled; use PATCH-based chunked upload",
@@ -2057,12 +2291,14 @@ async fn upload_session(
                 if !first_chunk.is_empty() {
                     match state.storage.append_upload(uuid, first_chunk).await {
                         Ok(_) => {}
-                        Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
+                        Err(StorageError::NotFound) => {
+                            return errors::blob_upload_unknown().into_response();
+                        }
                         Err(StorageError::TooLarge) => {
                             if policy.abort_on_error {
                                 let _ = state.storage.abort_upload(uuid).await;
                             }
-                            return errors::blob_upload_invalid("upload too large").into_response()
+                            return errors::blob_upload_invalid("upload too large").into_response();
                         }
                         Err(StorageError::InsufficientStorage) => {
                             if policy.abort_on_error {
@@ -2070,12 +2306,14 @@ async fn upload_session(
                             }
                             return errors::insufficient_storage().into_response();
                         }
-                        Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                        Err(StorageError::Unsupported) => {
+                            return errors::not_implemented().into_response();
+                        }
                         Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
                             if policy.abort_on_error {
                                 let _ = state.storage.abort_upload(uuid).await;
                             }
-                            return errors::internal_error().into_response()
+                            return errors::internal_error().into_response();
                         }
                     }
                 }
@@ -2095,12 +2333,14 @@ async fn upload_session(
                     }
                     match state.storage.append_upload(uuid, chunk).await {
                         Ok(_) => {}
-                        Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
+                        Err(StorageError::NotFound) => {
+                            return errors::blob_upload_unknown().into_response();
+                        }
                         Err(StorageError::TooLarge) => {
                             if policy.abort_on_error {
                                 let _ = state.storage.abort_upload(uuid).await;
                             }
-                            return errors::blob_upload_invalid("upload too large").into_response()
+                            return errors::blob_upload_invalid("upload too large").into_response();
                         }
                         Err(StorageError::InsufficientStorage) => {
                             if policy.abort_on_error {
@@ -2108,12 +2348,14 @@ async fn upload_session(
                             }
                             return errors::insufficient_storage().into_response();
                         }
-                        Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                        Err(StorageError::Unsupported) => {
+                            return errors::not_implemented().into_response();
+                        }
                         Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
                             if policy.abort_on_error {
                                 let _ = state.storage.abort_upload(uuid).await;
                             }
-                            return errors::internal_error().into_response()
+                            return errors::internal_error().into_response();
                         }
                     }
                 }
@@ -2124,7 +2366,9 @@ async fn upload_session(
                     let mut headers = registry_headers();
                     headers.insert(
                         "Location",
-                        format!("/v2/{name}/blobs/{}", digest.as_str()).parse().unwrap(),
+                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                            .parse()
+                            .unwrap(),
                     );
                     headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                     headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
@@ -2139,7 +2383,9 @@ async fn upload_session(
                 }
                 Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
                 Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-                Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    errors::insufficient_storage().into_response()
+                }
                 Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
             }
         }

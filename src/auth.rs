@@ -1,4 +1,4 @@
-use crate::{http_api::errors, AppState};
+use crate::{AppState, http_api::errors};
 use axum::{
     body::Body,
     extract::State,
@@ -7,13 +7,18 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use base64::Engine as _;
-use headers::{authorization::Basic, Authorization, HeaderMapExt};
-use hmac::{Hmac, Mac};
-use serde::Deserialize;
-use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use headers::{Authorization, HeaderMapExt, authorization::Basic};
 use tracing::info;
+
+use crate::security;
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim)
+}
 
 pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     // Path is expected to look like:
@@ -54,56 +59,6 @@ pub(crate) fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
             return repo == prefix || repo.starts_with(&format!("{prefix}/"));
         }
         pat == repo
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenScope {
-    #[serde(rename = "type")]
-    typ: String,
-    name: String,
-    actions: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenPayload {
-    exp: u64,
-    #[serde(default)]
-    scopes: Vec<TokenScope>,
-}
-
-fn verify_bearer_token(signing_key: &str, token: &str) -> Option<TokenPayload> {
-    let (payload_b64, sig_b64) = token.split_once('.')?;
-
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(sig_b64.as_bytes())
-        .ok()?;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes()).ok()?;
-    mac.update(payload_b64.as_bytes());
-    mac.verify_slice(&sig).ok()?;
-
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64.as_bytes())
-        .ok()?;
-    let payload: TokenPayload = serde_json::from_slice(&payload_bytes).ok()?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    if now > payload.exp {
-        return None;
-    }
-
-    Some(payload)
-}
-
-fn bearer_allows_push(payload: &TokenPayload, repo: &str) -> bool {
-    payload.scopes.iter().any(|s| {
-        s.typ == "repository"
-            && s.name == repo
-            && s.actions.iter().any(|a| a == "push")
     })
 }
 
@@ -156,12 +111,11 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     };
 
     // Bearer: accept any valid, unexpired token minted by this registry.
-    if let Some(authz) = headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = authz.strip_prefix("Bearer ") {
-            if verify_bearer_token(&state.config.token_signing_key, token.trim()).is_some() {
+    if let Some(token) = bearer_token_from_headers(headers) {
+        if let Ok(claims) = security::verify_bearer_token(&state.config.token_signing_key, token) {
+            // Treat only tokens with an authenticated subject as "authenticated".
+            // Anonymous pull tokens (sub missing) should not satisfy catalog auth.
+            if claims.sub.as_deref().is_some_and(|s| !s.is_empty()) {
                 return true;
             }
         }
@@ -198,21 +152,19 @@ pub async fn require_push_basic_auth(
     };
 
     // Prefer Bearer for container clients; they typically expect token flows.
-    if let Some(authz) = request
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = authz.strip_prefix("Bearer ") {
-            if let (Some(repo), Some(payload)) = (repo.as_deref(), verify_bearer_token(&state.config.token_signing_key, token.trim())) {
-                if bearer_allows_push(&payload, repo) {
-                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                        if !repo_allowed(allowlist, repo) {
-                            return errors::denied("push not allowed for this repository").into_response();
-                        }
+    if let (Some(token), Some(repo)) = (
+        bearer_token_from_headers(request.headers()),
+        repo.as_deref(),
+    ) {
+        if let Ok(claims) = security::verify_bearer_token(&state.config.token_signing_key, token) {
+            if security::token_allows_repo_action(&claims, repo, security::RepoAction::Push) {
+                if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+                    if !repo_allowed(allowlist, repo) {
+                        return errors::denied("push not allowed for this repository")
+                            .into_response();
                     }
-                    return next.run(request).await;
                 }
+                return next.run(request).await;
             }
         }
     }
@@ -224,7 +176,8 @@ pub async fn require_push_basic_auth(
             if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
                 if let Some(repo) = repo.as_deref() {
                     if !repo_allowed(allowlist, repo) {
-                        return errors::denied("push not allowed for this repository").into_response();
+                        return errors::denied("push not allowed for this repository")
+                            .into_response();
                     }
                 }
             }

@@ -3,19 +3,21 @@ mod config;
 mod http_api;
 mod proxy;
 mod registry;
+mod security;
 mod storage;
 
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
     http::Request,
     middleware::Next,
     response::IntoResponse,
     routing::{any, get},
-    Router,
 };
 use config::{Config, StorageBackend};
 use http_api::handlers;
 use semver::Version;
+use sha2::Digest as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +25,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use sha2::Digest as _;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -79,11 +80,10 @@ async fn main() {
                     .s3_bucket
                     .clone()
                     .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
-                let prefix = config
-                    .proxy
-                    .cache_s3_prefix
-                    .clone()
-                    .unwrap_or_else(|| format!("{}/cache", config.s3_prefix.trim_end_matches('/')));
+                let prefix =
+                    config.proxy.cache_s3_prefix.clone().unwrap_or_else(|| {
+                        format!("{}/cache", config.s3_prefix.trim_end_matches('/'))
+                    });
                 Some(Arc::new(storage::s3::S3Storage::new(
                     Some(endpoint),
                     Some(region),
@@ -222,8 +222,14 @@ fn spawn_proxy_gc(state: AppState) {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(err) =
-                proxy_gc_once(&storage, &fs_root, max_cache_bytes, &repo_rules, &proxy_for_gc).await
+            if let Err(err) = proxy_gc_once(
+                &storage,
+                &fs_root,
+                max_cache_bytes,
+                &repo_rules,
+                &proxy_for_gc,
+            )
+            .await
             {
                 tracing::warn!(error = %err, "proxy gc: run failed");
             }
@@ -259,7 +265,11 @@ fn spawn_proxy_scrub(state: AppState) {
             match proxy_scrub_once(&fs_root, max_files).await {
                 Ok((scanned, removed)) => {
                     if removed > 0 {
-                        tracing::info!(scanned, removed, "proxy scrub: removed corrupted cache entries");
+                        tracing::info!(
+                            scanned,
+                            removed,
+                            "proxy scrub: removed corrupted cache entries"
+                        );
                     } else {
                         tracing::debug!(scanned, removed, "proxy scrub: ok");
                     }
@@ -272,7 +282,10 @@ fn spawn_proxy_scrub(state: AppState) {
     });
 }
 
-async fn proxy_scrub_once(fs_root: &std::path::PathBuf, max_files: usize) -> Result<(u64, u64), String> {
+async fn proxy_scrub_once(
+    fs_root: &std::path::PathBuf,
+    max_files: usize,
+) -> Result<(u64, u64), String> {
     let repos_root = fs_root.join("repos");
     let mut stack: Vec<std::path::PathBuf> = vec![repos_root];
     let mut scanned: u64 = 0;
@@ -323,10 +336,7 @@ async fn proxy_scrub_once(fs_root: &std::path::PathBuf, max_files: usize) -> Res
                 .unwrap_or("");
 
             if parent_name == "manifests" {
-                let file_hex = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let file_hex = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if file_hex.len() != 64 || !file_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue;
                 }
@@ -388,7 +398,12 @@ async fn proxy_gc_once(
     let protected = compute_protected_blobs(storage, repo_rules, proxy).await;
 
     let blobs_root = fs_root.join("blobs").join("sha256");
-    let mut entries: Vec<(registry::digest::Digest, u64, Option<u64>, std::time::SystemTime)> = Vec::new();
+    let mut entries: Vec<(
+        registry::digest::Digest,
+        u64,
+        Option<u64>,
+        std::time::SystemTime,
+    )> = Vec::new();
     let mut total: u64 = 0;
 
     let mut prefixes = match tokio::fs::read_dir(&blobs_root).await {
@@ -399,7 +414,12 @@ async fn proxy_gc_once(
 
     while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
         let prefix_path = prefix_ent.path();
-        if !prefix_ent.file_type().await.map_err(|e| e.to_string())?.is_dir() {
+        if !prefix_ent
+            .file_type()
+            .await
+            .map_err(|e| e.to_string())?
+            .is_dir()
+        {
             continue;
         }
         let mut dir = match tokio::fs::read_dir(&prefix_path).await {
@@ -464,7 +484,12 @@ async fn proxy_gc_once(
     }
 
     if removed_blobs > 0 {
-        tracing::info!(removed_blobs, removed_bytes, max_cache_bytes, "proxy gc: evicted cached blobs");
+        tracing::info!(
+            removed_blobs,
+            removed_bytes,
+            max_cache_bytes,
+            "proxy gc: evicted cached blobs"
+        );
     }
     Ok(())
 }
@@ -494,7 +519,9 @@ async fn compute_protected_blobs(
                     allow_prerelease,
                 } => {
                     if let Ok(tags) = storage.list_tags(&repo).await {
-                        if let Some(latest) = pick_latest_semver_tag(tags, tag_regex.as_deref(), *allow_prerelease) {
+                        if let Some(latest) =
+                            pick_latest_semver_tag(tags, tag_regex.as_deref(), *allow_prerelease)
+                        {
                             pinned_tags.push(latest);
                         }
                     }
@@ -635,7 +662,11 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     true
 }
 
-fn pick_latest_semver_tag(tags: Vec<String>, tag_regex: Option<&str>, allow_prerelease: bool) -> Option<String> {
+fn pick_latest_semver_tag(
+    tags: Vec<String>,
+    tag_regex: Option<&str>,
+    allow_prerelease: bool,
+) -> Option<String> {
     let re = tag_regex.and_then(|r| regex::Regex::new(r).ok());
     let mut best: Option<(Version, String)> = None;
 
@@ -705,12 +736,14 @@ fn is_upload_path(path: &str) -> bool {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("install Ctrl-C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
     };
 
     #[cfg(unix)]
     let term = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         sigterm.recv().await;
     };

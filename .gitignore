@@ -2,3 +2,5 @@
 /target2
 /data
 /certs
+/.nfs*
+/ideas.txt
