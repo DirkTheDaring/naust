@@ -1000,6 +1000,13 @@ async fn manifest_by_reference(
         }
     };
 
+    // Record tag access for eviction/observability (best-effort).
+    if Digest::parse(reference).is_err() {
+        if let Some(proxy) = state.proxy.as_ref() {
+            proxy.note_tag_access(name, reference);
+        }
+    }
+
     match method {
         Method::DELETE => match state.storage.delete_manifest(name, &digest).await {
             Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
@@ -1023,6 +1030,13 @@ async fn manifest_by_reference(
                     if let Ok(meta) = cache.head_manifest(name, &digest).await {
                         if let Some(proxy) = state.proxy.as_ref() {
                             proxy.note_manifest_access(name, &digest);
+                            if let Some(refs) = proxy.get_manifest_refs(name, &digest) {
+                                for blob in refs.blobs {
+                                    if let Ok(d) = crate::registry::digest::Digest::parse(&blob) {
+                                        proxy.note_blob_access(&d);
+                                    }
+                                }
+                            }
                         }
                         let mut headers = registry_headers();
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
@@ -1094,6 +1108,13 @@ async fn manifest_by_reference(
                     if let Ok((meta, bytes)) = cache.get_manifest(name, &digest).await {
                         if let Some(proxy) = state.proxy.as_ref() {
                             proxy.note_manifest_access(name, &digest);
+                            if let Some(refs) = proxy.get_manifest_refs(name, &digest) {
+                                for blob in refs.blobs {
+                                    if let Ok(d) = crate::registry::digest::Digest::parse(&blob) {
+                                        proxy.note_blob_access(&d);
+                                    }
+                                }
+                            }
                         }
                         let mut headers = registry_headers();
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());

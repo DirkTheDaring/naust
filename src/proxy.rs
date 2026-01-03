@@ -471,6 +471,23 @@ impl Proxy {
         let _ = self.db.insert(key, ts.to_be_bytes().to_vec());
     }
 
+    pub fn note_tag_access(&self, repo: &str, tag: &str) {
+        let key = format!("tagaccess::{repo}::{tag}");
+        let ts = Self::now_unix();
+        let _ = self.db.insert(key, ts.to_be_bytes().to_vec());
+    }
+
+    pub fn get_tag_last_access(&self, repo: &str, tag: &str) -> Option<u64> {
+        let key = format!("tagaccess::{repo}::{tag}");
+        let v = self.db.get(key).ok().flatten()?;
+        if v.len() != 8 {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&v);
+        Some(u64::from_be_bytes(buf))
+    }
+
     pub fn index_manifest(&self, repo: &str, digest: &Digest, bytes: &[u8]) {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return;
