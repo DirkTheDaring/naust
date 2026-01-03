@@ -226,6 +226,14 @@ Best-practice profile (`BEST_PRACTICE=1` or `[profile].name="best_practice"`) ch
 | Token signing key | `token.signing_key` | `REGISTRY__TOKEN__SIGNING_KEY` | `TOKEN_SIGNING_KEY` | random per-process (best-practice: required) |
 | Token TTL | `token.ttl_secs` | `REGISTRY__TOKEN__TTL_SECS` | `TOKEN_TTL_SECS` | `600` |
 
+Proxy cache maintenance:
+
+| Purpose | TOML key | Canonical env | Legacy env | Default |
+| --- | --- | --- | --- | --- |
+| Cache scrub enabled | `proxy.cache.scrub_enabled` | `REGISTRY__PROXY__CACHE__SCRUB_ENABLED` | `PROXY_SCRUB_ENABLED` | `false` |
+| Cache scrub interval | `proxy.cache.scrub_interval_secs` | `REGISTRY__PROXY__CACHE__SCRUB_INTERVAL_SECS` | `PROXY_SCRUB_INTERVAL_SECS` | `3600` |
+| Cache scrub max files | `proxy.cache.scrub_max_files_per_run` | `REGISTRY__PROXY__CACHE__SCRUB_MAX_FILES_PER_RUN` | `PROXY_SCRUB_MAX_FILES_PER_RUN` | `2000` |
+
 - `LISTEN_ADDR` (default `127.0.0.1:5000`)
 - `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (if unset, pushes are rejected)
 - `REGISTRY_PUSH_ALLOW_REPOS` (optional, comma-separated; supports `org/*` prefixes and `*`)

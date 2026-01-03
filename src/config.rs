@@ -119,6 +119,12 @@ pub struct ProxyConfig {
     // How often to run cache GC/eviction (seconds).
     pub gc_interval_secs: u64,
 
+    // Optional cache scrub: scan cached manifests/tags and delete corrupt entries.
+    // Useful after crashes or unclean shutdowns, and to clean legacy/corrupt files.
+    pub scrub_enabled: bool,
+    pub scrub_interval_secs: u64,
+    pub scrub_max_files_per_run: usize,
+
     // Required when enabled: upper bound for cached content (best-effort enforcement).
     pub max_cache_bytes: Option<u64>,
 
@@ -242,6 +248,13 @@ struct FileProxyCache {
     max_cache_bytes: Option<u64>,
     #[serde(default)]
     gc_interval_secs: Option<u64>,
+
+    #[serde(default)]
+    scrub_enabled: Option<bool>,
+    #[serde(default)]
+    scrub_interval_secs: Option<u64>,
+    #[serde(default)]
+    scrub_max_files_per_run: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -734,6 +747,29 @@ impl Config {
         .or(file_cfg.proxy.cache.gc_interval_secs)
         .unwrap_or(3600);
 
+        let scrub_enabled = env_bool_opt(&[
+            "REGISTRY__PROXY__CACHE__SCRUB_ENABLED",
+            "PROXY_SCRUB_ENABLED",
+        ])
+        .or(file_cfg.proxy.cache.scrub_enabled)
+        .unwrap_or(false);
+
+        let scrub_interval_secs = env_u64_any(&[
+            "REGISTRY__PROXY__CACHE__SCRUB_INTERVAL_SECS",
+            "PROXY_SCRUB_INTERVAL_SECS",
+        ])
+        .or(file_cfg.proxy.cache.scrub_interval_secs)
+        .unwrap_or(3600)
+        .max(1);
+
+        let scrub_max_files_per_run = env_usize_any(&[
+            "REGISTRY__PROXY__CACHE__SCRUB_MAX_FILES_PER_RUN",
+            "PROXY_SCRUB_MAX_FILES_PER_RUN",
+        ])
+        .or(file_cfg.proxy.cache.scrub_max_files_per_run)
+        .unwrap_or(2000)
+        .max(1);
+
         let repo_rules = file_cfg
             .proxy
             .repos
@@ -785,6 +821,9 @@ impl Config {
             cache_fs_root,
             cache_s3_prefix,
             gc_interval_secs,
+            scrub_enabled,
+            scrub_interval_secs,
+            scrub_max_files_per_run,
             max_cache_bytes,
             repo_rules,
         };

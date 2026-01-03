@@ -90,6 +90,11 @@ index_path = "./data/cache/proxy-index"
 max_cache_bytes = 10737418240 # 10 GiB
 gc_interval_secs = 3600
 
+# Optional: periodically scan cached manifests/tags and delete corrupted entries.
+scrub_enabled = false
+scrub_interval_secs = 3600
+scrub_max_files_per_run = 2000
+
 # Per-repo policies (TOML-only)
 [[proxy.repos]]
 match = "library/alpine"

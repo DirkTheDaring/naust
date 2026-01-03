@@ -1,6 +1,7 @@
 use super::{ensure_dir, BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError};
 use crate::registry::digest::Digest;
 use async_trait::async_trait;
+use std::path::Path;
 use std::path::PathBuf;
 use bytes::Bytes;
 use sha2::Digest as _;
@@ -194,6 +195,55 @@ fn map_fs_io_err(err: std::io::Error) -> StorageError {
     StorageError::Internal(err.to_string())
 }
 
+async fn fsync_dir(path: &Path) -> Result<(), StorageError> {
+    // Best-effort durability: fsync the directory so rename/link updates survive power loss.
+    // This is a blocking operation; run it off the async runtime.
+    let dir = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(&dir)?;
+        f.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?
+    .map_err(map_fs_io_err)
+}
+
+async fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    let Some(parent) = path.parent() else {
+        return Err(StorageError::Internal("invalid path".to_string()));
+    };
+    ensure_dir(&parent.to_path_buf());
+
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let tmp_name = format!(".tmp.{file_name}.{}", uuid::Uuid::new_v4());
+    let tmp_path = parent.join(tmp_name);
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .await
+        .map_err(map_fs_io_err)?;
+
+    file.write_all(bytes).await.map_err(map_fs_io_err)?;
+    file.flush().await.map_err(map_fs_io_err)?;
+    // Ensure file data+metadata is on stable storage before we make it visible.
+    file.sync_all().await.map_err(map_fs_io_err)?;
+    drop(file);
+
+    if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(map_fs_io_err(err));
+    }
+
+    fsync_dir(parent).await?;
+    Ok(())
+}
+
 #[async_trait]
 impl Storage for FsStorage {
     fn kind(&self) -> &'static str {
@@ -339,9 +389,7 @@ impl Storage for FsStorage {
 
         let media_type = self.detect_manifest_media_type(&bytes).await?;
         let path = dir.join(digest.hex());
-        tokio::fs::write(&path, &bytes)
-            .await
-            .map_err(map_fs_io_err)?;
+        atomic_write_file(&path, &bytes).await?;
 
         Ok(ManifestMeta {
             size: bytes.len() as u64,
@@ -353,9 +401,8 @@ impl Storage for FsStorage {
         let dir = self.root.join("repos").join(name).join("tags");
         ensure_dir(&dir);
         let path = dir.join(tag);
-        tokio::fs::write(&path, format!("{}\n", digest.as_str()))
-            .await
-            .map_err(map_fs_io_err)?;
+        let body = format!("{}\n", digest.as_str());
+        atomic_write_file(&path, body.as_bytes()).await?;
         Ok(())
     }
 
@@ -449,6 +496,10 @@ impl Storage for FsStorage {
             return Err(StorageError::DigestMismatch);
         }
 
+        // Ensure the uploaded data is durable before we make it visible in the blob store.
+        file.sync_all().await.map_err(map_fs_io_err)?;
+        drop(file);
+
         // Move into blob store.
         let dest_dir = self
             .root
@@ -461,6 +512,10 @@ impl Storage for FsStorage {
         tokio::fs::rename(&upload_path, &dest_path)
             .await
             .map_err(map_fs_io_err)?;
+
+        // Make the rename durable (both directories are updated by rename).
+        fsync_dir(self.uploads_dir().as_path()).await?;
+        fsync_dir(dest_dir.as_path()).await?;
 
         let meta = tokio::fs::metadata(&dest_path)
             .await
@@ -522,9 +577,7 @@ impl Storage for FsStorage {
 
         let bytes = serde_json::to_vec(&existing)
             .map_err(|err| StorageError::Internal(err.to_string()))?;
-        tokio::fs::write(&path, bytes)
-            .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        atomic_write_file(&path, &bytes).await?;
         Ok(())
     }
 

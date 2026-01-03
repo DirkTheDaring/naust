@@ -23,6 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use sha2::Digest as _;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -142,6 +143,7 @@ async fn main() {
 
     spawn_upload_gc(state.clone());
     spawn_proxy_gc(state.clone());
+    spawn_proxy_scrub(state.clone());
 
     let app = Router::new()
         .route("/token", get(handlers::token))
@@ -227,6 +229,153 @@ fn spawn_proxy_gc(state: AppState) {
             }
         }
     });
+}
+
+fn spawn_proxy_scrub(state: AppState) {
+    if !state.config.proxy.enabled {
+        return;
+    }
+    if !state.config.proxy.scrub_enabled {
+        return;
+    }
+    if state.config.storage_backend != StorageBackend::Filesystem {
+        tracing::warn!("proxy scrub: only filesystem backend is supported currently");
+        return;
+    }
+
+    let interval = Duration::from_secs(state.config.proxy.scrub_interval_secs.max(1));
+    let max_files = state.config.proxy.scrub_max_files_per_run.max(1);
+    let fs_root = state
+        .config
+        .proxy
+        .cache_fs_root
+        .clone()
+        .unwrap_or_else(|| state.config.fs_root.join("cache"));
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match proxy_scrub_once(&fs_root, max_files).await {
+                Ok((scanned, removed)) => {
+                    if removed > 0 {
+                        tracing::info!(scanned, removed, "proxy scrub: removed corrupted cache entries");
+                    } else {
+                        tracing::debug!(scanned, removed, "proxy scrub: ok");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "proxy scrub: run failed");
+                }
+            }
+        }
+    });
+}
+
+async fn proxy_scrub_once(fs_root: &std::path::PathBuf, max_files: usize) -> Result<(u64, u64), String> {
+    let repos_root = fs_root.join("repos");
+    let mut stack: Vec<std::path::PathBuf> = vec![repos_root];
+    let mut scanned: u64 = 0;
+    let mut removed: u64 = 0;
+
+    while let Some(dir) = stack.pop() {
+        if (scanned as usize) >= max_files {
+            break;
+        }
+
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(d) => d,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            if (scanned as usize) >= max_files {
+                break;
+            }
+
+            let path = ent.path();
+            let ft = match ent.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            if ft.is_dir() {
+                // Skip blob store; scrub focuses on repo metadata-like structures.
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name == "blobs" || name == "uploads" {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+
+            if !ft.is_file() {
+                continue;
+            }
+
+            scanned += 1;
+
+            let parent_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+
+            if parent_name == "manifests" {
+                let file_hex = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if file_hex.len() != 64 || !file_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+
+                let bytes = match tokio::fs::read(&path).await {
+                    Ok(b) => b,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        tracing::debug!(error = %err, path = %path.display(), "proxy scrub: read manifest failed");
+                        continue;
+                    }
+                };
+                if bytes.is_empty() {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    removed += 1;
+                    continue;
+                }
+
+                // Must be valid JSON.
+                if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    removed += 1;
+                    continue;
+                }
+
+                // Must match filename digest.
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&bytes);
+                let computed = hex::encode(hasher.finalize());
+                if computed != file_hex {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    removed += 1;
+                }
+            } else if parent_name == "tags" {
+                // Tag pointers should parse as a digest; invalid pointers are removed.
+                let content = match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => s,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => continue,
+                };
+                if crate::registry::digest::Digest::parse(content.trim()).is_err() {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    Ok((scanned, removed))
 }
 
 async fn proxy_gc_once(
