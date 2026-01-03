@@ -13,11 +13,22 @@ use tracing::info;
 use crate::security;
 
 fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
-    headers
+    const MAX_BEARER_TOKEN_LEN: usize = 8192;
+
+    let token = headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::trim)
+        .map(str::trim)?;
+
+    if token.is_empty() || token.len() > MAX_BEARER_TOKEN_LEN {
+        return None;
+    }
+    Some(token)
+}
+
+fn bearer_claims_are_authenticated(claims: &security::TokenClaims) -> bool {
+    claims.sub.as_deref().is_some_and(|s| !s.is_empty())
 }
 
 pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
@@ -113,9 +124,7 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     // Bearer: accept any valid, unexpired token minted by this registry.
     if let Some(token) = bearer_token_from_headers(headers) {
         if let Ok(claims) = security::verify_bearer_token(&state.config.token_signing_key, token) {
-            // Treat only tokens with an authenticated subject as "authenticated".
-            // Anonymous pull tokens (sub missing) should not satisfy catalog auth.
-            if claims.sub.as_deref().is_some_and(|s| !s.is_empty()) {
+            if bearer_claims_are_authenticated(&claims) {
                 return true;
             }
         }
@@ -142,24 +151,28 @@ pub async fn require_push_basic_auth(
     }
 
     let repo = extract_repo_from_v2_path(request.uri().path());
+    let Some(repo_name) = repo.as_deref() else {
+        return unauthorized_registry_challenge(&state, None);
+    };
 
     // If auth is not configured, reject pushes by default (safe default).
     let Some(expected_user) = state.config.push_username.as_deref() else {
-        return unauthorized_registry_challenge(&state, repo.as_deref());
+        return unauthorized_registry_challenge(&state, Some(repo_name));
     };
     let Some(expected_pass) = state.config.push_password.as_deref() else {
-        return unauthorized_registry_challenge(&state, repo.as_deref());
+        return unauthorized_registry_challenge(&state, Some(repo_name));
     };
 
     // Prefer Bearer for container clients; they typically expect token flows.
-    if let (Some(token), Some(repo)) = (
-        bearer_token_from_headers(request.headers()),
-        repo.as_deref(),
-    ) {
+    if let Some(token) = bearer_token_from_headers(request.headers()) {
         if let Ok(claims) = security::verify_bearer_token(&state.config.token_signing_key, token) {
-            if security::token_allows_repo_action(&claims, repo, security::RepoAction::Push) {
+            if !bearer_claims_are_authenticated(&claims) {
+                return unauthorized_registry_challenge(&state, Some(repo_name));
+            }
+
+            if security::token_allows_repo_action(&claims, repo_name, security::RepoAction::Push) {
                 if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                    if !repo_allowed(allowlist, repo) {
+                    if !repo_allowed(allowlist, repo_name) {
                         return errors::denied("push not allowed for this repository")
                             .into_response();
                     }
@@ -174,11 +187,9 @@ pub async fn require_push_basic_auth(
         let pass_ok = basic.password() == expected_pass;
         if user_ok && pass_ok {
             if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                if let Some(repo) = repo.as_deref() {
-                    if !repo_allowed(allowlist, repo) {
-                        return errors::denied("push not allowed for this repository")
-                            .into_response();
-                    }
+                if !repo_allowed(allowlist, repo_name) {
+                    return errors::denied("push not allowed for this repository")
+                        .into_response();
                 }
             }
             return next.run(request).await;
@@ -204,5 +215,108 @@ pub async fn require_push_basic_auth(
         "push auth denied"
     );
 
-    unauthorized_registry_challenge(&state, repo.as_deref())
+    unauthorized_registry_challenge(&state, Some(repo_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bearer_claims_are_authenticated, bearer_token_from_headers, extract_repo_from_v2_path,
+        repo_allowed,
+    };
+    use crate::security;
+    use axum::http::HeaderMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs()
+    }
+
+    #[test]
+    fn bearer_claims_authentication_requires_non_empty_sub() {
+        let signing_key = "test-signing-key";
+        let now = now_secs();
+        let scopes: Vec<security::TokenScope> = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "org/repo".to_string(),
+            actions: vec!["pull".to_string()],
+        }];
+
+        let anon = security::issue_bearer_token(signing_key, None, &scopes, now, now + 3600)
+            .expect("issue token");
+        let claims_anon = security::verify_bearer_token(signing_key, &anon).expect("verify");
+        assert!(!bearer_claims_are_authenticated(&claims_anon));
+
+        let user = security::issue_bearer_token(signing_key, Some("user"), &scopes, now, now + 3600)
+            .expect("issue token");
+        let claims_user = security::verify_bearer_token(signing_key, &user).expect("verify");
+        assert!(bearer_claims_are_authenticated(&claims_user));
+    }
+
+    #[test]
+    fn extract_repo_from_v2_path_parses_repo_names() {
+        assert_eq!(
+            extract_repo_from_v2_path("/v2/library/alpine/manifests/latest").as_deref(),
+            Some("library/alpine")
+        );
+        assert_eq!(
+            extract_repo_from_v2_path("/v2/org/repo/blobs/sha256:deadbeef").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            extract_repo_from_v2_path("/v2/org/repo/tags/list").as_deref(),
+            Some("org/repo")
+        );
+
+        assert!(extract_repo_from_v2_path("/v2/").is_none());
+        assert!(extract_repo_from_v2_path("/v2").is_none());
+        assert!(extract_repo_from_v2_path("/notv2/org/repo/manifests/latest").is_none());
+
+        // Upload paths are repository-scoped too (auth gating needs the repo).
+        assert_eq!(
+            extract_repo_from_v2_path("/v2/org/repo/blobs/uploads/").as_deref(),
+            Some("org/repo")
+        );
+
+        // Missing marker segment should not be treated as a repo.
+        assert!(extract_repo_from_v2_path("/v2/org/repo/somethingelse").is_none());
+    }
+
+    #[test]
+    fn repo_allowed_matches_exact_and_prefix() {
+        let allowlist = vec!["org/repo".to_string(), "org/*".to_string()];
+        assert!(repo_allowed(&allowlist, "org/repo"));
+        assert!(repo_allowed(&allowlist, "org/other"));
+        assert!(!repo_allowed(&allowlist, "other/repo"));
+    }
+
+    #[test]
+    fn repo_allowed_star_allows_everything() {
+        let allowlist = vec!["*".to_string()];
+        assert!(repo_allowed(&allowlist, "anything/here"));
+        assert!(repo_allowed(&allowlist, "single"));
+    }
+
+    #[test]
+    fn repo_allowed_prefix_matches_exact_prefix_repo_too() {
+        let allowlist = vec!["org/*".to_string()];
+        // This registry treats 'org/*' as allowing 'org' and 'org/...'.
+        assert!(repo_allowed(&allowlist, "org"));
+        assert!(repo_allowed(&allowlist, "org/repo"));
+        assert!(!repo_allowed(&allowlist, "org2/repo"));
+    }
+
+    #[test]
+    fn bearer_token_from_headers_rejects_empty_and_oversized() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert!(bearer_token_from_headers(&headers).is_none());
+
+        let huge = format!("Bearer {}", "a".repeat(9000));
+        headers.insert(http::header::AUTHORIZATION, huge.parse().unwrap());
+        assert!(bearer_token_from_headers(&headers).is_none());
+    }
 }

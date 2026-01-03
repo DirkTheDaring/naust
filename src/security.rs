@@ -56,7 +56,15 @@ impl RepoAction {
 }
 
 pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims, TokenError> {
+    const MAX_TOKEN_LEN: usize = 8192;
+    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+        return Err(TokenError::InvalidFormat);
+    }
+
     let (payload_b64, sig_b64) = token.split_once('.').ok_or(TokenError::InvalidFormat)?;
+    if payload_b64.is_empty() || sig_b64.is_empty() {
+        return Err(TokenError::InvalidFormat);
+    }
 
     let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(sig_b64.as_bytes())
@@ -208,5 +216,48 @@ mod tests {
             TokenError::InvalidSignature => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn bearer_wrong_key_rejected() {
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+        let token = issue_bearer_token("key-a", None, &scopes, now, now + 3600).expect("issue");
+
+        let err = verify_bearer_token("key-b", &token).expect_err("wrong key");
+        match err {
+            TokenError::InvalidSignature => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bearer_empty_or_oversized_rejected_as_invalid_format() {
+        let err = verify_bearer_token("k", "").expect_err("empty");
+        assert!(matches!(err, TokenError::InvalidFormat));
+
+        let huge = "a".repeat(9000);
+        let err = verify_bearer_token("k", &huge).expect_err("oversized");
+        assert!(matches!(err, TokenError::InvalidFormat));
+    }
+
+    #[test]
+    fn bearer_empty_parts_rejected_as_invalid_format() {
+        let err = verify_bearer_token("k", ".sig").expect_err("empty payload");
+        assert!(matches!(err, TokenError::InvalidFormat));
+
+        let err = verify_bearer_token("k", "payload.").expect_err("empty sig");
+        assert!(matches!(err, TokenError::InvalidFormat));
+    }
+
+    #[test]
+    fn bearer_invalid_signature_vs_format_classification() {
+        // Wrong separator -> format error.
+        let err = verify_bearer_token("k", "payload+sig").expect_err("format");
+        assert!(matches!(err, TokenError::InvalidFormat));
+
+        // Proper structure but invalid base64/signature should not look like a format issue.
+        let err = verify_bearer_token("k", "cGF5bG9hZA.sig").expect_err("signature");
+        assert!(matches!(err, TokenError::InvalidSignature));
     }
 }

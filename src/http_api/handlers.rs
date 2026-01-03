@@ -100,9 +100,7 @@ pub async fn token(
     let token_scopes = sanitize_token_scopes(&scopes);
 
     // If push is requested, require Basic auth and validate creds.
-    let wants_push = token_scopes
-        .iter()
-        .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Push));
+    let wants_push = wants_push_from_token_scopes(&token_scopes);
     let subject = if wants_push {
         let Some(expected_user) = state.config.push_username.as_deref() else {
             return token_unauthorized(&state);
@@ -215,6 +213,10 @@ fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
             continue;
         }
 
+        if s.name.trim().is_empty() {
+            continue;
+        }
+
         let mut actions: Vec<String> = Vec::new();
         for a in &s.actions {
             if a == security::RepoAction::Pull.as_str() || a == security::RepoAction::Push.as_str() {
@@ -236,6 +238,12 @@ fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
         });
     }
     out
+}
+
+fn wants_push_from_token_scopes(token_scopes: &[security::TokenScope]) -> bool {
+    token_scopes
+        .iter()
+        .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Push))
 }
 
 fn parse_scopes(scope: &str) -> Vec<Scope> {
@@ -1328,7 +1336,7 @@ fn is_valid_tag(tag: &str) -> bool {
 mod tests {
     use super::{
         is_valid_repo_name, is_valid_tag, parse_scopes, sanitize_token_scopes,
-        token_scope_requests_repo_action,
+        token_scope_requests_repo_action, wants_push_from_token_scopes,
     };
     use crate::security;
 
@@ -1398,6 +1406,51 @@ mod tests {
         let scopes = parse_scopes("repository:org/repo:delete");
         let token_scopes = sanitize_token_scopes(&scopes);
         assert!(token_scopes.is_empty());
+    }
+
+    #[test]
+    fn sanitize_token_scopes_drops_empty_repo_names() {
+        let scopes = parse_scopes("repository::pull");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert!(token_scopes.is_empty());
+    }
+
+    #[test]
+    fn parse_scopes_ignores_whitespace_only() {
+        let scopes = parse_scopes("   \t  ");
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn sanitize_token_scopes_drops_empty_action_lists() {
+        let scopes = parse_scopes("repository:org/repo:");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert!(token_scopes.is_empty());
+    }
+
+    #[test]
+    fn wants_push_ignores_unknown_only_actions() {
+        let scopes = parse_scopes("repository:org/repo:delete");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert!(!wants_push_from_token_scopes(&token_scopes));
+    }
+
+    #[test]
+    fn wants_push_true_only_when_repository_push_present() {
+        let scopes = parse_scopes(
+            "repository:org/repo:pull repository:org/repo2:pull,push registry:catalog:*:push",
+        );
+        let token_scopes = sanitize_token_scopes(&scopes);
+
+        assert!(wants_push_from_token_scopes(&token_scopes));
+    }
+
+    #[test]
+    fn wants_push_false_for_repository_pull_only() {
+        let scopes = parse_scopes("repository:org/repo:pull registry:catalog:*:push");
+        let token_scopes = sanitize_token_scopes(&scopes);
+
+        assert!(!wants_push_from_token_scopes(&token_scopes));
     }
 }
 
