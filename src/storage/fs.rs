@@ -468,6 +468,15 @@ impl Storage for FsStorage {
         Ok(BlobMeta { size: meta.len() })
     }
 
+    async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
+        let path = self.upload_path(uuid);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StorageError::Internal(err.to_string())),
+        }
+    }
+
     async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
         let path = self.blob_path(digest);
         match tokio::fs::remove_file(&path).await {

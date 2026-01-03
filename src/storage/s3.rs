@@ -666,6 +666,26 @@ impl Storage for S3Storage {
         Ok(BlobMeta { size: total })
     }
 
+    async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+        let (base_uuid, upload_id) = Self::decode_upload_token(uuid)?;
+        let key = self.upload_key(&base_uuid);
+
+        // Abort the multipart upload (best-effort).
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+
+        // If an object exists anyway, try deleting it (best-effort).
+        let _ = client.delete_object().bucket(bucket).key(&key).send().await;
+        Ok(())
+    }
+
     async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
         let client = self.client().await?;
         let bucket = self.bucket()?;

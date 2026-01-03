@@ -1,0 +1,47 @@
+services:
+  registry:
+    environment:
+      # Optional: load a TOML config file.
+      CONFIG_PATH: "/config/registry.toml"
+
+      # IMPORTANT:
+      # The registry uses: defaults < config file < env vars.
+      # The base compose files set lots of env vars; we blank them here so
+      # the TOML file can control them when this overlay is enabled.
+      LISTEN_ADDR: ""
+      PUBLIC_URL: ""
+      TLS_CERT_PATH: ""
+      TLS_KEY_PATH: ""
+
+      REGISTRY_USERNAME: ""
+      REGISTRY_PASSWORD: ""
+      REGISTRY_PUSH_ALLOW_REPOS: ""
+
+      STORAGE_BACKEND: ""
+      STORAGE_FS_ROOT: ""
+      STORAGE_S3_ENDPOINT: ""
+      STORAGE_S3_REGION: ""
+      STORAGE_S3_BUCKET: ""
+      STORAGE_S3_PREFIX: ""
+
+      ALLOW_TAG_OVERWRITE: ""
+      MAX_UPLOAD_BYTES: ""
+      MAX_REQUEST_BODY_BYTES: ""
+      REQUEST_TIMEOUT_SECS: ""
+      UPLOAD_REQUEST_TIMEOUT_SECS: ""
+      DISALLOW_MONOLITHIC_UPLOADS: ""
+      CATALOG_REQUIRES_AUTH: ""
+
+      TOKEN_SERVICE: ""
+      TOKEN_SIGNING_KEY: ""
+      TOKEN_TTL_SECS: ""
+
+      # In best-practice mode, a stable signing key is required.
+      # (Either set it in the TOML under [token].signing_key or here.)
+      # TOKEN_SIGNING_KEY: "change-me"
+
+    volumes:
+      # Mount your config into the container.
+      # Default: ./registry.toml
+      # Example: REGISTRY_TOML_PATH=./configs/registry.best_practice.toml
+      - ${REGISTRY_TOML_PATH:-./registry.toml}:/config/registry.toml:ro

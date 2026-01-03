@@ -1,0 +1,98 @@
+# Example configuration file for registry-rust
+# Usage:
+#   CONFIG_PATH=/etc/registry/registry.toml ./registry-rust
+# Precedence:
+#   defaults < config file < env vars
+
+[server]
+listen_addr = "127.0.0.1:5000"
+# Recommended for token realm and external URLs (especially behind proxies)
+public_url = "http://127.0.0.1:5000"
+
+[server.tls]
+# If both are set, the server serves HTTPS.
+cert_path = ""
+key_path  = ""
+
+[auth.push]
+# If username/password are unset, pushes are rejected.
+username = "demo"
+password = "demo"
+# Optional allowlist; supports "org/*" and "*".
+allow_repos = ["myrepo"]
+
+[token]
+service = "registry-rust"
+# Set a stable secret in production.
+signing_key = "change-me"
+ttl_secs = 600
+
+[storage]
+backend = "fs"  # "fs" or "s3"
+
+[storage.fs]
+root = "./data"
+
+[storage.s3]
+endpoint = ""
+region = ""
+bucket = ""
+prefix = "registry"
+
+[features]
+allow_tag_overwrite = true
+automatic_crossmount = false
+
+[uploads]
+# Zero-trust-ish operators often set this to true.
+disallow_monolithic_uploads = false
+
+# Filesystem backend maintenance: clean up stale upload temp files.
+gc_enabled = true
+gc_interval_secs = 3600
+gc_max_age_secs = 86400
+
+[limits]
+max_upload_bytes = 5368709120          # 5 GiB
+max_request_body_bytes = 33554432      # 32 MiB (manifests are read with a cap)
+
+[timeouts]
+request_timeout_secs = 300
+upload_request_timeout_secs = 3600
+
+[catalog]
+requires_auth = false
+
+# Pull-through cache / proxy (optional)
+[proxy]
+enabled = false
+mode = "allowlist" # "allowlist" (default) or "any"
+
+[proxy.upstream]
+base_url = "https://registry-1.docker.io"
+
+[proxy.safety]
+# If empty, defaults to allowing only the configured upstream host (plus auth.docker.io for Docker Hub).
+allowed_upstream_hosts = []
+# Even in proxy-any mode, this is a safety net.
+allowed_repo_prefixes = ["library/"]
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.cache]
+# Separate cache storage root to avoid mixing push content with cached pull-through content.
+fs_root = "./data/cache"
+# Local metadata DB for tag freshness (TTL/ETag).
+index_path = "./data/cache/proxy-index"
+# Required when proxy.enabled=true
+max_cache_bytes = 10737418240 # 10 GiB
+gc_interval_secs = 3600
+
+# Per-repo policies (TOML-only)
+[[proxy.repos]]
+match = "library/alpine"
+# tag_policy = "digest_only" | { ttl_seconds = 3600 } | "always_revalidate"
+tag_policy = { ttl_seconds = 3600 }
+# eviction policy examples:
+# eviction = { type = "keep_tags", tags = ["latest"] }
+# eviction = { type = "keep_latest_cached_semver", tag_regex = "^v?\\d+\\.\\d+\\.\\d+$", allow_prerelease = false }

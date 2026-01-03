@@ -116,6 +116,9 @@ pub trait Storage: Send + Sync {
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError>;
 
+    // Best-effort cleanup for failed/abandoned uploads.
+    async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError>;
+
     // Content Management: blob deletion.
     async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError>;
 

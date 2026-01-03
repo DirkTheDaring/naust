@@ -19,6 +19,7 @@ use hmac::{Hmac, Mac};
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -770,7 +771,40 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
                 (StatusCode::OK, headers).into_response()
             }
-            Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
+            Err(StorageError::NotFound) => {
+                if let Some(cache) = state.proxy_cache.as_ref() {
+                    if let Ok(meta) = cache.head_blob(&digest).await {
+                        if let Some(proxy) = state.proxy.as_ref() {
+                            proxy.note_blob_access(&digest);
+                        }
+                        let mut headers = registry_headers();
+                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                        return (StatusCode::OK, headers).into_response();
+                    }
+                }
+
+                if let Some(proxy) = state.proxy.as_ref() {
+                    if let Ok(decision) = proxy.decision_for_repo(name) {
+                        match proxy.head_blob_upstream(&decision, &digest).await {
+                            Ok(size) => {
+                                let mut headers = registry_headers();
+                                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                                headers.insert("Content-Length", size.to_string().parse().unwrap());
+                                return (StatusCode::OK, headers).into_response();
+                            }
+                            Err(crate::proxy::ProxyError::NotFound) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: head blob failed");
+                                return errors::internal_error().into_response();
+                            }
+                        }
+                    }
+                }
+                errors::blob_unknown().into_response()
+            }
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
@@ -788,7 +822,56 @@ async fn blob_by_digest(state: AppState, method: Method, name: &str, digest_str:
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
                 (StatusCode::OK, headers, body).into_response()
             }
-            Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
+            Err(StorageError::NotFound) => {
+                if let Some(cache) = state.proxy_cache.as_ref() {
+                    if let Ok((meta, reader)) = cache.open_blob(&digest).await {
+                        if let Some(proxy) = state.proxy.as_ref() {
+                            proxy.note_blob_access(&digest);
+                        }
+                        let stream = ReaderStream::new(reader);
+                        let body = Body::from_stream(stream);
+
+                        let mut headers = registry_headers();
+                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                        return (StatusCode::OK, headers, body).into_response();
+                    }
+                }
+
+                if let Some(proxy) = state.proxy.as_ref() {
+                    if let Ok(decision) = proxy.decision_for_repo(name) {
+                        let Some(cache) = state.proxy_cache.as_ref() else {
+                            return errors::internal_error().into_response();
+                        };
+                        match proxy
+                            .fetch_blob_into_storage(&decision, &digest, cache)
+                            .await
+                        {
+                            Ok(()) => {
+                                // Retry from cache storage.
+                                if let Ok((meta, reader)) = cache.open_blob(&digest).await {
+                                    proxy.note_blob_access(&digest);
+                                    let stream = ReaderStream::new(reader);
+                                    let body = Body::from_stream(stream);
+
+                                    let mut headers = registry_headers();
+                                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                                    return (StatusCode::OK, headers, body).into_response();
+                                }
+                            }
+                            Err(crate::proxy::ProxyError::NotFound) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: fetch blob failed");
+                                return errors::internal_error().into_response();
+                            }
+                        }
+                    }
+                }
+                errors::blob_unknown().into_response()
+            }
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
@@ -810,17 +893,111 @@ async fn manifest_by_reference(
     }
 
     // Reference can be a digest or a tag.
-    let digest = match Digest::parse(reference) {
-        Ok(d) => d,
-        Err(_) => match state.storage.resolve_tag(name, reference).await {
+    let is_digest_ref = Digest::parse(reference).is_ok();
+
+    // Resolve tag references to a digest (with optional proxying).
+    let digest = if let Ok(d) = Digest::parse(reference) {
+        d
+    } else {
+        match state.storage.resolve_tag(name, reference).await {
             Ok(d) => d,
-            Err(StorageError::NotFound) => return errors::manifest_unknown().into_response(),
+            Err(StorageError::NotFound) => {
+                // Check cache storage for an existing cached tag.
+                if let Some(cache) = state.proxy_cache.as_ref() {
+                    if let Ok(d) = cache.resolve_tag(name, reference).await {
+                        d
+                    } else {
+                        // Tag not known locally. If proxying is enabled and repo is allowed, resolve from upstream.
+                        if let Some(proxy) = state.proxy.as_ref() {
+                            let Some(cache) = state.proxy_cache.as_ref() else {
+                                return errors::internal_error().into_response();
+                            };
+                            if let Ok(decision) = proxy.decision_for_repo(name) {
+                                match decision.tag_policy.clone() {
+                                    crate::config::TagPolicy::DigestOnly => {
+                                        match proxy
+                                            .fetch_manifest_and_cache(
+                                                &decision,
+                                                reference,
+                                                cache,
+                                                state.config.max_request_body_bytes,
+                                                false,
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            Ok(crate::proxy::FetchManifestResult::Fetched { digest, .. }) => digest,
+                                            Ok(_) => {
+                                                return errors::internal_error().into_response();
+                                            }
+                                            Err(crate::proxy::ProxyError::NotFound) => {
+                                                return errors::manifest_unknown().into_response();
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(error = %err, repo = name, tag = reference, "proxy: resolve tag failed");
+                                                return errors::internal_error().into_response();
+                                            }
+                                        }
+                                    }
+                                    crate::config::TagPolicy::TtlSeconds(ttl) => {
+                                        if let Err(resp) = ensure_tag_fresh(
+                                            &state,
+                                            proxy,
+                                            &decision,
+                                            cache,
+                                            reference,
+                                            ttl,
+                                            false,
+                                        )
+                                        .await
+                                        {
+                                            return resp;
+                                        }
+                                        match cache.resolve_tag(name, reference).await {
+                                            Ok(d) => d,
+                                            Err(StorageError::NotFound) => return errors::manifest_unknown().into_response(),
+                                            Err(_) => return errors::internal_error().into_response(),
+                                        }
+                                    }
+                                    crate::config::TagPolicy::AlwaysRevalidate => {
+                                        if let Err(resp) = ensure_tag_fresh(
+                                            &state,
+                                            proxy,
+                                            &decision,
+                                            cache,
+                                            reference,
+                                            0,
+                                            true,
+                                        )
+                                        .await
+                                        {
+                                            return resp;
+                                        }
+                                        match cache.resolve_tag(name, reference).await {
+                                            Ok(d) => d,
+                                            Err(StorageError::NotFound) => return errors::manifest_unknown().into_response(),
+                                            Err(_) => return errors::internal_error().into_response(),
+                                        }
+                                    }
+                                }
+                            } else {
+                                return errors::manifest_unknown().into_response();
+                            }
+                        } else {
+                            return errors::manifest_unknown().into_response();
+                        }
+                    }
+                } else {
+                    // Tag not known locally and no cache store.
+                    return errors::manifest_unknown().into_response();
+                }
+            }
             Err(StorageError::DigestMismatch) => return errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
             Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
             Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
-        },
+        }
     };
 
     match method {
@@ -841,7 +1018,63 @@ async fn manifest_by_reference(
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
                 (StatusCode::OK, headers).into_response()
             }
-            Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
+            Err(StorageError::NotFound) => {
+                if let Some(cache) = state.proxy_cache.as_ref() {
+                    if let Ok(meta) = cache.head_manifest(name, &digest).await {
+                        if let Some(proxy) = state.proxy.as_ref() {
+                            proxy.note_manifest_access(name, &digest);
+                        }
+                        let mut headers = registry_headers();
+                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                        headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                        return (StatusCode::OK, headers).into_response();
+                    }
+                }
+
+                // For manifests, on miss we fetch+cache on HEAD too (small), to avoid extra upstream roundtrips.
+                if let Some(proxy) = state.proxy.as_ref() {
+                    let Some(cache) = state.proxy_cache.as_ref() else {
+                        return errors::internal_error().into_response();
+                    };
+                    if let Ok(decision) = proxy.decision_for_repo(name) {
+                        let digest_ref;
+                        let upstream_ref: &str = if is_digest_ref {
+                            digest_ref = digest.as_str();
+                            digest_ref.as_str()
+                        } else {
+                            reference
+                        };
+                        match proxy
+                            .fetch_manifest_and_cache(
+                                &decision,
+                                upstream_ref,
+                                cache,
+                                state.config.max_request_body_bytes,
+                                false,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                if let Ok(meta) = cache.head_manifest(name, &digest).await {
+                                    let mut headers = registry_headers();
+                                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                                    headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                                    return (StatusCode::OK, headers).into_response();
+                                }
+                            }
+                            Err(crate::proxy::ProxyError::NotFound) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
+                                return errors::internal_error().into_response();
+                            }
+                        }
+                    }
+                }
+                errors::manifest_unknown().into_response()
+            }
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
@@ -856,7 +1089,62 @@ async fn manifest_by_reference(
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
                 (StatusCode::OK, headers, Body::from(bytes)).into_response()
             }
-            Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
+            Err(StorageError::NotFound) => {
+                if let Some(cache) = state.proxy_cache.as_ref() {
+                    if let Ok((meta, bytes)) = cache.get_manifest(name, &digest).await {
+                        if let Some(proxy) = state.proxy.as_ref() {
+                            proxy.note_manifest_access(name, &digest);
+                        }
+                        let mut headers = registry_headers();
+                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                        headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                        return (StatusCode::OK, headers, Body::from(bytes)).into_response();
+                    }
+                }
+
+                if let Some(proxy) = state.proxy.as_ref() {
+                    let Some(cache) = state.proxy_cache.as_ref() else {
+                        return errors::internal_error().into_response();
+                    };
+                    if let Ok(decision) = proxy.decision_for_repo(name) {
+                        let digest_ref;
+                        let upstream_ref: &str = if is_digest_ref {
+                            digest_ref = digest.as_str();
+                            digest_ref.as_str()
+                        } else {
+                            reference
+                        };
+                        match proxy
+                            .fetch_manifest_and_cache(
+                                &decision,
+                                upstream_ref,
+                                cache,
+                                state.config.max_request_body_bytes,
+                                false,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                if let Ok((meta, bytes)) = cache.get_manifest(name, &digest).await {
+                                    let mut headers = registry_headers();
+                                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                                    headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                                    return (StatusCode::OK, headers, Body::from(bytes)).into_response();
+                                }
+                            }
+                            Err(crate::proxy::ProxyError::NotFound) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
+                                return errors::internal_error().into_response();
+                            }
+                        }
+                    }
+                }
+                errors::manifest_unknown().into_response()
+            }
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
@@ -937,7 +1225,141 @@ fn is_supported_manifest_media_type(media_type: &str) -> bool {
             | "application/vnd.oci.artifact.manifest.v1+json"
             | "application/vnd.oci.image.index.v1+json"
             | "application/vnd.docker.distribution.manifest.v2+json"
+            | "application/vnd.docker.distribution.manifest.list.v2+json"
     )
+}
+
+async fn ensure_tag_fresh(
+    state: &AppState,
+    proxy: &crate::proxy::Proxy,
+    decision: &crate::proxy::RepoDecision,
+    storage: &Arc<dyn crate::storage::Storage>,
+    tag: &str,
+    ttl_secs: u64,
+    always_revalidate: bool,
+) -> Result<(), Response> {
+    let now = crate::proxy::Proxy::now_unix();
+    let current_digest = storage.resolve_tag(&decision.local_repo, tag).await.ok();
+    let meta = proxy.get_tag_meta(&decision.local_repo, tag);
+
+    if !always_revalidate {
+        if let (Some(d), Some(m)) = (&current_digest, &meta) {
+            if m.expires_at_unix > now && m.digest == d.as_str() {
+                return Ok(());
+            }
+        }
+    }
+
+    // Revalidate via HEAD (conditional if we have an ETag).
+    let if_none_match = meta.as_ref().and_then(|m| m.etag.clone());
+    let head = proxy
+        .fetch_manifest_and_cache(
+            decision,
+            tag,
+            storage,
+            state.config.max_request_body_bytes,
+            true,
+            if_none_match,
+        )
+        .await;
+
+    match head {
+        Ok(crate::proxy::FetchManifestResult::NotModified { etag, digest }) => {
+            // If we don't have the manifest locally (or no tag pointer), fetch the body.
+            if current_digest.is_none()
+                || storage
+                    .head_manifest(&decision.local_repo, current_digest.as_ref().unwrap())
+                    .await
+                    .is_err()
+            {
+                let _ = proxy
+                    .fetch_manifest_and_cache(
+                        decision,
+                        tag,
+                        storage,
+                        state.config.max_request_body_bytes,
+                        false,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, repo = decision.local_repo, tag, "proxy: fetch manifest after 304 failed");
+                        errors::internal_error().into_response()
+                    })?;
+            }
+
+            if let Some(d) = storage
+                .resolve_tag(&decision.local_repo, tag)
+                .await
+                .ok()
+                .or(digest)
+            {
+                let m = crate::proxy::TagMeta {
+                    digest: d.as_str(),
+                    expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                    etag,
+                };
+                proxy.put_tag_meta(&decision.local_repo, tag, &m);
+            }
+            Ok(())
+        }
+        Ok(crate::proxy::FetchManifestResult::HeadOk { etag, digest, .. }) => {
+            let needs_get = match (&current_digest, &digest) {
+                (Some(local), Some(up)) if local.hex() == up.hex() => {
+                    storage.head_manifest(&decision.local_repo, local).await.is_err()
+                }
+                _ => true,
+            };
+
+            if needs_get {
+                let fetched = proxy
+                    .fetch_manifest_and_cache(
+                        decision,
+                        tag,
+                        storage,
+                        state.config.max_request_body_bytes,
+                        false,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, repo = decision.local_repo, tag, "proxy: fetch manifest failed");
+                        errors::internal_error().into_response()
+                    })?;
+                if let crate::proxy::FetchManifestResult::Fetched { digest, etag, .. } = fetched {
+                    let m = crate::proxy::TagMeta {
+                        digest: digest.as_str(),
+                        expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                        etag,
+                    };
+                    proxy.put_tag_meta(&decision.local_repo, tag, &m);
+                }
+            } else if let Some(d) = current_digest {
+                let m = crate::proxy::TagMeta {
+                    digest: d.as_str(),
+                    expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                    etag,
+                };
+                proxy.put_tag_meta(&decision.local_repo, tag, &m);
+            }
+            Ok(())
+        }
+        Ok(crate::proxy::FetchManifestResult::Fetched { digest, etag, .. }) => {
+            let m = crate::proxy::TagMeta {
+                digest: digest.as_str(),
+                expires_at_unix: if always_revalidate { now } else { crate::proxy::Proxy::ttl_expires_at(ttl_secs) },
+                etag,
+            };
+            proxy.put_tag_meta(&decision.local_repo, tag, &m);
+            Ok(())
+        }
+        Err(crate::proxy::ProxyError::NotFound) => Err(errors::manifest_unknown().into_response()),
+        Err(crate::proxy::ProxyError::TooLarge) => Err(errors::payload_too_large().into_response()),
+        Err(err) => {
+            tracing::warn!(error = %err, repo = decision.local_repo, tag, "proxy: revalidate failed");
+            Err(errors::internal_error().into_response())
+        }
+    }
 }
 
 async fn manifest_put(state: AppState, name: &str, reference: &str, body: Body) -> Response {
@@ -1237,6 +1659,8 @@ async fn upload_create(
             Err(_) => return errors::digest_invalid().into_response(),
         };
 
+        let policy = state.config.resolved_upload_policy_for_repo(name);
+
         if state.storage.head_blob(&digest).await.is_ok() {
             let mut headers = registry_headers();
             headers.insert(
@@ -1287,13 +1711,21 @@ async fn upload_create(
 
         let first_chunk = match first {
             Ok(c) => c,
-            Err(_) => return errors::internal_error().into_response(),
+            Err(_) => {
+                if policy.abort_on_error {
+                    let _ = state.storage.abort_upload(&meta.uuid).await;
+                }
+                return errors::internal_error().into_response();
+            }
         };
 
         if !first_chunk.is_empty() {
             let chunk_len = first_chunk.len();
             if let Err(err) = state.storage.append_upload(&meta.uuid, first_chunk).await {
                 tracing::warn!(storage = state.storage.kind(), repo = name, uuid = %meta.uuid, chunk_len, "append_upload failed");
+                if policy.abort_on_error {
+                    let _ = state.storage.abort_upload(&meta.uuid).await;
+                }
                 return match err {
                     StorageError::NotFound => errors::blob_upload_unknown().into_response(),
                     StorageError::TooLarge => errors::blob_upload_invalid("upload too large").into_response(),
@@ -1307,7 +1739,12 @@ async fn upload_create(
         while let Some(next) = stream.next().await {
             let chunk = match next {
                 Ok(c) => c,
-                Err(_) => return errors::internal_error().into_response(),
+                Err(_) => {
+                    if policy.abort_on_error {
+                        let _ = state.storage.abort_upload(&meta.uuid).await;
+                    }
+                    return errors::internal_error().into_response();
+                }
             };
             if chunk.is_empty() {
                 continue;
@@ -1315,6 +1752,9 @@ async fn upload_create(
             let chunk_len = chunk.len();
             if let Err(err) = state.storage.append_upload(&meta.uuid, chunk).await {
                 tracing::warn!(storage = state.storage.kind(), repo = name, uuid = %meta.uuid, chunk_len, "append_upload failed");
+                if policy.abort_on_error {
+                    let _ = state.storage.abort_upload(&meta.uuid).await;
+                }
                 return match err {
                     StorageError::NotFound => errors::blob_upload_unknown().into_response(),
                     StorageError::TooLarge => errors::blob_upload_invalid("upload too large").into_response(),
@@ -1337,7 +1777,12 @@ async fn upload_create(
                 (StatusCode::CREATED, headers).into_response()
             }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::DigestMismatch) => errors::digest_invalid().into_response(),
+            Err(StorageError::DigestMismatch) => {
+                if policy.abort_on_digest_mismatch {
+                    let _ = state.storage.abort_upload(&meta.uuid).await;
+                }
+                errors::digest_invalid().into_response()
+            }
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
@@ -1391,6 +1836,8 @@ async fn upload_session(
 
     let location = format!("/v2/{name}/blobs/uploads/{uuid}");
 
+    let policy = state.config.resolved_upload_policy_for_repo(name);
+
     match method {
         Method::GET => match state.storage.upload_status(uuid).await {
             Ok(meta) => {
@@ -1439,7 +1886,12 @@ async fn upload_session(
             while let Some(next) = stream.next().await {
                 let chunk = match next {
                     Ok(c) => c,
-                    Err(_) => return errors::internal_error().into_response(),
+                    Err(_) => {
+                        if policy.abort_on_error {
+                            let _ = state.storage.abort_upload(uuid).await;
+                        }
+                        return errors::internal_error().into_response();
+                    }
                 };
                 if chunk.is_empty() {
                     continue;
@@ -1448,11 +1900,22 @@ async fn upload_session(
                     Ok(m) => m,
                     Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
                     Err(StorageError::TooLarge) => {
+                        if policy.abort_on_error {
+                            let _ = state.storage.abort_upload(uuid).await;
+                        }
                         return errors::blob_upload_invalid("upload too large").into_response()
                     }
-                    Err(StorageError::InsufficientStorage) => return errors::insufficient_storage().into_response(),
+                    Err(StorageError::InsufficientStorage) => {
+                        if policy.abort_on_error {
+                            let _ = state.storage.abort_upload(uuid).await;
+                        }
+                        return errors::insufficient_storage().into_response();
+                    }
                     Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
                     Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
+                        if policy.abort_on_error {
+                            let _ = state.storage.abort_upload(uuid).await;
+                        }
                         return errors::internal_error().into_response()
                     }
                 };
@@ -1507,20 +1970,34 @@ async fn upload_session(
 
                 let first_chunk = match first {
                     Ok(c) => c,
-                    Err(_) => return errors::internal_error().into_response(),
+                    Err(_) => {
+                        if policy.abort_on_error {
+                            let _ = state.storage.abort_upload(uuid).await;
+                        }
+                        return errors::internal_error().into_response();
+                    }
                 };
                 if !first_chunk.is_empty() {
                     match state.storage.append_upload(uuid, first_chunk).await {
                         Ok(_) => {}
                         Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
                         Err(StorageError::TooLarge) => {
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
                             return errors::blob_upload_invalid("upload too large").into_response()
                         }
                         Err(StorageError::InsufficientStorage) => {
-                            return errors::insufficient_storage().into_response()
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
+                            return errors::insufficient_storage().into_response();
                         }
                         Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
                         Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
                             return errors::internal_error().into_response()
                         }
                     }
@@ -1529,7 +2006,12 @@ async fn upload_session(
                 while let Some(next) = stream.next().await {
                     let chunk = match next {
                         Ok(c) => c,
-                        Err(_) => return errors::internal_error().into_response(),
+                        Err(_) => {
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
+                            return errors::internal_error().into_response();
+                        }
                     };
                     if chunk.is_empty() {
                         continue;
@@ -1538,13 +2020,22 @@ async fn upload_session(
                         Ok(_) => {}
                         Err(StorageError::NotFound) => return errors::blob_upload_unknown().into_response(),
                         Err(StorageError::TooLarge) => {
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
                             return errors::blob_upload_invalid("upload too large").into_response()
                         }
                         Err(StorageError::InsufficientStorage) => {
-                            return errors::insufficient_storage().into_response()
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
+                            return errors::insufficient_storage().into_response();
                         }
                         Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
                         Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
+                            if policy.abort_on_error {
+                                let _ = state.storage.abort_upload(uuid).await;
+                            }
                             return errors::internal_error().into_response()
                         }
                     }
@@ -1563,7 +2054,12 @@ async fn upload_session(
                     (StatusCode::CREATED, headers).into_response()
                 }
                 Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-                Err(StorageError::DigestMismatch) => errors::digest_invalid().into_response(),
+                Err(StorageError::DigestMismatch) => {
+                    if policy.abort_on_digest_mismatch {
+                        let _ = state.storage.abort_upload(uuid).await;
+                    }
+                    errors::digest_invalid().into_response()
+                }
                 Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
                 Err(StorageError::TooLarge) => errors::internal_error().into_response(),
                 Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),

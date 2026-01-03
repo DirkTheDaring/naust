@@ -1,0 +1,812 @@
+use crate::{
+    config::{EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, TagPolicy},
+    registry::digest::Digest,
+    storage::StorageError,
+};
+use bytes::Bytes;
+use reqwest::redirect::Policy;
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use futures_util::StreamExt;
+use sha2::Digest as _;
+use tokio::sync::{Mutex, Semaphore};
+use url::Url;
+
+#[derive(Clone)]
+pub struct Proxy {
+    cfg: ProxyConfig,
+    client: reqwest::Client,
+    upstream_host_allow: Vec<String>,
+    upstream_sem: Arc<Semaphore>,
+    token_cache: Arc<Mutex<HashMap<String, CachedToken>>>,
+    db: sled::Db,
+    singleflight: Arc<SingleFlight>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RepoDecision {
+    pub local_repo: String,
+    pub upstream_repo: String,
+    pub tag_policy: TagPolicy,
+    pub eviction_policy: EvictionPolicy,
+}
+
+#[derive(Clone, Debug)]
+struct CachedToken {
+    token: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TagMeta {
+    pub digest: String,
+    pub expires_at_unix: u64,
+    pub etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ManifestRefs {
+    pub blobs: Vec<String>,
+    pub manifests: Vec<String>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error("proxy disabled")]
+    Disabled,
+    #[error("repo not allowed")]
+    RepoNotAllowed,
+    #[error("upstream not configured")]
+    UpstreamNotConfigured,
+    #[error("invalid upstream url")]
+    InvalidUpstreamUrl,
+    #[error("upstream host not allowed: {0}")]
+    UpstreamHostNotAllowed(String),
+    #[error("blocked upstream egress to private network: {0}")]
+    BlockedEgress(String),
+    #[error("upstream request failed: {0}")]
+    Upstream(String),
+    #[error("digest mismatch")]
+    DigestMismatch,
+    #[error("not found")]
+    NotFound,
+    #[error("too large")]
+    TooLarge,
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+impl Proxy {
+    pub fn new(cfg: &ProxyConfig) -> Result<Option<Self>, ProxyError> {
+        if !cfg.enabled {
+            return Ok(None);
+        }
+
+        let upstream_base = cfg
+            .upstream_base_url
+            .as_deref()
+            .ok_or(ProxyError::UpstreamNotConfigured)?;
+        let upstream_url = Url::parse(upstream_base).map_err(|_| ProxyError::InvalidUpstreamUrl)?;
+        let upstream_host = upstream_url
+            .host_str()
+            .ok_or(ProxyError::InvalidUpstreamUrl)?
+            .to_string();
+
+        // If no explicit allowlist is provided, default to allowing only the configured upstream host.
+        let upstream_host_allow = if cfg.allowed_upstream_hosts.is_empty() {
+            let mut v = vec![upstream_host.clone()];
+            // Docker Hub uses a separate host for Bearer token exchange.
+            if upstream_host.eq_ignore_ascii_case("registry-1.docker.io") {
+                v.push("auth.docker.io".to_string());
+            }
+            v
+        } else {
+            cfg.allowed_upstream_hosts.clone()
+        };
+
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| ProxyError::Internal(e.to_string()))?;
+
+        let db = sled::open(&cfg.index_path).map_err(|e| ProxyError::Internal(e.to_string()))?;
+
+        Ok(Some(Self {
+            cfg: cfg.clone(),
+            client,
+            upstream_host_allow,
+            upstream_sem: Arc::new(Semaphore::new(cfg.max_concurrent_upstream.max(1))),
+            token_cache: Arc::new(Mutex::new(HashMap::new())),
+            db,
+            singleflight: Arc::new(SingleFlight::default()),
+        }))
+    }
+
+    pub fn decision_for_repo(&self, repo: &str) -> Result<RepoDecision, ProxyError> {
+        if !self.cfg.enabled {
+            return Err(ProxyError::Disabled);
+        }
+
+        if !self.allowed_by_prefix_safety(repo) {
+            return Err(ProxyError::RepoNotAllowed);
+        }
+
+        let matched_rule = self.match_rule(repo);
+        let (tag_policy, eviction_policy, upstream_repo) = match (&self.cfg.mode, matched_rule) {
+            (ProxyMode::Allowlist, None) => return Err(ProxyError::RepoNotAllowed),
+            (_, Some(rule)) => (
+                rule.tag_policy.clone(),
+                rule.eviction_policy.clone(),
+                rule.upstream_repo
+                    .clone()
+                    .unwrap_or_else(|| repo.to_string()),
+            ),
+            (ProxyMode::Any, None) => (
+                TagPolicy::DigestOnly,
+                EvictionPolicy::Default,
+                repo.to_string(),
+            ),
+        };
+
+        Ok(RepoDecision {
+            local_repo: repo.to_string(),
+            upstream_repo,
+            tag_policy,
+            eviction_policy,
+        })
+    }
+
+    fn allowed_by_prefix_safety(&self, repo: &str) -> bool {
+        if self.cfg.allowed_repo_prefixes.is_empty() {
+            return true;
+        }
+        self.cfg
+            .allowed_repo_prefixes
+            .iter()
+            .any(|p| repo.starts_with(p))
+    }
+
+    fn match_rule(&self, repo: &str) -> Option<&ProxyRepoRule> {
+        self.cfg
+            .repo_rules
+            .iter()
+            .find(|r| wildcard_match(&r.match_pattern, repo))
+    }
+
+    fn upstream_base_url(&self) -> Result<Url, ProxyError> {
+        let upstream_base = self
+            .cfg
+            .upstream_base_url
+            .as_deref()
+            .ok_or(ProxyError::UpstreamNotConfigured)?;
+        Url::parse(upstream_base).map_err(|_| ProxyError::InvalidUpstreamUrl)
+    }
+
+    async fn ensure_upstream_allowed(&self, url: &Url) -> Result<(), ProxyError> {
+        let host = url
+            .host_str()
+            .ok_or(ProxyError::InvalidUpstreamUrl)?
+            .to_string();
+        if !self
+            .upstream_host_allow
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&host))
+        {
+            return Err(ProxyError::UpstreamHostNotAllowed(host));
+        }
+
+        if self.cfg.block_private_networks {
+            let port = url.port_or_known_default().unwrap_or(443);
+            let addrs = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+            for addr in addrs {
+                if is_blocked_ip(addr.ip()) {
+                    return Err(ProxyError::BlockedEgress(addr.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_manifest_header_value() -> &'static str {
+        // Include both OCI and Docker media types, including manifest lists.
+        "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.artifact.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
+    }
+
+    pub async fn head_blob_upstream(&self, decision: &RepoDecision, digest: &Digest) -> Result<u64, ProxyError> {
+        let _permit = self
+            .upstream_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| ProxyError::Internal(e.to_string()))?;
+
+        let mut url = self.upstream_base_url()?;
+        url.set_path(&format!("/v2/{}/blobs/{}", decision.upstream_repo, digest.as_str()));
+        self.ensure_upstream_allowed(&url).await?;
+
+        let resp = self
+            .send_with_bearer(reqwest::Method::HEAD, url, None, Some(decision))
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ProxyError::NotFound);
+        }
+        if !resp.status().is_success() {
+            return Err(ProxyError::Upstream(format!("HEAD blob status {}", resp.status())));
+        }
+
+        let len = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(len)
+    }
+
+    pub async fn fetch_blob_into_storage(
+        &self,
+        decision: &RepoDecision,
+        digest: &Digest,
+        storage: &Arc<dyn crate::storage::Storage>,
+    ) -> Result<(), ProxyError> {
+        // Singleflight per digest to avoid thundering herd.
+        let key = format!("blob:{}", digest.as_str());
+        let _guard = self.singleflight.lock(&key).await;
+
+        if storage.head_blob(digest).await.is_ok() {
+            return Ok(());
+        }
+
+        let _permit = self
+            .upstream_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| ProxyError::Internal(e.to_string()))?;
+
+        let mut url = self.upstream_base_url()?;
+        url.set_path(&format!("/v2/{}/blobs/{}", decision.upstream_repo, digest.as_str()));
+        self.ensure_upstream_allowed(&url).await?;
+
+        let resp = self
+            .send_with_bearer(reqwest::Method::GET, url, None, Some(decision))
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ProxyError::NotFound);
+        }
+        if !resp.status().is_success() {
+            return Err(ProxyError::Upstream(format!("GET blob status {}", resp.status())));
+        }
+
+        let upload = storage
+            .create_upload()
+            .await
+            .map_err(map_storage_err)?;
+
+        let mut stream = resp.bytes_stream();
+        while let Some(next) = stream.next().await {
+            let chunk = next.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+            if chunk.is_empty() {
+                continue;
+            }
+            if let Err(e) = storage.append_upload(&upload.uuid, chunk).await {
+                let _ = storage.abort_upload(&upload.uuid).await;
+                return Err(map_storage_err(e));
+            }
+        }
+
+        if let Err(e) = storage.finalize_upload(&upload.uuid, digest).await {
+            let _ = storage.abort_upload(&upload.uuid).await;
+            return Err(map_storage_err(e));
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_manifest_and_cache(
+        &self,
+        decision: &RepoDecision,
+        reference: &str,
+        storage: &Arc<dyn crate::storage::Storage>,
+        max_bytes: usize,
+        revalidate_only: bool,
+        if_none_match: Option<String>,
+    ) -> Result<FetchManifestResult, ProxyError> {
+        // Singleflight per repo+reference.
+        let key = format!("manifest:{}:{}", decision.local_repo, reference);
+        let _guard = self.singleflight.lock(&key).await;
+
+        let mut url = self.upstream_base_url()?;
+        url.set_path(&format!("/v2/{}/manifests/{}", decision.upstream_repo, reference));
+        self.ensure_upstream_allowed(&url).await?;
+
+        let mut extra_headers = vec![
+            (reqwest::header::ACCEPT, Self::accept_manifest_header_value().to_string()),
+        ];
+        if let Some(etag) = if_none_match {
+            extra_headers.push((reqwest::header::IF_NONE_MATCH, etag));
+        }
+
+        let method = if revalidate_only {
+            reqwest::Method::HEAD
+        } else {
+            reqwest::Method::GET
+        };
+
+        let resp = self
+            .send_with_bearer(method, url, Some(extra_headers), Some(decision))
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ProxyError::NotFound);
+        }
+
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            let etag = resp
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let digest = resp
+                .headers()
+                .get("docker-content-digest")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| Digest::parse(s).ok());
+            return Ok(FetchManifestResult::NotModified { etag, digest });
+        }
+
+        if !resp.status().is_success() {
+            return Err(ProxyError::Upstream(format!(
+                "{} manifest status {}",
+                if revalidate_only { "HEAD" } else { "GET" },
+                resp.status()
+            )));
+        }
+
+        let media_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let upstream_digest = resp
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| Digest::parse(s).ok());
+
+        if revalidate_only {
+            return Ok(FetchManifestResult::HeadOk {
+                media_type,
+                etag,
+                digest: upstream_digest,
+            });
+        }
+
+        let bytes = read_response_limited(resp, max_bytes).await?;
+        if bytes.is_empty() {
+            return Err(ProxyError::Upstream("empty manifest body".to_string()));
+        }
+
+        // Compute digest of the raw bytes.
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        let digest_hex = hex::encode(hasher.finalize());
+        let computed = Digest::parse(&format!("sha256:{digest_hex}"))
+            .map_err(|_| ProxyError::Internal("failed to parse computed digest".to_string()))?;
+
+        if let Ok(ref_digest) = Digest::parse(reference) {
+            if ref_digest.hex() != computed.hex() {
+                return Err(ProxyError::DigestMismatch);
+            }
+        }
+        if let Some(up) = upstream_digest {
+            if up.hex() != computed.hex() {
+                // Should not happen with a correct upstream.
+                return Err(ProxyError::DigestMismatch);
+            }
+        }
+
+        storage
+            .put_manifest(&decision.local_repo, &computed, bytes.clone())
+            .await
+            .map_err(map_storage_err)?;
+
+        self.index_manifest(&decision.local_repo, &computed, &bytes);
+        self.note_manifest_access(&decision.local_repo, &computed);
+
+        if Digest::parse(reference).is_err() {
+            storage
+                .set_tag(&decision.local_repo, reference, &computed)
+                .await
+                .map_err(map_storage_err)?;
+        }
+
+        Ok(FetchManifestResult::Fetched {
+            digest: computed,
+            media_type,
+            etag,
+            bytes,
+        })
+    }
+
+    pub fn get_tag_meta(&self, repo: &str, tag: &str) -> Option<TagMeta> {
+        let key = format!("tagmeta::{repo}::{tag}");
+        self.db
+            .get(key)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice::<TagMeta>(&v).ok())
+    }
+
+    pub fn put_tag_meta(&self, repo: &str, tag: &str, meta: &TagMeta) {
+        let key = format!("tagmeta::{repo}::{tag}");
+        if let Ok(v) = serde_json::to_vec(meta) {
+            let _ = self.db.insert(key, v);
+            let _ = self.db.flush();
+        }
+    }
+
+    pub fn note_blob_access(&self, digest: &Digest) {
+        let key = format!("blobaccess::{}", digest.hex());
+        let ts = Self::now_unix();
+        let _ = self.db.insert(key, ts.to_be_bytes().to_vec());
+    }
+
+    pub fn note_manifest_access(&self, repo: &str, digest: &Digest) {
+        let key = format!("manifestaccess::{repo}::{}", digest.hex());
+        let ts = Self::now_unix();
+        let _ = self.db.insert(key, ts.to_be_bytes().to_vec());
+    }
+
+    pub fn index_manifest(&self, repo: &str, digest: &Digest, bytes: &[u8]) {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return;
+        };
+        let mut refs = ManifestRefs::default();
+
+        // Index/list: manifests[].digest
+        if let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) {
+            for m in manifests {
+                if let Some(d) = m.get("digest").and_then(|d| d.as_str()) {
+                    if Digest::parse(d).is_ok() {
+                        refs.manifests.push(d.to_string());
+                    }
+                }
+            }
+        }
+
+        // Manifest: config.digest + layers[].digest
+        if let Some(cfg_digest) = v
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|d| d.as_str())
+        {
+            if Digest::parse(cfg_digest).is_ok() {
+                refs.blobs.push(cfg_digest.to_string());
+            }
+        }
+        if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
+            for layer in layers {
+                if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
+                    if Digest::parse(d).is_ok() {
+                        refs.blobs.push(d.to_string());
+                    }
+                }
+            }
+        }
+
+        let key = format!("manifestrefs::{repo}::{}", digest.hex());
+        if let Ok(encoded) = serde_json::to_vec(&refs) {
+            let _ = self.db.insert(key, encoded);
+        }
+    }
+
+    pub fn get_manifest_refs(&self, repo: &str, digest: &Digest) -> Option<ManifestRefs> {
+        let key = format!("manifestrefs::{repo}::{}", digest.hex());
+        self.db
+            .get(key)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice::<ManifestRefs>(&v).ok())
+    }
+
+    pub fn get_blob_last_access(&self, digest: &Digest) -> Option<u64> {
+        let key = format!("blobaccess::{}", digest.hex());
+        let v = self.db.get(key).ok().flatten()?;
+        if v.len() != 8 {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&v);
+        Some(u64::from_be_bytes(buf))
+    }
+
+    pub fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs()
+    }
+
+    pub fn ttl_expires_at(ttl_secs: u64) -> u64 {
+        Self::now_unix().saturating_add(ttl_secs)
+    }
+
+    async fn send_with_bearer(
+        &self,
+        method: reqwest::Method,
+        url: Url,
+        extra_headers: Option<Vec<(reqwest::header::HeaderName, String)>>,
+        decision: Option<&RepoDecision>,
+    ) -> Result<reqwest::Response, ProxyError> {
+        self.ensure_upstream_allowed(&url).await?;
+
+        let extra_headers_retry = extra_headers.clone();
+
+        let mut req = self.client.request(method.clone(), url.clone());
+        if let Some(hs) = extra_headers.as_ref() {
+            for (name, value) in hs {
+                if let Ok(v) = reqwest::header::HeaderValue::from_str(&value) {
+                    req = req.header(name, v);
+                }
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+
+        let www = resp
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let Some(challenge) = parse_bearer_challenge(&www) else {
+            return Err(ProxyError::Upstream("missing bearer challenge".to_string()));
+        };
+
+        // Compute scope if not present (Docker Hub usually includes it).
+        let scope = challenge.scope.or_else(|| {
+            decision.map(|d| format!("repository:{}:pull", d.upstream_repo))
+        });
+        let token = self.get_token(&challenge.realm, &challenge.service, scope.as_deref()).await?;
+
+        let mut req2 = self.client.request(method, url);
+        if let Some(hs) = extra_headers_retry.as_ref() {
+            for (name, value) in hs {
+                if let Ok(v) = reqwest::header::HeaderValue::from_str(&value) {
+                    req2 = req2.header(name, v);
+                }
+            }
+        }
+        req2 = req2.bearer_auth(token);
+        req2.send()
+            .await
+            .map_err(|e| ProxyError::Upstream(e.to_string()))
+    }
+
+    async fn get_token(
+        &self,
+        realm: &str,
+        service: &str,
+        scope: Option<&str>,
+    ) -> Result<String, ProxyError> {
+        let cache_key = format!("{realm}|{service}|{}", scope.unwrap_or(""));
+        let now = Self::now_unix();
+        {
+            let cache = self.token_cache.lock().await;
+            if let Some(t) = cache.get(&cache_key) {
+                if t.expires_at_unix > now.saturating_add(5) {
+                    return Ok(t.token.clone());
+                }
+            }
+        }
+
+        let realm_url = Url::parse(realm).map_err(|_| ProxyError::Upstream("invalid token realm".to_string()))?;
+        self.ensure_upstream_allowed(&realm_url).await?;
+
+        let mut req = self.client.get(realm_url);
+        req = req.query(&[("service", service)]);
+        if let Some(scope) = scope {
+            req = req.query(&[("scope", scope)]);
+        }
+        let resp = req.send().await.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProxyError::Upstream(format!("token endpoint status {}", resp.status())));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        let token = v
+            .get("token")
+            .or_else(|| v.get("access_token"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| ProxyError::Upstream("missing token in response".to_string()))?
+            .to_string();
+        let expires_in = v
+            .get("expires_in")
+            .and_then(|e| e.as_u64())
+            .unwrap_or(300);
+
+        let mut cache = self.token_cache.lock().await;
+        cache.insert(
+            cache_key,
+            CachedToken {
+                token: token.clone(),
+                expires_at_unix: now.saturating_add(expires_in),
+            },
+        );
+        Ok(token)
+    }
+}
+
+pub enum FetchManifestResult {
+    Fetched {
+        digest: Digest,
+        media_type: String,
+        etag: Option<String>,
+        bytes: Bytes,
+    },
+    HeadOk {
+        media_type: String,
+        etag: Option<String>,
+        digest: Option<Digest>,
+    },
+    NotModified {
+        etag: Option<String>,
+        digest: Option<Digest>,
+    },
+}
+
+#[derive(Default)]
+struct SingleFlight {
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl SingleFlight {
+    async fn lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let arc = {
+            let mut map = self.locks.lock().await;
+            map.entry(key.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        arc.lock_owned().await
+    }
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    // Very small glob: '*' matches any substring.
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    if !value.starts_with(first) {
+        return false;
+    }
+    let mut remainder = &value[first.len()..];
+    let mut last_part = first;
+    for part in parts {
+        if part.is_empty() {
+            last_part = part;
+            continue;
+        }
+        if let Some(idx) = remainder.find(part) {
+            remainder = &remainder[idx + part.len()..];
+            last_part = part;
+        } else {
+            return false;
+        }
+    }
+    if !pattern.ends_with('*') {
+        // If pattern doesn't end with '*', ensure we consumed to the end by checking that the last
+        // non-empty part is a suffix.
+        if !value.ends_with(last_part) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
+    }
+}
+
+async fn read_response_limited(resp: reqwest::Response, limit: usize) -> Result<Bytes, ProxyError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(next) = stream.next().await {
+        let chunk = next.map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(ProxyError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
+}
+
+fn map_storage_err(err: StorageError) -> ProxyError {
+    match err {
+        StorageError::NotFound => ProxyError::NotFound,
+        StorageError::DigestMismatch => ProxyError::DigestMismatch,
+        StorageError::TooLarge => ProxyError::TooLarge,
+        StorageError::InsufficientStorage => ProxyError::Upstream("insufficient storage".to_string()),
+        StorageError::Unsupported => ProxyError::Internal("storage unsupported".to_string()),
+        StorageError::Internal(e) => ProxyError::Internal(e),
+    }
+}
+
+#[derive(Debug)]
+struct BearerChallenge {
+    realm: String,
+    service: String,
+    scope: Option<String>,
+}
+
+fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
+    // Example: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+    let header = header.trim();
+    if !header.to_ascii_lowercase().starts_with("bearer ") {
+        return None;
+    }
+    let rest = header[7..].trim();
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+    for part in rest.split(',') {
+        let part = part.trim();
+        let (k, v) = part.split_once('=')?;
+        let k = k.trim().to_ascii_lowercase();
+        let mut v = v.trim().to_string();
+        if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+            v = v[1..v.len() - 1].to_string();
+        }
+        match k.as_str() {
+            "realm" => realm = Some(v),
+            "service" => service = Some(v),
+            "scope" => scope = Some(v),
+            _ => {}
+        }
+    }
+    Some(BearerChallenge {
+        realm: realm?,
+        service: service?,
+        scope,
+    })
+}

@@ -42,6 +42,10 @@ pub struct Config {
     // This forces clients to use PATCH-based chunked uploads.
     pub disallow_monolithic_uploads: bool,
 
+    // Upload cleanup policy: controls whether failed uploads are aborted immediately,
+    // trading disk cleanup vs the ability to resume.
+    pub upload_policy: UploadPolicyConfig,
+
     // If true, repository/org listing endpoints require authentication.
     pub catalog_requires_auth: bool,
 
@@ -49,6 +53,103 @@ pub struct Config {
     pub token_service: String,
     pub token_signing_key: String,
     pub token_ttl_secs: u64,
+
+    pub proxy: ProxyConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadPolicyConfig {
+    pub abort_on_error: bool,
+    pub abort_on_digest_mismatch: bool,
+    // TOML only (for now): repo-specific overrides.
+    pub repo_rules: Vec<UploadRepoPolicyRule>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadRepoPolicyRule {
+    pub match_pattern: String,
+    pub abort_on_error: Option<bool>,
+    pub abort_on_digest_mismatch: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedUploadPolicy {
+    pub abort_on_error: bool,
+    pub abort_on_digest_mismatch: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyConfig {
+    pub enabled: bool,
+
+    // "allowlist" (default) or "any".
+    pub mode: ProxyMode,
+
+    // Upstream base URL, e.g. https://registry-1.docker.io
+    pub upstream_base_url: Option<String>,
+
+    // Safety net: explicit allowlist of upstream hosts.
+    pub allowed_upstream_hosts: Vec<String>,
+
+    // Safety net: even in proxy-any mode, only allow these prefixes.
+    // Examples: ["library/", "myorg/"]
+    pub allowed_repo_prefixes: Vec<String>,
+
+    // SSRF guard: block loopback/link-local/private IPs.
+    pub block_private_networks: bool,
+
+    // Concurrency guard: cap upstream requests.
+    pub max_concurrent_upstream: usize,
+
+    // Cache/metadata index path (local disk).
+    pub index_path: PathBuf,
+
+    // Separate cache storage location to avoid mixing push content with pull-through content.
+    // - Filesystem: root directory for cached registry storage layout.
+    // - S3: prefix under the configured bucket for cached content.
+    pub cache_fs_root: Option<PathBuf>,
+    pub cache_s3_prefix: Option<String>,
+
+    // How often to run cache GC/eviction (seconds).
+    pub gc_interval_secs: u64,
+
+    // Required when enabled: upper bound for cached content (best-effort enforcement).
+    pub max_cache_bytes: Option<u64>,
+
+    // Repo-specific policies (TOML only, for now).
+    pub repo_rules: Vec<ProxyRepoRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxyMode {
+    Allowlist,
+    Any,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyRepoRule {
+    pub match_pattern: String,
+    pub upstream_repo: Option<String>,
+    pub tag_policy: TagPolicy,
+    pub eviction_policy: EvictionPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub enum TagPolicy {
+    DigestOnly,
+    TtlSeconds(u64),
+    AlwaysRevalidate,
+}
+
+#[derive(Clone, Debug)]
+pub enum EvictionPolicy {
+    Default,
+    KeepTags(Vec<String>),
+    // Keep the highest SemVer tag among *cached tags* (optionally filtered by regex).
+    KeepLatestCachedSemver {
+        tag_regex: Option<String>,
+        allow_prerelease: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +180,103 @@ struct FileConfig {
     timeouts: FileTimeouts,
     #[serde(default)]
     catalog: FileCatalog,
+
+    #[serde(default)]
+    proxy: FileProxy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxy {
+    #[serde(default)]
+    enabled: Option<bool>,
+
+    #[serde(default)]
+    mode: Option<String>,
+
+    #[serde(default)]
+    upstream: FileProxyUpstream,
+
+    #[serde(default)]
+    safety: FileProxySafety,
+
+    #[serde(default)]
+    cache: FileProxyCache,
+
+    #[serde(default)]
+    repos: Vec<FileProxyRepoRule>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyUpstream {
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxySafety {
+    #[serde(default)]
+    allowed_upstream_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_repo_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    block_private_networks: Option<bool>,
+    #[serde(default)]
+    max_concurrent_upstream: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyCache {
+    #[serde(default)]
+    index_path: Option<String>,
+    #[serde(default)]
+    fs_root: Option<String>,
+    #[serde(default)]
+    s3_prefix: Option<String>,
+    #[serde(default)]
+    max_cache_bytes: Option<u64>,
+    #[serde(default)]
+    gc_interval_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileProxyRepoRule {
+    #[serde(rename = "match")]
+    match_pattern: String,
+
+    #[serde(default)]
+    upstream_repo: Option<String>,
+
+    #[serde(default)]
+    tag_policy: FileTagPolicy,
+
+    #[serde(default)]
+    eviction: FileEvictionPolicy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FileTagPolicy {
+    #[default]
+    DigestOnly,
+    TtlSeconds(u64),
+    AlwaysRevalidate,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum FileEvictionPolicy {
+    #[default]
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "keep_tags")]
+    KeepTags { tags: Vec<String> },
+    #[serde(rename = "keep_latest_cached_semver")]
+    KeepLatestCachedSemver {
+        #[serde(default)]
+        tag_regex: Option<String>,
+        #[serde(default)]
+        allow_prerelease: Option<bool>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -173,11 +371,29 @@ struct FileUploads {
     disallow_monolithic_uploads: Option<bool>,
 
     #[serde(default)]
+    abort_on_error: Option<bool>,
+    #[serde(default)]
+    abort_on_digest_mismatch: Option<bool>,
+
+    #[serde(default)]
     gc_enabled: Option<bool>,
     #[serde(default)]
     gc_interval_secs: Option<u64>,
     #[serde(default)]
     gc_max_age_secs: Option<u64>,
+
+    #[serde(default)]
+    repos: Vec<FileUploadRepoPolicy>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileUploadRepoPolicy {
+    #[serde(rename = "match")]
+    match_pattern: String,
+    #[serde(default)]
+    abort_on_error: Option<bool>,
+    #[serde(default)]
+    abort_on_digest_mismatch: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -324,6 +540,29 @@ impl Config {
                 .or(file_cfg.uploads.disallow_monolithic_uploads)
                 .unwrap_or(best_practice);
 
+        let uploads_abort_on_error = env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_ERROR", "UPLOAD_ABORT_ON_ERROR"])
+            .or(file_cfg.uploads.abort_on_error)
+            .unwrap_or(false);
+        let uploads_abort_on_digest_mismatch =
+            env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_DIGEST_MISMATCH", "UPLOAD_ABORT_ON_DIGEST_MISMATCH"])
+                .or(file_cfg.uploads.abort_on_digest_mismatch)
+                .unwrap_or(false);
+
+        let upload_policy = UploadPolicyConfig {
+            abort_on_error: uploads_abort_on_error,
+            abort_on_digest_mismatch: uploads_abort_on_digest_mismatch,
+            repo_rules: file_cfg
+                .uploads
+                .repos
+                .iter()
+                .map(|r| UploadRepoPolicyRule {
+                    match_pattern: r.match_pattern.clone(),
+                    abort_on_error: r.abort_on_error,
+                    abort_on_digest_mismatch: r.abort_on_digest_mismatch,
+                })
+                .collect(),
+        };
+
         let catalog_requires_auth = env_bool_opt(&["REGISTRY__CATALOG__REQUIRES_AUTH", "CATALOG_REQUIRES_AUTH"])
             .or(file_cfg.catalog.requires_auth)
             .unwrap_or(best_practice);
@@ -356,6 +595,174 @@ impl Config {
             .or(file_cfg.token.ttl_secs)
             .unwrap_or(600);
 
+        let proxy_enabled = env_bool_opt(&["REGISTRY__PROXY__ENABLED", "PROXY_ENABLED"])
+            .or(file_cfg.proxy.enabled)
+            .unwrap_or(false);
+
+        let proxy_mode_raw = env_str_any(&["REGISTRY__PROXY__MODE", "PROXY_MODE"]).or(file_cfg.proxy.mode.clone());
+        let proxy_mode = match proxy_mode_raw
+            .as_deref()
+            .unwrap_or("allowlist")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "allowlist" => ProxyMode::Allowlist,
+            "any" => ProxyMode::Any,
+            other => {
+                eprintln!("Unknown PROXY_MODE='{other}', defaulting to allowlist");
+                ProxyMode::Allowlist
+            }
+        };
+
+        let upstream_base_url = env_str_any(&[
+            "REGISTRY__PROXY__UPSTREAM__BASE_URL",
+            "PROXY_UPSTREAM_BASE_URL",
+        ])
+        .or_else(|| file_cfg.proxy.upstream.base_url.clone())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+        let allowed_upstream_hosts = env_str_any(&[
+            "REGISTRY__PROXY__SAFETY__ALLOWED_UPSTREAM_HOSTS",
+            "PROXY_ALLOWED_UPSTREAM_HOSTS",
+        ])
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .or_else(|| file_cfg.proxy.safety.allowed_upstream_hosts.clone())
+        .unwrap_or_default();
+
+        let allowed_repo_prefixes = env_str_any(&[
+            "REGISTRY__PROXY__SAFETY__ALLOWED_REPO_PREFIXES",
+            "PROXY_ALLOWED_REPO_PREFIXES",
+        ])
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .or_else(|| file_cfg.proxy.safety.allowed_repo_prefixes.clone())
+        .unwrap_or_default();
+
+        let block_private_networks = env_bool_opt(&[
+            "REGISTRY__PROXY__SAFETY__BLOCK_PRIVATE_NETWORKS",
+            "PROXY_BLOCK_PRIVATE_NETWORKS",
+        ])
+        .or(file_cfg.proxy.safety.block_private_networks)
+        .unwrap_or(true);
+
+        let max_concurrent_upstream = env_usize_any(&[
+            "REGISTRY__PROXY__SAFETY__MAX_CONCURRENT_UPSTREAM",
+            "PROXY_MAX_CONCURRENT_UPSTREAM",
+        ])
+        .or(file_cfg.proxy.safety.max_concurrent_upstream)
+        .unwrap_or(16);
+
+        let cache_fs_root = env_str_any(&["REGISTRY__PROXY__CACHE__FS_ROOT", "PROXY_CACHE_FS_ROOT"])
+            .or_else(|| file_cfg.proxy.cache.fs_root.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                if storage_backend == StorageBackend::Filesystem {
+                    Some(fs_root.join("cache"))
+                } else {
+                    None
+                }
+            });
+
+        let cache_s3_prefix = env_str_any(&["REGISTRY__PROXY__CACHE__S3_PREFIX", "PROXY_CACHE_S3_PREFIX"])
+            .or_else(|| file_cfg.proxy.cache.s3_prefix.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if storage_backend == StorageBackend::S3 {
+                    Some(format!("{}/cache", s3_prefix.trim_end_matches('/')))
+                } else {
+                    None
+                }
+            });
+
+        let index_path = env_str_any(&["REGISTRY__PROXY__CACHE__INDEX_PATH", "PROXY_INDEX_PATH"])
+            .or_else(|| file_cfg.proxy.cache.index_path.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| cache_fs_root.as_ref().map(|p| p.join("proxy-index")))
+            .unwrap_or_else(|| PathBuf::from("./data/cache/proxy-index"));
+
+        let max_cache_bytes = env_u64_any(&["REGISTRY__PROXY__CACHE__MAX_CACHE_BYTES", "PROXY_MAX_CACHE_BYTES"])
+            .or(file_cfg.proxy.cache.max_cache_bytes);
+
+        let gc_interval_secs = env_u64_any(&[
+            "REGISTRY__PROXY__CACHE__GC_INTERVAL_SECS",
+            "PROXY_GC_INTERVAL_SECS",
+        ])
+        .or(file_cfg.proxy.cache.gc_interval_secs)
+        .unwrap_or(3600);
+
+        let repo_rules = file_cfg
+            .proxy
+            .repos
+            .iter()
+            .map(|r| {
+                let tag_policy = match r.tag_policy {
+                    FileTagPolicy::DigestOnly => TagPolicy::DigestOnly,
+                    FileTagPolicy::TtlSeconds(s) => TagPolicy::TtlSeconds(s),
+                    FileTagPolicy::AlwaysRevalidate => TagPolicy::AlwaysRevalidate,
+                };
+                let eviction_policy = match &r.eviction {
+                    FileEvictionPolicy::Default => EvictionPolicy::Default,
+                    FileEvictionPolicy::KeepTags { tags } => EvictionPolicy::KeepTags(tags.clone()),
+                    FileEvictionPolicy::KeepLatestCachedSemver {
+                        tag_regex,
+                        allow_prerelease,
+                    } => EvictionPolicy::KeepLatestCachedSemver {
+                        tag_regex: tag_regex.clone(),
+                        allow_prerelease: allow_prerelease.unwrap_or(false),
+                    },
+                };
+                ProxyRepoRule {
+                    match_pattern: r.match_pattern.trim().to_string(),
+                    upstream_repo: r.upstream_repo.clone().map(|s| s.trim().to_string()),
+                    tag_policy,
+                    eviction_policy,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if proxy_enabled {
+            if upstream_base_url.is_none() {
+                panic!("proxy.enabled requires proxy.upstream.base_url (or PROXY_UPSTREAM_BASE_URL)");
+            }
+            if max_cache_bytes.is_none() {
+                panic!("proxy.enabled requires proxy.cache.max_cache_bytes (or PROXY_MAX_CACHE_BYTES) to be set");
+            }
+        }
+
+        let proxy = ProxyConfig {
+            enabled: proxy_enabled,
+            mode: proxy_mode,
+            upstream_base_url,
+            allowed_upstream_hosts,
+            allowed_repo_prefixes,
+            block_private_networks,
+            max_concurrent_upstream,
+            index_path,
+            cache_fs_root,
+            cache_s3_prefix,
+            gc_interval_secs,
+            max_cache_bytes,
+            repo_rules,
+        };
+
         Self {
             listen_addr,
             tls_cert_path,
@@ -379,17 +786,78 @@ impl Config {
             request_timeout_secs,
             upload_request_timeout_secs,
             disallow_monolithic_uploads,
+            upload_policy,
             catalog_requires_auth,
             public_url,
             token_service,
             token_signing_key,
             token_ttl_secs,
+
+            proxy,
         }
     }
 
+    pub fn resolved_upload_policy_for_repo(&self, repo: &str) -> ResolvedUploadPolicy {
+        for rule in &self.upload_policy.repo_rules {
+            if wildcard_match(&rule.match_pattern, repo) {
+                return ResolvedUploadPolicy {
+                    abort_on_error: rule
+                        .abort_on_error
+                        .unwrap_or(self.upload_policy.abort_on_error),
+                    abort_on_digest_mismatch: rule
+                        .abort_on_digest_mismatch
+                        .unwrap_or(self.upload_policy.abort_on_digest_mismatch),
+                };
+            }
+        }
+        ResolvedUploadPolicy {
+            abort_on_error: self.upload_policy.abort_on_error,
+            abort_on_digest_mismatch: self.upload_policy.abort_on_digest_mismatch,
+        }
+    }
     pub fn push_auth_configured(&self) -> bool {
         self.push_username.is_some() && self.push_password.is_some()
     }
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    // Minimal glob: '*' matches any substring.
+    if pattern == "*" {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+
+    let mut rest = value;
+    let mut first = true;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            if !rest.starts_with(part) {
+                return false;
+            }
+            rest = &rest[part.len()..];
+            first = false;
+            continue;
+        }
+
+        if let Some(pos) = rest.find(part) {
+            rest = &rest[pos + part.len()..];
+        } else {
+            return false;
+        }
+
+        if i == parts.len() - 1 && !pattern.ends_with('*') {
+            return rest.is_empty();
+        }
+
+        first = false;
+    }
+    true
 }
 
 fn load_config_file() -> FileConfig {

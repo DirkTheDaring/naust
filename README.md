@@ -16,6 +16,13 @@ Smoke test:
 CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/smoke.sh
 ```
 
+Pull-through cache smoke test (offline; starts a local upstream registry):
+
+```sh
+chmod +x scripts/pullthrough-smoke.sh
+scripts/pullthrough-smoke.sh
+```
+
 Podman (real client) smoke test:
 
 ```sh
@@ -138,6 +145,15 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 ### Config file (TOML)
 
 You can optionally load configuration from a TOML file and still override any value via environment variables.
+
+## Pull-through cache (proxy)
+
+This registry can act as a pull-through cache for selected upstream repositories (useful for Docker Hub rate limits).
+
+Important: cached pull-through content is stored in a separate storage root/prefix (filesystem default: `./data/cache`).
+This prevents pushed images from being mixed into the cache and makes cache cleanup as simple as removing the cache directory.
+
+See `configs/registry.example.toml` for an example `proxy` configuration.
 
 - Enable: set `CONFIG_PATH` to a TOML file (see `configs/registry.example.toml` and `configs/registry.best_practice.toml`).
 - Precedence: defaults < config file < env vars

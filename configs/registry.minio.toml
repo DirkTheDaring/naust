@@ -1,0 +1,50 @@
+# MinIO (S3 backend) example configuration
+# For docker compose usage:
+#   REGISTRY_TOML_PATH=./configs/registry.minio.toml \
+#   docker compose -f docker-compose.yml -f docker-compose.minio.yml -f docker-compose.config.yml up --build
+#
+# NOTE: AWS credentials are still read from standard AWS env vars.
+
+[server]
+listen_addr = "0.0.0.0:5000"
+public_url = "http://127.0.0.1:5000"
+
+[auth.push]
+username = "demo"
+password = "demo"
+allow_repos = ["myrepo"]
+
+[token]
+service = "registry-rust"
+signing_key = "minio-smoke-signing-key-change-me"
+ttl_secs = 600
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+endpoint = "http://minio:9000"
+region = "us-east-1"
+bucket = "registry"
+prefix = "registry"
+
+[features]
+allow_tag_overwrite = true
+automatic_crossmount = false
+
+[uploads]
+disallow_monolithic_uploads = false
+gc_enabled = true
+gc_interval_secs = 3600
+gc_max_age_secs = 86400
+
+[limits]
+max_upload_bytes = 5368709120
+max_request_body_bytes = 33554432
+
+[timeouts]
+request_timeout_secs = 300
+upload_request_timeout_secs = 3600
+
+[catalog]
+requires_auth = false

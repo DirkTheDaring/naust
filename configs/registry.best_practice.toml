@@ -1,0 +1,61 @@
+# Best-practice configuration (security/robustness oriented)
+#
+# Intended posture:
+# - Stable token signing key (required)
+# - Catalog/meta endpoints require auth
+# - Monolithic uploads rejected (force PATCH-based chunking)
+# - No tag overwrite
+# - Separate upload timeout
+
+[profile]
+name = "best_practice"
+
+[server]
+listen_addr = "0.0.0.0:5000"
+public_url = "https://registry.example.com"
+
+[server.tls]
+cert_path = "/certs/cert.pem"
+key_path  = "/certs/key.pem"
+
+[auth.push]
+username = "demo"
+password = "demo"
+# allow_repos = ["org/*"]
+
+[token]
+service = "registry-rust"
+# MUST be set to a long random secret for real deployments.
+signing_key = "REPLACE_ME_WITH_LONG_RANDOM_SECRET"
+ttl_secs = 600
+
+[storage]
+backend = "fs"
+
+[storage.fs]
+root = "/data"
+
+[features]
+allow_tag_overwrite = false
+automatic_crossmount = false
+
+[uploads]
+disallow_monolithic_uploads = true
+gc_enabled = true
+gc_interval_secs = 3600
+# Consider increasing if you expect long pauses in uploads.
+gc_max_age_secs = 86400
+
+[limits]
+# Set according to your capacity and risk tolerance.
+max_upload_bytes = 1099511627776       # 1 TiB
+max_request_body_bytes = 33554432
+
+[timeouts]
+# Normal API calls should fail fast.
+request_timeout_secs = 60
+# Long transfers need a longer per-request timeout; chunked PATCH keeps individual requests bounded.
+upload_request_timeout_secs = 7200
+
+[catalog]
+requires_auth = true
