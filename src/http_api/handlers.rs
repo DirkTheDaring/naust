@@ -2108,6 +2108,26 @@ mod tests {
     }
 
     #[test]
+    fn token_primary_signing_key_follows_key_order() {
+        let mut cfg = minimal_config_for_token_tests();
+
+        cfg.token_signing_keys = vec![
+            security::TokenSigningKey {
+                kid: "k_new".to_string(),
+                key: "new-key".to_string(),
+            },
+            security::TokenSigningKey {
+                kid: "k_old".to_string(),
+                key: "old-key".to_string(),
+            },
+        ];
+        assert_eq!(cfg.token_primary_signing_key().kid, "k_new");
+
+        cfg.token_signing_keys.swap(0, 1);
+        assert_eq!(cfg.token_primary_signing_key().kid, "k_old");
+    }
+
+    #[test]
     fn robot_push_token_is_scoped_by_prefix_grants() {
         let mut cfg = minimal_config_for_token_tests();
         cfg.robots.enabled = true;

@@ -349,6 +349,95 @@ mod tests {
     }
 
     #[test]
+    fn bearer_round_trip_with_key_includes_kid_and_verifies_with_keyring() {
+        let signing_key_primary = TokenSigningKey {
+            kid: "k2026_01".to_string(),
+            key: "key-primary".to_string(),
+        };
+        let signing_key_secondary = TokenSigningKey {
+            kid: "k2025_12".to_string(),
+            key: "key-secondary".to_string(),
+        };
+        let aud = "registry";
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+
+        let token = issue_bearer_token_with_key(
+            &signing_key_primary,
+            aud,
+            Some("user"),
+            &scopes,
+            now,
+            now + 60,
+        )
+        .expect("issue token");
+
+        let claims = verify_bearer_token_bound_with_keys(
+            &[signing_key_primary.clone(), signing_key_secondary],
+            &token,
+            aud,
+            60,
+        )
+        .expect("verify");
+
+        assert_eq!(claims.kid.as_deref(), Some("k2026_01"));
+    }
+
+    #[test]
+    fn bearer_overlap_verification_accepts_token_signed_with_secondary_key() {
+        let signing_key_primary = TokenSigningKey {
+            kid: "k_new".to_string(),
+            key: "new-key".to_string(),
+        };
+        let signing_key_old = TokenSigningKey {
+            kid: "k_old".to_string(),
+            key: "old-key".to_string(),
+        };
+        let aud = "registry";
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+
+        // Simulate an in-flight token minted before rotation.
+        let token =
+            issue_bearer_token_with_key(&signing_key_old, aud, None, &scopes, now, now + 60)
+                .expect("issue token");
+
+        // After rotation, verify against both keys.
+        let claims = verify_bearer_token_bound_with_keys(
+            &[signing_key_primary.clone(), signing_key_old.clone()],
+            &token,
+            aud,
+            60,
+        )
+        .expect("verify with overlap");
+        assert_eq!(claims.kid.as_deref(), Some("k_old"));
+
+        // Without the old key, signature verification should fail.
+        let err = verify_bearer_token_bound_with_keys(&[signing_key_primary], &token, aud, 60)
+            .expect_err("should fail without old key");
+        assert!(matches!(err, TokenError::InvalidSignature));
+    }
+
+    #[test]
+    fn bearer_legacy_token_without_kid_verifies_with_default_keyring_entry() {
+        let aud = "registry";
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+
+        let token = issue_bearer_token("legacy-key", aud, None, &scopes, now, now + 60)
+            .expect("issue legacy token");
+
+        let keyring = vec![TokenSigningKey {
+            kid: "default".to_string(),
+            key: "legacy-key".to_string(),
+        }];
+
+        let claims = verify_bearer_token_bound_with_keys(&keyring, &token, aud, 60)
+            .expect("verify legacy token");
+        assert!(claims.kid.is_none());
+    }
+
+    #[test]
     fn bearer_expired_rejected() {
         let signing_key = "test-signing-key";
         let aud = "registry";

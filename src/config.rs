@@ -102,7 +102,11 @@ pub struct Config {
 
 impl Config {
     pub fn token_primary_signing_key(&self) -> &crate::security::TokenSigningKey {
-        self.token_signing_keys.first().expect("token signing keys")
+        self.token_signing_keys.first().unwrap_or_else(|| {
+            panic!(
+                "token_signing_keys is empty (misconfiguration): set TOKEN_SIGNING_KEY, token.signing_key, or token.signing_keys"
+            )
+        })
     }
 }
 
@@ -900,6 +904,8 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
+        let raw_file_signing_keys_count = file_cfg.token.signing_keys.len();
+
         let file_signing_keys = file_cfg
             .token
             .signing_keys
@@ -910,6 +916,18 @@ impl Config {
             })
             .filter(|k| !k.kid.is_empty() && !k.key.is_empty())
             .collect::<Vec<_>>();
+
+        if raw_file_signing_keys_count > 0 && file_signing_keys.is_empty() {
+            panic!(
+                "token.signing_keys is present but contains no valid entries (each entry requires non-empty kid and key)"
+            );
+        }
+        if raw_file_signing_keys_count > file_signing_keys.len() {
+            eprintln!(
+                "Warning: token.signing_keys contains {} invalid entries (missing/empty kid or key); ignoring them",
+                raw_file_signing_keys_count - file_signing_keys.len()
+            );
+        }
 
         let (token_signing_key, token_signing_keys) = if !file_signing_keys.is_empty() {
             if env_token_signing_key.is_some() {
