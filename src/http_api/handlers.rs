@@ -27,6 +27,90 @@ use super::errors;
 use crate::request_routing::{V2RouteMode, v2_route_mode_for_request};
 use crate::security;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TokenRejection {
+    Unauthorized,
+    Denied(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenDecision {
+    subject: Option<String>,
+    scopes: Vec<security::TokenScope>,
+    ttl_secs: u64,
+}
+
+fn decide_token_scopes_for_request(
+    cfg: &crate::config::Config,
+    token_scopes: &[security::TokenScope],
+    basic: Option<(String, String)>,
+) -> Result<TokenDecision, TokenRejection> {
+    let wants_push = wants_push_from_token_scopes(token_scopes);
+
+    // Pull-only tokens: keep behavior simple and backwards compatible.
+    // (No auth required; we mint exactly the sanitized requested scopes.)
+    if !wants_push {
+        return Ok(TokenDecision {
+            subject: None,
+            scopes: token_scopes.to_vec(),
+            ttl_secs: cfg.token_ttl_secs,
+        });
+    }
+
+    // Push requested: first try robot auth (if enabled), then fall back to legacy push user/pass.
+    if cfg.robots.enabled {
+        if let Some((user, pass)) = basic.as_ref() {
+            if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == *user) {
+                if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+                    let granted =
+                        crate::rbac::grant_scopes_by_prefix(token_scopes, &account.grants);
+                    if granted.is_empty() {
+                        return Err(TokenRejection::Denied("push not allowed by robot policy"));
+                    }
+
+                    // Ensure we did not implicitly drop all requested push actions.
+                    // (If push was requested, at least one push must remain granted.)
+                    let granted_wants_push = wants_push_from_token_scopes(&granted);
+                    if !granted_wants_push {
+                        return Err(TokenRejection::Denied("push not allowed by robot policy"));
+                    }
+
+                    let ttl_secs = match account.max_ttl_secs {
+                        Some(max) if max > 0 => cfg.token_ttl_secs.min(max),
+                        _ => cfg.token_ttl_secs,
+                    };
+
+                    return Ok(TokenDecision {
+                        subject: Some(format!("robot:{}", account.name)),
+                        scopes: granted,
+                        ttl_secs,
+                    });
+                }
+            }
+        }
+    }
+
+    // Legacy global push auth.
+    let Some(expected_user) = cfg.push_username.as_deref() else {
+        return Err(TokenRejection::Unauthorized);
+    };
+    let Some(expected_pass) = cfg.push_password.as_deref() else {
+        return Err(TokenRejection::Unauthorized);
+    };
+    let Some((user, pass)) = basic else {
+        return Err(TokenRejection::Unauthorized);
+    };
+    if user != expected_user || pass != expected_pass {
+        return Err(TokenRejection::Unauthorized);
+    }
+
+    Ok(TokenDecision {
+        subject: Some(user),
+        scopes: token_scopes.to_vec(),
+        ttl_secs: cfg.token_ttl_secs,
+    })
+}
+
 pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Response {
     // Many clients (Docker/Podman) perform auth negotiation via GET /v2/.
     // For "anonymous pull + authenticated push" we still advertise auth here so
@@ -100,32 +184,20 @@ pub async fn token(
     // We only mint repository scopes and only the actions we understand.
     let token_scopes = sanitize_token_scopes(&scopes);
 
-    // If push is requested, require Basic auth and validate creds.
-    let wants_push = wants_push_from_token_scopes(&token_scopes);
-    let subject = if wants_push {
-        let Some(expected_user) = state.config.push_username.as_deref() else {
-            return token_unauthorized(&state);
-        };
-        let Some(expected_pass) = state.config.push_password.as_deref() else {
-            return token_unauthorized(&state);
-        };
+    let basic = headers
+        .typed_get::<Authorization<Basic>>()
+        .map(|Authorization(b)| (b.username().to_string(), b.password().to_string()));
 
-        match headers.typed_get::<Authorization<Basic>>() {
-            Some(Authorization(basic))
-                if basic.username() == expected_user && basic.password() == expected_pass =>
-            {
-                Some(basic.username().to_string())
-            }
-            _ => return token_unauthorized(&state),
-        }
-    } else {
-        None
+    let decision = match decide_token_scopes_for_request(&state.config, &token_scopes, basic) {
+        Ok(d) => d,
+        Err(TokenRejection::Unauthorized) => return token_unauthorized(&state),
+        Err(TokenRejection::Denied(msg)) => return errors::denied(msg).into_response(),
     };
 
-    // Enforce repo allowlist for push tokens too.
-    if wants_push {
+    // Enforce legacy repo allowlist for push tokens as an additional safety net.
+    if wants_push_from_token_scopes(&decision.scopes) {
         if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-            for scope in &token_scopes {
+            for scope in &decision.scopes {
                 if scope.typ == "repository" {
                     if !crate::auth::repo_allowed(allowlist, &scope.name) {
                         return errors::denied("push not allowed for this repository")
@@ -140,9 +212,15 @@ pub async fn token(
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs();
-    let exp = now.saturating_add(state.config.token_ttl_secs);
+    let exp = now.saturating_add(decision.ttl_secs);
 
-    let token = match issue_token(&state, subject.as_deref(), &token_scopes, now, exp) {
+    let token = match issue_token(
+        &state,
+        decision.subject.as_deref(),
+        &decision.scopes,
+        now,
+        exp,
+    ) {
         Ok(t) => t,
         Err(_) => return errors::internal_error().into_response(),
     };
@@ -150,7 +228,7 @@ pub async fn token(
     let body = serde_json::json!({
         "token": token,
         "access_token": token,
-        "expires_in": state.config.token_ttl_secs,
+        "expires_in": decision.ttl_secs,
         "issued_at": format_rfc3339(now),
     });
 
@@ -1709,10 +1787,15 @@ fn is_valid_tag(tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_valid_repo_name, is_valid_tag, parse_scopes, sanitize_token_scopes,
-        token_scope_requests_repo_action, wants_push_from_token_scopes,
+        decide_token_scopes_for_request, is_valid_repo_name, is_valid_tag, parse_scopes,
+        sanitize_token_scopes, token_scope_requests_repo_action, wants_push_from_token_scopes,
     };
+    use crate::config::{Config, ProxyConfig, ProxyMode, RobotsConfig, UploadPolicyConfig};
+    use crate::rbac::Grant;
+    use crate::robot_secrets;
     use crate::security;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
 
     #[test]
     fn repo_name_validation() {
@@ -1834,6 +1917,138 @@ mod tests {
         let token_scopes = sanitize_token_scopes(&scopes);
 
         assert!(!wants_push_from_token_scopes(&token_scopes));
+    }
+
+    fn minimal_config_for_token_tests() -> Config {
+        Config {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 5000)),
+            tls_cert_path: None,
+            tls_key_path: None,
+            push_username: None,
+            push_password: None,
+            push_allow_repos: Some(vec!["*".to_string()]),
+            storage_backend: crate::config::StorageBackend::Filesystem,
+            fs_root: PathBuf::from("./data"),
+            s3_endpoint: None,
+            s3_region: None,
+            s3_bucket: None,
+            s3_prefix: "registry".to_string(),
+            allow_tag_overwrite: true,
+            automatic_crossmount: false,
+            upload_gc_enabled: true,
+            upload_gc_interval_secs: 3600,
+            upload_gc_max_age_secs: 86400,
+            max_upload_bytes: 5 * 1024 * 1024 * 1024,
+            max_request_body_bytes: 32 * 1024 * 1024,
+            max_concurrent_buffered_requests: 8,
+            max_concurrent_requests: 256,
+            request_timeout_secs: 300,
+            upload_request_timeout_secs: 3600,
+            disallow_monolithic_uploads: false,
+            upload_policy: UploadPolicyConfig {
+                abort_on_error: false,
+                abort_on_digest_mismatch: false,
+                repo_rules: Vec::new(),
+            },
+            catalog_requires_auth: false,
+            public_url: Some("http://127.0.0.1:5000".to_string()),
+            token_service: "registry-rust".to_string(),
+            token_signing_key: "test-key".to_string(),
+            token_ttl_secs: 600,
+            robots: RobotsConfig::default(),
+            proxy: ProxyConfig {
+                enabled: false,
+                mode: ProxyMode::Allowlist,
+                upstream_base_url: None,
+                upstream_username: None,
+                upstream_password: None,
+                allowed_upstream_hosts: Vec::new(),
+                allowed_repo_prefixes: Vec::new(),
+                block_private_networks: true,
+                max_concurrent_upstream: 16,
+                index_path: PathBuf::from("./data/cache/proxy-index"),
+                cache_fs_root: None,
+                cache_s3_prefix: None,
+                gc_interval_secs: 3600,
+                scrub_enabled: false,
+                scrub_interval_secs: 3600,
+                scrub_max_files_per_run: 2000,
+                max_cache_bytes: None,
+                repo_rules: Vec::new(),
+                upstreams: Vec::new(),
+                routing_proxy_hosts: Vec::new(),
+                routing_trust_x_forwarded_host: false,
+            },
+        }
+    }
+
+    #[test]
+    fn robot_push_token_is_scoped_by_prefix_grants() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.robots.enabled = true;
+
+        let hash = robot_secrets::hash_robot_secret("s3cr3t").expect("hash");
+        cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+            name: "ci".to_string(),
+            secret_hash: hash,
+            grants: vec![Grant {
+                repo_prefix: "org/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+            max_ttl_secs: Some(120),
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "org/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let decision = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("ci".to_string(), "s3cr3t".to_string())),
+        )
+        .expect("should authorize");
+
+        assert_eq!(decision.subject.as_deref(), Some("robot:ci"));
+        assert_eq!(decision.scopes, requested);
+        assert_eq!(decision.ttl_secs, 120);
+    }
+
+    #[test]
+    fn robot_push_token_denied_when_repo_not_in_grants() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.robots.enabled = true;
+
+        let hash = robot_secrets::hash_robot_secret("s3cr3t").expect("hash");
+        cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+            name: "ci".to_string(),
+            secret_hash: hash,
+            grants: vec![Grant {
+                repo_prefix: "org/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+            max_ttl_secs: None,
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "other/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let err = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("ci".to_string(), "s3cr3t".to_string())),
+        )
+        .expect_err("should deny");
+
+        assert_eq!(
+            err,
+            super::TokenRejection::Denied("push not allowed by robot policy")
+        );
     }
 }
 

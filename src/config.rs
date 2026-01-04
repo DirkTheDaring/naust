@@ -1239,7 +1239,8 @@ impl Config {
         }
     }
     pub fn push_auth_configured(&self) -> bool {
-        self.push_username.is_some() && self.push_password.is_some()
+        (self.push_username.is_some() && self.push_password.is_some())
+            || (self.robots.enabled && !self.robots.accounts.is_empty())
     }
 }
 
