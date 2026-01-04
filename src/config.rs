@@ -91,12 +91,19 @@ pub struct Config {
     pub public_url: Option<String>,
     pub token_service: String,
     pub token_signing_key: String,
+    pub token_signing_keys: Vec<crate::security::TokenSigningKey>,
     pub token_ttl_secs: u64,
 
     // Planned (not used yet): robot accounts + scoped grants for token minting.
     pub robots: RobotsConfig,
 
     pub proxy: ProxyConfig,
+}
+
+impl Config {
+    pub fn token_primary_signing_key(&self) -> &crate::security::TokenSigningKey {
+        self.token_signing_keys.first().expect("token signing keys")
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -553,7 +560,15 @@ struct FileToken {
     #[serde(default)]
     signing_key: Option<String>,
     #[serde(default)]
+    signing_keys: Vec<FileTokenSigningKey>,
+    #[serde(default)]
     ttl_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileTokenSigningKey {
+    kid: String,
+    key: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -880,18 +895,58 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "registry-rust".to_string());
 
-        let token_signing_key = env_str_any(&["REGISTRY__TOKEN__SIGNING_KEY", "TOKEN_SIGNING_KEY"])
-            .or_else(|| file_cfg.token.signing_key.clone())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if best_practice {
-                    panic!(
-                        "best_practice requires TOKEN_SIGNING_KEY (or config token.signing_key) to be set"
-                    );
+        let env_token_signing_key =
+            env_str_any(&["REGISTRY__TOKEN__SIGNING_KEY", "TOKEN_SIGNING_KEY"])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+        let file_signing_keys = file_cfg
+            .token
+            .signing_keys
+            .iter()
+            .map(|k| crate::security::TokenSigningKey {
+                kid: k.kid.trim().to_string(),
+                key: k.key.trim().to_string(),
+            })
+            .filter(|k| !k.kid.is_empty() && !k.key.is_empty())
+            .collect::<Vec<_>>();
+
+        let (token_signing_key, token_signing_keys) = if !file_signing_keys.is_empty() {
+            if env_token_signing_key.is_some() {
+                eprintln!(
+                    "Warning: TOKEN_SIGNING_KEY is set but token.signing_keys is present; ignoring env TOKEN_SIGNING_KEY"
+                );
+            }
+
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for k in &file_signing_keys {
+                if !seen.insert(k.kid.clone()) {
+                    panic!("token.signing_keys contains duplicate kid='{}'", k.kid);
                 }
-                uuid::Uuid::new_v4().to_string()
-            });
+            }
+
+            (file_signing_keys[0].key.clone(), file_signing_keys)
+        } else {
+            let token_signing_key = env_token_signing_key
+                .or_else(|| file_cfg.token.signing_key.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if best_practice {
+                        panic!(
+                            "best_practice requires TOKEN_SIGNING_KEY (or config token.signing_key or token.signing_keys) to be set"
+                        );
+                    }
+                    uuid::Uuid::new_v4().to_string()
+                });
+
+            let token_signing_keys = vec![crate::security::TokenSigningKey {
+                kid: "default".to_string(),
+                key: token_signing_key.clone(),
+            }];
+
+            (token_signing_key, token_signing_keys)
+        };
 
         let token_ttl_secs = env_u64_any(&["REGISTRY__TOKEN__TTL_SECS", "TOKEN_TTL_SECS"])
             .or(file_cfg.token.ttl_secs)
@@ -1212,6 +1267,7 @@ impl Config {
             public_url,
             token_service,
             token_signing_key,
+            token_signing_keys,
             token_ttl_secs,
 
             robots,

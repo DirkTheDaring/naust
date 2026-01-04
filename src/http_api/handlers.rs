@@ -179,10 +179,18 @@ pub async fn token(
         }
     }
 
-    if let Some(svc) = service_param.as_deref() {
-        if svc != state.config.token_service {
-            return errors::denied("invalid token service").into_response();
+    if !service_param_is_valid(service_param.as_deref(), &state.config.token_service) {
+        if let Some(svc) = service_param.as_deref() {
+            let denied_total = state.auth_metrics.inc_token_denied();
+            tracing::warn!(
+                event = "token_denied",
+                reason = "invalid_service",
+                requested_service = %svc,
+                configured_service = %state.config.token_service,
+                token_denied_total = denied_total,
+            );
         }
+        return errors::denied("invalid token service").into_response();
     }
     let scopes = scopes_raw
         .iter()
@@ -192,6 +200,7 @@ pub async fn token(
     // Be lenient in parsing, but never mint unexpected permissions.
     // We only mint repository scopes and only the actions we understand.
     let token_scopes = sanitize_token_scopes(&scopes);
+    let requested_wants_push = wants_push_from_token_scopes(&token_scopes);
 
     let basic = headers
         .typed_get::<Authorization<Basic>>()
@@ -199,9 +208,40 @@ pub async fn token(
 
     let decision = match decide_token_scopes_for_request(&state.config, &token_scopes, basic) {
         Ok(d) => d,
-        Err(TokenRejection::Unauthorized) => return token_unauthorized(&state),
-        Err(TokenRejection::Denied(msg)) => return errors::denied(msg).into_response(),
+        Err(TokenRejection::Unauthorized) => {
+            let denied_total = state.auth_metrics.inc_token_denied();
+            tracing::warn!(
+                event = "token_denied",
+                reason = "unauthorized",
+                service = %state.config.token_service,
+                requested_scopes_len = token_scopes.len(),
+                wants_push = requested_wants_push,
+                token_denied_total = denied_total,
+            );
+            return token_unauthorized(&state);
+        }
+        Err(TokenRejection::Denied(msg)) => {
+            let denied_total = state.auth_metrics.inc_token_denied();
+            tracing::warn!(
+                event = "token_denied",
+                reason = %msg,
+                service = %state.config.token_service,
+                requested_scopes_len = token_scopes.len(),
+                wants_push = requested_wants_push,
+                token_denied_total = denied_total,
+            );
+            return errors::denied(msg).into_response();
+        }
     };
+
+    tracing::debug!(
+        event = "token_decision",
+        service = %state.config.token_service,
+        requested_scopes = ?token_scopes,
+        granted_scopes = ?decision.scopes,
+        subject = decision.subject.as_deref().unwrap_or("<anon>"),
+        ttl_secs = decision.ttl_secs,
+    );
 
     // Enforce legacy repo allowlist for push tokens as an additional safety net.
     if wants_push_from_token_scopes(&decision.scopes) {
@@ -209,6 +249,15 @@ pub async fn token(
             for scope in &decision.scopes {
                 if scope.typ == "repository" {
                     if !crate::auth::repo_allowed(allowlist, &scope.name) {
+                        let denied_total = state.auth_metrics.inc_token_denied();
+                        tracing::warn!(
+                            event = "token_denied",
+                            reason = "push_repo_not_allowed",
+                            service = %state.config.token_service,
+                            repo = %scope.name,
+                            subject = decision.subject.as_deref().unwrap_or("<anon>"),
+                            token_denied_total = denied_total,
+                        );
                         return errors::denied("push not allowed for this repository")
                             .into_response();
                     }
@@ -231,8 +280,29 @@ pub async fn token(
         exp,
     ) {
         Ok(t) => t,
-        Err(_) => return errors::internal_error().into_response(),
+        Err(_) => {
+            let err_total = state.auth_metrics.inc_token_internal_error();
+            tracing::error!(
+                event = "token_error",
+                reason = "issue_failed",
+                service = %state.config.token_service,
+                token_internal_error_total = err_total,
+            );
+            return errors::internal_error().into_response();
+        }
     };
+
+    let issued_total = state.auth_metrics.inc_token_issued();
+    tracing::info!(
+        event = "token_issued",
+        service = %state.config.token_service,
+        subject = decision.subject.as_deref().unwrap_or("<anon>"),
+        ttl_secs = decision.ttl_secs,
+        requested_scopes_len = token_scopes.len(),
+        granted_scopes_len = decision.scopes.len(),
+        wants_push = wants_push_from_token_scopes(&decision.scopes),
+        token_issued_total = issued_total,
+    );
 
     let body = serde_json::json!({
         "token": token,
@@ -250,6 +320,13 @@ pub async fn token(
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
+}
+
+fn service_param_is_valid(service_param: Option<&str>, configured_service: &str) -> bool {
+    match service_param {
+        None => true,
+        Some(s) => s == configured_service,
+    }
 }
 
 fn token_unauthorized(state: &AppState) -> Response {
@@ -375,8 +452,8 @@ fn issue_token(
     iat: u64,
     exp: u64,
 ) -> Result<String, ()> {
-    security::issue_bearer_token(
-        &state.config.token_signing_key,
+    security::issue_bearer_token_with_key(
+        state.config.token_primary_signing_key(),
         &state.config.token_service,
         subject,
         scopes,
@@ -1804,7 +1881,8 @@ fn is_valid_tag(tag: &str) -> bool {
 mod tests {
     use super::{
         decide_token_scopes_for_request, is_valid_repo_name, is_valid_tag, parse_scopes,
-        sanitize_token_scopes, token_scope_requests_repo_action, wants_push_from_token_scopes,
+        sanitize_token_scopes, service_param_is_valid, token_scope_requests_repo_action,
+        wants_push_from_token_scopes,
     };
     use crate::config::{Config, ProxyConfig, ProxyMode, RobotsConfig, UploadPolicyConfig};
     use crate::rbac::Grant;
@@ -1845,6 +1923,33 @@ mod tests {
             scopes[0].actions,
             vec!["push".to_string(), "pull".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_scopes_splits_by_whitespace_into_multiple_items() {
+        let scopes = parse_scopes("repository:org/repo:pull  repository:org/repo2:push");
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0].typ, "repository");
+        assert_eq!(scopes[0].name, "org/repo");
+        assert_eq!(scopes[0].actions, vec!["pull".to_string()]);
+        assert_eq!(scopes[1].name, "org/repo2");
+        assert_eq!(scopes[1].actions, vec!["push".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_token_scopes_drops_non_repository_scope_types() {
+        let scopes = parse_scopes("registry:catalog:*:push repository:org/repo:pull");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert_eq!(token_scopes.len(), 1);
+        assert_eq!(token_scopes[0].typ, "repository");
+        assert_eq!(token_scopes[0].name, "org/repo");
+    }
+
+    #[test]
+    fn service_param_validation_allows_missing_and_requires_exact_match() {
+        assert!(service_param_is_valid(None, "registry"));
+        assert!(service_param_is_valid(Some("registry"), "registry"));
+        assert!(!service_param_is_valid(Some("other"), "registry"));
     }
 
     #[test]
@@ -1970,6 +2075,10 @@ mod tests {
             public_url: Some("http://127.0.0.1:5000".to_string()),
             token_service: "registry-rust".to_string(),
             token_signing_key: "test-key".to_string(),
+            token_signing_keys: vec![security::TokenSigningKey {
+                kid: "default".to_string(),
+                key: "test-key".to_string(),
+            }],
             token_ttl_secs: 600,
             robots: RobotsConfig::default(),
             proxy: ProxyConfig {
@@ -2065,6 +2174,74 @@ mod tests {
             err,
             super::TokenRejection::Denied("push not allowed by robot policy")
         );
+    }
+
+    #[test]
+    fn robot_auth_failure_does_not_allow_push_without_legacy_creds() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.robots.enabled = true;
+
+        let hash = robot_secrets::hash_robot_secret("s3cr3t").expect("hash");
+        cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+            name: "ci".to_string(),
+            secret_hash: hash,
+            grants: vec![Grant {
+                repo_prefix: "org/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+            max_ttl_secs: None,
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "org/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let err = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("ci".to_string(), "wrong".to_string())),
+        )
+        .expect_err("should deny");
+
+        assert_eq!(err, super::TokenRejection::Unauthorized);
+    }
+
+    #[test]
+    fn legacy_push_creds_work_even_when_robots_enabled() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.robots.enabled = true;
+        cfg.push_username = Some("admin".to_string());
+        cfg.push_password = Some("pw".to_string());
+
+        // Add a robot too; we should still allow legacy when legacy creds match.
+        let hash = robot_secrets::hash_robot_secret("s3cr3t").expect("hash");
+        cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+            name: "ci".to_string(),
+            secret_hash: hash,
+            grants: vec![Grant {
+                repo_prefix: "org/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+            max_ttl_secs: None,
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "org/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let decision = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("admin".to_string(), "pw".to_string())),
+        )
+        .expect("should authorize");
+
+        assert_eq!(decision.subject.as_deref(), Some("admin"));
+        assert_eq!(decision.scopes, requested);
     }
 }
 

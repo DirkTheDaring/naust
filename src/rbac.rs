@@ -180,6 +180,30 @@ mod tests {
     }
 
     #[test]
+    fn prefix_boundary_does_not_match_similar_prefixes_or_bare_org() {
+        let grants = vec![Grant {
+            repo_prefix: "org/".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let requested = vec![
+            security::TokenScope {
+                typ: "repository".to_string(),
+                name: "org".to_string(),
+                actions: vec!["pull".to_string()],
+            },
+            security::TokenScope {
+                typ: "repository".to_string(),
+                name: "org2/repo".to_string(),
+                actions: vec!["pull".to_string()],
+            },
+        ];
+
+        let granted = grant_scopes_by_prefix(&requested, &grants);
+        assert!(granted.is_empty());
+    }
+
+    #[test]
     fn grant_scopes_preserves_requested_action_order() {
         let requested = vec![security::TokenScope {
             typ: "repository".to_string(),

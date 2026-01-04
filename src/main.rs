@@ -24,15 +24,40 @@ use semver::Version;
 use sha2::Digest as _;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[derive(Debug, Default)]
+pub struct AuthMetrics {
+    token_issued_total: AtomicU64,
+    token_denied_total: AtomicU64,
+    token_internal_error_total: AtomicU64,
+}
+
+impl AuthMetrics {
+    pub fn inc_token_issued(&self) -> u64 {
+        self.token_issued_total.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn inc_token_denied(&self) -> u64 {
+        self.token_denied_total.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn inc_token_internal_error(&self) -> u64 {
+        self.token_internal_error_total
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub auth_metrics: Arc<AuthMetrics>,
     pub storage: Arc<dyn storage::Storage>,
     pub proxy: Option<Arc<proxy::Proxy>>,
     pub proxy_cache: Option<Arc<dyn storage::Storage>>,
@@ -228,6 +253,7 @@ async fn main() {
 
     let state = AppState {
         config,
+        auth_metrics: Arc::new(AuthMetrics::default()),
         storage,
         proxy,
         proxy_cache,

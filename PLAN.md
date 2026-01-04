@@ -97,6 +97,13 @@ Security-first implementation plan:
 
 See `docs/rbac.md` for the detailed invariants, TOML schema proposal, and phased rollout plan.
 
+## Review & rollout
+
+Use `docs/rbac.md` as the operational + reviewer checklist for:
+- staged rollout of robots/push scopes
+- log expectations (token_issued/token_denied/token_error)
+- rotation/revocation playbooks (robot secrets + token signing key)
+
 ## Error Handling
 Implement Docker Registry error response format (JSON with `errors` array) and error codes like:
 - `NAME_INVALID`

@@ -123,8 +123,8 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
 
     // Bearer: accept any valid, unexpired token minted by this registry.
     if let Some(token) = bearer_token_from_headers(headers) {
-        if let Ok(claims) = security::verify_bearer_token_bound(
-            &state.config.token_signing_key,
+        if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+            &state.config.token_signing_keys,
             token,
             &state.config.token_service,
             state.config.token_ttl_secs,
@@ -182,8 +182,8 @@ pub async fn require_push_basic_auth(
 
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
-        if let Ok(claims) = security::verify_bearer_token_bound(
-            &state.config.token_signing_key,
+        if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+            &state.config.token_signing_keys,
             token,
             &state.config.token_service,
             state.config.token_ttl_secs,

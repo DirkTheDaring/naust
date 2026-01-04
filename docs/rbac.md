@@ -67,7 +67,7 @@ Notes:
 This is intentionally flat and reviewable.
 
 ```toml
-# Not implemented yet (planned): robot accounts and scoped grants.
+# Implemented: robot accounts and scoped grants.
 #
 # [auth.robots]
 # enabled = true
@@ -131,7 +131,75 @@ Hardening:
   2) enable push for narrow prefixes
   3) expand after validating logs/metrics
 
-## Reviewer checklist
+## Reviewer & rollout checklist
+
+### Security invariants
+
+- Granted scopes are the intersection of requested and allowed policy.
+- Policy evaluation is deny-by-default (invalid policy or unknown action => no grant).
+- Prefix matching boundaries are correct (no `org/` -> `org2/...` bleed).
+- Tokens are service-bound (`aud == token_service`) and TTL-bounded (`exp - iat <= token_ttl_secs`).
+- Tokens contain `iss`, `aud`, `iat`, `exp` and `jti` for correlation.
+
+### Config + operational safety
+
+- Strict config parsing enabled in production (`BEST_PRACTICE=1` or `[config].strict=true`).
+- Robot secrets are stored only as Argon2id hashes (no plaintext in config or env vars).
+- `token_signing_key` is long, random, and treated as a secret (rotate on compromise).
+- `token_ttl_secs` is short (minutes, not hours) to bound blast radius.
+
+### Logging hygiene
+
+- No secrets in logs: no Basic credentials, no secret hashes, no full bearer tokens.
+- Token flow emits structured events:
+   - `token_issued` (info)
+   - `token_denied` (warn)
+   - `token_error` (error)
+   - `token_decision` (debug; includes requested/granted scopes)
+
+### Staged rollout plan
+
+1) Deploy with robots enabled but only granting pull (or only for a narrow prefix).
+2) Validate logs for `token_denied` reasons and expected subjects (`robot:<name>`).
+3) Enable push grants for a single repo prefix used by CI.
+4) Expand prefixes gradually after verifying clients behave as expected.
+
+## Operational playbook
+
+### Create / rotate a robot secret
+
+1) Generate a new Argon2id hash:
+    - Run `registry-rust hash-secret` and paste the secret on stdin.
+2) Update `secret_hash` in TOML for the robot account.
+3) Restart the registry process.
+
+Notes:
+- Old secrets stop working immediately after restart.
+- Prefer one robot per workload; rotate secrets periodically.
+
+### Token signing key rotation (current model: single key)
+
+Current implementation uses a single HMAC signing key (no `kid` / overlap).
+
+Rotation procedure:
+1) Pick a maintenance window (or accept a brief re-auth surge).
+2) Update `token_signing_key`.
+3) Restart the registry.
+
+Impact:
+- All previously issued tokens become invalid immediately.
+- Clients will re-fetch tokens automatically; keep TTL short to reduce disruption.
+
+### Incident response (suspected credential leakage)
+
+- If a robot secret is suspected leaked: rotate that robot’s `secret_hash` and restart.
+- If the signing key is suspected leaked: rotate `token_signing_key` and restart (hard cutover).
+- Review `token_denied` and `token_issued` logs for unexpected subjects, repos, or push activity.
+
+### Limitations / planned improvements
+
+- No multi-key verification (`kid`) yet; rotation is a hard cutover.
+- No persistent token revocation list (by design); rely on short TTL + key rotation.
 
 - Policy engine is small/pure and heavily tested
 - No scope escalation possible (subset checks)

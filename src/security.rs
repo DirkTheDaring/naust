@@ -48,6 +48,38 @@ pub struct TokenClaims {
     // Unique ID (useful for log correlation; not persisted).
     #[serde(default)]
     pub jti: Option<String>,
+
+    // Key id used for signing (helps key rotation with overlap).
+    #[serde(default)]
+    pub kid: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenSigningKey {
+    pub kid: String,
+    pub key: String,
+}
+
+fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), TokenError> {
+    const MAX_TOKEN_LEN: usize = 8192;
+    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+        return Err(TokenError::InvalidFormat);
+    }
+
+    let (payload_b64, sig_b64) = token.split_once('.').ok_or(TokenError::InvalidFormat)?;
+    if payload_b64.is_empty() || sig_b64.is_empty() {
+        return Err(TokenError::InvalidFormat);
+    }
+
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(sig_b64.as_bytes())
+        .map_err(|_| TokenError::InvalidSignature)?;
+
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .map_err(|_| TokenError::InvalidPayload)?;
+
+    Ok((payload_b64, sig, payload_bytes))
 }
 
 #[allow(dead_code)]
@@ -67,19 +99,7 @@ impl RepoAction {
 }
 
 pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims, TokenError> {
-    const MAX_TOKEN_LEN: usize = 8192;
-    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
-        return Err(TokenError::InvalidFormat);
-    }
-
-    let (payload_b64, sig_b64) = token.split_once('.').ok_or(TokenError::InvalidFormat)?;
-    if payload_b64.is_empty() || sig_b64.is_empty() {
-        return Err(TokenError::InvalidFormat);
-    }
-
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(sig_b64.as_bytes())
-        .map_err(|_| TokenError::InvalidSignature)?;
+    let (payload_b64, sig, payload_bytes) = decode_token_parts(token)?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
         .map_err(|_| TokenError::InvalidSigningKey)?;
@@ -87,11 +107,61 @@ pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims
     mac.verify_slice(&sig)
         .map_err(|_| TokenError::InvalidSignature)?;
 
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64.as_bytes())
-        .map_err(|_| TokenError::InvalidPayload)?;
     let claims: TokenClaims =
         serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TokenError::InvalidPayload)?
+        .as_secs();
+    if now > claims.exp {
+        return Err(TokenError::Expired);
+    }
+
+    Ok(claims)
+}
+
+pub fn verify_bearer_token_with_keys(
+    signing_keys: &[TokenSigningKey],
+    token: &str,
+) -> Result<TokenClaims, TokenError> {
+    if signing_keys.is_empty() {
+        return Err(TokenError::InvalidSigningKey);
+    }
+
+    let (payload_b64, sig, payload_bytes) = decode_token_parts(token)?;
+    let claims: TokenClaims =
+        serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
+
+    // Use `kid` as a hint only; never trust it without signature verification.
+    let mut candidates: Vec<&TokenSigningKey> = Vec::with_capacity(signing_keys.len());
+    if let Some(kid) = claims.kid.as_deref() {
+        for k in signing_keys {
+            if k.kid == kid {
+                candidates.push(k);
+            }
+        }
+    }
+    for k in signing_keys {
+        if !candidates.iter().any(|x| x.kid == k.kid) {
+            candidates.push(k);
+        }
+    }
+
+    let mut verified = false;
+    for k in candidates {
+        let mut mac = Hmac::<Sha256>::new_from_slice(k.key.as_bytes())
+            .map_err(|_| TokenError::InvalidSigningKey)?;
+        mac.update(payload_b64.as_bytes());
+        if mac.verify_slice(&sig).is_ok() {
+            verified = true;
+            break;
+        }
+    }
+
+    if !verified {
+        return Err(TokenError::InvalidSignature);
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -132,6 +202,34 @@ pub fn verify_bearer_token_bound(
     Ok(claims)
 }
 
+pub fn verify_bearer_token_bound_with_keys(
+    signing_keys: &[TokenSigningKey],
+    token: &str,
+    expected_aud: &str,
+    max_ttl_secs: u64,
+) -> Result<TokenClaims, TokenError> {
+    let claims = verify_bearer_token_with_keys(signing_keys, token)?;
+
+    if claims.aud.as_deref() != Some(expected_aud) {
+        return Err(TokenError::InvalidPayload);
+    }
+
+    let Some(iat) = claims.iat else {
+        return Err(TokenError::InvalidPayload);
+    };
+    if claims.exp < iat {
+        return Err(TokenError::InvalidPayload);
+    }
+    if max_ttl_secs > 0 {
+        let ttl = claims.exp.saturating_sub(iat);
+        if ttl > max_ttl_secs {
+            return Err(TokenError::InvalidPayload);
+        }
+    }
+
+    Ok(claims)
+}
+
 pub fn issue_bearer_token(
     signing_key: &str,
     aud: &str,
@@ -148,12 +246,44 @@ pub fn issue_bearer_token(
         scopes: scopes.to_vec(),
         aud: Some(aud.to_string()),
         jti: Some(Uuid::new_v4().to_string()),
+        kid: None,
     };
 
     let payload_bytes = serde_json::to_vec(&claims).map_err(|_| TokenError::InvalidPayload)?;
     let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
 
     let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
+        .map_err(|_| TokenError::InvalidSigningKey)?;
+    mac.update(payload_b64.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+
+    Ok(format!("{payload_b64}.{sig_b64}"))
+}
+
+pub fn issue_bearer_token_with_key(
+    signing_key: &TokenSigningKey,
+    aud: &str,
+    subject: Option<&str>,
+    scopes: &[TokenScope],
+    iat: u64,
+    exp: u64,
+) -> Result<String, TokenError> {
+    let claims = TokenClaims {
+        iss: Some("registry-rust".to_string()),
+        sub: subject.map(|s| s.to_string()),
+        iat: Some(iat),
+        exp,
+        scopes: scopes.to_vec(),
+        aud: Some(aud.to_string()),
+        jti: Some(Uuid::new_v4().to_string()),
+        kid: Some(signing_key.kid.clone()),
+    };
+
+    let payload_bytes = serde_json::to_vec(&claims).map_err(|_| TokenError::InvalidPayload)?;
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.key.as_bytes())
         .map_err(|_| TokenError::InvalidSigningKey)?;
     mac.update(payload_b64.as_bytes());
     let sig = mac.finalize().into_bytes();
@@ -338,6 +468,21 @@ mod tests {
 
         let err = verify_bearer_token_bound(signing_key, &token, "registry", 3600)
             .expect_err("ttl too large");
+        assert!(matches!(err, TokenError::InvalidPayload));
+    }
+
+    #[test]
+    fn bearer_exp_before_iat_rejected_as_invalid_payload() {
+        let signing_key = "test-signing-key";
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+
+        // Signed token where exp < iat is structurally invalid, but still might not be expired.
+        let token = issue_bearer_token(signing_key, "registry", None, &scopes, now + 10, now + 1)
+            .expect("issue");
+
+        let err = verify_bearer_token_bound(signing_key, &token, "registry", 3600)
+            .expect_err("exp < iat");
         assert!(matches!(err, TokenError::InvalidPayload));
     }
 }
