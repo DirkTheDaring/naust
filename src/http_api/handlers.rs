@@ -57,7 +57,8 @@ fn decide_token_scopes_for_request(
         });
     }
 
-    // Push requested: first try robot auth (if enabled), then fall back to legacy push user/pass.
+    // Push requested: first try robot auth (if enabled), then user/group auth (if enabled),
+    // then fall back to legacy push user/pass.
     if cfg.robots.enabled {
         if let Some((user, pass)) = basic.as_ref() {
             if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == *user) {
@@ -82,6 +83,43 @@ fn decide_token_scopes_for_request(
 
                     return Ok(TokenDecision {
                         subject: Some(format!("robot:{}", account.name)),
+                        scopes: granted,
+                        ttl_secs,
+                    });
+                }
+            }
+        }
+    }
+
+    if cfg.users.enabled {
+        if let Some((user, pass)) = basic.as_ref() {
+            if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == *user) {
+                if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+                    let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
+                    for group_name in &account.groups {
+                        if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name)
+                        {
+                            union_grants.extend(group.grants.clone());
+                        }
+                    }
+
+                    let granted = crate::rbac::grant_scopes_by_prefix(token_scopes, &union_grants);
+                    if granted.is_empty() {
+                        return Err(TokenRejection::Denied("push not allowed by user policy"));
+                    }
+
+                    let granted_wants_push = wants_push_from_token_scopes(&granted);
+                    if !granted_wants_push {
+                        return Err(TokenRejection::Denied("push not allowed by user policy"));
+                    }
+
+                    let ttl_secs = match account.max_ttl_secs {
+                        Some(max) if max > 0 => cfg.token_ttl_secs.min(max),
+                        _ => cfg.token_ttl_secs,
+                    };
+
+                    return Ok(TokenDecision {
+                        subject: Some(format!("user:{}", account.name)),
                         scopes: granted,
                         ttl_secs,
                     });
@@ -2081,6 +2119,7 @@ mod tests {
             }],
             token_ttl_secs: 600,
             robots: RobotsConfig::default(),
+            users: crate::config::UsersConfig::default(),
             proxy: ProxyConfig {
                 enabled: false,
                 mode: ProxyMode::Allowlist,
@@ -2262,6 +2301,137 @@ mod tests {
 
         assert_eq!(decision.subject.as_deref(), Some("admin"));
         assert_eq!(decision.scopes, requested);
+    }
+
+    #[test]
+    fn user_push_token_is_scoped_by_group_grants() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.users.enabled = true;
+
+        cfg.users.groups.push(crate::config::GroupConfig {
+            name: "dev".to_string(),
+            grants: vec![Grant {
+                repo_prefix: "org/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+        });
+
+        let hash = robot_secrets::hash_robot_secret("pw").expect("hash");
+        cfg.users.accounts.push(crate::config::UserAccountConfig {
+            name: "alice".to_string(),
+            secret_hash: hash,
+            groups: vec!["dev".to_string()],
+            max_ttl_secs: Some(120),
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "org/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let decision = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("alice".to_string(), "pw".to_string())),
+        )
+        .expect("should authorize");
+
+        assert_eq!(decision.subject.as_deref(), Some("user:alice"));
+        assert_eq!(decision.scopes, requested);
+        assert_eq!(decision.ttl_secs, 120);
+    }
+
+    #[test]
+    fn user_push_token_denied_when_repo_not_in_group_grants() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.users.enabled = true;
+
+        cfg.users.groups.push(crate::config::GroupConfig {
+            name: "dev".to_string(),
+            grants: vec![Grant {
+                repo_prefix: "other/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+        });
+
+        let hash = robot_secrets::hash_robot_secret("pw").expect("hash");
+        cfg.users.accounts.push(crate::config::UserAccountConfig {
+            name: "bob".to_string(),
+            secret_hash: hash,
+            groups: vec!["dev".to_string()],
+            max_ttl_secs: None,
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "org/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let err = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("bob".to_string(), "pw".to_string())),
+        )
+        .expect_err("should deny");
+
+        assert_eq!(
+            err,
+            super::TokenRejection::Denied("push not allowed by user policy")
+        );
+    }
+
+    #[test]
+    fn robot_precedence_on_name_collision_denies_even_if_user_would_allow() {
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.robots.enabled = true;
+        cfg.users.enabled = true;
+
+        // Robot has the colliding name and valid creds but does NOT allow this repo.
+        let shared_hash = robot_secrets::hash_robot_secret("pw").expect("hash");
+        cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+            name: "sam".to_string(),
+            secret_hash: shared_hash.clone(),
+            grants: vec![Grant {
+                repo_prefix: "org/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+            max_ttl_secs: None,
+        });
+
+        // User would allow it via group grants, but must not be reached.
+        cfg.users.groups.push(crate::config::GroupConfig {
+            name: "writers".to_string(),
+            grants: vec![Grant {
+                repo_prefix: "other/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            }],
+        });
+        cfg.users.accounts.push(crate::config::UserAccountConfig {
+            name: "sam".to_string(),
+            secret_hash: shared_hash,
+            groups: vec!["writers".to_string()],
+            max_ttl_secs: None,
+        });
+
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "other/repo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let err = decide_token_scopes_for_request(
+            &cfg,
+            &requested,
+            Some(("sam".to_string(), "pw".to_string())),
+        )
+        .expect_err("should deny");
+
+        assert_eq!(
+            err,
+            super::TokenRejection::Denied("push not allowed by robot policy")
+        );
     }
 }
 

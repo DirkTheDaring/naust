@@ -97,6 +97,9 @@ pub struct Config {
     // Robot accounts + scoped grants for token minting.
     pub robots: RobotsConfig,
 
+    // Harbor-lite Phase 2: human users + groups for token minting.
+    pub users: UsersConfig,
+
     pub proxy: ProxyConfig,
 }
 
@@ -114,6 +117,27 @@ impl Config {
 pub struct RobotsConfig {
     pub enabled: bool,
     pub accounts: Vec<RobotAccountConfig>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UsersConfig {
+    pub enabled: bool,
+    pub accounts: Vec<UserAccountConfig>,
+    pub groups: Vec<GroupConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UserAccountConfig {
+    pub name: String,
+    pub secret_hash: String,
+    pub groups: Vec<String>,
+    pub max_ttl_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupConfig {
+    pub name: String,
+    pub grants: Vec<crate::rbac::Grant>,
 }
 
 #[derive(Clone, Debug)]
@@ -516,6 +540,41 @@ struct FileAuth {
 
     #[serde(default)]
     robots: FileRobots,
+
+    #[serde(default)]
+    users: FileUsers,
+
+    #[serde(default)]
+    groups: Vec<FileAuthGroup>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileUsers {
+    #[serde(default)]
+    enabled: Option<bool>,
+
+    #[serde(default)]
+    accounts: Vec<FileUserAccount>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileUserAccount {
+    name: String,
+    secret_hash: String,
+
+    #[serde(default)]
+    groups: Vec<String>,
+
+    #[serde(default)]
+    max_ttl_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileAuthGroup {
+    name: String,
+
+    #[serde(default)]
+    grants: Vec<FileRobotGrant>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -998,6 +1057,84 @@ impl Config {
                 .collect(),
         };
 
+        let groups = file_cfg
+            .auth
+            .groups
+            .iter()
+            .map(|g| GroupConfig {
+                name: g.name.trim().to_string(),
+                grants: g
+                    .grants
+                    .iter()
+                    .map(|gr| crate::rbac::Grant {
+                        repo_prefix: gr.repo_prefix.trim().to_string(),
+                        actions: gr
+                            .actions
+                            .iter()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .filter(|g| !g.name.is_empty())
+            .collect::<Vec<_>>();
+
+        // Validate group uniqueness + grants when users are enabled.
+        let users_enabled = file_cfg.auth.users.enabled.unwrap_or(false);
+        if users_enabled {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for g in &groups {
+                if !seen.insert(g.name.clone()) {
+                    panic!("auth.groups contains duplicate name='{}'", g.name);
+                }
+                let _ = crate::rbac::validate_grants(&g.grants)
+                    .unwrap_or_else(|e| panic!("invalid grants in group '{}': {:?}", g.name, e));
+            }
+        }
+
+        let users = UsersConfig {
+            enabled: users_enabled,
+            groups: groups.clone(),
+            accounts: file_cfg
+                .auth
+                .users
+                .accounts
+                .iter()
+                .map(|a| UserAccountConfig {
+                    name: a.name.trim().to_string(),
+                    secret_hash: a.secret_hash.trim().to_string(),
+                    groups: a
+                        .groups
+                        .iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    max_ttl_secs: a.max_ttl_secs,
+                })
+                .filter(|a| !a.name.is_empty())
+                .collect(),
+        };
+
+        if users.enabled {
+            for a in &users.accounts {
+                if a.secret_hash.is_empty() {
+                    panic!(
+                        "auth.users.accounts entry '{}' has empty secret_hash",
+                        a.name
+                    );
+                }
+                for grp in &a.groups {
+                    if !groups.iter().any(|g| g.name == *grp) {
+                        panic!(
+                            "auth.users.accounts '{}' references unknown group '{}'",
+                            a.name, grp
+                        );
+                    }
+                }
+            }
+        }
+
         let proxy_enabled = env_bool_opt(&["REGISTRY__PROXY__ENABLED", "PROXY_ENABLED"])
             .or(file_cfg.proxy.enabled)
             .unwrap_or(false);
@@ -1289,6 +1426,7 @@ impl Config {
             token_ttl_secs,
 
             robots,
+            users,
 
             proxy,
         }
@@ -1315,6 +1453,7 @@ impl Config {
     pub fn push_auth_configured(&self) -> bool {
         (self.push_username.is_some() && self.push_password.is_some())
             || (self.robots.enabled && !self.robots.accounts.is_empty())
+            || (self.users.enabled && !self.users.accounts.is_empty())
     }
 }
 

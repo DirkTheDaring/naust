@@ -204,6 +204,7 @@ Legacy rotation procedure (single key):
 ### Limitations / planned improvements
 
 - Harbor-style human users/groups/projects are not implemented (robots-only model today).
+- A concrete plan for adding users+groups (without an identity system) is in `docs/harbor-lite-phase2.md`.
 - No persistent token revocation list (by design); rely on short TTL + key removal/rotation.
 - Token endpoint rate limiting is global (not per-IP). Consider adding per-IP limiting if exposed to untrusted networks.
 
