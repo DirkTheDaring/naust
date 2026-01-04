@@ -272,6 +272,15 @@ All options also support a canonical `REGISTRY__...` env var namespace (double-u
 
 Existing env var names continue to work.
 
+### Token endpoint rate limiting
+
+To reduce brute-force and protect expensive password/hash verification, `/token` is rate limited (global, per-process).
+
+- Disable: `TOKEN_RATE_LIMIT_RPM=0`
+- Tune:
+  - `TOKEN_RATE_LIMIT_RPM` / `REGISTRY__TOKEN__RATE_LIMIT_RPM` (default: `1200`)
+  - `TOKEN_RATE_LIMIT_WINDOW_SECS` / `REGISTRY__TOKEN__RATE_LIMIT_WINDOW_SECS` (default: `60`)
+
 ### Config option inventory
 
 Precedence: defaults < config file < env vars

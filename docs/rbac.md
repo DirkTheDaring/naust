@@ -177,29 +177,35 @@ Notes:
 - Old secrets stop working immediately after restart.
 - Prefer one robot per workload; rotate secrets periodically.
 
-### Token signing key rotation (current model: single key)
+### Token signing key rotation (overlap, recommended)
 
-Current implementation uses a single HMAC signing key (no `kid` / overlap).
+Current implementation supports overlap rotation using multiple HMAC signing keys with a `kid` hint.
 
 Rotation procedure:
-1) Pick a maintenance window (or accept a brief re-auth surge).
-2) Update `token_signing_key`.
+1) Add a new primary key as the FIRST entry in `[[token.signing_keys]]`.
+2) Keep the previous key(s) listed after it for an overlap window.
 3) Restart the registry.
+4) After the overlap window (>= max token TTL), remove the old key(s) and restart again.
 
-Impact:
-- All previously issued tokens become invalid immediately.
-- Clients will re-fetch tokens automatically; keep TTL short to reduce disruption.
+Notes:
+- The FIRST `token.signing_keys` entry is used to mint new tokens.
+- All `token.signing_keys` entries are accepted for verification.
+- Env vars (`TOKEN_SIGNING_KEY` / `REGISTRY__TOKEN__SIGNING_KEY`) are ignored when `token.signing_keys` is present.
+
+Legacy rotation procedure (single key):
+- If you use `token.signing_key` / `TOKEN_SIGNING_KEY` only, rotation is still a hard cutover.
 
 ### Incident response (suspected credential leakage)
 
 - If a robot secret is suspected leaked: rotate that robot’s `secret_hash` and restart.
-- If the signing key is suspected leaked: rotate `token_signing_key` and restart (hard cutover).
+- If a signing key is suspected leaked: rotate by removing the compromised key from `token.signing_keys` (or changing `token.signing_key`) and restart.
 - Review `token_denied` and `token_issued` logs for unexpected subjects, repos, or push activity.
 
 ### Limitations / planned improvements
 
-- No multi-key verification (`kid`) yet; rotation is a hard cutover.
-- No persistent token revocation list (by design); rely on short TTL + key rotation.
+- Harbor-style human users/groups/projects are not implemented (robots-only model today).
+- No persistent token revocation list (by design); rely on short TTL + key removal/rotation.
+- Token endpoint rate limiting is global (not per-IP). Consider adding per-IP limiting if exposed to untrusted networks.
 
 - Policy engine is small/pure and heavily tested
 - No scope escalation possible (subset checks)

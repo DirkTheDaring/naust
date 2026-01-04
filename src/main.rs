@@ -8,6 +8,7 @@ mod request_routing;
 mod robot_secrets;
 mod security;
 mod storage;
+mod token_rate_limit;
 
 use axum::{
     Router,
@@ -30,6 +31,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
 
 #[derive(Debug, Default)]
 pub struct AuthMetrics {
@@ -297,8 +300,39 @@ async fn main() {
     spawn_proxy_gc(state.clone());
     spawn_proxy_scrub(state.clone());
 
+    // Token endpoint hardening: rate limit expensive credential checks.
+    // Defaults are conservative and should not impact normal clients.
+    // Set TOKEN_RATE_LIMIT_RPM=0 to disable.
+    let token_rate_limit_rpm = std::env::var("REGISTRY__TOKEN__RATE_LIMIT_RPM")
+        .ok()
+        .or_else(|| std::env::var("TOKEN_RATE_LIMIT_RPM").ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(1200);
+    let token_rate_limit_window_secs = std::env::var("REGISTRY__TOKEN__RATE_LIMIT_WINDOW_SECS")
+        .ok()
+        .or_else(|| std::env::var("TOKEN_RATE_LIMIT_WINDOW_SECS").ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+
+    let token_rate_limiter = if token_rate_limit_rpm == 0 {
+        TokenRateLimiter::disabled()
+    } else {
+        TokenRateLimiter::new(
+            token_rate_limit_rpm,
+            Duration::from_secs(token_rate_limit_window_secs.max(1)),
+        )
+    };
+
+    let token =
+        Router::new()
+            .route("/token", get(handlers::token))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let limiter = token_rate_limiter.clone();
+                async move { limit_token_requests(limiter, req, next).await }
+            }));
+
     let app = Router::new()
-        .route("/token", get(handlers::token))
+        .merge(token)
         .merge(meta)
         .merge(v2)
         .with_state(state.clone())

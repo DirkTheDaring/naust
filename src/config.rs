@@ -94,7 +94,7 @@ pub struct Config {
     pub token_signing_keys: Vec<crate::security::TokenSigningKey>,
     pub token_ttl_secs: u64,
 
-    // Planned (not used yet): robot accounts + scoped grants for token minting.
+    // Robot accounts + scoped grants for token minting.
     pub robots: RobotsConfig,
 
     pub proxy: ProxyConfig,
