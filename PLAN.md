@@ -85,6 +85,18 @@ Notes:
 - Docker supports basic auth via `docker login`.
 - In production, prefer TLS termination in front (reverse proxy) or run the registry behind HTTPS.
 
+## RBAC / token issuance (planned)
+
+This is a critical security flow: authorization decisions directly control which Bearer token scopes are minted.
+
+Security-first implementation plan:
+
+- Start with **robot accounts + repo-prefix ACL** (most value, minimal new attack surface).
+- Keep authorization logic in a small pure module (easy to review + test).
+- Enforce invariants: deny-by-default, never grant more than requested, never grant more than policy allows.
+
+See `docs/rbac.md` for the detailed invariants, TOML schema proposal, and phased rollout plan.
+
 ## Error Handling
 Implement Docker Registry error response format (JSON with `errors` array) and error codes like:
 - `NAME_INVALID`

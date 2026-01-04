@@ -18,7 +18,7 @@ pub enum TokenError {
     InvalidSigningKey,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenScope {
     #[serde(rename = "type")]
     pub typ: String,

@@ -93,7 +93,24 @@ pub struct Config {
     pub token_signing_key: String,
     pub token_ttl_secs: u64,
 
+    // Planned (not used yet): robot accounts + scoped grants for token minting.
+    pub robots: RobotsConfig,
+
     pub proxy: ProxyConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RobotsConfig {
+    pub enabled: bool,
+    pub accounts: Vec<RobotAccountConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RobotAccountConfig {
+    pub name: String,
+    pub secret_hash: String,
+    pub grants: Vec<crate::rbac::Grant>,
+    pub max_ttl_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +263,8 @@ pub enum StorageBackend {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
+    config: FileConfigMeta,
+    #[serde(default)]
     profile: FileProfile,
     #[serde(default)]
     server: FileServer,
@@ -268,6 +287,19 @@ struct FileConfig {
 
     #[serde(default)]
     proxy: FileProxy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileConfigMeta {
+    // When enabled, fail fast if the TOML contains unknown keys (helps catch typos).
+    #[serde(default)]
+    strict: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LoadedFileConfig {
+    cfg: FileConfig,
+    ignored_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -470,6 +502,38 @@ struct FileTls {
 struct FileAuth {
     #[serde(default)]
     push: FilePushAuth,
+
+    #[serde(default)]
+    robots: FileRobots,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileRobots {
+    #[serde(default)]
+    enabled: Option<bool>,
+
+    #[serde(default)]
+    accounts: Vec<FileRobotAccount>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileRobotAccount {
+    name: String,
+    secret_hash: String,
+
+    #[serde(default)]
+    grants: Vec<FileRobotGrant>,
+
+    #[serde(default)]
+    max_ttl_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileRobotGrant {
+    repo_prefix: String,
+
+    #[serde(default)]
+    actions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -589,7 +653,8 @@ impl Config {
     pub fn from_env() -> Self {
         // Precedence:
         //   defaults < config file (CONFIG_PATH) < env vars
-        let file_cfg = load_config_file();
+        let loaded = load_config_file();
+        let file_cfg = loaded.cfg;
 
         let best_practice = env_bool_opt(&["BEST_PRACTICE"]).unwrap_or(false)
             || file_cfg
@@ -598,6 +663,31 @@ impl Config {
                 .as_deref()
                 .map(|s| s.eq_ignore_ascii_case("best_practice"))
                 .unwrap_or(false);
+
+        // Optional strict config parsing: fail fast on unknown keys/typos.
+        // - enabled by env vars, TOML [config].strict, or best_practice profile.
+        let strict_config = env_bool_opt(&["REGISTRY__CONFIG__STRICT", "STRICT_CONFIG"])
+            .or(file_cfg.config.strict)
+            .unwrap_or(best_practice);
+        if !loaded.ignored_paths.is_empty() {
+            if strict_config {
+                let mut paths = loaded.ignored_paths;
+                paths.sort();
+                paths.dedup();
+                panic!(
+                    "Unknown TOML keys found (enable fix or remove typos):\n  - {}",
+                    paths.join("\n  - ")
+                );
+            } else {
+                let mut paths = loaded.ignored_paths;
+                paths.sort();
+                paths.dedup();
+                eprintln!(
+                    "Warning: unknown TOML keys ignored (set STRICT_CONFIG=1 to fail fast):\n  - {}",
+                    paths.join("\n  - ")
+                );
+            }
+        }
 
         let listen_addr = env_socket_addr(&["REGISTRY__SERVER__LISTEN_ADDR", "LISTEN_ADDR"])
             .unwrap_or_else(|| {
@@ -806,6 +896,34 @@ impl Config {
         let token_ttl_secs = env_u64_any(&["REGISTRY__TOKEN__TTL_SECS", "TOKEN_TTL_SECS"])
             .or(file_cfg.token.ttl_secs)
             .unwrap_or(600);
+
+        let robots = RobotsConfig {
+            enabled: file_cfg.auth.robots.enabled.unwrap_or(false),
+            accounts: file_cfg
+                .auth
+                .robots
+                .accounts
+                .iter()
+                .map(|a| RobotAccountConfig {
+                    name: a.name.trim().to_string(),
+                    secret_hash: a.secret_hash.trim().to_string(),
+                    grants: a
+                        .grants
+                        .iter()
+                        .map(|g| crate::rbac::Grant {
+                            repo_prefix: g.repo_prefix.trim().to_string(),
+                            actions: g
+                                .actions
+                                .iter()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                        })
+                        .collect(),
+                    max_ttl_secs: a.max_ttl_secs,
+                })
+                .collect(),
+        };
 
         let proxy_enabled = env_bool_opt(&["REGISTRY__PROXY__ENABLED", "PROXY_ENABLED"])
             .or(file_cfg.proxy.enabled)
@@ -1095,6 +1213,8 @@ impl Config {
             token_service,
             token_signing_key,
             token_ttl_secs,
+
+            robots,
 
             proxy,
         }
@@ -1401,6 +1521,31 @@ max_cache_bytes = 456
             "./data/cache/ghcr.io/proxy-index"
         );
     }
+
+    #[test]
+    fn toml_unknown_keys_are_detected() {
+        let cfg = r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+lisen_addr = "127.0.0.1:5001" # typo (unknown)
+
+[storage]
+backend = "fs"
+[storage.fs]
+root = "./data"
+"#;
+
+        let (_cfg, ignored_paths) = parse_toml_config(cfg).expect("parse toml");
+
+        assert!(
+            ignored_paths.iter().any(|p| p == "server.lisen_addr"),
+            "expected typo key to be reported"
+        );
+        assert!(
+            !ignored_paths.iter().any(|p| p == "server.listen_addr"),
+            "known key should not be reported"
+        );
+    }
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -1443,26 +1588,35 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     true
 }
 
-fn load_config_file() -> FileConfig {
+fn parse_toml_config(contents: &str) -> Result<(FileConfig, Vec<String>), toml::de::Error> {
+    let mut ignored_paths = Vec::<String>::new();
+    let deser = toml::de::Deserializer::new(contents);
+    let cfg = serde_ignored::deserialize(deser, |path| {
+        ignored_paths.push(path.to_string());
+    })?;
+    Ok((cfg, ignored_paths))
+}
+
+fn load_config_file() -> LoadedFileConfig {
     let Some(path) = env_str_any(&["CONFIG_PATH", "REGISTRY__CONFIG_PATH"]) else {
-        return FileConfig::default();
+        return LoadedFileConfig::default();
     };
     let path = path.trim();
     if path.is_empty() {
-        return FileConfig::default();
+        return LoadedFileConfig::default();
     }
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(err) => {
             eprintln!("Failed to read CONFIG_PATH='{path}': {err}");
-            return FileConfig::default();
+            return LoadedFileConfig::default();
         }
     };
-    match toml::from_str::<FileConfig>(&contents) {
-        Ok(cfg) => cfg,
+    match parse_toml_config(&contents) {
+        Ok((cfg, ignored_paths)) => LoadedFileConfig { cfg, ignored_paths },
         Err(err) => {
             eprintln!("Failed to parse config file '{path}' as TOML: {err}");
-            FileConfig::default()
+            LoadedFileConfig::default()
         }
     }
 }

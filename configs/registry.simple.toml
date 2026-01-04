@@ -1,0 +1,33 @@
+# Minimal, working configuration (proxy + multi-upstream) intended to be hard to misconfigure.
+
+[profile]
+name = "best_practice"
+
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[token]
+service = "registry-rust"
+# Set a stable secret in production.
+signing_key = "change-me"
+ttl_secs = 600
+
+[storage]
+backend = "fs"
+
+[storage.fs]
+root = "./data"
+
+[proxy]
+enabled = true
+mode = "any"
+
+# Upstreams can be declared using inline tables.
+# Each entry must define:
+# - hosts: which inbound hosts select this upstream route
+# - base_url: upstream registry base URL
+# - max_cache_bytes: cache cap for that upstream route
+upstreams = [
+  { hosts = ["docker.io"], base_url = "https://registry-1.docker.io", max_cache_bytes = 10737418240 },
+  { hosts = ["ghcr.io"], base_url = "https://ghcr.io", max_cache_bytes = 10737418240 },
+]

@@ -26,6 +26,23 @@ password = "demo"
 # Optional allowlist; supports "org/*" and "*".
 allow_repos = ["*"]
 
+# Planned (not implemented yet): robot accounts + scoped grants (Harbor-style RBAC lite)
+#
+# Security note: avoid storing plaintext secrets in config. Use hashed secrets (Argon2id).
+# This block is commented out so it won't trip strict config parsing.
+#
+# [auth.robots]
+# enabled = true
+#
+# [[auth.robots.accounts]]
+# name = "ci"
+# secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+# grants = [
+#   { repo_prefix = "org1/", actions = ["pull","push"] },
+#   { repo_prefix = "library/", actions = ["pull"] },
+# ]
+# max_ttl_secs = 600
+
 [token]
 service = "registry-rust"
 # Set a stable secret in production.

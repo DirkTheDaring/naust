@@ -2,8 +2,10 @@ mod auth;
 mod config;
 mod http_api;
 mod proxy;
+mod rbac;
 mod registry;
 mod request_routing;
+mod robot_secrets;
 mod security;
 mod storage;
 
@@ -70,6 +72,28 @@ impl AppState {
 
 #[tokio::main]
 async fn main() {
+    // Helper: generate an Argon2id hash for a robot secret.
+    // Usage: `registry-rust hash-secret` (reads the secret from stdin).
+    if std::env::args().nth(1).as_deref() == Some("hash-secret") {
+        use std::io::Read as _;
+
+        let mut secret = String::new();
+        std::io::stdin()
+            .read_to_string(&mut secret)
+            .expect("read stdin");
+
+        match crate::robot_secrets::hash_robot_secret(&secret) {
+            Ok(hash) => {
+                println!("{hash}");
+                return;
+            }
+            Err(err) => {
+                eprintln!("hash-secret failed: {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())

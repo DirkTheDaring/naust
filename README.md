@@ -146,6 +146,14 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 
 You can optionally load configuration from a TOML file and still override any value via environment variables.
 
+By default, unknown TOML keys are ignored with a warning printed to stderr.
+
+To fail fast on unknown keys (recommended), enable strict parsing via one of:
+
+- `STRICT_CONFIG=1` (or `REGISTRY__CONFIG__STRICT=1`)
+- `[config].strict = true` in the TOML
+- best-practice profile (`BEST_PRACTICE=1` or `[profile].name="best_practice"`)
+
 ## Pull-through cache (proxy)
 
 This registry can act as a pull-through cache for selected upstream repositories (useful for Docker Hub rate limits).
@@ -153,8 +161,11 @@ This registry can act as a pull-through cache for selected upstream repositories
 Important: cached pull-through content is stored in a separate storage root/prefix (filesystem default: `./data/cache`).
 This prevents pushed images from being mixed into the cache and makes cache cleanup as simple as removing the cache directory.
 
-See `configs/registry.example.toml` for an annotated `proxy` configuration template.
-For a full working multi-upstream example (Docker Hub + GHCR in one process), see `configs/registry.proxy.multi.toml`.
+Minimal working config: `configs/registry.simple.toml`.
+
+Full reference config (all settings, annotated): `configs/registry.example.toml`.
+
+Multi-upstream example (Docker Hub + GHCR, one process): `configs/registry.proxy.multi.toml`.
 
 ### Unambiguous local vs cache behavior (route by Host)
 
