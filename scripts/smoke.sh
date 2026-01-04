@@ -40,7 +40,7 @@ if [[ $USE_TOML -eq 0 ]]; then
 fi
 
 log "Starting registry on $ADDR (repo=$REPO tag=$TAG)"
-RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" >/tmp/registry-rust.log 2>&1 &
+RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" server >/tmp/registry-rust.log 2>&1 &
 PID=$!
 cleanup() {
   kill "$PID" >/dev/null 2>&1 || true

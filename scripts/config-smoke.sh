@@ -28,7 +28,7 @@ if [[ ! -x "$BIN" ]]; then
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target2 cargo build -q)
 fi
 
-"$BIN" &
+"$BIN" server &
 PID=$!
 
 cleanup() {

@@ -7,7 +7,7 @@ Minimal Docker/OCI registry (Distribution v2-ish) in Rust.
 ```sh
 export REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo
 export REGISTRY_PUSH_ALLOW_REPOS=myrepo
-CARGO_TARGET_DIR=target2 cargo run
+CARGO_TARGET_DIR=target2 cargo run -- server
 ```
 
 Smoke test:
@@ -142,6 +142,13 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 
 ## Environment variables
 
+## CLI helpers
+
+- `registry-rust server [--config <PATH>]`: run the registry server
+- `registry-rust check-config [--config <PATH>]`: parse/validate config and exit
+- `registry-rust audit-permissions [--config <PATH>]`: print effective RBAC permissions and exit
+- `registry-rust hash-secret`: read a secret from stdin and print an Argon2id hash (for robots/users)
+
 ### Config file (TOML)
 
 You can optionally load configuration from a TOML file and still override any value via environment variables.
@@ -261,7 +268,7 @@ Example:
 ```sh
 CONFIG_PATH=./configs/registry.best_practice.toml \
 TOKEN_SIGNING_KEY='replace-me-with-a-long-random-secret' \
-CARGO_TARGET_DIR=target2 cargo run
+CARGO_TARGET_DIR=target2 cargo run -- server
 ```
 
 ### Canonical env var namespace

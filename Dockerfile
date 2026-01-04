@@ -35,3 +35,4 @@ EXPOSE 5000
 
 USER registry
 ENTRYPOINT ["/usr/local/bin/registry-rust"]
+CMD ["server"]

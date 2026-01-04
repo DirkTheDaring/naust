@@ -85,7 +85,7 @@ export TLS_CERT_PATH="$CERT_PATH"
 export TLS_KEY_PATH="$KEY_PATH"
 
 log "Starting registry on $ADDR (TLS enabled)"
-RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" >/tmp/registry-rust-podman.log 2>&1 &
+RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" server >/tmp/registry-rust-podman.log 2>&1 &
 PID=$!
 cleanup() {
   kill "$PID" >/dev/null 2>&1 || true

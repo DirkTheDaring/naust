@@ -131,7 +131,7 @@ EOF
 unset TLS_CERT_PATH TLS_KEY_PATH
 
 log "Starting upstream registry ($UPSTREAM_ADDR)"
-CONFIG_PATH="$TMP_UP" RUST_LOG=warn "$BIN" >/tmp/registry-rust-upstream.log 2>&1 &
+CONFIG_PATH="$TMP_UP" RUST_LOG=warn "$BIN" server >/tmp/registry-rust-upstream.log 2>&1 &
 PID_UP=$!
 sleep 0.5
 
@@ -165,7 +165,7 @@ _=$(curl -fsS -u "$USER:$PASS" -X PUT -H 'Content-Type: application/vnd.oci.imag
   "http://$UPSTREAM_ADDR/v2/$REPO/manifests/$TAG")
 
 log "Starting proxy registry ($PROXY_ADDR)"
-CONFIG_PATH="$TMP_PROXY" RUST_LOG=warn "$BIN" >/tmp/registry-rust-proxy.log 2>&1 &
+CONFIG_PATH="$TMP_PROXY" RUST_LOG=warn "$BIN" server >/tmp/registry-rust-proxy.log 2>&1 &
 PID_PROXY=$!
 sleep 0.6
 

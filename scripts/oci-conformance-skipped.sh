@@ -72,7 +72,7 @@ start_registry() {
     ALLOW_TAG_OVERWRITE=1 \
     PUBLIC_URL="${OCI_ROOT_URL}" \
     RUST_LOG=info \
-    ./target/debug/registry-rust >"${registry_log}" 2>&1 &
+    ./target/debug/registry-rust server >"${registry_log}" 2>&1 &
   registry_pid="$!"
 
   log "Waiting for registry to respond"

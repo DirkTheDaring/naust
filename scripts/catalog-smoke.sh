@@ -86,7 +86,7 @@ start_registry() {
   export CATALOG_REQUIRES_AUTH="$require_auth"
 
   log "Starting registry on $ADDR (CATALOG_REQUIRES_AUTH=$require_auth)"
-  RUST_LOG=warn "$BIN" >/tmp/registry-rust-catalog.log 2>&1 &
+  RUST_LOG=warn "$BIN" server >/tmp/registry-rust-catalog.log 2>&1 &
   PID=$!
   export PID
 }

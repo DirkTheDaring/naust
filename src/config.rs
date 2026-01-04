@@ -1880,7 +1880,8 @@ fn parse_toml_config(contents: &str) -> Result<(FileConfig, Vec<String>), toml::
 }
 
 fn load_config_file() -> LoadedFileConfig {
-    let Some(path) = env_str_any(&["CONFIG_PATH", "REGISTRY__CONFIG_PATH"]) else {
+    let Some(path) = env_str_any(&["CONFIG_PATH", "REGISTRY__CONFIG_PATH", "REGISTRY_TOML_PATH"])
+    else {
         return LoadedFileConfig::default();
     };
     let path = path.trim();

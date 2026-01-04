@@ -1,6 +1,7 @@
 # Example configuration file for registry-rust
 # Usage:
-#   CONFIG_PATH=/etc/registry/registry.toml ./registry-rust
+#   ./registry-rust server --config /etc/registry/registry.toml
+#   # (equivalently: CONFIG_PATH=/etc/registry/registry.toml ./registry-rust server)
 # Precedence:
 #   defaults < config file < env vars
 

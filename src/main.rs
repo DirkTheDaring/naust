@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod config;
 mod http_api;
@@ -19,6 +20,7 @@ use axum::{
     response::IntoResponse,
     routing::{any, get},
 };
+use clap::{Parser, Subcommand};
 use config::{Config, StorageBackend};
 use http_api::handlers;
 use semver::Version;
@@ -33,6 +35,44 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "registry-rust",
+    about = "Minimal Docker/OCI registry (Distribution v2-ish)",
+    version,
+    arg_required_else_help = true,
+    disable_help_subcommand = true
+)]
+struct Cli {
+    /// Path to a TOML config file.
+    ///
+    /// Equivalent to setting `CONFIG_PATH`.
+    #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
+    config: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// Run the registry server.
+    #[command(name = "server")]
+    Server,
+
+    /// Parse and validate configuration, then exit.
+    #[command(name = "check-config")]
+    CheckConfig,
+
+    /// Read a secret from stdin and print an Argon2id hash (for robots/users).
+    #[command(name = "hash-secret")]
+    HashSecret,
+
+    /// Print effective RBAC permissions (robots + users/groups) and exit.
+    #[command(name = "audit-permissions")]
+    AuditPermissions,
+}
 
 #[derive(Debug, Default)]
 pub struct AuthMetrics {
@@ -100,26 +140,76 @@ impl AppState {
 
 #[tokio::main]
 async fn main() {
-    // Helper: generate an Argon2id hash for a robot secret.
-    // Usage: `registry-rust hash-secret` (reads the secret from stdin).
-    if std::env::args().nth(1).as_deref() == Some("hash-secret") {
-        use std::io::Read as _;
+    let cli = Cli::parse();
 
-        let mut secret = String::new();
-        std::io::stdin()
-            .read_to_string(&mut secret)
-            .expect("read stdin");
+    if let Some(path) = &cli.config {
+        // In Rust 2024, mutating environment variables is `unsafe`.
+        // This happens before we spawn any tasks.
+        unsafe {
+            std::env::set_var("CONFIG_PATH", path);
+        }
+    }
 
-        match crate::robot_secrets::hash_robot_secret(&secret) {
-            Ok(hash) => {
-                println!("{hash}");
-                return;
-            }
-            Err(err) => {
-                eprintln!("hash-secret failed: {err}");
-                std::process::exit(2);
+    match cli.command {
+        CliCommand::CheckConfig => {
+            let _cfg = match std::panic::catch_unwind(Config::from_env) {
+                Ok(c) => c,
+                Err(err) => {
+                    let msg = if let Some(s) = err.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = err.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else {
+                        "<non-string panic>".to_string()
+                    };
+                    eprintln!("check-config: failed to load config: {msg}");
+                    std::process::exit(2);
+                }
+            };
+
+            println!("OK");
+            return;
+        }
+        CliCommand::AuditPermissions => {
+            // Access audit: print effective permissions and exit.
+            let cfg = match std::panic::catch_unwind(Config::from_env) {
+                Ok(c) => c,
+                Err(err) => {
+                    let msg = if let Some(s) = err.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = err.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else {
+                        "<non-string panic>".to_string()
+                    };
+                    eprintln!("audit-permissions: failed to load config: {msg}");
+                    std::process::exit(2);
+                }
+            };
+
+            let _report = crate::audit::print_audit(&cfg);
+            return;
+        }
+        CliCommand::HashSecret => {
+            use std::io::Read as _;
+
+            let mut secret = String::new();
+            std::io::stdin()
+                .read_to_string(&mut secret)
+                .expect("read stdin");
+
+            match crate::robot_secrets::hash_robot_secret(&secret) {
+                Ok(hash) => {
+                    println!("{hash}");
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("hash-secret failed: {err}");
+                    std::process::exit(2);
+                }
             }
         }
+        CliCommand::Server => {}
     }
 
     tracing_subscriber::registry()
@@ -127,7 +217,20 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = Arc::new(Config::from_env());
+    let config = match std::panic::catch_unwind(Config::from_env) {
+        Ok(c) => Arc::new(c),
+        Err(err) => {
+            let msg = if let Some(s) = err.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = err.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else {
+                "<non-string panic>".to_string()
+            };
+            eprintln!("server: failed to load config: {msg}");
+            std::process::exit(2);
+        }
+    };
     let addr = config.listen_addr;
     let storage = storage::from_config(config.as_ref());
 
