@@ -163,6 +163,8 @@ This prevents pushed images from being mixed into the cache and makes cache clea
 
 Minimal working config: `configs/registry.simple.toml`.
 
+Users/groups example (Harbor-lite Phase 2): `configs/registry.users_groups.toml`.
+
 Full reference config (all settings, annotated): `configs/registry.example.toml`.
 
 Multi-upstream example (Docker Hub + GHCR, one process): `configs/registry.proxy.multi.toml`.
@@ -281,6 +283,16 @@ To reduce brute-force and protect expensive password/hash verification, `/token`
   - `TOKEN_RATE_LIMIT_RPM` / `REGISTRY__TOKEN__RATE_LIMIT_RPM` (default: `1200`)
   - `TOKEN_RATE_LIMIT_WINDOW_SECS` / `REGISTRY__TOKEN__RATE_LIMIT_WINDOW_SECS` (default: `60`)
 
+### Harbor-lite RBAC (robots + users/groups)
+
+Push tokens are authorized via deterministic repo-prefix grants (deny-by-default):
+
+- **Robots**: `[auth.robots]` + `[[auth.robots.accounts]]` (config-only)
+- **Users + groups**: `[auth.users]` + `[[auth.users.accounts]]` + `[[auth.groups]]` (config-only)
+
+These settings are TOML-only to keep reviewable policy in source control.
+See `docs/rbac.md` and `docs/harbor-lite-phase2.md`.
+
 ### Config option inventory
 
 Precedence: defaults < config file < env vars
@@ -328,6 +340,8 @@ key = "<old-long-random-secret>"
 | Push username | `auth.push.username` | `REGISTRY__AUTH__PUSH__USERNAME` | `REGISTRY_USERNAME` | unset |
 | Push password | `auth.push.password` | `REGISTRY__AUTH__PUSH__PASSWORD` | `REGISTRY_PASSWORD` | unset |
 | Push allowlist | `auth.push.allow_repos` | `REGISTRY__AUTH__PUSH__ALLOW_REPOS` | `REGISTRY_PUSH_ALLOW_REPOS` | unset |
+| Robot accounts (RBAC) | `auth.robots` | (n/a) | (n/a) | disabled |
+| Users/groups (RBAC) | `auth.users` / `auth.groups` | (n/a) | (n/a) | disabled |
 | Storage backend | `storage.backend` | `REGISTRY__STORAGE__BACKEND` | `STORAGE_BACKEND` | `fs` |
 | FS root | `storage.fs.root` | `REGISTRY__STORAGE__FS__ROOT` | `STORAGE_FS_ROOT` | `./data` |
 | S3 endpoint | `storage.s3.endpoint` | `REGISTRY__STORAGE__S3__ENDPOINT` | `STORAGE_S3_ENDPOINT` | unset |

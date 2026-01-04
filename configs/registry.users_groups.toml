@@ -1,0 +1,42 @@
+# Example: Harbor-lite users + groups (config-only).
+#
+# This file is intended as a minimal starting point for using:
+# - [auth.users] + [[auth.users.accounts]]
+# - [[auth.groups]]
+#
+# Generate Argon2id hashes using the CLI helper (see docs/rbac.md).
+
+[server]
+listen_addr = "127.0.0.1:5000"
+public_url = "http://127.0.0.1:5000"
+
+[token]
+service = "registry-rust"
+# Set a stable secret in production.
+signing_key = "change-me"
+ttl_secs = 600
+
+[storage]
+backend = "fs"
+
+[storage.fs]
+root = "./data"
+
+# Harbor-lite Phase 2 (implemented): users + groups.
+[auth.users]
+enabled = true
+
+[[auth.users.accounts]]
+name = "alice"
+# Replace with an actual Argon2id hash.
+secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+# Group membership
+groups = ["devs"]
+# Optional per-user TTL cap
+max_ttl_secs = 600
+
+[[auth.groups]]
+name = "devs"
+grants = [
+  { repo_prefix = "org1/", actions = ["pull", "push"] },
+]

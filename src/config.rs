@@ -1057,83 +1057,7 @@ impl Config {
                 .collect(),
         };
 
-        let groups = file_cfg
-            .auth
-            .groups
-            .iter()
-            .map(|g| GroupConfig {
-                name: g.name.trim().to_string(),
-                grants: g
-                    .grants
-                    .iter()
-                    .map(|gr| crate::rbac::Grant {
-                        repo_prefix: gr.repo_prefix.trim().to_string(),
-                        actions: gr
-                            .actions
-                            .iter()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect(),
-                    })
-                    .collect(),
-            })
-            .filter(|g| !g.name.is_empty())
-            .collect::<Vec<_>>();
-
-        // Validate group uniqueness + grants when users are enabled.
-        let users_enabled = file_cfg.auth.users.enabled.unwrap_or(false);
-        if users_enabled {
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for g in &groups {
-                if !seen.insert(g.name.clone()) {
-                    panic!("auth.groups contains duplicate name='{}'", g.name);
-                }
-                let _ = crate::rbac::validate_grants(&g.grants)
-                    .unwrap_or_else(|e| panic!("invalid grants in group '{}': {:?}", g.name, e));
-            }
-        }
-
-        let users = UsersConfig {
-            enabled: users_enabled,
-            groups: groups.clone(),
-            accounts: file_cfg
-                .auth
-                .users
-                .accounts
-                .iter()
-                .map(|a| UserAccountConfig {
-                    name: a.name.trim().to_string(),
-                    secret_hash: a.secret_hash.trim().to_string(),
-                    groups: a
-                        .groups
-                        .iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                    max_ttl_secs: a.max_ttl_secs,
-                })
-                .filter(|a| !a.name.is_empty())
-                .collect(),
-        };
-
-        if users.enabled {
-            for a in &users.accounts {
-                if a.secret_hash.is_empty() {
-                    panic!(
-                        "auth.users.accounts entry '{}' has empty secret_hash",
-                        a.name
-                    );
-                }
-                for grp in &a.groups {
-                    if !groups.iter().any(|g| g.name == *grp) {
-                        panic!(
-                            "auth.users.accounts '{}' references unknown group '{}'",
-                            a.name, grp
-                        );
-                    }
-                }
-            }
-        }
+        let users = resolve_users_config(&file_cfg);
 
         let proxy_enabled = env_bool_opt(&["REGISTRY__PROXY__ENABLED", "PROXY_ENABLED"])
             .or(file_cfg.proxy.enabled)
@@ -1457,6 +1381,88 @@ impl Config {
     }
 }
 
+fn resolve_users_config(file_cfg: &FileConfig) -> UsersConfig {
+    let groups = file_cfg
+        .auth
+        .groups
+        .iter()
+        .map(|g| GroupConfig {
+            name: g.name.trim().to_string(),
+            grants: g
+                .grants
+                .iter()
+                .map(|gr| crate::rbac::Grant {
+                    repo_prefix: gr.repo_prefix.trim().to_string(),
+                    actions: gr
+                        .actions
+                        .iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                })
+                .collect(),
+        })
+        .filter(|g| !g.name.is_empty())
+        .collect::<Vec<_>>();
+
+    // Validate group uniqueness + grants when users are enabled.
+    let enabled = file_cfg.auth.users.enabled.unwrap_or(false);
+    if enabled {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for g in &groups {
+            if !seen.insert(g.name.clone()) {
+                panic!("auth.groups contains duplicate name='{}'", g.name);
+            }
+            let _ = crate::rbac::validate_grants(&g.grants)
+                .unwrap_or_else(|e| panic!("invalid grants in group '{}': {:?}", g.name, e));
+        }
+    }
+
+    let users = UsersConfig {
+        enabled,
+        groups: groups.clone(),
+        accounts: file_cfg
+            .auth
+            .users
+            .accounts
+            .iter()
+            .map(|a| UserAccountConfig {
+                name: a.name.trim().to_string(),
+                secret_hash: a.secret_hash.trim().to_string(),
+                groups: a
+                    .groups
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                max_ttl_secs: a.max_ttl_secs,
+            })
+            .filter(|a| !a.name.is_empty())
+            .collect(),
+    };
+
+    if users.enabled {
+        for a in &users.accounts {
+            if a.secret_hash.is_empty() {
+                panic!(
+                    "auth.users.accounts entry '{}' has empty secret_hash",
+                    a.name
+                );
+            }
+            for grp in &a.groups {
+                if !groups.iter().any(|g| g.name == *grp) {
+                    panic!(
+                        "auth.users.accounts '{}' references unknown group '{}'",
+                        a.name, grp
+                    );
+                }
+            }
+        }
+    }
+
+    users
+}
+
 fn resolve_proxy_upstreams(
     storage_backend: &StorageBackend,
     fs_root: &PathBuf,
@@ -1661,6 +1667,15 @@ fn resolve_proxy_upstreams(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = err.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = err.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "<non-string panic>".to_string()
+        }
+    }
 
     #[test]
     fn proxy_upstreams_shorthand_parses_and_resolves() {
@@ -1758,6 +1773,59 @@ root = "./data"
         assert!(
             !ignored_paths.iter().any(|p| p == "server.listen_addr"),
             "known key should not be reported"
+        );
+    }
+
+    #[test]
+    fn users_groups_toml_parses_into_config_when_enabled() {
+        let cfg = r#"
+[auth.users]
+enabled = true
+
+[[auth.groups]]
+name = "devs"
+grants = [
+  { repo_prefix = "org/", actions = ["pull", "push"] },
+]
+
+[[auth.users.accounts]]
+name = "alice"
+secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$example$example"
+groups = ["devs"]
+max_ttl_secs = 123
+"#;
+
+        let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
+        let cfg = resolve_users_config(&file_cfg);
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.groups[0].name, "devs");
+        assert_eq!(cfg.accounts.len(), 1);
+        assert_eq!(cfg.accounts[0].name, "alice");
+        assert_eq!(cfg.accounts[0].groups, vec!["devs".to_string()]);
+        assert_eq!(cfg.accounts[0].max_ttl_secs, Some(123));
+    }
+
+    #[test]
+    fn users_groups_rejects_unknown_group_reference() {
+        let cfg = r#"
+[auth.users]
+enabled = true
+
+[[auth.users.accounts]]
+name = "alice"
+secret_hash = "not-empty"
+groups = ["missing"]
+"#;
+
+        let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
+        let err =
+            std::panic::catch_unwind(|| resolve_users_config(&file_cfg)).expect_err("should panic");
+        let msg = panic_message(err);
+        assert!(
+            msg.contains("references unknown group"),
+            "unexpected panic message: {msg}"
         );
     }
 }

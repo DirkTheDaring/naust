@@ -1,4 +1,4 @@
-# RBAC / Harbor-style users & groups (security review + implementation plan)
+# RBAC / Harbor-style robots, users & groups
 
 This document captures a security-first, reviewable approach to Harbor-style authorization for `registry-rust`.
 
@@ -88,12 +88,30 @@ This is intentionally flat and reviewable.
 # max_ttl_secs = 600
 ```
 
+Implemented Phase 2 (users + groups) uses the same grant format, but assigns grants via group membership:
+
+```toml
+[auth.users]
+enabled = true
+
+[[auth.users.accounts]]
+name = "alice"
+secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+groups = ["devs"]
+
+[[auth.groups]]
+name = "devs"
+grants = [
+   { repo_prefix = "org1/", actions = ["pull","push"] },
+]
+```
+
 Design constraints:
 - avoid regex in v1 (prefix is enough for most org layouts)
 - explicit actions only
 - `repo_prefix` should typically end with `/` (enforceable)
 
-## Implementation outline (phased)
+## Implementation outline (historical)
 
 ### Phase 1 — Pure policy engine (reviewability first)
 
@@ -203,8 +221,8 @@ Legacy rotation procedure (single key):
 
 ### Limitations / planned improvements
 
-- Harbor-style human users/groups/projects are not implemented (robots-only model today).
-- A concrete plan for adding users+groups (without an identity system) is in `docs/harbor-lite-phase2.md`.
+- Harbor-style users + groups are implemented (config-only). See `docs/harbor-lite-phase2.md`.
+- Projects/tenants, external IdP integration (OIDC/LDAP), and UI/CRUD flows are out of scope.
 - No persistent token revocation list (by design); rely on short TTL + key removal/rotation.
 - Token endpoint rate limiting is global (not per-IP). Consider adding per-IP limiting if exposed to untrusted networks.
 
