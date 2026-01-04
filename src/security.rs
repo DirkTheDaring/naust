@@ -3,6 +3,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
@@ -34,9 +35,19 @@ pub struct TokenClaims {
 
     // Present in tokens we mint, but not required for verification.
     #[serde(default)]
+    pub iss: Option<String>,
+    #[serde(default)]
     pub sub: Option<String>,
     #[serde(default)]
     pub iat: Option<u64>,
+
+    // Audience binding (service name). We mint this and enforce it for auth.
+    #[serde(default)]
+    pub aud: Option<String>,
+
+    // Unique ID (useful for log correlation; not persisted).
+    #[serde(default)]
+    pub jti: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -93,18 +104,50 @@ pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims
     Ok(claims)
 }
 
+pub fn verify_bearer_token_bound(
+    signing_key: &str,
+    token: &str,
+    expected_aud: &str,
+    max_ttl_secs: u64,
+) -> Result<TokenClaims, TokenError> {
+    let claims = verify_bearer_token(signing_key, token)?;
+
+    if claims.aud.as_deref() != Some(expected_aud) {
+        return Err(TokenError::InvalidPayload);
+    }
+
+    let Some(iat) = claims.iat else {
+        return Err(TokenError::InvalidPayload);
+    };
+    if claims.exp < iat {
+        return Err(TokenError::InvalidPayload);
+    }
+    if max_ttl_secs > 0 {
+        let ttl = claims.exp.saturating_sub(iat);
+        if ttl > max_ttl_secs {
+            return Err(TokenError::InvalidPayload);
+        }
+    }
+
+    Ok(claims)
+}
+
 pub fn issue_bearer_token(
     signing_key: &str,
+    aud: &str,
     subject: Option<&str>,
     scopes: &[TokenScope],
     iat: u64,
     exp: u64,
 ) -> Result<String, TokenError> {
     let claims = TokenClaims {
+        iss: Some("registry-rust".to_string()),
         sub: subject.map(|s| s.to_string()),
         iat: Some(iat),
         exp,
         scopes: scopes.to_vec(),
+        aud: Some(aud.to_string()),
+        jti: Some(Uuid::new_v4().to_string()),
     };
 
     let payload_bytes = serde_json::to_vec(&claims).map_err(|_| TokenError::InvalidPayload)?;
@@ -141,6 +184,7 @@ mod tests {
     #[test]
     fn bearer_round_trip_ok() {
         let signing_key = "test-signing-key";
+        let aud = "registry";
         let now = now_secs();
         let scopes = vec![TokenScope {
             typ: "repository".to_string(),
@@ -148,11 +192,15 @@ mod tests {
             actions: vec!["pull".to_string(), "push".to_string()],
         }];
 
-        let token = issue_bearer_token(signing_key, Some("user"), &scopes, now, now + 3600)
+        let token = issue_bearer_token(signing_key, aud, Some("user"), &scopes, now, now + 3600)
             .expect("issue token");
-        let claims = verify_bearer_token(signing_key, &token).expect("verify token");
+        let claims =
+            verify_bearer_token_bound(signing_key, &token, aud, 3600).expect("verify token");
 
+        assert_eq!(claims.iss.as_deref(), Some("registry-rust"));
         assert_eq!(claims.sub.as_deref(), Some("user"));
+        assert_eq!(claims.aud.as_deref(), Some(aud));
+        assert!(claims.jti.as_deref().is_some_and(|s| !s.is_empty()));
         assert!(token_allows_repo_action(
             &claims,
             "org/repo",
@@ -173,12 +221,14 @@ mod tests {
     #[test]
     fn bearer_expired_rejected() {
         let signing_key = "test-signing-key";
+        let aud = "registry";
         let now = now_secs();
         let scopes: Vec<TokenScope> = Vec::new();
 
-        let token = issue_bearer_token(signing_key, None, &scopes, now, now.saturating_sub(1))
+        let token = issue_bearer_token(signing_key, aud, None, &scopes, now, now.saturating_sub(1))
             .expect("issue token");
-        let err = verify_bearer_token(signing_key, &token).expect_err("should be expired");
+        let err = verify_bearer_token_bound(signing_key, &token, aud, 3600)
+            .expect_err("should be expired");
 
         match err {
             TokenError::Expired => {}
@@ -198,10 +248,11 @@ mod tests {
     #[test]
     fn bearer_tampered_signature_rejected() {
         let signing_key = "test-signing-key";
+        let aud = "registry";
         let now = now_secs();
         let scopes: Vec<TokenScope> = Vec::new();
-        let token =
-            issue_bearer_token(signing_key, None, &scopes, now, now + 3600).expect("issue token");
+        let token = issue_bearer_token(signing_key, aud, None, &scopes, now, now + 3600)
+            .expect("issue token");
 
         let (payload, sig) = token.split_once('.').expect("token format");
         let mut sig_bytes = sig.as_bytes().to_vec();
@@ -222,7 +273,8 @@ mod tests {
     fn bearer_wrong_key_rejected() {
         let now = now_secs();
         let scopes: Vec<TokenScope> = Vec::new();
-        let token = issue_bearer_token("key-a", None, &scopes, now, now + 3600).expect("issue");
+        let token =
+            issue_bearer_token("key-a", "registry", None, &scopes, now, now + 3600).expect("issue");
 
         let err = verify_bearer_token("key-b", &token).expect_err("wrong key");
         match err {
@@ -259,5 +311,33 @@ mod tests {
         // Proper structure but invalid base64/signature should not look like a format issue.
         let err = verify_bearer_token("k", "cGF5bG9hZA.sig").expect_err("signature");
         assert!(matches!(err, TokenError::InvalidSignature));
+    }
+
+    #[test]
+    fn bearer_wrong_audience_rejected() {
+        let signing_key = "test-signing-key";
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+
+        let token = issue_bearer_token(signing_key, "aud-a", None, &scopes, now, now + 3600)
+            .expect("issue");
+
+        let err =
+            verify_bearer_token_bound(signing_key, &token, "aud-b", 3600).expect_err("wrong aud");
+        assert!(matches!(err, TokenError::InvalidPayload));
+    }
+
+    #[test]
+    fn bearer_ttl_over_max_rejected() {
+        let signing_key = "test-signing-key";
+        let now = now_secs();
+        let scopes: Vec<TokenScope> = Vec::new();
+
+        let token = issue_bearer_token(signing_key, "registry", None, &scopes, now, now + 7200)
+            .expect("issue");
+
+        let err = verify_bearer_token_bound(signing_key, &token, "registry", 3600)
+            .expect_err("ttl too large");
+        assert!(matches!(err, TokenError::InvalidPayload));
     }
 }

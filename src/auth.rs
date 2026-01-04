@@ -123,7 +123,12 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
 
     // Bearer: accept any valid, unexpired token minted by this registry.
     if let Some(token) = bearer_token_from_headers(headers) {
-        if let Ok(claims) = security::verify_bearer_token(&state.config.token_signing_key, token) {
+        if let Ok(claims) = security::verify_bearer_token_bound(
+            &state.config.token_signing_key,
+            token,
+            &state.config.token_service,
+            state.config.token_ttl_secs,
+        ) {
             if bearer_claims_are_authenticated(&claims) {
                 return true;
             }
@@ -177,7 +182,12 @@ pub async fn require_push_basic_auth(
 
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
-        if let Ok(claims) = security::verify_bearer_token(&state.config.token_signing_key, token) {
+        if let Ok(claims) = security::verify_bearer_token_bound(
+            &state.config.token_signing_key,
+            token,
+            &state.config.token_service,
+            state.config.token_ttl_secs,
+        ) {
             if !bearer_claims_are_authenticated(&claims) {
                 return unauthorized_registry_challenge(&state, Some(repo_name));
             }
@@ -249,6 +259,7 @@ mod tests {
     #[test]
     fn bearer_claims_authentication_requires_non_empty_sub() {
         let signing_key = "test-signing-key";
+        let aud = "registry";
         let now = now_secs();
         let scopes: Vec<security::TokenScope> = vec![security::TokenScope {
             typ: "repository".to_string(),
@@ -256,15 +267,17 @@ mod tests {
             actions: vec!["pull".to_string()],
         }];
 
-        let anon = security::issue_bearer_token(signing_key, None, &scopes, now, now + 3600)
+        let anon = security::issue_bearer_token(signing_key, aud, None, &scopes, now, now + 3600)
             .expect("issue token");
-        let claims_anon = security::verify_bearer_token(signing_key, &anon).expect("verify");
+        let claims_anon =
+            security::verify_bearer_token_bound(signing_key, &anon, aud, 3600).expect("verify");
         assert!(!bearer_claims_are_authenticated(&claims_anon));
 
         let user =
-            security::issue_bearer_token(signing_key, Some("user"), &scopes, now, now + 3600)
+            security::issue_bearer_token(signing_key, aud, Some("user"), &scopes, now, now + 3600)
                 .expect("issue token");
-        let claims_user = security::verify_bearer_token(signing_key, &user).expect("verify");
+        let claims_user =
+            security::verify_bearer_token_bound(signing_key, &user, aud, 3600).expect("verify");
         assert!(bearer_claims_are_authenticated(&claims_user));
     }
 

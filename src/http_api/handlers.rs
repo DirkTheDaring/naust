@@ -168,11 +168,20 @@ pub async fn token(
     // Expected query params:
     //   service=<name>
     //   scope=repository:<repo>:pull,push
+    let mut service_param: Option<String> = None;
     let mut scopes_raw: Vec<String> = Vec::new();
     let raw = raw_query.0.unwrap_or_default();
     for (k, v) in form_urlencoded::parse(raw.as_bytes()) {
-        if k == "scope" {
+        if k == "service" {
+            service_param = Some(v.into_owned());
+        } else if k == "scope" {
             scopes_raw.push(v.into_owned());
+        }
+    }
+
+    if let Some(svc) = service_param.as_deref() {
+        if svc != state.config.token_service {
+            return errors::denied("invalid token service").into_response();
         }
     }
     let scopes = scopes_raw
@@ -366,8 +375,15 @@ fn issue_token(
     iat: u64,
     exp: u64,
 ) -> Result<String, ()> {
-    security::issue_bearer_token(&state.config.token_signing_key, subject, scopes, iat, exp)
-        .map_err(|_| ())
+    security::issue_bearer_token(
+        &state.config.token_signing_key,
+        &state.config.token_service,
+        subject,
+        scopes,
+        iat,
+        exp,
+    )
+    .map_err(|_| ())
 }
 
 fn format_rfc3339(unix_secs: u64) -> String {
