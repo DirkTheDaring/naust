@@ -1,0 +1,47 @@
+# Build registry-rust RPMs inside a Fedora container.
+#
+# Usage (podman):
+#   podman build -f packaging/docker/Dockerfile.fedora-rpmbuild \
+#     --build-arg FEDORA_VERSION=40 -t registry-rust-rpmbuild:40 .
+#   podman run --rm -e HOME=/tmp -v "$PWD:/workspace:Z" -w /workspace \
+#     registry-rust-rpmbuild:40 make clean-rpm rpm
+#
+# Note: We install Rust via rustup so the toolchain is not tied to the Fedora release.
+
+ARG FEDORA_VERSION=43
+FROM fedora:${FEDORA_VERSION}
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+# Base build tooling + RPM tooling.
+RUN dnf -y update \
+ && dnf -y install \
+      ca-certificates \
+      curl \
+      findutils \
+      gcc \
+      gcc-c++ \
+      git \
+      make \
+      cmake \
+      pkgconf-pkg-config \
+      perl \
+      tar \
+      gzip \
+      xz \
+      rpm-build \
+      rpmdevtools \
+      systemd-rpm-macros \
+      which \
+ && dnf -y clean all
+
+# Rust toolchain via rustup (keeps edition 2024 working on older Fedora).
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+ && rustc --version \
+ && cargo --version
+
+WORKDIR /workspace

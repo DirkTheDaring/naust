@@ -77,6 +77,24 @@ docker compose up --build
 
 This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`registry-data`).
 
+## Build RPM (containerized, Fedora)
+
+The default `make rpm` builds on the host.
+
+To build the RPM inside a specific Fedora release (useful for targeting different Fedora versions), use the container build helper:
+
+```sh
+packaging/docker/build-rpm-in-fedora.sh 40
+```
+
+If rootless Podman fails (e.g. because your home directory is mounted `noexec`), use:
+
+```sh
+packaging/docker/build-rpm-in-fedora.sh --rootful 40
+```
+
+Artifacts are written to `./dist/rpmbuild/RPMS/...` as usual.
+
 ### Config file (optional)
 
 To run with a TOML config file via compose, use the overlay and set `REGISTRY_TOML_PATH`:
