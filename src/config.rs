@@ -41,6 +41,8 @@ pub struct Config {
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
 
+    pub tls_acme: Option<AcmeConfig>,
+
     pub push_username: Option<String>,
     pub push_password: Option<String>,
     pub push_allow_repos: Option<Vec<String>>,
@@ -295,6 +297,31 @@ pub enum StorageBackend {
     S3,
 }
 
+#[derive(Clone, Debug)]
+pub struct AcmeConfig {
+    pub email: String,
+    pub names: Vec<String>,
+    pub output_dir: PathBuf,
+    pub allow_first_wildcard: bool,
+    pub renewal_window_secs: u64,
+    pub proxy: Option<String>,
+    pub debug: bool,
+    pub propagation_check_disabled: bool,
+    pub propagation_check_strict: bool,
+    pub provider: AcmeProvider,
+}
+
+#[derive(Clone, Debug)]
+pub enum AcmeProvider {
+    Ispone {
+        base_url: String,
+        authorization: String,
+    },
+    ExecPath {
+        exec_path: PathBuf,
+    },
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
@@ -531,6 +558,68 @@ struct FileTls {
     cert_path: Option<String>,
     #[serde(default)]
     key_path: Option<String>,
+
+    #[serde(default)]
+    acme: FileTlsAcme,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileTlsAcme {
+    #[serde(default)]
+    enabled: Option<bool>,
+
+    // "ispone" or "exec_path".
+    #[serde(default)]
+    provider: Option<String>,
+
+    #[serde(default)]
+    email: Option<String>,
+
+    #[serde(default)]
+    names: Vec<String>,
+
+    // Directory where acmecert-core writes cert.pem + key.pem.
+    #[serde(default)]
+    output_dir: Option<String>,
+
+    #[serde(default)]
+    allow_first_wildcard: Option<bool>,
+
+    #[serde(default)]
+    renewal_window_secs: Option<u64>,
+
+    // Optional HTTP proxy for ACME + hook calls.
+    #[serde(default)]
+    proxy: Option<String>,
+
+    #[serde(default)]
+    debug: Option<bool>,
+
+    // DNS TXT propagation pre-checks.
+    #[serde(default)]
+    propagation_check_disabled: Option<bool>,
+    #[serde(default)]
+    propagation_check_strict: Option<bool>,
+
+    #[serde(default)]
+    ispone: FileTlsAcmeIspone,
+
+    #[serde(default)]
+    exec_path: FileTlsAcmeExec,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileTlsAcmeIspone {
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    authorization: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileTlsAcmeExec {
+    #[serde(default)]
+    exec_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -775,16 +864,210 @@ impl Config {
                     .unwrap_or_else(|| ([127, 0, 0, 1], 5000).into())
             });
 
-        let tls_cert_path = env_str_any(&["REGISTRY__SERVER__TLS__CERT_PATH", "TLS_CERT_PATH"])
+        let mut tls_cert_path = env_str_any(&["REGISTRY__SERVER__TLS__CERT_PATH", "TLS_CERT_PATH"])
             .or_else(|| file_cfg.server.tls.cert_path.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        let tls_key_path = env_str_any(&["REGISTRY__SERVER__TLS__KEY_PATH", "TLS_KEY_PATH"])
+        let mut tls_key_path = env_str_any(&["REGISTRY__SERVER__TLS__KEY_PATH", "TLS_KEY_PATH"])
             .or_else(|| file_cfg.server.tls.key_path.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+
+        // ACME TLS provisioning (DNS-01 via acmecert-core).
+        let acme_enabled = env_bool_opt(&[
+            "REGISTRY__SERVER__TLS__ACME__ENABLED",
+            "TLS_ACME_ENABLED",
+        ])
+        .or(file_cfg.server.tls.acme.enabled)
+        .unwrap_or(false);
+
+        let tls_acme = if acme_enabled {
+            let provider_raw = env_str_any(&[
+                "REGISTRY__SERVER__TLS__ACME__PROVIDER",
+                "TLS_ACME_PROVIDER",
+            ])
+            .or_else(|| file_cfg.server.tls.acme.provider.clone())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "ispone".to_string());
+
+            let email = env_str_any(&["REGISTRY__SERVER__TLS__ACME__EMAIL", "TLS_ACME_EMAIL"])
+                .or_else(|| file_cfg.server.tls.acme.email.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ACME is enabled but email is missing: set server.tls.acme.email (or TLS_ACME_EMAIL)"
+                    )
+                });
+
+            let names = {
+                let mut out = env_str_any(&["REGISTRY__SERVER__TLS__ACME__NAMES", "TLS_ACME_NAMES"])
+                    .map(|s| {
+                        s.split(',')
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| file_cfg.server.tls.acme.names.clone());
+                out.retain(|s| !s.trim().is_empty());
+                if out.is_empty() {
+                    panic!(
+                        "ACME is enabled but names is empty: set server.tls.acme.names (or TLS_ACME_NAMES)"
+                    );
+                }
+                out
+            };
+
+            let output_dir = env_str_any(&[
+                "REGISTRY__SERVER__TLS__ACME__OUTPUT_DIR",
+                "TLS_ACME_OUTPUT_DIR",
+            ])
+            .or_else(|| file_cfg.server.tls.acme.output_dir.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "ACME is enabled but output_dir is missing: set server.tls.acme.output_dir (or TLS_ACME_OUTPUT_DIR)"
+                )
+            });
+
+            let allow_first_wildcard = env_bool_opt(&[
+                "REGISTRY__SERVER__TLS__ACME__ALLOW_FIRST_WILDCARD",
+                "TLS_ACME_ALLOW_FIRST_WILDCARD",
+            ])
+            .or(file_cfg.server.tls.acme.allow_first_wildcard)
+            .unwrap_or(false);
+
+            let renewal_window_secs = env_u64_any(&[
+                "REGISTRY__SERVER__TLS__ACME__RENEWAL_WINDOW_SECS",
+                "TLS_ACME_RENEWAL_WINDOW_SECS",
+            ])
+            .or(file_cfg.server.tls.acme.renewal_window_secs)
+            .unwrap_or(30 * 24 * 60 * 60);
+
+            let proxy = env_str_any(&["REGISTRY__SERVER__TLS__ACME__PROXY", "TLS_ACME_PROXY"])
+                .or_else(|| file_cfg.server.tls.acme.proxy.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let debug = env_bool_opt(&["REGISTRY__SERVER__TLS__ACME__DEBUG", "TLS_ACME_DEBUG"])
+                .or(file_cfg.server.tls.acme.debug)
+                .unwrap_or(false);
+
+            let propagation_check_disabled = env_bool_opt(&[
+                "REGISTRY__SERVER__TLS__ACME__PROPAGATION_CHECK_DISABLED",
+                "TLS_ACME_PROPAGATION_CHECK_DISABLED",
+            ])
+            .or(file_cfg.server.tls.acme.propagation_check_disabled)
+            .unwrap_or(false);
+
+            let propagation_check_strict = env_bool_opt(&[
+                "REGISTRY__SERVER__TLS__ACME__PROPAGATION_CHECK_STRICT",
+                "TLS_ACME_PROPAGATION_CHECK_STRICT",
+            ])
+            .or(file_cfg.server.tls.acme.propagation_check_strict)
+            .unwrap_or(false);
+
+            let provider = match provider_raw.as_str() {
+                "ispone" => {
+                    let base_url = env_str_any(&[
+                        "REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL",
+                        "TLS_ACME_ISPONE_BASE_URL",
+                    ])
+                    .or_else(|| file_cfg.server.tls.acme.ispone.base_url.clone())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "ACME provider 'ispone' requires base_url: set server.tls.acme.ispone.base_url (or TLS_ACME_ISPONE_BASE_URL)"
+                        )
+                    });
+
+                    let authorization = env_str_any(&[
+                        "REGISTRY__SERVER__TLS__ACME__ISPONE__AUTHORIZATION",
+                        "TLS_ACME_ISPONE_AUTHORIZATION",
+                    ])
+                    .or_else(|| file_cfg.server.tls.acme.ispone.authorization.clone())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "ACME provider 'ispone' requires authorization: set server.tls.acme.ispone.authorization (or TLS_ACME_ISPONE_AUTHORIZATION)"
+                        )
+                    });
+
+                    AcmeProvider::Ispone {
+                        base_url,
+                        authorization,
+                    }
+                }
+                "exec_path" | "exec" => {
+                    let exec_path = env_str_any(&[
+                        "REGISTRY__SERVER__TLS__ACME__EXEC_PATH__EXEC_PATH",
+                        "TLS_ACME_EXEC_PATH",
+                    ])
+                    .or_else(|| file_cfg.server.tls.acme.exec_path.exec_path.clone())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "ACME provider 'exec_path' requires exec_path: set server.tls.acme.exec_path.exec_path (or TLS_ACME_EXEC_PATH)"
+                        )
+                    });
+                    AcmeProvider::ExecPath { exec_path }
+                }
+                other => {
+                    panic!(
+                        "Unknown server.tls.acme.provider '{other}': expected 'ispone' or 'exec_path'"
+                    )
+                }
+            };
+
+            // When ACME is enabled, default TLS cert/key paths to the generated output.
+            let generated_cert = output_dir.join("cert.pem");
+            let generated_key = output_dir.join("key.pem");
+
+            match (&tls_cert_path, &tls_key_path) {
+                (None, None) => {
+                    tls_cert_path = Some(generated_cert.clone());
+                    tls_key_path = Some(generated_key.clone());
+                }
+                (Some(cert), Some(key)) => {
+                    if cert != &generated_cert || key != &generated_key {
+                        panic!(
+                            "ACME is enabled but TLS cert/key paths do not match ACME output_dir. Expected cert_path={:?} key_path={:?}",
+                            generated_cert,
+                            generated_key
+                        );
+                    }
+                }
+                _ => {
+                    panic!(
+                        "ACME is enabled but only one of TLS cert/key paths is set; set both or neither"
+                    );
+                }
+            }
+
+            Some(AcmeConfig {
+                email,
+                names,
+                output_dir,
+                allow_first_wildcard,
+                renewal_window_secs,
+                proxy,
+                debug,
+                propagation_check_disabled,
+                propagation_check_strict,
+                provider,
+            })
+        } else {
+            None
+        };
 
         let push_username = env_str_any(&["REGISTRY__AUTH__PUSH__USERNAME", "REGISTRY_USERNAME"])
             .or_else(|| file_cfg.auth.push.username.clone());
@@ -1320,6 +1603,7 @@ impl Config {
             listen_addr,
             tls_cert_path,
             tls_key_path,
+            tls_acme,
             push_username,
             push_password,
             push_allow_repos,

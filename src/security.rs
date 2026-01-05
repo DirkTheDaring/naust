@@ -98,6 +98,7 @@ impl RepoAction {
     }
 }
 
+#[cfg(test)]
 pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims, TokenError> {
     let (payload_b64, sig, payload_bytes) = decode_token_parts(token)?;
 
@@ -174,6 +175,7 @@ pub fn verify_bearer_token_with_keys(
     Ok(claims)
 }
 
+#[cfg(test)]
 pub fn verify_bearer_token_bound(
     signing_key: &str,
     token: &str,
@@ -230,6 +232,7 @@ pub fn verify_bearer_token_bound_with_keys(
     Ok(claims)
 }
 
+#[cfg(test)]
 pub fn issue_bearer_token(
     signing_key: &str,
     aud: &str,

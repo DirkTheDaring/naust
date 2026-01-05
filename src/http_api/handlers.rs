@@ -2083,6 +2083,7 @@ mod tests {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 5000)),
             tls_cert_path: None,
             tls_key_path: None,
+            tls_acme: None,
             push_username: None,
             push_password: None,
             push_allow_repos: Some(vec!["*".to_string()]),

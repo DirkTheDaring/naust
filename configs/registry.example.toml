@@ -20,6 +20,37 @@ public_url = "http://127.0.0.1:5000"
 cert_path = ""
 key_path  = ""
 
+# Optional: ACME DNS-01 certificate provisioning (writes cert.pem/key.pem to output_dir).
+# When enabled:
+# - If cert_path/key_path are unset, they default to <output_dir>/cert.pem and <output_dir>/key.pem.
+# - If cert_path/key_path are set, they MUST match those generated paths.
+#
+# [server.tls.acme]
+# enabled = false
+# provider = "ispone" # or "exec_path"
+# email = "admin@example.com"
+# names = ["registry.example.com"]
+# output_dir = "./data/acme/registry.example.com"
+# allow_first_wildcard = false
+# renewal_window_secs = 2592000  # 30 days
+# proxy = ""                    # optional HTTP proxy URL
+# debug = false
+# propagation_check_disabled = false
+# propagation_check_strict = false
+#
+# # Provider: ispone (HTTP bridge)
+# [server.tls.acme.ispone]
+# base_url = "https://ispone-bridge.example.com"
+# # Accepts either a raw token (converted to 'Bearer <token>') or a full header value.
+# authorization = "Bearer <token>"
+#
+# # Provider: exec_path (external script/binary)
+# [server.tls.acme.exec_path]
+# # Contract:
+# #   <exec_path> present <record_fqdn> <txt_value>
+# #   <exec_path> cleanup <record_fqdn> <txt_value>
+# exec_path = "/usr/local/bin/acme-dns-hook"
+
 [auth.push]
 # If username/password are unset, pushes are rejected.
 username = "demo"

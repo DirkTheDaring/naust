@@ -344,6 +344,17 @@ key = "<old-long-random-secret>"
 | Public URL | `server.public_url` | `REGISTRY__SERVER__PUBLIC_URL` | `PUBLIC_URL` | unset |
 | TLS cert path | `server.tls.cert_path` | `REGISTRY__SERVER__TLS__CERT_PATH` | `TLS_CERT_PATH` | unset |
 | TLS key path | `server.tls.key_path` | `REGISTRY__SERVER__TLS__KEY_PATH` | `TLS_KEY_PATH` | unset |
+| TLS ACME enabled | `server.tls.acme.enabled` | `REGISTRY__SERVER__TLS__ACME__ENABLED` | `TLS_ACME_ENABLED` | off |
+| TLS ACME provider | `server.tls.acme.provider` | `REGISTRY__SERVER__TLS__ACME__PROVIDER` | `TLS_ACME_PROVIDER` | `ispone` |
+| TLS ACME email | `server.tls.acme.email` | `REGISTRY__SERVER__TLS__ACME__EMAIL` | `TLS_ACME_EMAIL` | unset |
+| TLS ACME names | `server.tls.acme.names` | `REGISTRY__SERVER__TLS__ACME__NAMES` | `TLS_ACME_NAMES` | unset |
+| TLS ACME output dir | `server.tls.acme.output_dir` | `REGISTRY__SERVER__TLS__ACME__OUTPUT_DIR` | `TLS_ACME_OUTPUT_DIR` | unset |
+| TLS ACME renewal window | `server.tls.acme.renewal_window_secs` | `REGISTRY__SERVER__TLS__ACME__RENEWAL_WINDOW_SECS` | `TLS_ACME_RENEWAL_WINDOW_SECS` | `2592000` |
+| TLS ACME debug | `server.tls.acme.debug` | `REGISTRY__SERVER__TLS__ACME__DEBUG` | `TLS_ACME_DEBUG` | off |
+| TLS ACME proxy | `server.tls.acme.proxy` | `REGISTRY__SERVER__TLS__ACME__PROXY` | `TLS_ACME_PROXY` | unset |
+| TLS ACME ispone base URL | `server.tls.acme.ispone.base_url` | `REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL` | `TLS_ACME_ISPONE_BASE_URL` | unset |
+| TLS ACME ispone auth | `server.tls.acme.ispone.authorization` | `REGISTRY__SERVER__TLS__ACME__ISPONE__AUTHORIZATION` | `TLS_ACME_ISPONE_AUTHORIZATION` | unset |
+| TLS ACME exec hook path | `server.tls.acme.exec_path.exec_path` | `REGISTRY__SERVER__TLS__ACME__EXEC_PATH__EXEC_PATH` | `TLS_ACME_EXEC_PATH` | unset |
 | Push username | `auth.push.username` | `REGISTRY__AUTH__PUSH__USERNAME` | `REGISTRY_USERNAME` | unset |
 | Push password | `auth.push.password` | `REGISTRY__AUTH__PUSH__PASSWORD` | `REGISTRY_PASSWORD` | unset |
 | Push allowlist | `auth.push.allow_repos` | `REGISTRY__AUTH__PUSH__ALLOW_REPOS` | `REGISTRY_PUSH_ALLOW_REPOS` | unset |
@@ -424,6 +435,13 @@ Auth/token (for Docker/Podman clients):
 TLS:
 
 - `TLS_CERT_PATH`, `TLS_KEY_PATH` (if both set, the server listens with HTTPS)
+
+ACME TLS provisioning (optional):
+
+- Configure `[server.tls.acme]` in the TOML to generate/renew `cert.pem` + `key.pem` during server start.
+- Providers:
+  - `ispone` (HTTP bridge): `TLS_ACME_ISPONE_BASE_URL`, `TLS_ACME_ISPONE_AUTHORIZATION`
+  - `exec_path` (external hook): `TLS_ACME_EXEC_PATH`
 
 S3 backend:
 

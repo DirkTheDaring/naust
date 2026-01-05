@@ -36,6 +36,87 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
 
+async fn maybe_generate_tls_certs(cfg: &Config) {
+    let Some(acme) = cfg.tls_acme.as_ref() else {
+        return;
+    };
+
+    use acmecert_core::prefab::{ExecHook, IsponeHttpHook};
+    use acmecert_core::types::{AuthorizationHeader, ProxyUrl};
+
+    tracing::info!(
+        output_dir = %acme.output_dir.display(),
+        names = ?acme.names,
+        provider = %match &acme.provider {
+            config::AcmeProvider::Ispone { .. } => "ispone",
+            config::AcmeProvider::ExecPath { .. } => "exec_path",
+        },
+        "acme: ensuring TLS certificate"
+    );
+
+    let proxy = match acme.proxy.as_deref() {
+        Some(s) => Some(
+            s.parse::<ProxyUrl>()
+                .unwrap_or_else(|_| panic!("acme.proxy is not a valid URL: '{s}'")),
+        ),
+        None => None,
+    };
+
+    let propagation_check = acmecert_core::api::PropagationCheck::from_flags(
+        acme.propagation_check_disabled,
+        acme.propagation_check_strict,
+    );
+
+    let req = acmecert_core::simple::PemDirRequest::new(
+        acme.email.clone(),
+        acme.names.clone(),
+        acme.output_dir.clone(),
+    );
+    let opts = acmecert_core::simple::PemDirOptions {
+        allow_first_wildcard: acme.allow_first_wildcard,
+        proxy: acme.proxy.clone(),
+        propagation_check,
+        renewal_window: Duration::from_secs(acme.renewal_window_secs.max(1)),
+    };
+
+    match &acme.provider {
+        config::AcmeProvider::Ispone {
+            base_url,
+            authorization,
+        } => {
+            let authorization = AuthorizationHeader::from_token_or_header_value(authorization)
+                .unwrap_or_else(|e| {
+                    panic!("acme.ispone.authorization is invalid: {e}")
+                });
+
+            let hook = IsponeHttpHook::new(base_url.clone(), authorization, proxy, acme.debug)
+                .unwrap_or_else(|e| {
+                    panic!("failed to initialize ispone hook: {e}")
+                });
+
+            acmecert_core::simple::generate_pem_dir(req, opts, &hook)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("acme cert generation failed: {e}")
+                });
+        }
+        config::AcmeProvider::ExecPath { exec_path } => {
+            let hook = ExecHook {
+                path: exec_path.clone(),
+                debug: acme.debug,
+            };
+
+            acmecert_core::simple::generate_pem_dir(req, opts, &hook)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("acme cert generation failed: {e}")
+                });
+        }
+    }
+
+    tracing::info!("acme: TLS certificate ready");
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "registry-rust",
@@ -212,8 +293,11 @@ async fn main() {
         CliCommand::Server => {}
     }
 
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -231,8 +315,34 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    // Start phase: generate/renew TLS certs before we attempt to load them.
+    // This runs only when [server.tls.acme] is enabled.
+    maybe_generate_tls_certs(config.as_ref()).await;
     let addr = config.listen_addr;
     let storage = storage::from_config(config.as_ref());
+
+    let tls_enabled = config.tls_cert_path.is_some() && config.tls_key_path.is_some();
+    let proxy_mode = if !config.proxy.enabled {
+        "disabled"
+    } else if config.proxy.upstreams.is_empty() {
+        "single"
+    } else {
+        "multi"
+    };
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        listen_addr = %addr,
+        tls = tls_enabled,
+        public_url = config.public_url.as_deref().unwrap_or(""),
+        storage_backend = ?config.storage_backend,
+        proxy_enabled = config.proxy.enabled,
+        proxy_mode,
+        proxy_upstreams = config.proxy.upstreams.len(),
+        proxy_routing_hosts = config.proxy.routing_proxy_hosts.len(),
+        "registry starting"
+    );
 
     let mut proxy_upstreams: Vec<ProxyContext> = Vec::new();
 
@@ -446,7 +556,7 @@ async fn main() {
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
 
-    tracing::info!(%addr, "registry listening");
+    tracing::info!(%addr, tls = tls_enabled, "registry listening");
 
     if let (Some(cert), Some(key)) = (tls_cert_path, tls_key_path) {
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
