@@ -13,6 +13,8 @@ SPECS := $(TOPDIR)/SPECS
 SPEC := packaging/rpm/$(NAME).spec
 TARBALL := $(SOURCES)/$(NAME)-$(VERSION).tar.gz
 
+.PHONY: sync-version bump-version
+
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 
 .PHONY: rpmlint
@@ -23,7 +25,7 @@ TARBALL := $(SOURCES)/$(NAME)-$(VERSION).tar.gz
 
 .PHONY: deb-container
 
-rpm: rpm-dirs $(TARBALL)
+rpm: sync-version rpm-dirs $(TARBALL)
 	rpmbuild -bb $(SPEC) \
 		--define "_topdir $(TOPDIR)" \
 		--define "version_override $(VERSION)" \
@@ -73,6 +75,7 @@ RPM_CONTAINER_FEDORA ?= 42
 RPM_CONTAINER_ROOTFUL ?= auto
 
 rpm-container:
+	@$(MAKE) sync-version
 	@chmod +x packaging/docker/build-rpm-in-fedora.sh
 	@rootful_mode="$(RPM_CONTAINER_ROOTFUL)"; \
 	if [ "$$rootful_mode" = "auto" ]; then \
@@ -95,6 +98,7 @@ rpm-container:
 	fi
 
 rpmlint-container:
+	@$(MAKE) sync-version
 	@chmod +x packaging/docker/build-rpm-in-fedora.sh
 	@rootful_mode="$(RPM_CONTAINER_ROOTFUL)"; \
 	if [ "$$rootful_mode" = "auto" ]; then \
@@ -128,6 +132,7 @@ deb: deb-dirs
 		echo "error: dpkg-deb not found (use packaging/docker/build-deb-in-debian.sh)" >&2; \
 		exit 1; \
 	fi
+	@$(MAKE) sync-version
 	cargo build --release
 	@rm -rf $(DEB_STAGE)
 	@mkdir -p $(DEB_STAGE)/DEBIAN
@@ -146,9 +151,7 @@ deb: deb-dirs
 	@install -m 0644 packaging/deb/systemd/registry-rust.service $(DEB_STAGE)/usr/lib/systemd/system/registry-rust.service
 	@install -m 0644 README.md $(DEB_STAGE)/usr/share/doc/registry-rust/README.md
 	@install -m 0644 packaging/deb/doc/copyright $(DEB_STAGE)/usr/share/doc/registry-rust/copyright
-	@printf "registry-rust (%s) UNRELEASED; urgency=medium\n\n  * Initial package.\n\n -- %s  %s\n" \
-		"$(DEB_VERSION)" "$(DEB_MAINTAINER)" "$$(date -R)" \
-		> $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian
+	@install -m 0644 packaging/deb/doc/changelog.Debian $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian
 	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian; fi
 	@install -m 0644 packaging/deb/doc/registry-rust.1 $(DEB_STAGE)/usr/share/man/man1/registry-rust.1
 	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/man/man1/registry-rust.1; fi
@@ -179,6 +182,7 @@ DEB_CONTAINER_SUITE ?= trixie
 DEB_CONTAINER_ROOTFUL ?= auto
 
 deb-container:
+	@$(MAKE) sync-version
 	@chmod +x packaging/docker/build-deb-in-debian.sh
 	@rootful_mode="$(DEB_CONTAINER_ROOTFUL)"; \
 	if [ "$$rootful_mode" = "auto" ]; then \
@@ -199,3 +203,48 @@ deb-container:
 		echo "deb-container: using rootless container engine"; \
 		packaging/docker/build-deb-in-debian.sh $(DEB_CONTAINER_SUITE); \
 	fi
+
+sync-version:
+	@set -euo pipefail; \
+	ver="$(VERSION)"; rel="$(RELEASE)"; debver="$(DEB_VERSION)"; maint="$(DEB_MAINTAINER)"; \
+	spec_file="$(SPEC)"; \
+	if [ -f "$$spec_file" ]; then \
+		sed -i -E "s/^(Version:[[:space:]]+%\{\?version_override\}%\{!\?version_override:)[0-9][0-9A-Za-z\._-]*(\})/\1$${ver}\2/" "$$spec_file"; \
+		if ! awk -v want="$${ver}-$${rel}%{?dist}" 'BEGIN{in_section=0; found=0} /^%changelog[[:space:]]*$$/{in_section=1; next} in_section { if($$0 ~ /^[[:space:]]*$$/) next; if($$0 ~ /^\* / && index($$0, want)>0) found=1; exit } END{exit found?0:1}' "$$spec_file"; then \
+			today="$$(LC_ALL=C date '+%a %b %d %Y')"; \
+			tmp="$$(mktemp)"; \
+			awk -v header="* $$today $(NAME) packaging - $${ver}-$${rel}%{?dist}" -v body="- Bump version to $${ver}" '{print; if($$0 ~ /^%changelog[[:space:]]*$$/){print header; print body; print ""}}' "$$spec_file" > "$$tmp"; \
+			mv "$$tmp" "$$spec_file"; \
+		fi; \
+	fi; \
+	deb_changelog="packaging/deb/doc/changelog.Debian"; \
+	first="$$(head -n 1 "$$deb_changelog" 2>/dev/null || true)"; \
+	if ! printf "%s" "$$first" | grep -q "($(DEB_VERSION))"; then \
+		tmp="$$(mktemp)"; \
+		{ \
+			echo "$(NAME) ($${debver}) unstable; urgency=medium"; \
+			echo; \
+			echo "  * Bump version to $${ver}."; \
+			echo; \
+			echo " -- $${maint}  $$(LC_ALL=C date -R)"; \
+			echo; \
+			if [ -f "$$deb_changelog" ]; then cat "$$deb_changelog"; fi; \
+		} > "$$tmp"; \
+		mv "$$tmp" "$$deb_changelog"; \
+	fi
+
+# Bump Cargo.toml package version and propagate it into packaging metadata.
+#
+# Usage:
+#   make bump-version NEW=0.2.0
+bump-version:
+	@if [ -z "$(NEW)" ]; then \
+		echo "usage: make bump-version NEW=x.y.z" >&2; \
+		exit 2; \
+	fi
+	@set -euo pipefail; \
+	new_ver="$(NEW)"; \
+	tmp="$$(mktemp)"; \
+	awk -v new_ver="$$new_ver" 'BEGIN{in_pkg=0; done=0} /^\[package\][[:space:]]*$$/{in_pkg=1; print; next} /^\[[^]]+\][[:space:]]*$$/ && $$0 !~ /^\[package\][[:space:]]*$$/{in_pkg=0; print; next} in_pkg && !done && $$0 ~ /^version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$$/{print "version = \"" new_ver "\""; done=1; next} {print} END{if(!done) exit 3}' Cargo.toml > "$$tmp"; \
+	mv "$$tmp" Cargo.toml; \
+	$(MAKE) sync-version
