@@ -21,6 +21,7 @@ pub struct Proxy {
     cfg: ProxyConfig,
     client: reqwest::Client,
     upstream_host_allow: Vec<String>,
+    upstream_base_domain: Option<String>,
     upstream_sem: Arc<Semaphore>,
     token_cache: Arc<Mutex<HashMap<String, CachedToken>>>,
     db: sled::Db,
@@ -100,15 +101,12 @@ impl Proxy {
 
         // If no explicit allowlist is provided, default to allowing only the configured upstream host.
         let upstream_host_allow = if cfg.allowed_upstream_hosts.is_empty() {
-            let mut v = vec![upstream_host.clone()];
-            // Docker Hub uses a separate host for Bearer token exchange.
-            if upstream_host.eq_ignore_ascii_case("registry-1.docker.io") {
-                v.push("auth.docker.io".to_string());
-            }
-            v
+            vec![upstream_host.clone()]
         } else {
             cfg.allowed_upstream_hosts.clone()
         };
+
+        let upstream_base_domain = base_domain(&upstream_host);
 
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
@@ -122,11 +120,37 @@ impl Proxy {
             cfg: cfg.clone(),
             client,
             upstream_host_allow,
+            upstream_base_domain,
             upstream_sem: Arc::new(Semaphore::new(cfg.max_concurrent_upstream.max(1))),
             token_cache: Arc::new(Mutex::new(HashMap::new())),
             db,
             singleflight: Arc::new(SingleFlight::default()),
         }))
+    }
+
+    pub fn upstream_base_url_for_log(&self) -> Option<&str> {
+        self.cfg.upstream_base_url.as_deref()
+    }
+
+    fn is_token_realm_host_allowed(&self, host: &str) -> bool {
+        if self
+            .upstream_host_allow
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+        {
+            return true;
+        }
+
+        // Generic safe-ish default for Bearer token exchange without per-registry hardcoding:
+        // allow token realm hosts under the same base domain as the configured upstream host.
+        // Example: registry-1.docker.io -> auth.docker.io (base domain docker.io).
+        let Some(up) = self.upstream_base_domain.as_deref() else {
+            return false;
+        };
+        let Some(h) = base_domain(host) else {
+            return false;
+        };
+        h.as_str().eq_ignore_ascii_case(up)
     }
 
     pub fn decision_for_repo(&self, repo: &str) -> Result<RepoDecision, ProxyError> {
@@ -216,6 +240,57 @@ impl Proxy {
         Ok(())
     }
 
+    async fn ensure_redirect_allowed(&self, url: &Url) -> Result<(), ProxyError> {
+        let host = url
+            .host_str()
+            .ok_or(ProxyError::InvalidUpstreamUrl)?
+            .to_string();
+
+        // Only follow HTTPS redirects.
+        if url.scheme() != "https" {
+            return Err(ProxyError::UpstreamHostNotAllowed(host));
+        }
+
+        if self.cfg.block_private_networks {
+            let port = url.port_or_known_default().unwrap_or(443);
+            let addrs = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+            for addr in addrs {
+                if is_blocked_ip(addr.ip()) {
+                    return Err(ProxyError::BlockedEgress(addr.to_string()));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_token_realm_allowed(&self, url: &Url) -> Result<(), ProxyError> {
+        let host = url
+            .host_str()
+            .ok_or(ProxyError::InvalidUpstreamUrl)?
+            .to_string();
+        if url.scheme() != "https" {
+            return Err(ProxyError::UpstreamHostNotAllowed(host));
+        }
+        if !self.is_token_realm_host_allowed(&host) {
+            return Err(ProxyError::UpstreamHostNotAllowed(host));
+        }
+
+        if self.cfg.block_private_networks {
+            let port = url.port_or_known_default().unwrap_or(443);
+            let addrs = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+            for addr in addrs {
+                if is_blocked_ip(addr.ip()) {
+                    return Err(ProxyError::BlockedEgress(addr.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
     fn accept_manifest_header_value() -> &'static str {
         // Include both OCI and Docker media types, including manifest lists.
         "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.artifact.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
@@ -604,57 +679,111 @@ impl Proxy {
         extra_headers: Option<Vec<(reqwest::header::HeaderName, String)>>,
         decision: Option<&RepoDecision>,
     ) -> Result<reqwest::Response, ProxyError> {
+        const MAX_REDIRECTS: usize = 5;
+
+        // First request must be to the configured upstream host; redirects are checked separately.
         self.ensure_upstream_allowed(&url).await?;
 
-        let extra_headers_retry = extra_headers.clone();
+        let mut current_url = url;
+        let mut current_headers = extra_headers;
+        let mut bearer_token: Option<String> = None;
+        let mut redirects = 0usize;
 
-        let mut req = self.client.request(method.clone(), url.clone());
-        if let Some(hs) = extra_headers.as_ref() {
-            for (name, value) in hs {
-                if let Ok(v) = reqwest::header::HeaderValue::from_str(&value) {
-                    req = req.header(name, v);
+        loop {
+            if redirects > 0 {
+                self.ensure_redirect_allowed(&current_url).await?;
+            }
+
+            let mut req = self
+                .client
+                .request(method.clone(), current_url.clone());
+
+            if let Some(hs) = current_headers.as_ref() {
+                for (name, value) in hs {
+                    if let Ok(v) = reqwest::header::HeaderValue::from_str(value) {
+                        req = req.header(name, v);
+                    }
                 }
             }
-        }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
-        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(tok) = bearer_token.as_ref() {
+                req = req.bearer_auth(tok);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+
+            // Handle bearer challenge only for the original upstream host.
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && bearer_token.is_none() {
+                let www = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let Some(challenge) = parse_bearer_challenge(&www) else {
+                    return Err(ProxyError::Upstream("missing bearer challenge".to_string()));
+                };
+
+                // Compute scope if not present (Docker Hub usually includes it).
+                let scope = challenge
+                    .scope
+                    .or_else(|| decision.map(|d| format!("repository:{}:pull", d.upstream_repo)));
+                let token = self
+                    .get_token(&challenge.realm, &challenge.service, scope.as_deref())
+                    .await?;
+                bearer_token = Some(token);
+                continue;
+            }
+
+            // Upstreams (notably Docker Hub) may redirect blob downloads to a CDN.
+            if resp.status().is_redirection() {
+                let Some(loc) = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                else {
+                    return Err(ProxyError::Upstream("redirect without Location".to_string()));
+                };
+
+                if redirects >= MAX_REDIRECTS {
+                    return Err(ProxyError::Upstream("too many upstream redirects".to_string()));
+                }
+                redirects += 1;
+
+                let next_url = Url::parse(loc)
+                    .or_else(|_| current_url.join(loc))
+                    .map_err(|_| ProxyError::Upstream("invalid redirect location".to_string()))?;
+
+                let host_changed = next_url.host_str() != current_url.host_str();
+                current_url = next_url;
+
+                if host_changed {
+                    // Never forward bearer auth across hosts.
+                    bearer_token = None;
+
+                    // Drop any potentially sensitive headers if we ever add them.
+                    if let Some(hs) = current_headers.as_ref() {
+                        let filtered: Vec<(reqwest::header::HeaderName, String)> = hs
+                            .iter()
+                            .filter(|(n, _)| {
+                                *n != reqwest::header::AUTHORIZATION
+                                    && *n != reqwest::header::COOKIE
+                                    && *n != reqwest::header::PROXY_AUTHORIZATION
+                            })
+                            .cloned()
+                            .collect();
+                        current_headers = Some(filtered);
+                    }
+                }
+
+                continue;
+            }
+
             return Ok(resp);
         }
-
-        let www = resp
-            .headers()
-            .get(reqwest::header::WWW_AUTHENTICATE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let Some(challenge) = parse_bearer_challenge(&www) else {
-            return Err(ProxyError::Upstream("missing bearer challenge".to_string()));
-        };
-
-        // Compute scope if not present (Docker Hub usually includes it).
-        let scope = challenge
-            .scope
-            .or_else(|| decision.map(|d| format!("repository:{}:pull", d.upstream_repo)));
-        let token = self
-            .get_token(&challenge.realm, &challenge.service, scope.as_deref())
-            .await?;
-
-        let mut req2 = self.client.request(method, url);
-        if let Some(hs) = extra_headers_retry.as_ref() {
-            for (name, value) in hs {
-                if let Ok(v) = reqwest::header::HeaderValue::from_str(&value) {
-                    req2 = req2.header(name, v);
-                }
-            }
-        }
-        req2 = req2.bearer_auth(token);
-        req2.send()
-            .await
-            .map_err(|e| ProxyError::Upstream(e.to_string()))
     }
 
     async fn get_token(
@@ -676,30 +805,65 @@ impl Proxy {
 
         let realm_url = Url::parse(realm)
             .map_err(|_| ProxyError::Upstream("invalid token realm".to_string()))?;
-        self.ensure_upstream_allowed(&realm_url).await?;
+        self.ensure_token_realm_allowed(&realm_url).await?;
 
-        let mut req = self.client.get(realm_url);
-        req = req.query(&[("service", service)]);
+        let mut base_req = self.client.get(realm_url.clone());
+        base_req = base_req.query(&[("service", service)]);
         if let Some(scope) = scope {
-            req = req.query(&[("scope", scope)]);
+            base_req = base_req.query(&[("scope", scope)]);
         }
 
         // Optional upstream credentials (e.g. Docker Hub requires authentication to raise rate limits).
+        // Treat empty strings as "not set" to avoid spurious 401s.
+        let mut auth_user: Option<&str> = None;
+        let mut auth_pass: Option<&str> = None;
         if let (Some(user), Some(pass)) = (
             self.cfg.upstream_username.as_deref(),
             self.cfg.upstream_password.as_deref(),
         ) {
-            req = req.basic_auth(user, Some(pass));
+            let user = user.trim();
+            let pass = pass.trim();
+            if !user.is_empty() && !pass.is_empty() {
+                auth_user = Some(user);
+                auth_pass = Some(pass);
+            }
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        let mut resp = {
+            let mut req = base_req;
+            if let (Some(user), Some(pass)) = (auth_user, auth_pass) {
+                req = req.basic_auth(user, Some(pass));
+            }
+            req.send()
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?
+        };
+
+        // If credentials were configured but rejected, fall back to anonymous token fetch.
+        // This keeps public pulls working even if upstream creds are wrong.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && auth_user.is_some() {
+            tracing::warn!(
+                token_realm = realm,
+                token_service = service,
+                token_scope = scope.unwrap_or(""),
+                "proxy: upstream token basic auth rejected, retrying anonymously"
+            );
+            resp = self
+                .client
+                .get(realm_url.clone())
+                .query(&[("service", service)])
+                .query(&scope.map(|s| ("scope", s)).into_iter().collect::<Vec<_>>())
+                .send()
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        }
+
         if !resp.status().is_success() {
             return Err(ProxyError::Upstream(format!(
-                "token endpoint status {}",
-                resp.status()
+                "token endpoint status {} (realm={realm} service={service} scope={} auth_used={})",
+                resp.status(),
+                scope.unwrap_or(""),
+                auth_user.is_some()
             )));
         }
         let v: serde_json::Value = resp
@@ -821,6 +985,32 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
         }
     }
     true
+}
+
+fn base_domain(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+
+    // Never treat IPs as having a "base domain".
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() < 2 {
+        return None;
+    }
+
+    Some(
+        format!(
+            "{}.{}",
+            labels[labels.len() - 2],
+            labels[labels.len() - 1]
+        )
+        .to_ascii_lowercase(),
+    )
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {

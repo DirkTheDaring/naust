@@ -124,7 +124,7 @@ mode = "any" # "allowlist" or "any"
 # - reads never consult local storage (cache/upstream only)
 # - writes are rejected (405)
 # Patterns support a minimal '*' glob.
-proxy_hosts = ["*"]
+proxy_hosts = ["docker-io.thor.kaupon.de"]
 trust_x_forwarded_host = false
 
 # Single-upstream mode (optional when using [[proxy.upstreams]])
@@ -154,12 +154,17 @@ scrub_max_files_per_run = 2000
 # Multiple upstream registries / isolated caches (single process)
 
 [[proxy.upstreams]]
-hosts = ["dockerhub-cache.local"]
+hosts = ["docker-io.thor.kaupon.de"]
 base_url = "https://registry-1.docker.io"
+username = "dietmarkling"
+password = "test"
 max_cache_bytes = 10737418240
 
 [proxy.upstreams.safety]
-allowed_upstream_hosts = []
+# Leave empty to rely on the built-in safe default:
+# - allow only the upstream host
+# - Bearer token realm host under the same base domain (e.g. auth.docker.io for docker.io)
+# allowed_upstream_hosts = []
 allowed_repo_prefixes = ["library/"]
 block_private_networks = true
 max_concurrent_upstream = 16

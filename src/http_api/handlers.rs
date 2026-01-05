@@ -520,6 +520,9 @@ pub async fn v2_dispatch(
     Path(rest): Path<String>,
     body: Body,
 ) -> Response {
+    let request_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
     let route_mode = v2_route_mode_for_request(&state.config.proxy, &headers);
     let proxy_ctx = state.proxy_context_for_request(&headers);
 
@@ -594,6 +597,7 @@ pub async fn v2_dispatch(
             reference,
             route_mode,
             proxy_ctx.clone(),
+            request_host,
         )
         .await;
     }
@@ -1336,6 +1340,7 @@ async fn manifest_by_reference(
     reference: &str,
     route_mode: V2RouteMode,
     proxy_ctx: Option<ProxyContext>,
+    request_host: Option<&str>,
 ) -> Response {
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
@@ -1352,6 +1357,7 @@ async fn manifest_by_reference(
             reference,
             is_digest_ref,
             proxy_ctx,
+            request_host,
         )
         .await;
     }
@@ -1404,7 +1410,14 @@ async fn manifest_by_reference(
                                     return errors::manifest_unknown().into_response();
                                 }
                                 Err(err) => {
-                                    tracing::warn!(error = %err, repo = name, tag = reference, "proxy: resolve tag failed");
+                                    tracing::warn!(
+                                        error = %err,
+                                        request_host = request_host.unwrap_or("<missing>"),
+                                        proxy_upstream = ctx.proxy.upstream_base_url_for_log().unwrap_or("<unset>"),
+                                        repo = name,
+                                        tag = reference,
+                                        "proxy: resolve tag failed"
+                                    );
                                     return errors::internal_error().into_response();
                                 }
                             }
@@ -1660,6 +1673,7 @@ async fn manifest_by_reference_proxy_only(
     reference: &str,
     is_digest_ref: bool,
     proxy_ctx: Option<ProxyContext>,
+    request_host: Option<&str>,
 ) -> Response {
     match method {
         Method::GET | Method::HEAD => {}
@@ -1705,7 +1719,14 @@ async fn manifest_by_reference_proxy_only(
                                 return errors::manifest_unknown().into_response();
                             }
                             Err(err) => {
-                                tracing::warn!(error = %err, repo = name, tag = reference, "proxy: resolve tag failed");
+                                tracing::warn!(
+                                    error = %err,
+                                    request_host = request_host.unwrap_or("<missing>"),
+                                    proxy_upstream = ctx.proxy.upstream_base_url_for_log().unwrap_or("<unset>"),
+                                    repo = name,
+                                    tag = reference,
+                                    "proxy: resolve tag failed"
+                                );
                                 return errors::internal_error().into_response();
                             }
                         }
