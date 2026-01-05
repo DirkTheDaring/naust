@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+service_name="registry-rust.service"
+
+case "${1:-}" in
+  purge)
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+      deb-systemd-helper purge "$service_name" >/dev/null || true
+      deb-systemd-helper unmask "$service_name" >/dev/null || true
+    fi
+    ;;
+
+  remove)
+    ;;
+
+  abort-install|abort-upgrade|disappear)
+    ;;
+esac
+
+exit 0

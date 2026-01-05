@@ -1,0 +1,30 @@
+[Unit]
+Description=registry-rust OCI registry
+Documentation=man:registry-rust(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=registry
+Group=registry
+
+EnvironmentFile=-/etc/default/registry-rust
+
+# Allow admins to pass extra args/config overlays.
+ExecStart=/usr/bin/registry-rust --config /etc/registry-rust/registry.core.toml --config /etc/registry-rust/registry.auth.toml $REGISTRY_RUST_ARGS server
+
+WorkingDirectory=/var/lib/registry-rust
+StateDirectory=registry-rust
+
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/registry-rust
+
+[Install]
+WantedBy=multi-user.target

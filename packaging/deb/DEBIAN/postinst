@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+service_name="registry-rust.service"
+
+case "${1:-}" in
+  configure)
+    if ! getent group registry >/dev/null 2>&1; then
+      addgroup --system registry >/dev/null || true
+    fi
+
+    if ! getent passwd registry >/dev/null 2>&1; then
+      adduser \
+        --system \
+        --ingroup registry \
+        --home /var/lib/registry-rust \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        --disabled-login \
+        --disabled-password \
+        registry >/dev/null || true
+    fi
+
+    install -d -o registry -g registry -m 0750 /var/lib/registry-rust || true
+
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+      deb-systemd-helper unmask "$service_name" >/dev/null || true
+      deb-systemd-helper enable "$service_name" >/dev/null || true
+    fi
+
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+      if [ -n "${2:-}" ]; then
+        deb-systemd-invoke try-restart "$service_name" >/dev/null || true
+      else
+        deb-systemd-invoke start "$service_name" >/dev/null || true
+      fi
+    fi
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+exit 0

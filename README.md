@@ -95,6 +95,25 @@ packaging/docker/build-rpm-in-fedora.sh --rootful 40
 
 Artifacts are written to `./dist/rpmbuild/RPMS/...` as usual.
 
+## Build DEB (containerized, Debian)
+
+The `make deb` target produces a Debian `.deb` package under `./dist/`.
+
+If you are not on a Debian-based host (or you don't want to install `dpkg-deb` locally), build inside the latest Debian stable container (currently `trixie`):
+
+```sh
+chmod +x packaging/docker/build-deb-in-debian.sh
+packaging/docker/build-deb-in-debian.sh trixie
+```
+
+If rootless Podman fails (e.g. because your home directory is mounted `noexec`), use:
+
+```sh
+packaging/docker/build-deb-in-debian.sh --rootful trixie
+```
+
+Artifacts are written to `./dist/registry-rust_<version>_<arch>.deb`.
+
 ### Config file (optional)
 
 To run with a TOML config file via compose, use the overlay and set `REGISTRY_TOML_PATH`:

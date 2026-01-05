@@ -1,0 +1,5 @@
+registry-rust (0.1.0-1) unstable; urgency=medium
+
+  * Initial package.
+
+ -- Registry Rust Maintainers <registry-rust@localhost>  Mon, 05 Jan 2026 00:00:00 +0000

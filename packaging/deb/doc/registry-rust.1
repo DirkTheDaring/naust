@@ -1,0 +1,25 @@
+.TH REGISTRY-RUST 1 "January 2026" "registry-rust" "User Commands"
+.SH NAME
+registry-rust \- OCI/Docker registry server
+.SH SYNOPSIS
+.B registry-rust
+.RI [OPTIONS] " server"
+.SH DESCRIPTION
+.B registry-rust
+is a lightweight OCI/Docker registry implementation in Rust.
+.PP
+For the full CLI and configuration options, run:
+.PP
+.B registry-rust --help
+.SH FILES
+.TP
+.I /etc/registry-rust/registry.core.toml
+Core configuration.
+.TP
+.I /etc/registry-rust/registry.auth.toml
+Authentication/authorization configuration.
+.TP
+.I /etc/default/registry-rust
+Environment overrides for the systemd service.
+.SH SEE ALSO
+systemd(1)

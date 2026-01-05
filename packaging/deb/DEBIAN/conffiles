@@ -1,0 +1,3 @@
+/etc/registry-rust/registry.core.toml
+/etc/registry-rust/registry.auth.toml
+/etc/default/registry-rust

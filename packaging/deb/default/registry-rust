@@ -1,0 +1,10 @@
+# /etc/default/registry-rust
+#
+# Environment overrides for the registry-rust systemd service on Debian.
+#
+# Example:
+#   RUST_LOG=info
+#   REGISTRY_RUST_ARGS="--config /etc/registry-rust/registry.local.toml"
+
+# RUST_LOG=info
+# REGISTRY_RUST_ARGS=

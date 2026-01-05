@@ -1,0 +1,13 @@
+Package: registry-rust
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @INSTALLED_SIZE@
+Depends: libc6, adduser, ca-certificates, systemd | systemd-sysv
+Description: OCI Distribution Registry (Rust)
+ A lightweight OCI/Docker registry implementation in Rust.
+ .
+ It supports basic push/pull workflows and is suitable for local or
+ on-prem deployments.
