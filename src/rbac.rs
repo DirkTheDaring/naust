@@ -30,7 +30,8 @@ pub fn validate_grants(grants: &[Grant]) -> Result<Vec<Grant>, PolicyError> {
         if prefix.is_empty() {
             return Err(PolicyError::EmptyRepoPrefix);
         }
-        if !prefix.ends_with('/') {
+        // Special-case: allow '*' as an explicit "match all repositories" grant.
+        if prefix != "*" && !prefix.ends_with('/') {
             return Err(PolicyError::RepoPrefixMustEndWithSlash(prefix));
         }
 
@@ -86,7 +87,7 @@ pub fn grant_scopes_by_prefix(
 
         let mut allowed: Vec<&str> = Vec::new();
         for g in &grants {
-            if repo.starts_with(&g.repo_prefix) {
+            if g.repo_prefix == "*" || repo.starts_with(&g.repo_prefix) {
                 for a in &g.actions {
                     if !allowed.iter().any(|x| x == a) {
                         allowed.push(a);
@@ -221,5 +222,33 @@ mod tests {
             granted[0].actions,
             vec!["push".to_string(), "pull".to_string()]
         );
+    }
+
+    #[test]
+    fn validate_grants_allows_star_wildcard() {
+        let ok = validate_grants(&[Grant {
+            repo_prefix: "*".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }])
+        .expect("should accept");
+
+        assert_eq!(ok[0].repo_prefix, "*");
+    }
+
+    #[test]
+    fn wildcard_grant_matches_any_repository() {
+        let requested = vec![security::TokenScope {
+            typ: "repository".to_string(),
+            name: "anyorg/anyrepo".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let grants = vec![Grant {
+            repo_prefix: "*".to_string(),
+            actions: vec!["pull".to_string(), "push".to_string()],
+        }];
+
+        let granted = grant_scopes_by_prefix(&requested, &grants);
+        assert_eq!(granted, requested);
     }
 }

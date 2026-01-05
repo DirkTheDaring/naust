@@ -8,12 +8,163 @@ use sha2::Digest as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+const UPLOAD_SHA256_STATE_MAGIC: &[u8; 8] = b"RRSHA256";
+const UPLOAD_SHA256_STATE_VERSION: u8 = 1;
+
+#[derive(Clone, Debug)]
+struct SerializableSha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+impl SerializableSha256 {
+    fn new() -> Self {
+        // SHA-256 IV (FIPS 180-4)
+        Self {
+            state: [
+                0x6a09e667,
+                0xbb67ae85,
+                0x3c6ef372,
+                0xa54ff53a,
+                0x510e527f,
+                0x9b05688c,
+                0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: [0u8; 64],
+            buffer_len: 0,
+            total_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        if input.is_empty() {
+            return;
+        }
+
+        self.total_len = self.total_len.saturating_add(input.len() as u64);
+
+        // Fill existing buffer to a full block.
+        if self.buffer_len > 0 {
+            let need = 64 - self.buffer_len;
+            let take = need.min(input.len());
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&input[..take]);
+            self.buffer_len += take;
+            input = &input[take..];
+
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                self.compress_block(&block);
+                self.buffer_len = 0;
+            }
+        }
+
+        // Process full blocks directly from input.
+        while input.len() >= 64 {
+            let block: &[u8; 64] = input[..64].try_into().expect("slice length checked");
+            self.compress_block(block);
+            input = &input[64..];
+        }
+
+        // Store remaining tail.
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffer_len = input.len();
+        }
+    }
+
+    fn compress_block(&mut self, block: &[u8; 64]) {
+        use sha2::digest::generic_array::GenericArray;
+        use sha2::digest::typenum::U64;
+        let mut ga = GenericArray::<u8, U64>::default();
+        ga.copy_from_slice(block);
+        sha2::compress256(&mut self.state, std::slice::from_ref(&ga));
+    }
+
+    fn finalize_hex(&self) -> String {
+        let mut tmp = self.clone();
+        let bit_len = tmp.total_len.saturating_mul(8);
+
+        // Padding: 0x80, then 0x00 until length mod 64 == 56, then 64-bit big-endian length.
+        let mut pad = [0u8; 128];
+        pad[0] = 0x80;
+
+        let rem = (tmp.total_len % 64) as usize;
+        let pad_len = if rem < 56 { 56 - rem } else { 56 + 64 - rem };
+        tmp.update(&pad[..pad_len]);
+
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&bit_len.to_be_bytes());
+        tmp.update(&len_bytes);
+
+        // Output is state words in big-endian.
+        let mut out = [0u8; 32];
+        for (i, w) in tmp.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        hex::encode(out)
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 1 + 8 + 1 + 64 + 32);
+        out.extend_from_slice(UPLOAD_SHA256_STATE_MAGIC);
+        out.push(UPLOAD_SHA256_STATE_VERSION);
+        out.extend_from_slice(&self.total_len.to_le_bytes());
+        out.push(self.buffer_len.min(64) as u8);
+        out.extend_from_slice(&self.buffer);
+        for w in self.state {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let need = 8 + 1 + 8 + 1 + 64 + 32;
+        if bytes.len() != need {
+            return None;
+        }
+        if &bytes[..8] != UPLOAD_SHA256_STATE_MAGIC {
+            return None;
+        }
+        if bytes[8] != UPLOAD_SHA256_STATE_VERSION {
+            return None;
+        }
+
+        let total_len = u64::from_le_bytes(bytes[9..17].try_into().ok()?);
+        let buffer_len = bytes[17] as usize;
+        if buffer_len > 64 {
+            return None;
+        }
+        let mut buffer = [0u8; 64];
+        buffer.copy_from_slice(&bytes[18..82]);
+
+        let mut state = [0u32; 8];
+        let mut off = 82;
+        for i in 0..8 {
+            state[i] = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+            off += 4;
+        }
+
+        Some(Self {
+            state,
+            buffer,
+            buffer_len,
+            total_len,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct FsStorage {
     root: PathBuf,
     max_upload_bytes: u64,
+    upload_hashes: Mutex<std::collections::HashMap<String, SerializableSha256>>,
 }
 
 impl FsStorage {
@@ -22,7 +173,113 @@ impl FsStorage {
         Self {
             root,
             max_upload_bytes,
+            upload_hashes: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn upload_hash_path(&self, uuid: &str) -> PathBuf {
+        self.uploads_dir().join(format!("{uuid}.sha256state"))
+    }
+
+    async fn load_upload_hash_state_from_disk(
+        &self,
+        uuid: &str,
+        expected_len: u64,
+    ) -> Option<SerializableSha256> {
+        let path = self.upload_hash_path(uuid);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        let st = SerializableSha256::from_bytes(&bytes)?;
+        if st.total_len != expected_len {
+            return None;
+        }
+        Some(st)
+    }
+
+    async fn persist_upload_hash_state(&self, uuid: &str, st: &SerializableSha256) -> Result<(), StorageError> {
+        let path = self.upload_hash_path(uuid);
+        let bytes = st.to_bytes();
+        atomic_write_file(&path, &bytes).await
+    }
+
+    async fn rebuild_upload_hash_state_from_data_file(
+        &self,
+        uuid: &str,
+        observed_len: u64,
+    ) -> Option<SerializableSha256> {
+        let path = self.upload_path(uuid);
+        let mut file = tokio::fs::File::open(&path).await.ok()?;
+
+        let t = Instant::now();
+        let mut hasher = SerializableSha256::new();
+        let mut buf = vec![0u8; 1024 * 64];
+        loop {
+            let n = file.read(&mut buf).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+
+        let elapsed = t.elapsed();
+        let file_len_now = tokio::fs::metadata(&path).await.ok()?.len();
+        if file_len_now != observed_len {
+            return None;
+        }
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let mib = observed_len as f64 / (1024.0 * 1024.0);
+            let mib_s = mib / elapsed.as_secs_f64().max(0.000_001);
+            tracing::debug!(
+                target: "registry_rust::storage::fs",
+                event = "upload_hash_resume_rebuild",
+                uuid,
+                size_bytes = observed_len,
+                elapsed_ms = elapsed.as_millis() as u64,
+                read_hash_mib_s = mib_s,
+            );
+        }
+
+        Some(hasher)
+    }
+
+    async fn ensure_upload_hash_state(&self, uuid: &str, current_len: u64) -> Option<SerializableSha256> {
+        // Fast path: in-memory.
+        {
+            let map = self.upload_hashes.lock().await;
+            if let Some(st) = map.get(uuid) {
+                if st.total_len == current_len {
+                    return Some(st.clone());
+                }
+            }
+        }
+
+        // Next: on-disk state.
+        if let Some(st) = self
+            .load_upload_hash_state_from_disk(uuid, current_len)
+            .await
+        {
+            let mut map = self.upload_hashes.lock().await;
+            map.insert(uuid.to_string(), st.clone());
+            return Some(st);
+        }
+
+        // If empty file, create fresh state and persist.
+        if current_len == 0 {
+            let st = SerializableSha256::new();
+            let _ = self.persist_upload_hash_state(uuid, &st).await;
+            let mut map = self.upload_hashes.lock().await;
+            map.insert(uuid.to_string(), st.clone());
+            return Some(st);
+        }
+
+        // Fallback: rebuild from partial file and persist.
+        let st = self
+            .rebuild_upload_hash_state_from_data_file(uuid, current_len)
+            .await?;
+        let _ = self.persist_upload_hash_state(uuid, &st).await;
+        let mut map = self.upload_hashes.lock().await;
+        map.insert(uuid.to_string(), st.clone());
+        Some(st)
     }
 
     fn blob_path(&self, digest: &Digest) -> PathBuf {
@@ -426,6 +683,12 @@ impl Storage for FsStorage {
             .await
             .map_err(map_fs_io_err)?;
 
+        // Track + persist hash state from the beginning so resumes after restart are cheap.
+        let st = SerializableSha256::new();
+        let _ = self.persist_upload_hash_state(&uuid, &st).await;
+        let mut map = self.upload_hashes.lock().await;
+        map.insert(uuid.clone(), st);
+
         Ok(super::UploadMeta { uuid, offset: 0 })
     }
 
@@ -449,6 +712,7 @@ impl Storage for FsStorage {
         uuid: &str,
         chunk: Bytes,
     ) -> Result<super::UploadMeta, StorageError> {
+        let t_total = Instant::now();
         let path = self.upload_path(uuid);
 
         let current_len = match tokio::fs::metadata(&path).await {
@@ -474,6 +738,38 @@ impl Storage for FsStorage {
         file.write_all(&chunk).await.map_err(map_fs_io_err)?;
         file.flush().await.map_err(map_fs_io_err)?;
 
+        // Update hash state (persisted). If we can't keep it consistent, drop state and fall back.
+        if let Some(mut st) = self.ensure_upload_hash_state(uuid, current_len).await {
+            if st.total_len == current_len {
+                st.update(&chunk);
+                let _ = self.persist_upload_hash_state(uuid, &st).await;
+                let mut map = self.upload_hashes.lock().await;
+                map.insert(uuid.to_string(), st);
+            } else {
+                let mut map = self.upload_hashes.lock().await;
+                map.remove(uuid);
+            }
+        }
+
+        // Debug-level timing to help diagnose slow pushes without spamming normal logs.
+        // We only log when enabled AND the operation is "interesting" (big chunk or slow write).
+        let elapsed = t_total.elapsed();
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && (elapsed > Duration::from_millis(200) || chunk.len() >= 16 * 1024 * 1024)
+        {
+            let mib = chunk.len() as f64 / (1024.0 * 1024.0);
+            let secs = elapsed.as_secs_f64().max(0.000_001);
+            let mib_s = mib / secs;
+            tracing::debug!(
+                target: "registry_rust::storage::fs",
+                event = "upload_append",
+                uuid,
+                chunk_bytes = chunk.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                write_mib_s = mib_s,
+            );
+        }
+
         let meta = file
             .metadata()
             .await
@@ -486,6 +782,9 @@ impl Storage for FsStorage {
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError> {
         let upload_path = self.upload_path(uuid);
+        let upload_hash_path = self.upload_hash_path(uuid);
+
+        let t_total = Instant::now();
         let mut file = match tokio::fs::File::open(&upload_path).await {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -494,27 +793,71 @@ impl Storage for FsStorage {
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
 
-        let mut hasher = sha2::Sha256::new();
-        let mut buf = vec![0u8; 1024 * 64];
-        loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|err| StorageError::Internal(err.to_string()))?;
-            if n == 0 {
-                break;
+        let upload_size_bytes = file
+            .metadata()
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?
+            .len();
+
+        let mut hash_source = "file_reread";
+        let t_hash = Instant::now();
+
+        // Prefer persisted state (and in-memory cache) to avoid a second full reread at finalize.
+        let state_from_mem = {
+            let mut map = self.upload_hashes.lock().await;
+            map.remove(uuid)
+        };
+
+        let state = match state_from_mem {
+            Some(st) if st.total_len == upload_size_bytes => Some(st),
+            _ => self.ensure_upload_hash_state(uuid, upload_size_bytes).await,
+        };
+
+        let (computed_hex, hash_elapsed) = if let Some(st) = state {
+            if st.total_len == upload_size_bytes {
+                hash_source = "saved_state";
+                (st.finalize_hex(), t_hash.elapsed())
+            } else {
+                // Unexpected mismatch; fall back.
+                let mut hasher = sha2::Sha256::new();
+                let mut buf = vec![0u8; 1024 * 64];
+                loop {
+                    let n = file
+                        .read(&mut buf)
+                        .await
+                        .map_err(|err| StorageError::Internal(err.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                (hex::encode(hasher.finalize()), t_hash.elapsed())
             }
-            hasher.update(&buf[..n]);
-        }
-        let computed = hasher.finalize();
-        let computed_hex = hex::encode(computed);
+        } else {
+            // No usable state: hash the file now.
+            let mut hasher = sha2::Sha256::new();
+            let mut buf = vec![0u8; 1024 * 64];
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|err| StorageError::Internal(err.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            (hex::encode(hasher.finalize()), t_hash.elapsed())
+        };
 
         if computed_hex != digest.hex() {
             return Err(StorageError::DigestMismatch);
         }
 
         // Ensure the uploaded data is durable before we make it visible in the blob store.
+        let t_sync = Instant::now();
         file.sync_all().await.map_err(map_fs_io_err)?;
+        let sync_elapsed = t_sync.elapsed();
         drop(file);
 
         // Move into blob store.
@@ -526,13 +869,43 @@ impl Storage for FsStorage {
         ensure_dir(&dest_dir);
 
         let dest_path = dest_dir.join(digest.hex());
+        let t_rename = Instant::now();
         tokio::fs::rename(&upload_path, &dest_path)
             .await
             .map_err(map_fs_io_err)?;
+        let rename_elapsed = t_rename.elapsed();
 
         // Make the rename durable (both directories are updated by rename).
+        let t_fsync = Instant::now();
         fsync_dir(self.uploads_dir().as_path()).await?;
         fsync_dir(dest_dir.as_path()).await?;
+        let fsync_elapsed = t_fsync.elapsed();
+
+        // Info-level summary for operators: where did the time go?
+        let total_elapsed = t_total.elapsed();
+        let size_mib = upload_size_bytes as f64 / (1024.0 * 1024.0);
+        let hash_ms_u64 = hash_elapsed.as_millis() as u64;
+        let total_ms_u64 = total_elapsed.as_millis() as u64;
+        let hash_mib_s = (hash_ms_u64 >= 1).then(|| size_mib / (hash_ms_u64 as f64 / 1000.0));
+        let total_mib_s = (total_ms_u64 >= 1).then(|| size_mib / (total_ms_u64 as f64 / 1000.0));
+        tracing::info!(
+            target: "registry_rust::storage::fs",
+            event = "upload_finalize",
+            uuid,
+            digest = %digest.as_str(),
+            size_bytes = upload_size_bytes,
+            hash_source,
+            hash_ms = hash_ms_u64,
+            sync_ms = sync_elapsed.as_millis() as u64,
+            rename_ms = rename_elapsed.as_millis() as u64,
+            fsync_ms = fsync_elapsed.as_millis() as u64,
+            total_ms = total_ms_u64,
+            hash_mib_s,
+            total_mib_s,
+        );
+
+        // Best-effort cleanup: remove persisted hash state.
+        let _ = tokio::fs::remove_file(&upload_hash_path).await;
 
         let meta = tokio::fs::metadata(&dest_path)
             .await
@@ -541,6 +914,14 @@ impl Storage for FsStorage {
     }
 
     async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
+        // Best-effort cleanup: drop in-memory state.
+        let mut map = self.upload_hashes.lock().await;
+        map.remove(uuid);
+
+        // Best-effort cleanup: remove persisted hash state.
+        let hash_path = self.upload_hash_path(uuid);
+        let _ = tokio::fs::remove_file(&hash_path).await;
+
         let path = self.upload_path(uuid);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),

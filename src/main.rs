@@ -36,6 +36,15 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
 
+fn install_rustls_crypto_provider() {
+    // rustls 0.23 requires selecting a process-wide CryptoProvider when multiple
+    // providers are enabled via crate features (e.g. both aws-lc-rs and ring).
+    // We prefer aws-lc-rs here.
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    // Ignore "already installed" errors (e.g. in tests or if a dependency installed it first).
+    let _ = rustls::crypto::CryptoProvider::install_default(provider);
+}
+
 async fn maybe_generate_tls_certs(cfg: &Config) {
     let Some(acme) = cfg.tls_acme.as_ref() else {
         return;
@@ -232,6 +241,8 @@ impl AppState {
 
 #[tokio::main]
 async fn main() {
+    install_rustls_crypto_provider();
+
     let cli = Cli::parse();
 
     let config_paths = cli.config;
@@ -1305,7 +1316,21 @@ fn spawn_upload_gc(state: AppState) {
                 };
 
                 if age >= max_age {
-                    if tokio::fs::remove_file(&path).await.is_ok() {
+                    let removed_this = tokio::fs::remove_file(&path).await.is_ok();
+
+                    // If we removed a partial upload file, also remove its stored hash state.
+                    // And vice versa, to avoid leaving orphan sidecars around.
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        if let Some(uuid) = name.strip_suffix(".data") {
+                            let sidecar = uploads_dir.join(format!("{uuid}.sha256state"));
+                            let _ = tokio::fs::remove_file(&sidecar).await;
+                        } else if let Some(uuid) = name.strip_suffix(".sha256state") {
+                            let data = uploads_dir.join(format!("{uuid}.data"));
+                            let _ = tokio::fs::remove_file(&data).await;
+                        }
+                    }
+
+                    if removed_this {
                         removed += 1;
                     }
                 }
