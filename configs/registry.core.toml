@@ -1,0 +1,207 @@
+# Core configuration for registry-rust (intended to be stable-ish).
+# Layer this with an auth file:
+#   ./registry-rust server \
+#     --config /etc/registry/registry.core.toml \
+#     --config /etc/registry/registry.auth.toml
+# Precedence:
+#   defaults < config files (in order) < env vars
+
+[profile]
+# Optional: "best_practice" changes defaults and makes token.signing_key required.
+# name = "best_practice"
+name = ""
+
+[server]
+listen_addr = "127.0.0.1:5000"
+# Recommended for token realm and external URLs (especially behind proxies)
+public_url = "http://127.0.0.1:5000"
+
+[server.tls]
+# If both are set, the server serves HTTPS.
+cert_path = ""
+key_path  = ""
+
+# Optional: ACME DNS-01 certificate provisioning (writes cert.pem/key.pem to output_dir).
+# When enabled:
+# - If cert_path/key_path are unset, they default to <output_dir>/cert.pem and <output_dir>/key.pem.
+# - If cert_path/key_path are set, they MUST match those generated paths.
+#
+# [server.tls.acme]
+# enabled = false
+# provider = "ispone" # or "exec_path"
+# email = "admin@example.com"
+# names = ["registry.example.com"]
+# output_dir = "./data/acme/registry.example.com"
+# allow_first_wildcard = false
+# renewal_window_secs = 2592000  # 30 days
+# proxy = ""                    # optional HTTP proxy URL
+# debug = false
+# propagation_check_disabled = false
+# propagation_check_strict = false
+#
+# [server.tls.acme.ispone]
+# base_url = "https://ispone-bridge.example.com"
+# authorization = "Bearer <token>"
+#
+# [server.tls.acme.exec_path]
+# exec_path = "/usr/local/bin/acme-dns-hook"
+
+[token]
+service = "registry-rust"
+# Token TTL in seconds.
+ttl_secs = 600
+# Set a stable secret in production.
+# Overlap key rotation (recommended): provide multiple keys.
+# - The FIRST entry is the primary key used to mint new tokens.
+# - All entries are accepted for verification, so you can rotate without breaking in-flight tokens.
+[[token.signing_keys]]
+kid = "k2026_01"
+key = "change-me-primary"
+
+[[token.signing_keys]]
+kid = "k2025_12"
+key = "change-me-secondary"
+
+# Legacy single-key config (still supported):
+# signing_key = "change-me"
+
+[storage]
+backend = "fs"  # "fs" or "s3"
+
+[storage.fs]
+root = "./data"
+
+[storage.s3]
+endpoint = ""
+region = ""
+bucket = ""
+prefix = "registry"
+
+[features]
+allow_tag_overwrite = true
+automatic_crossmount = false
+
+[uploads]
+# Zero-trust-ish operators often set this to true.
+disallow_monolithic_uploads = false
+
+# Upload failure handling defaults (clients may resume uploads unless aborted).
+abort_on_error = false
+abort_on_digest_mismatch = false
+
+# Filesystem backend maintenance: clean up stale upload temp files.
+gc_enabled = true
+gc_interval_secs = 3600
+gc_max_age_secs = 86400
+
+# Optional per-repo upload behavior overrides.
+[[uploads.repos]]
+match = "myrepo"
+abort_on_error = false
+abort_on_digest_mismatch = true
+
+[limits]
+max_upload_bytes = 5368709120          # 5 GiB
+max_request_body_bytes = 33554432      # 32 MiB (manifests are read with a cap)
+max_concurrent_buffered_requests = 8   # caps concurrent manifest buffering
+max_concurrent_requests = 256          # caps in-flight /v2 requests (uploads excluded)
+
+[timeouts]
+request_timeout_secs = 300
+upload_request_timeout_secs = 3600
+
+[catalog]
+requires_auth = false
+
+# Pull-through cache / proxy (optional)
+[proxy]
+enabled = true
+mode = "any" # "allowlist" or "any"
+
+# Request routing (global / single-upstream mode)
+[proxy.routing]
+# If the request Host matches any of these patterns, the registry runs in "proxy-only" mode:
+# - reads never consult local storage (cache/upstream only)
+# - writes are rejected (405)
+# Patterns support a minimal '*' glob.
+proxy_hosts = ["*"]
+trust_x_forwarded_host = false
+
+# Single-upstream mode (optional when using [[proxy.upstreams]])
+[proxy.upstream]
+base_url = ""
+username = ""
+password = ""
+
+# Safety net / SSRF hardening
+[proxy.safety]
+allowed_upstream_hosts = []
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.cache]
+index_path = "./data/cache/proxy-index"
+fs_root = ""
+s3_prefix = ""
+max_cache_bytes = 0
+
+gc_interval_secs = 3600
+scrub_enabled = false
+scrub_interval_secs = 3600
+scrub_max_files_per_run = 2000
+
+# Multiple upstream registries / isolated caches (single process)
+
+[[proxy.upstreams]]
+hosts = ["dockerhub-cache.local"]
+base_url = "https://registry-1.docker.io"
+max_cache_bytes = 10737418240
+
+[proxy.upstreams.safety]
+allowed_upstream_hosts = []
+allowed_repo_prefixes = ["library/"]
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
+# Multi-upstream mode (optional)
+# [[proxy.upstreams]]
+# hosts = ["docker.example.com"]
+# base_url = "https://registry-1.docker.io"
+# username = ""
+# password = ""
+# max_cache_bytes = 10737418240
+#
+# [proxy.upstreams.routing]
+# hosts = ["docker.example.com"]
+# trust_x_forwarded_host = false
+#
+# [proxy.upstreams.upstream]
+# base_url = "https://registry-1.docker.io"
+# username = ""
+# password = ""
+#
+# [proxy.upstreams.safety]
+# allowed_upstream_hosts = ["registry-1.docker.io"]
+# allowed_repo_prefixes = ["library/"]
+# block_private_networks = true
+# max_concurrent_upstream = 16
+#
+# [proxy.upstreams.cache]
+# index_path = "./data/cache/proxy-index-docker"
+# fs_root = "./data/cache/docker"
+# s3_prefix = ""
+# max_cache_bytes = 10737418240
+
+# Optional per-repo proxy policy overrides.
+# [[proxy.repos]]
+# match = "library/*"
+# upstream_repo = "library/${name#library/}"
+# tag_policy = { ttl_seconds = 600 }
+# eviction = { keep_tags = ["latest"] }

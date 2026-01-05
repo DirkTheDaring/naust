@@ -95,11 +95,13 @@ fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Resp
     if let Ok(v) = http::HeaderValue::from_str(&bearer) {
         resp.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
     }
-    // Also advertise Basic so curl workflows keep working.
-    resp.headers_mut().append(
-        http::header::WWW_AUTHENTICATE,
-        http::HeaderValue::from_static("Basic realm=\"registry\""),
-    );
+    // Also advertise Basic so curl workflows keep working, unless token-only mode is configured.
+    if state.config.push_auth_mode != crate::config::PushAuthMode::TokenOnly {
+        resp.headers_mut().append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Basic realm=\"registry\""),
+        );
+    }
 
     resp.headers_mut().insert(
         http::header::HeaderName::from_static("docker-distribution-api-version"),
@@ -113,14 +115,6 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
 }
 
 pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
-    // If auth isn't configured, treat as unauthenticated.
-    let Some(expected_user) = state.config.push_username.as_deref() else {
-        return false;
-    };
-    let Some(expected_pass) = state.config.push_password.as_deref() else {
-        return false;
-    };
-
     // Bearer: accept any valid, unexpired token minted by this registry.
     if let Some(token) = bearer_token_from_headers(headers) {
         if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
@@ -134,6 +128,17 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
             }
         }
     }
+
+    if state.config.push_auth_mode == crate::config::PushAuthMode::TokenOnly {
+        return false;
+    }
+
+    let (Some(expected_user), Some(expected_pass)) = (
+        state.config.push_username.as_deref(),
+        state.config.push_password.as_deref(),
+    ) else {
+        return false;
+    };
 
     // Basic: accept configured push credentials.
     if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
@@ -172,12 +177,14 @@ pub async fn require_push_basic_auth(
         return unauthorized_registry_challenge(&state, None);
     };
 
-    // If auth is not configured, reject pushes by default (safe default).
-    let Some(expected_user) = state.config.push_username.as_deref() else {
-        return unauthorized_registry_challenge(&state, Some(repo_name));
-    };
-    let Some(expected_pass) = state.config.push_password.as_deref() else {
-        return unauthorized_registry_challenge(&state, Some(repo_name));
+    // Default safe behavior: deny pushes if basic creds aren't configured.
+    // Token-only mode explicitly allows push via Bearer without separate Basic creds.
+    let (expected_user, expected_pass) = match state.config.push_auth_mode {
+        crate::config::PushAuthMode::TokenOnly => (None, None),
+        crate::config::PushAuthMode::BasicOrToken | crate::config::PushAuthMode::DenyIfNoBasic => (
+            state.config.push_username.as_deref(),
+            state.config.push_password.as_deref(),
+        ),
     };
 
     // Prefer Bearer for container clients; they typically expect token flows.
@@ -204,16 +211,29 @@ pub async fn require_push_basic_auth(
         }
     }
 
-    if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
-        let user_ok = basic.username() == expected_user;
-        let pass_ok = basic.password() == expected_pass;
-        if user_ok && pass_ok {
-            if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                if !repo_allowed(allowlist, repo_name) {
-                    return errors::denied("push not allowed for this repository").into_response();
+    // If token-only mode is enabled, do not accept Basic for pushes.
+    if state.config.push_auth_mode != crate::config::PushAuthMode::TokenOnly {
+        // In the default mode, missing creds means deny pushes.
+        if state.config.push_auth_mode == crate::config::PushAuthMode::DenyIfNoBasic
+            && (expected_user.is_none() || expected_pass.is_none())
+        {
+            return unauthorized_registry_challenge(&state, Some(repo_name));
+        }
+
+        if let (Some(expected_user), Some(expected_pass)) = (expected_user, expected_pass) {
+            if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
+                let user_ok = basic.username() == expected_user;
+                let pass_ok = basic.password() == expected_pass;
+                if user_ok && pass_ok {
+                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+                        if !repo_allowed(allowlist, repo_name) {
+                            return errors::denied("push not allowed for this repository")
+                                .into_response();
+                        }
+                    }
+                    return next.run(request).await;
                 }
             }
-            return next.run(request).await;
         }
     }
 

@@ -1,0 +1,51 @@
+# Auth configuration for registry-rust (expected to change frequently).
+# Layer this on top of a core config:
+#   ./registry-rust server --config ./configs/registry.core.toml --config ./configs/registry.auth.toml
+
+[auth.push]
+# Push authorization mode.
+#
+# - "token_only" (default): pushes allowed via Bearer token only; Basic creds are ignored.
+# - "basic_or_token": pushes allowed via Bearer token OR Basic creds (if configured).
+# - "token_only": pushes allowed via Bearer token only; Basic creds are ignored.
+mode = "token_only"
+
+# Optional legacy/basic push creds (ignored in token_only mode).
+# username = "demo"
+# password = "demo"
+
+# Optional allowlist; supports "org/*" and "*".
+allow_repos = ["*"]
+
+# Robot accounts + scoped grants (Harbor-style RBAC lite)
+#
+# Security note: avoid storing plaintext secrets in config. Use hashed secrets (Argon2id).
+#
+# [auth.robots]
+# enabled = true
+#
+# [[auth.robots.accounts]]
+# name = "ci"
+# secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+# grants = [
+#   { repo_prefix = "org1/", actions = ["pull","push"] },
+#   { repo_prefix = "library/", actions = ["pull"] },
+# ]
+# max_ttl_secs = 600
+
+# Human users + groups (no DB, config-only)
+#
+# [auth.users]
+# enabled = true
+#
+# [[auth.users.accounts]]
+# name = "alice"
+# secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+# groups = ["devs"]
+# max_ttl_secs = 600
+#
+# [[auth.groups]]
+# name = "devs"
+# grants = [
+#   { repo_prefix = "org1/", actions = ["pull","push"] },
+# ]

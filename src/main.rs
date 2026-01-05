@@ -128,9 +128,20 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
 struct Cli {
     /// Path to a TOML config file.
     ///
-    /// Equivalent to setting `CONFIG_PATH`.
-    #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
-    config: Option<std::path::PathBuf>,
+    /// Can be provided multiple times; later files override earlier ones.
+    ///
+    /// Merge behavior:
+    /// - tables deep-merge
+    /// - arrays/lists are replaced wholesale
+    /// - scalar values are overridden
+    #[arg(
+        short = 'c',
+        long = "config",
+        value_name = "PATH",
+        global = true,
+        action = clap::ArgAction::Append
+    )]
+    config: Vec<std::path::PathBuf>,
 
     #[command(subcommand)]
     command: CliCommand,
@@ -223,17 +234,11 @@ impl AppState {
 async fn main() {
     let cli = Cli::parse();
 
-    if let Some(path) = &cli.config {
-        // In Rust 2024, mutating environment variables is `unsafe`.
-        // This happens before we spawn any tasks.
-        unsafe {
-            std::env::set_var("CONFIG_PATH", path);
-        }
-    }
+    let config_paths = cli.config;
 
     match cli.command {
         CliCommand::CheckConfig => {
-            let _cfg = match std::panic::catch_unwind(Config::from_env) {
+            let _cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths)) {
                 Ok(c) => c,
                 Err(err) => {
                     let msg = if let Some(s) = err.downcast_ref::<String>() {
@@ -253,7 +258,7 @@ async fn main() {
         }
         CliCommand::AuditPermissions => {
             // Access audit: print effective permissions and exit.
-            let cfg = match std::panic::catch_unwind(Config::from_env) {
+            let cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths)) {
                 Ok(c) => c,
                 Err(err) => {
                     let msg = if let Some(s) = err.downcast_ref::<String>() {
@@ -301,7 +306,13 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = match std::panic::catch_unwind(Config::from_env) {
+    let config = match std::panic::catch_unwind(|| {
+        if config_paths.is_empty() {
+            Config::from_env()
+        } else {
+            Config::from_env_with_files(&config_paths)
+        }
+    }) {
         Ok(c) => Arc::new(c),
         Err(err) => {
             let msg = if let Some(s) = err.downcast_ref::<String>() {
@@ -311,7 +322,11 @@ async fn main() {
             } else {
                 "<non-string panic>".to_string()
             };
-            eprintln!("server: failed to load config: {msg}");
+            if config_paths.is_empty() {
+                eprintln!("server: failed to load config: {msg}");
+            } else {
+                eprintln!("server: failed to load layered config: {msg}");
+            }
             std::process::exit(2);
         }
     };

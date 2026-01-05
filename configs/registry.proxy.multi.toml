@@ -18,6 +18,7 @@ public_url = "http://127.0.0.1:5000"
 [auth.push]
 # Configure if you also want to allow pushes to local storage on other hostnames.
 # Proxy-only hosts (matching [[proxy.upstreams]].hosts) always reject writes.
+mode = "basic_or_token"
 username = "demo"
 password = "demo"
 allow_repos = ["myrepo"]

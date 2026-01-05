@@ -2,6 +2,11 @@
 # Usage:
 #   ./registry-rust server --config /etc/registry/registry.toml
 #   # (equivalently: CONFIG_PATH=/etc/registry/registry.toml ./registry-rust server)
+#
+# Layered configs (repeatable --config; later files override earlier ones; lists replaced wholesale):
+#   ./registry-rust server \
+#     --config /etc/registry/registry.core.toml \
+#     --config /etc/registry/registry.auth.toml
 # Precedence:
 #   defaults < config file < env vars
 
@@ -52,7 +57,16 @@ key_path  = ""
 # exec_path = "/usr/local/bin/acme-dns-hook"
 
 [auth.push]
-# If username/password are unset, pushes are rejected.
+# Push authorization mode.
+#
+# - "token_only" (default): pushes allowed via Bearer token only; Basic creds are ignored.
+# - "basic_or_token": pushes allowed via Bearer token OR Basic creds (if configured).
+# - "token_only": pushes allowed via Bearer token only; Basic creds are ignored.
+#
+# This example includes Basic creds, so we opt into allowing them.
+mode = "basic_or_token"
+
+# If mode is not "token_only" and username/password are unset, pushes are rejected.
 username = "demo"
 password = "demo"
 # Optional allowlist; supports "org/*" and "*".
@@ -94,6 +108,8 @@ allow_repos = ["*"]
 
 [token]
 service = "registry-rust"
+# Token TTL in seconds.
+ttl_secs = 600
 # Set a stable secret in production.
 # Overlap key rotation (recommended): provide multiple keys.
 # - The FIRST entry is the primary key used to mint new tokens.
@@ -108,7 +124,6 @@ key = "change-me-secondary"
 
 # Legacy single-key config (still supported):
 # signing_key = "change-me"
-ttl_secs = 600
 
 [storage]
 backend = "fs"  # "fs" or "s3"
@@ -134,16 +149,16 @@ disallow_monolithic_uploads = false
 abort_on_error = false
 abort_on_digest_mismatch = false
 
+# Filesystem backend maintenance: clean up stale upload temp files.
+gc_enabled = true
+gc_interval_secs = 3600
+gc_max_age_secs = 86400
+
 # Optional per-repo upload behavior overrides.
 [[uploads.repos]]
 match = "myrepo"
 abort_on_error = false
 abort_on_digest_mismatch = true
-
-# Filesystem backend maintenance: clean up stale upload temp files.
-gc_enabled = true
-gc_interval_secs = 3600
-gc_max_age_secs = 86400
 
 [limits]
 max_upload_bytes = 5368709120          # 5 GiB

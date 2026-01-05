@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use url::Url;
+use toml::Value;
 
 fn sanitize_for_path_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -46,6 +47,8 @@ pub struct Config {
     pub push_username: Option<String>,
     pub push_password: Option<String>,
     pub push_allow_repos: Option<Vec<String>>,
+
+    pub push_auth_mode: PushAuthMode,
 
     pub storage_backend: StorageBackend,
 
@@ -103,6 +106,16 @@ pub struct Config {
     pub users: UsersConfig,
 
     pub proxy: ProxyConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushAuthMode {
+    /// Current safe default: if `auth.push.username/password` are not configured, reject pushes.
+    DenyIfNoBasic,
+    /// Allow pushes with either a valid Bearer token OR the configured Basic credentials.
+    BasicOrToken,
+    /// Token-only: allow pushes only with valid Bearer tokens; ignore/disable Basic push creds.
+    TokenOnly,
 }
 
 impl Config {
@@ -698,6 +711,9 @@ struct FileRobotGrant {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FilePushAuth {
     #[serde(default)]
+    mode: Option<String>,
+
+    #[serde(default)]
     username: Option<String>,
     #[serde(default)]
     password: Option<String>,
@@ -818,9 +834,17 @@ struct FileCatalog {
 
 impl Config {
     pub fn from_env() -> Self {
+        Self::from_env_with_files(&[])
+    }
+
+    pub fn from_env_with_files(config_paths: &[PathBuf]) -> Self {
         // Precedence:
-        //   defaults < config file (CONFIG_PATH) < env vars
-        let loaded = load_config_file();
+        //   defaults < config file(s) < env vars
+        let loaded = if config_paths.is_empty() {
+            load_config_file()
+        } else {
+            load_config_files(config_paths)
+        };
         let file_cfg = loaded.cfg;
 
         let best_practice = env_bool_opt(&["BEST_PRACTICE"]).unwrap_or(false)
@@ -1073,6 +1097,19 @@ impl Config {
             .or_else(|| file_cfg.auth.push.username.clone());
         let push_password = env_str_any(&["REGISTRY__AUTH__PUSH__PASSWORD", "REGISTRY_PASSWORD"])
             .or_else(|| file_cfg.auth.push.password.clone());
+
+        let push_auth_mode_raw = env_str_any(&["REGISTRY__AUTH__PUSH__MODE", "PUSH_AUTH_MODE"])
+            .or_else(|| file_cfg.auth.push.mode.clone())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "token_only".to_string());
+        let push_auth_mode = match push_auth_mode_raw.as_str() {
+            "deny_if_no_basic" | "deny" => PushAuthMode::DenyIfNoBasic,
+            "basic_or_token" | "basic+token" | "basic" => PushAuthMode::BasicOrToken,
+            "token_only" | "token" => PushAuthMode::TokenOnly,
+            other => panic!(
+                "Unknown auth.push.mode '{other}': expected 'deny_if_no_basic', 'basic_or_token', or 'token_only'"
+            ),
+        };
 
         let push_allow_repos = env_str_any(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
@@ -1607,6 +1644,7 @@ impl Config {
             push_username,
             push_password,
             push_allow_repos,
+            push_auth_mode,
             storage_backend,
             fs_root,
             s3_endpoint,
@@ -1663,6 +1701,61 @@ impl Config {
             || (self.robots.enabled && !self.robots.accounts.is_empty())
             || (self.users.enabled && !self.users.accounts.is_empty())
     }
+}
+
+fn merge_toml_value(into: &mut Value, overlay: Value) {
+    match (into, overlay) {
+        (Value::Table(into_tbl), Value::Table(overlay_tbl)) => {
+            for (k, v) in overlay_tbl {
+                match into_tbl.get_mut(&k) {
+                    Some(existing) => merge_toml_value(existing, v),
+                    None => {
+                        into_tbl.insert(k, v);
+                    }
+                }
+            }
+        }
+        // Arrays/lists are replaced wholesale.
+        (into_any, overlay_any) => {
+            *into_any = overlay_any;
+        }
+    }
+}
+
+fn load_config_files(paths: &[PathBuf]) -> LoadedFileConfig {
+    let mut merged = Value::Table(toml::map::Map::new());
+    let mut ignored_paths = Vec::<String>::new();
+
+    for path in paths {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(err) => {
+                panic!("Failed to read config file {:?}: {err}", path);
+            }
+        };
+
+        // Validate unknown keys per file.
+        match parse_toml_config(&contents) {
+            Ok((_cfg, ignored)) => {
+                for p in ignored {
+                    ignored_paths.push(format!("{}: {p}", path.display()));
+                }
+            }
+            Err(err) => {
+                panic!("Failed to parse config file {:?} as TOML: {err}", path);
+            }
+        }
+
+        let value: Value = contents
+            .parse::<Value>()
+            .unwrap_or_else(|e| panic!("Failed to parse config file {:?} as TOML value: {e}", path));
+        merge_toml_value(&mut merged, value);
+    }
+
+    let cfg: FileConfig = merged
+        .try_into()
+        .unwrap_or_else(|e| panic!("Failed to deserialize merged config: {e}"));
+    LoadedFileConfig { cfg, ignored_paths }
 }
 
 fn resolve_users_config(file_cfg: &FileConfig) -> UsersConfig {

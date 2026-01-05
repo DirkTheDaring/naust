@@ -19,6 +19,7 @@ cert_path = "/certs/cert.pem"
 key_path  = "/certs/key.pem"
 
 [auth.push]
+mode = "basic_or_token"
 username = "demo"
 password = "demo"
 # allow_repos = ["org/*"]

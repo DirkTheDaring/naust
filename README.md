@@ -4,6 +4,27 @@ Minimal Docker/OCI registry (Distribution v2-ish) in Rust.
 
 ## Run locally (cargo)
 
+Using one config file:
+
+```sh
+cargo run -- server --config ./configs/registry.example.toml
+```
+
+Layer multiple config files (later files override earlier ones):
+
+```sh
+cargo run -- server \
+  --config ./configs/registry.core.toml \
+  --config ./configs/registry.auth.toml
+```
+
+Merge semantics:
+- TOML tables deep-merge
+- arrays/lists are replaced wholesale (last file wins)
+- scalar values are overridden
+
+Note: the configuration format is TOML (YAML is not supported).
+
 ```sh
 export REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo
 export REGISTRY_PUSH_ALLOW_REPOS=myrepo
@@ -355,6 +376,7 @@ key = "<old-long-random-secret>"
 | TLS ACME ispone base URL | `server.tls.acme.ispone.base_url` | `REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL` | `TLS_ACME_ISPONE_BASE_URL` | unset |
 | TLS ACME ispone auth | `server.tls.acme.ispone.authorization` | `REGISTRY__SERVER__TLS__ACME__ISPONE__AUTHORIZATION` | `TLS_ACME_ISPONE_AUTHORIZATION` | unset |
 | TLS ACME exec hook path | `server.tls.acme.exec_path.exec_path` | `REGISTRY__SERVER__TLS__ACME__EXEC_PATH__EXEC_PATH` | `TLS_ACME_EXEC_PATH` | unset |
+| Push auth mode | `auth.push.mode` | `REGISTRY__AUTH__PUSH__MODE` | `PUSH_AUTH_MODE` | `token_only` |
 | Push username | `auth.push.username` | `REGISTRY__AUTH__PUSH__USERNAME` | `REGISTRY_USERNAME` | unset |
 | Push password | `auth.push.password` | `REGISTRY__AUTH__PUSH__PASSWORD` | `REGISTRY_PASSWORD` | unset |
 | Push allowlist | `auth.push.allow_repos` | `REGISTRY__AUTH__PUSH__ALLOW_REPOS` | `REGISTRY_PUSH_ALLOW_REPOS` | unset |
@@ -393,7 +415,8 @@ Proxy cache maintenance:
 | Cache scrub max files | `proxy.cache.scrub_max_files_per_run` | `REGISTRY__PROXY__CACHE__SCRUB_MAX_FILES_PER_RUN` | `PROXY_SCRUB_MAX_FILES_PER_RUN` | `2000` |
 
 - `LISTEN_ADDR` (default `127.0.0.1:5000`)
-- `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (if unset, pushes are rejected)
+- `PUSH_AUTH_MODE` / `REGISTRY__AUTH__PUSH__MODE` (`deny_if_no_basic` | `basic_or_token` | `token_only`)
+- `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (required unless `PUSH_AUTH_MODE=token_only`)
 - `REGISTRY_PUSH_ALLOW_REPOS` (optional, comma-separated; supports `org/*` prefixes and `*`)
 - `STORAGE_BACKEND` (`fs` or `s3`)
 - `STORAGE_FS_ROOT` (default `./data`)

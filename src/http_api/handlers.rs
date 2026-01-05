@@ -2084,6 +2084,7 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             tls_acme: None,
+            push_auth_mode: crate::config::PushAuthMode::TokenOnly,
             push_username: None,
             push_password: None,
             push_allow_repos: Some(vec!["*".to_string()]),
