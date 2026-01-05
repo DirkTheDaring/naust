@@ -1,0 +1,11 @@
+# Local rpmlint config for this repository.
+#
+# Keep this intentionally narrow: we only filter warnings that are expected
+# in this project context (static `registry` user/group and proprietary license).
+
+Filters = [
+  '^registry-rust\..*: W: non-standard-uid\b',
+  '^registry-rust\..*: W: non-standard-gid\b',
+  '^registry-rust\.spec: W: no-%check-section\b',
+  '^registry-rust\..*: W: invalid-license\b',
+]

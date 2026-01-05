@@ -15,6 +15,10 @@ TARBALL := $(SOURCES)/$(NAME)-$(VERSION).tar.gz
 
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 
+.PHONY: rpmlint
+
+.PHONY: rpm-container rpmlint-container
+
 .PHONY: deb deb-dirs clean-deb
 
 .PHONY: deb-container
@@ -25,6 +29,15 @@ rpm: rpm-dirs $(TARBALL)
 		--define "version_override $(VERSION)" \
 		--define "release_override $(RELEASE)"
 	@echo "RPM(s) written under: $(TOPDIR)/RPMS"
+
+rpmlint: rpm
+	@if ! command -v rpmlint >/dev/null 2>&1; then \
+		echo "error: rpmlint not found (try: make rpmlint-container)" >&2; \
+		exit 1; \
+	fi
+	rpmlint -c packaging/rpm/rpmlint.toml \
+		$(TOPDIR)/SRPMS/$(NAME)-$(VERSION)-$(RELEASE)*.src.rpm \
+		$(TOPDIR)/RPMS/*/$(NAME)-$(VERSION)-$(RELEASE)*.rpm
 
 rpm-dirs:
 	mkdir -p $(TOPDIR)/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
@@ -38,6 +51,7 @@ $(TARBALL): rpm-dirs
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/sysusers.d
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/sysconfig
+	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/man
 	@cp -a target/release/registry-rust dist/rpmstage/$(NAME)-$(VERSION)/bin/registry-rust
 	@cp -a etc/registry-rust/*.toml dist/rpmstage/$(NAME)-$(VERSION)/etc/registry-rust/
 	@cp -a packaging/systemd/registry-rust.service dist/rpmstage/$(NAME)-$(VERSION)/systemd/registry-rust.service
@@ -45,11 +59,62 @@ $(TARBALL): rpm-dirs
 	@cp -a packaging/systemd/tmpfiles.d/registry-rust.conf dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d/registry-rust.conf
 	@cp -a packaging/sysconfig/registry-rust dist/rpmstage/$(NAME)-$(VERSION)/sysconfig/registry-rust
 	@cp -a README.md dist/rpmstage/$(NAME)-$(VERSION)/README.md
+	@cp -a packaging/deb/doc/registry-rust.1 dist/rpmstage/$(NAME)-$(VERSION)/man/registry-rust.1
 	@tar -C dist/rpmstage -czf $(TARBALL) $(NAME)-$(VERSION)
 	@cp -a $(SPEC) $(SPECS)/$(NAME).spec
 
 clean-rpm:
 	rm -rf dist/rpmstage dist/rpmbuild
+
+RPM_CONTAINER_FEDORA ?= 42
+# 0 = rootless (default when possible)
+# 1 = rootful (sudo podman)
+# auto = choose rootful when Podman is rootless (workaround for glibc mmap/noexec issues)
+RPM_CONTAINER_ROOTFUL ?= auto
+
+rpm-container:
+	@chmod +x packaging/docker/build-rpm-in-fedora.sh
+	@rootful_mode="$(RPM_CONTAINER_ROOTFUL)"; \
+	if [ "$$rootful_mode" = "auto" ]; then \
+		if command -v podman >/dev/null 2>&1; then \
+			if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qi true; then \
+				rootful_mode=1; \
+			else \
+				rootful_mode=0; \
+			fi; \
+		else \
+			rootful_mode=0; \
+		fi; \
+	fi; \
+	if [ "$$rootful_mode" = "1" ]; then \
+		echo "rpm-container: using --rootful (sudo podman)"; \
+		packaging/docker/build-rpm-in-fedora.sh --rootful $(RPM_CONTAINER_FEDORA); \
+	else \
+		echo "rpm-container: using rootless container engine"; \
+		packaging/docker/build-rpm-in-fedora.sh $(RPM_CONTAINER_FEDORA); \
+	fi
+
+rpmlint-container:
+	@chmod +x packaging/docker/build-rpm-in-fedora.sh
+	@rootful_mode="$(RPM_CONTAINER_ROOTFUL)"; \
+	if [ "$$rootful_mode" = "auto" ]; then \
+		if command -v podman >/dev/null 2>&1; then \
+			if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qi true; then \
+				rootful_mode=1; \
+			else \
+				rootful_mode=0; \
+			fi; \
+		else \
+			rootful_mode=0; \
+		fi; \
+	fi; \
+	if [ "$$rootful_mode" = "1" ]; then \
+		echo "rpmlint-container: using --rootful (sudo podman)"; \
+		packaging/docker/build-rpm-in-fedora.sh --rootful $(RPM_CONTAINER_FEDORA) -- rpmlint; \
+	else \
+		echo "rpmlint-container: using rootless container engine"; \
+		packaging/docker/build-rpm-in-fedora.sh $(RPM_CONTAINER_FEDORA) -- rpmlint; \
+	fi
 
 DEB_STAGE := dist/debstage/$(NAME)_$(DEB_VERSION)_$(DEB_ARCH)
 DEB_OUT := dist/$(NAME)_$(DEB_VERSION)_$(DEB_ARCH).deb

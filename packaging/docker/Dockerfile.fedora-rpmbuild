@@ -31,6 +31,7 @@ RUN dnf -y update \
       xz \
       rpm-build \
       rpmdevtools \
+     rpmlint \
       systemd-rpm-macros \
       which \
  && dnf -y clean all

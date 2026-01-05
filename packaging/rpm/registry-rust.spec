@@ -1,22 +1,22 @@
 Name:           registry-rust
 Version:        %{?version_override}%{!?version_override:0.1.0}
 Release:        %{?release_override}%{!?release_override:1}%{?dist}
-Summary:        Minimal Docker/OCI registry (Distribution v2-ish) in Rust
+Summary:        Minimal Docker/OCI registry (Distribution v2 compatible) in Rust
 
 # We package a prebuilt release binary (built outside of rpmbuild). On Fedora/RHEL,
 # automatic debuginfo/debugsource package generation can fail when the binary has
 # no DWARF symbols.
 %global debug_package %{nil}
 
-License:        Proprietary
+License:        LicenseRef-Proprietary
 URL:            https://example.invalid/registry-rust
-Source0:        %{name}-%{version}.tar.gz
+Source0:        https://example.invalid/registry-rust/releases/download/v%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  systemd-rpm-macros
 Requires:       ca-certificates
 %{?systemd_requires}
 
-# sysusers is executed in %pre; ensure systemd is present at install time.
+# sysusers is executed in %%pre; ensure systemd is present at install time.
 Requires(pre):  systemd
 
 %description
@@ -32,6 +32,7 @@ registry-rust is a minimal Docker/OCI registry implementation in Rust.
 rm -rf %{buildroot}
 
 install -D -m 0755 bin/registry-rust %{buildroot}%{_bindir}/registry-rust
+strip --strip-unneeded %{buildroot}%{_bindir}/registry-rust || :
 
 install -d %{buildroot}%{_sysconfdir}/registry-rust
 cp -a etc/registry-rust/registry.core.toml %{buildroot}%{_sysconfdir}/registry-rust/
@@ -45,6 +46,7 @@ install -D -m 0644 tmpfiles.d/registry-rust.conf %{buildroot}%{_tmpfilesdir}/reg
 install -D -m 0644 sysconfig/registry-rust %{buildroot}%{_sysconfdir}/sysconfig/registry-rust
 
 install -D -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
+install -D -m 0644 man/registry-rust.1 %{buildroot}%{_mandir}/man1/registry-rust.1
 
 %files
 %doc %{_docdir}/%{name}/README.md
@@ -55,6 +57,8 @@ install -D -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 %{_unitdir}/registry-rust.service
 %{_sysusersdir}/registry-rust.conf
 %{_tmpfilesdir}/registry-rust.conf
+%{_mandir}/man1/registry-rust.1*
+%ghost %dir %attr(0755,registry,registry) %{_localstatedir}/lib/registry-rust
 
 %pre
 %sysusers_create %{_sysusersdir}/registry-rust.conf
@@ -70,5 +74,5 @@ install -D -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 %systemd_postun_with_restart registry-rust.service
 
 %changelog
-* Mon Jan 05 2026 registry-rust packaging
+* Mon Jan 05 2026 registry-rust packaging - 0.1.0-1%{?dist}
 - Initial RPM packaging for local builds
