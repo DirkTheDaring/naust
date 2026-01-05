@@ -159,7 +159,7 @@ mod tests {
         V2RouteMode, effective_host_for_request, proxy_upstream_index_for_request,
         v2_route_mode_for_request, wildcard_match,
     };
-    use crate::config::{ProxyConfig, ProxyMode};
+    use crate::config::{ProxyConfig, ProxyMode, RedirectPolicy};
     use axum::http::HeaderMap;
     use std::path::PathBuf;
 
@@ -173,6 +173,7 @@ mod tests {
             allowed_upstream_hosts: vec![],
             allowed_repo_prefixes: vec!["library/".to_string()],
             block_private_networks: true,
+            redirect_policy: RedirectPolicy::AnyPublic,
             max_concurrent_upstream: 1,
             index_path: PathBuf::from("/tmp/registry-rust-test-proxy-index"),
             cache_fs_root: None,
@@ -242,6 +243,7 @@ mod tests {
                 allowed_upstream_hosts: vec![],
                 allowed_repo_prefixes: vec!["library/".to_string()],
                 block_private_networks: true,
+                redirect_policy: RedirectPolicy::AnyPublic,
                 max_concurrent_upstream: 1,
                 index_path: PathBuf::from("/tmp/a"),
                 cache_fs_root: Some(PathBuf::from("/tmp/cache-a")),
@@ -257,6 +259,7 @@ mod tests {
                 allowed_upstream_hosts: vec![],
                 allowed_repo_prefixes: vec![],
                 block_private_networks: true,
+                redirect_policy: RedirectPolicy::AnyPublic,
                 max_concurrent_upstream: 1,
                 index_path: PathBuf::from("/tmp/b"),
                 cache_fs_root: Some(PathBuf::from("/tmp/cache-b")),

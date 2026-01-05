@@ -1,0 +1,34 @@
+[Unit]
+Description=registry-rust OCI/Docker registry
+Documentation=https://docs.docker.com/registry/spec/api/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sysconfig/registry-rust
+ExecStart=/usr/bin/registry-rust --config /etc/registry-rust/registry.core.toml --config /etc/registry-rust/registry.auth.toml $REGISTRY_RUST_ARGS server
+Restart=on-failure
+RestartSec=2s
+
+# Run as a dedicated system user.
+User=registry
+Group=registry
+
+# Create and manage the writable state directory.
+StateDirectory=registry-rust
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/registry-rust
+
+# Basic hardening.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+# Allow reading config, writing state.
+ReadOnlyPaths=/etc/registry-rust
+ReadWritePaths=/var/lib/registry-rust
+
+[Install]
+WantedBy=multi-user.target

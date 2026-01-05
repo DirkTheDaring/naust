@@ -208,6 +208,9 @@ pub struct ProxyConfig {
     // SSRF guard: block loopback/link-local/private IPs.
     pub block_private_networks: bool,
 
+    // Redirect policy for upstream responses (notably Docker Hub blob CDN redirects).
+    pub redirect_policy: RedirectPolicy,
+
     // Concurrency guard: cap upstream requests.
     pub max_concurrent_upstream: usize,
 
@@ -263,6 +266,7 @@ pub struct ProxyUpstreamRoute {
     pub allowed_upstream_hosts: Vec<String>,
     pub allowed_repo_prefixes: Vec<String>,
     pub block_private_networks: bool,
+    pub redirect_policy: RedirectPolicy,
     pub max_concurrent_upstream: usize,
 
     // Cache settings (must be unique per upstream to avoid collisions).
@@ -276,6 +280,33 @@ pub struct ProxyUpstreamRoute {
 pub enum ProxyMode {
     Allowlist,
     Any,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedirectPolicy {
+    Disabled,
+    SameHost,
+    AnyPublic,
+}
+
+impl Default for RedirectPolicy {
+    fn default() -> Self {
+        Self::AnyPublic
+    }
+}
+
+impl std::str::FromStr for RedirectPolicy {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "same_host" => Ok(Self::SameHost),
+            "any_public" => Ok(Self::AnyPublic),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -483,6 +514,8 @@ struct FileProxySafety {
     allowed_repo_prefixes: Option<Vec<String>>,
     #[serde(default)]
     block_private_networks: Option<bool>,
+    #[serde(default)]
+    redirect_policy: Option<RedirectPolicy>,
     #[serde(default)]
     max_concurrent_upstream: Option<usize>,
 }
@@ -1459,6 +1492,14 @@ impl Config {
         .or(file_cfg.proxy.safety.block_private_networks)
         .unwrap_or(true);
 
+        let redirect_policy = env_str_any(&[
+            "REGISTRY__PROXY__SAFETY__REDIRECT_POLICY",
+            "PROXY_REDIRECT_POLICY",
+        ])
+        .and_then(|s| s.parse::<RedirectPolicy>().ok())
+        .or(file_cfg.proxy.safety.redirect_policy)
+        .unwrap_or_default();
+
         let max_concurrent_upstream = env_usize_any(&[
             "REGISTRY__PROXY__SAFETY__MAX_CONCURRENT_UPSTREAM",
             "PROXY_MAX_CONCURRENT_UPSTREAM",
@@ -1621,6 +1662,7 @@ impl Config {
             allowed_upstream_hosts,
             allowed_repo_prefixes,
             block_private_networks,
+            redirect_policy,
             max_concurrent_upstream,
             index_path,
             cache_fs_root,
@@ -1942,6 +1984,12 @@ fn resolve_proxy_upstreams(
                 .block_private_networks
                 .or(global_safety.block_private_networks)
                 .unwrap_or(true);
+
+            let redirect_policy = r
+                .safety
+                .redirect_policy
+                .or(global_safety.redirect_policy)
+                .unwrap_or_default();
             let max_concurrent_upstream = r
                 .safety
                 .max_concurrent_upstream
@@ -2007,6 +2055,7 @@ fn resolve_proxy_upstreams(
                 allowed_upstream_hosts,
                 allowed_repo_prefixes,
                 block_private_networks,
+                redirect_policy,
                 max_concurrent_upstream,
                 index_path,
                 cache_fs_root,

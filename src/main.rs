@@ -103,11 +103,22 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
                     panic!("failed to initialize ispone hook: {e}")
                 });
 
-            acmecert_core::simple::generate_pem_dir(req, opts, &hook)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("acme cert generation failed: {e}")
-                });
+            if let Err(e) = acmecert_core::simple::generate_pem_dir(req, opts, &hook).await {
+                // If we already have a cert/key on disk, keep the service available.
+                // If not, fail fast as before.
+                let cert_path = acme.output_dir.join("cert.pem");
+                let key_path = acme.output_dir.join("key.pem");
+                if cert_path.exists() && key_path.exists() {
+                    tracing::warn!(
+                        error = %e,
+                        cert_path = %cert_path.display(),
+                        key_path = %key_path.display(),
+                        "acme: provisioning failed; using existing certificate"
+                    );
+                } else {
+                    panic!("acme cert generation failed: {e:?}");
+                }
+            }
         }
         config::AcmeProvider::ExecPath { exec_path } => {
             let hook = ExecHook {
@@ -115,11 +126,20 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
                 debug: acme.debug,
             };
 
-            acmecert_core::simple::generate_pem_dir(req, opts, &hook)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("acme cert generation failed: {e}")
-                });
+            if let Err(e) = acmecert_core::simple::generate_pem_dir(req, opts, &hook).await {
+                let cert_path = acme.output_dir.join("cert.pem");
+                let key_path = acme.output_dir.join("key.pem");
+                if cert_path.exists() && key_path.exists() {
+                    tracing::warn!(
+                        error = %e,
+                        cert_path = %cert_path.display(),
+                        key_path = %key_path.display(),
+                        "acme: provisioning failed; using existing certificate"
+                    );
+                } else {
+                    panic!("acme cert generation failed: {e:?}");
+                }
+            }
         }
     }
 
@@ -383,6 +403,7 @@ async fn main() {
             per.allowed_upstream_hosts = up.allowed_upstream_hosts.clone();
             per.allowed_repo_prefixes = up.allowed_repo_prefixes.clone();
             per.block_private_networks = up.block_private_networks;
+            per.redirect_policy = up.redirect_policy;
             per.max_concurrent_upstream = up.max_concurrent_upstream;
             per.index_path = up.index_path.clone();
             per.cache_fs_root = up.cache_fs_root.clone();

@@ -2152,6 +2152,7 @@ mod tests {
                 allowed_upstream_hosts: Vec::new(),
                 allowed_repo_prefixes: Vec::new(),
                 block_private_networks: true,
+                redirect_policy: crate::config::RedirectPolicy::AnyPublic,
                 max_concurrent_upstream: 16,
                 index_path: PathBuf::from("./data/cache/proxy-index"),
                 cache_fs_root: None,

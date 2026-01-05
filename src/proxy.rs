@@ -1,5 +1,5 @@
 use crate::{
-    config::{EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, TagPolicy},
+    config::{EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, RedirectPolicy, TagPolicy},
     registry::digest::Digest,
     storage::StorageError,
 };
@@ -249,6 +249,13 @@ impl Proxy {
         // Only follow HTTPS redirects.
         if url.scheme() != "https" {
             return Err(ProxyError::UpstreamHostNotAllowed(host));
+        }
+
+        // Only follow redirects to the standard HTTPS port.
+        if let Some(port) = url.port() {
+            if port != 443 {
+                return Err(ProxyError::UpstreamHostNotAllowed(host));
+            }
         }
 
         if self.cfg.block_private_networks {
@@ -740,6 +747,14 @@ impl Proxy {
 
             // Upstreams (notably Docker Hub) may redirect blob downloads to a CDN.
             if resp.status().is_redirection() {
+                // Never follow redirects for non-idempotent methods.
+                if method != reqwest::Method::GET && method != reqwest::Method::HEAD {
+                    return Err(ProxyError::Upstream(format!(
+                        "unexpected redirect for method {}",
+                        method
+                    )));
+                }
+
                 let Some(loc) = resp
                     .headers()
                     .get(reqwest::header::LOCATION)
@@ -758,6 +773,21 @@ impl Proxy {
                     .map_err(|_| ProxyError::Upstream("invalid redirect location".to_string()))?;
 
                 let host_changed = next_url.host_str() != current_url.host_str();
+
+                match self.cfg.redirect_policy {
+                    RedirectPolicy::Disabled => {
+                        return Err(ProxyError::Upstream("upstream redirect blocked".to_string()));
+                    }
+                    RedirectPolicy::SameHost => {
+                        if host_changed {
+                            return Err(ProxyError::Upstream(
+                                "upstream cross-host redirect blocked".to_string(),
+                            ));
+                        }
+                    }
+                    RedirectPolicy::AnyPublic => {}
+                }
+
                 current_url = next_url;
 
                 if host_changed {

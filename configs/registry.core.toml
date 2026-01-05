@@ -124,7 +124,14 @@ mode = "any" # "allowlist" or "any"
 # - reads never consult local storage (cache/upstream only)
 # - writes are rejected (405)
 # Patterns support a minimal '*' glob.
-proxy_hosts = ["docker-io.thor.kaupon.de"]
+proxy_hosts = [
+	"docker-io.thor.kaupon.de",
+	"ghcr.thor.kaupon.de",
+	"gcr.thor.kaupon.de",
+	"k8s-gcr.thor.kaupon.de",
+	"registry-k8s.thor.kaupon.de",
+	"quay.thor.kaupon.de",
+]
 trust_x_forwarded_host = false
 
 # Single-upstream mode (optional when using [[proxy.upstreams]])
@@ -175,6 +182,92 @@ index_path = ""
 s3_prefix = ""
 max_cache_bytes = 10737418240
 
+[[proxy.upstreams]]
+hosts = ["ghcr.thor.kaupon.de"]
+base_url = "https://ghcr.io"
+max_cache_bytes = 10737418240
+
+[proxy.upstreams.safety]
+allowed_upstream_hosts = []
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
+[[proxy.upstreams]]
+hosts = ["quay.thor.kaupon.de"]
+base_url = "https://quay.io"
+max_cache_bytes = 10737418240
+
+[proxy.upstreams.safety]
+allowed_upstream_hosts = []
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
+[[proxy.upstreams]]
+hosts = ["gcr.thor.kaupon.de"]
+base_url = "https://gcr.io"
+max_cache_bytes = 10737418240
+
+[proxy.upstreams.safety]
+# GCR/registry.k8s.io commonly uses OAuth2 at oauth2.googleapis.com for tokens.
+allowed_upstream_hosts = ["oauth2.googleapis.com"]
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
+[[proxy.upstreams]]
+hosts = ["k8s-gcr.thor.kaupon.de"]
+base_url = "https://k8s.gcr.io"
+max_cache_bytes = 10737418240
+
+[proxy.upstreams.safety]
+allowed_upstream_hosts = ["oauth2.googleapis.com"]
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
+[[proxy.upstreams]]
+hosts = ["registry-k8s.thor.kaupon.de"]
+base_url = "https://registry.k8s.io"
+max_cache_bytes = 10737418240
+
+[proxy.upstreams.safety]
+allowed_upstream_hosts = ["oauth2.googleapis.com"]
+allowed_repo_prefixes = []
+block_private_networks = true
+max_concurrent_upstream = 16
+
+[proxy.upstreams.cache]
+fs_root = ""
+index_path = ""
+s3_prefix = ""
+max_cache_bytes = 10737418240
+
 # Multi-upstream mode (optional)
 # [[proxy.upstreams]]
 # hosts = ["docker.example.com"]
@@ -197,6 +290,11 @@ max_cache_bytes = 10737418240
 # allowed_repo_prefixes = ["library/"]
 # block_private_networks = true
 # max_concurrent_upstream = 16
+# Redirect handling:
+# - any_public (default): follow HTTPS:443 redirects with private-network blocking (needed for Docker Hub blobs)
+# - same_host: only follow redirects that stay on the upstream host
+# - disabled: do not follow redirects
+# redirect_policy = "any_public"
 #
 # [proxy.upstreams.cache]
 # index_path = "./data/cache/proxy-index-docker"
