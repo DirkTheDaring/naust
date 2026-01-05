@@ -1,3 +1,9 @@
+registry-rust (0.5.0-1) unstable; urgency=medium
+
+  * Bump version to 0.5.0.
+
+ -- Baldur <baldur@email.de>  Mon, 05 Jan 2026 22:30:57 +0100
+
 registry-rust (0.1.0-1) unstable; urgency=medium
 
   * Initial package.

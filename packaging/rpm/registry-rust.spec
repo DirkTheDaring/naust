@@ -1,5 +1,5 @@
 Name:           registry-rust
-Version:        %{?version_override}%{!?version_override:0.1.0}
+Version:        %{?version_override}%{!?version_override:0.5.0}
 Release:        %{?release_override}%{!?release_override:1}%{?dist}
 Summary:        Minimal Docker/OCI registry (Distribution v2 compatible) in Rust
 
@@ -74,5 +74,8 @@ install -D -m 0644 man/registry-rust.1 %{buildroot}%{_mandir}/man1/registry-rust
 %systemd_postun_with_restart registry-rust.service
 
 %changelog
+* Mon Jan 05 2026 registry-rust packaging - 0.5.0-1%{?dist}
+- Bump version to 0.5.0
+
 * Mon Jan 05 2026 registry-rust packaging - 0.1.0-1%{?dist}
 - Initial RPM packaging for local builds

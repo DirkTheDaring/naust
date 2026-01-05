@@ -64,10 +64,18 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
     );
 
     let proxy = match acme.proxy.as_deref() {
-        Some(s) => Some(
-            s.parse::<ProxyUrl>()
-                .unwrap_or_else(|_| panic!("acme.proxy is not a valid URL: '{s}'")),
-        ),
+        Some(s) => match s.parse::<ProxyUrl>() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                tracing::error!(
+                    proxy = %s,
+                    output_dir = %acme.output_dir.display(),
+                    names = ?acme.names,
+                    "acme.proxy is not a valid URL"
+                );
+                std::process::exit(2);
+            }
+        },
         None => None,
     };
 
@@ -93,15 +101,34 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
             base_url,
             authorization,
         } => {
-            let authorization = AuthorizationHeader::from_token_or_header_value(authorization)
-                .unwrap_or_else(|e| {
-                    panic!("acme.ispone.authorization is invalid: {e}")
-                });
+            let authorization = match AuthorizationHeader::from_token_or_header_value(authorization)
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        output_dir = %acme.output_dir.display(),
+                        names = ?acme.names,
+                        "acme.ispone.authorization is invalid"
+                    );
+                    std::process::exit(2);
+                }
+            };
 
-            let hook = IsponeHttpHook::new(base_url.clone(), authorization, proxy, acme.debug)
-                .unwrap_or_else(|e| {
-                    panic!("failed to initialize ispone hook: {e}")
-                });
+            let hook = match IsponeHttpHook::new(base_url.clone(), authorization, proxy, acme.debug)
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        base_url = %base_url,
+                        output_dir = %acme.output_dir.display(),
+                        names = ?acme.names,
+                        "failed to initialize ispone hook"
+                    );
+                    std::process::exit(1);
+                }
+            };
 
             if let Err(e) = acmecert_core::simple::generate_pem_dir(req, opts, &hook).await {
                 // If we already have a cert/key on disk, keep the service available.
@@ -116,7 +143,15 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
                         "acme: provisioning failed; using existing certificate"
                     );
                 } else {
-                    panic!("acme cert generation failed: {e:?}");
+                    tracing::error!(
+                        error = ?e,
+                        cert_path = %cert_path.display(),
+                        key_path = %key_path.display(),
+                        output_dir = %acme.output_dir.display(),
+                        names = ?acme.names,
+                        "acme: provisioning failed and no existing certificate is present"
+                    );
+                    std::process::exit(1);
                 }
             }
         }
@@ -137,7 +172,15 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
                         "acme: provisioning failed; using existing certificate"
                     );
                 } else {
-                    panic!("acme cert generation failed: {e:?}");
+                    tracing::error!(
+                        error = ?e,
+                        cert_path = %cert_path.display(),
+                        key_path = %key_path.display(),
+                        output_dir = %acme.output_dir.display(),
+                        names = ?acme.names,
+                        "acme: provisioning failed and no existing certificate is present"
+                    );
+                    std::process::exit(1);
                 }
             }
         }
@@ -412,7 +455,16 @@ async fn main() {
 
             let proxy = match proxy::Proxy::new(&per) {
                 Ok(p) => p.map(Arc::new).expect("proxy enabled"),
-                Err(err) => panic!("proxy upstream[{i}] init failed: {err}"),
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        upstream_index = i,
+                        index_path = %per.index_path.display(),
+                        cache_fs_root = ?per.cache_fs_root.as_deref().map(|p| p.display().to_string()),
+                        "proxy upstream init failed"
+                    );
+                    std::process::exit(1);
+                }
             };
 
             let cache: Arc<dyn storage::Storage> = match config.storage_backend {
@@ -459,8 +511,13 @@ async fn main() {
         match proxy::Proxy::new(&config.proxy) {
             Ok(p) => p.map(Arc::new),
             Err(err) => {
-                // Fail fast: proxy config errors should not start the server in a surprising state.
-                panic!("proxy init failed: {err}");
+                tracing::error!(
+                    error = %err,
+                    index_path = %config.proxy.index_path.display(),
+                    cache_fs_root = ?config.proxy.cache_fs_root.as_deref().map(|p| p.display().to_string()),
+                    "proxy init failed"
+                );
+                std::process::exit(1);
             }
         }
     } else {
