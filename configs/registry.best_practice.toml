@@ -49,7 +49,11 @@ enabled = true
 # 2) observe and validate
 # 3) enable_delete=true (allows delete)
 [blob_gc]
+# enabled: allows the *quarantine* phase (moves unreferenced blobs from live -> quarantine).
+# When false: admin GC "plan" remains available, but quarantine/delete are blocked.
 # enabled = false
+# enable_delete: additionally allows the *delete* phase (permanently deletes old quarantined blobs).
+# When false: /_admin/gc/delete is blocked and scheduled cleanup (if enabled) will quarantine only.
 # enable_delete = false
 #
 # Safety: newly finalized blobs are pinned for at least this long.
