@@ -1097,17 +1097,119 @@ async fn blob_by_digest(
     }
 
     match method {
-        Method::DELETE => match state.storage.delete_blob(&digest).await {
-            Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
-            Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
+        Method::DELETE => {
+            // Fast path: if the blob doesn't exist, don't do an expensive reference scan.
+            match state.storage.head_blob(&digest).await {
+                Ok(_) => {}
+                Err(StorageError::NotFound) => return errors::blob_unknown().into_response(),
+                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    return errors::insufficient_storage().into_response();
+                }
+                Err(_) => return errors::internal_error().into_response(),
             }
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
+
+            // Prefer the persistent ref-index (fast). On index errors, fall back to scanning.
+            if let Some(idx) = state.ref_index.as_ref() {
+                match idx.is_blob_referenced(&digest) {
+                    Ok(true) => return errors::blob_in_use("blob is still referenced").into_response(),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            digest = digest.as_str(),
+                            "ref-index lookup failed; attempting rebuild"
+                        );
+
+                        if state.config.ref_index.auto_rebuild_on_corruption {
+                            let _ = idx
+                                .ensure_healthy_or_rebuild(
+                                    &state.storage,
+                                    true,
+                                    false,
+                                )
+                                .await;
+                        }
+
+                        match idx.is_blob_referenced(&digest) {
+                            Ok(true) => {
+                                return errors::blob_in_use("blob is still referenced")
+                                    .into_response();
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    digest = digest.as_str(),
+                                    "ref-index still unhealthy; falling back to full scan"
+                                );
+                                match crate::blob_delete_safety::find_blob_reference(
+                                    &state.storage,
+                                    &digest,
+                                )
+                                .await
+                                {
+                                    Ok(Some(r)) => {
+                                        let mut msg = format!(
+                                            "blob is still referenced by manifest {}",
+                                            r.manifest
+                                        );
+                                        if let Some(tag) = r.tag {
+                                            msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
+                                        } else {
+                                            msg = format!("{msg} (repo={})", r.repo);
+                                        }
+                                        return errors::blob_in_use(&msg).into_response();
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            digest = digest.as_str(),
+                                            "safe blob delete: failed to scan for references"
+                                        );
+                                        return errors::internal_error().into_response();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                match crate::blob_delete_safety::find_blob_reference(&state.storage, &digest).await {
+                    Ok(Some(r)) => {
+                        let mut msg = format!("blob is still referenced by manifest {}", r.manifest);
+                        if let Some(tag) = r.tag {
+                            msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
+                        } else {
+                            msg = format!("{msg} (repo={})", r.repo);
+                        }
+                        return errors::blob_in_use(&msg).into_response();
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            digest = digest.as_str(),
+                            "safe blob delete: failed to scan for references"
+                        );
+                        return errors::internal_error().into_response();
+                    }
+                }
+            }
+
+            match state.storage.delete_blob(&digest).await {
+                Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
+                Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
+                Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+                Err(StorageError::InsufficientStorage) => {
+                    errors::insufficient_storage().into_response()
+                }
+                Err(StorageError::TooLarge) => errors::internal_error().into_response(),
+                Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+                Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
+            }
+        }
         Method::HEAD => match state.storage.head_blob(&digest).await {
             Ok(meta) => {
                 let mut headers = registry_headers();
@@ -1476,7 +1578,18 @@ async fn manifest_by_reference(
 
     match method {
         Method::DELETE => match state.storage.delete_manifest(name, &digest).await {
-            Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
+            Ok(()) => {
+                if let Some(idx) = state.ref_index.as_ref() {
+                    if let Err(err) = idx.sync_repo_tags(&state.storage, name).await {
+                        tracing::warn!(
+                            error = %err,
+                            repo = name,
+                            "ref-index: failed to resync tags after manifest delete"
+                        );
+                    }
+                }
+                (StatusCode::ACCEPTED, registry_headers()).into_response()
+            }
             Err(StorageError::NotFound) => errors::manifest_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::InsufficientStorage) => {
@@ -2732,6 +2845,17 @@ async fn manifest_put(
 
     // If reference is a tag, update tag pointer.
     if Digest::parse(reference).is_err() {
+        // Best-effort: capture old tag root for ref-index count updates.
+        let old_root_for_index = if state.ref_index.is_some() {
+            match state.storage.resolve_tag(name, reference).await {
+                Ok(d) => Some(d),
+                Err(StorageError::NotFound) => None,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         if let Err(err) = state.storage.set_tag(name, reference, &computed).await {
             return match err {
                 StorageError::Unsupported => errors::not_implemented().into_response(),
@@ -2741,6 +2865,22 @@ async fn manifest_put(
                 StorageError::InsufficientStorage => errors::insufficient_storage().into_response(),
                 StorageError::Internal(_) => errors::internal_error().into_response(),
             };
+        }
+
+        // Keep the ref-index up to date (best-effort). Errors here should not fail the push.
+        if let Some(idx) = state.ref_index.as_ref() {
+            if let Err(err) = idx
+                .on_tag_set(&state.storage, name, reference, &computed, old_root_for_index)
+                .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    repo = name,
+                    tag = reference,
+                    digest = computed.as_str(),
+                    "ref-index: failed to update on tag set"
+                );
+            }
         }
     }
 

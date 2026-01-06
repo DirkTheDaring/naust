@@ -59,6 +59,9 @@ pub struct Config {
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
 
+    // Persistent blob reference index (used to make DELETE blob safe without full scans).
+    pub ref_index: RefIndexConfig,
+
     pub allow_tag_overwrite: bool,
 
     // When true, allow cross-mounting blobs without a `from` repository.
@@ -106,6 +109,14 @@ pub struct Config {
     pub users: UsersConfig,
 
     pub proxy: ProxyConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct RefIndexConfig {
+    pub enabled: bool,
+    pub path: PathBuf,
+    pub rebuild_on_start: bool,
+    pub auto_rebuild_on_corruption: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -780,6 +791,21 @@ struct FileStorage {
     fs: FileStorageFs,
     #[serde(default)]
     s3: FileStorageS3,
+
+    #[serde(default)]
+    ref_index: FileStorageRefIndex,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileStorageRefIndex {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    rebuild_on_start: Option<bool>,
+    #[serde(default)]
+    auto_rebuild_on_corruption: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1186,6 +1212,37 @@ impl Config {
         let s3_prefix = env_str_any(&["REGISTRY__STORAGE__S3__PREFIX", "STORAGE_S3_PREFIX"])
             .or_else(|| file_cfg.storage.s3.prefix.clone())
             .unwrap_or_else(|| "registry".to_string());
+
+        let ref_index_enabled = env_bool_opt(&[
+            "REGISTRY__STORAGE__REF_INDEX__ENABLED",
+            "STORAGE_REF_INDEX_ENABLED",
+        ])
+        .or(file_cfg.storage.ref_index.enabled)
+        .unwrap_or(true);
+
+        let ref_index_path = env_str_any(&[
+            "REGISTRY__STORAGE__REF_INDEX__PATH",
+            "STORAGE_REF_INDEX_PATH",
+        ])
+        .or_else(|| file_cfg.storage.ref_index.path.clone())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fs_root.join("ref-index"));
+
+        let ref_index_rebuild_on_start = env_bool_opt(&[
+            "REGISTRY__STORAGE__REF_INDEX__REBUILD_ON_START",
+            "STORAGE_REF_INDEX_REBUILD_ON_START",
+        ])
+        .or(file_cfg.storage.ref_index.rebuild_on_start)
+        .unwrap_or(false);
+
+        let ref_index_auto_rebuild_on_corruption = env_bool_opt(&[
+            "REGISTRY__STORAGE__REF_INDEX__AUTO_REBUILD_ON_CORRUPTION",
+            "STORAGE_REF_INDEX_AUTO_REBUILD_ON_CORRUPTION",
+        ])
+        .or(file_cfg.storage.ref_index.auto_rebuild_on_corruption)
+        .unwrap_or(true);
 
         let allow_tag_overwrite = env_bool_opt(&[
             "REGISTRY__FEATURES__ALLOW_TAG_OVERWRITE",
@@ -1693,6 +1750,13 @@ impl Config {
             s3_region,
             s3_bucket,
             s3_prefix,
+
+            ref_index: RefIndexConfig {
+                enabled: ref_index_enabled,
+                path: ref_index_path,
+                rebuild_on_start: ref_index_rebuild_on_start,
+                auto_rebuild_on_corruption: ref_index_auto_rebuild_on_corruption,
+            },
             allow_tag_overwrite,
             automatic_crossmount,
             upload_gc_enabled,

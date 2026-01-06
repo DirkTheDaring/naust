@@ -1,7 +1,10 @@
 mod audit;
 mod auth;
+mod blob_delete_safety;
+mod blob_ref_index;
 mod config;
 mod http_api;
+mod manifest_refs;
 mod proxy;
 mod rbac;
 mod registry;
@@ -236,6 +239,28 @@ enum CliCommand {
     /// Print effective RBAC permissions (robots + users/groups) and exit.
     #[command(name = "audit-permissions")]
     AuditPermissions,
+
+    /// Inspect / rebuild the persistent blob reference index.
+    #[command(name = "ref-index")]
+    RefIndex {
+        #[command(subcommand)]
+        command: RefIndexCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RefIndexCommand {
+    /// Verify the index is healthy (schema + ready state). Exit 0 if OK, 1 if corrupt.
+    #[command(name = "check")]
+    Check,
+
+    /// Rebuild the index from the registry storage.
+    #[command(name = "rebuild")]
+    Rebuild,
+
+    /// Check and rebuild if corrupt (respects auto-rebuild config).
+    #[command(name = "ensure")]
+    Ensure,
 }
 
 #[derive(Debug, Default)]
@@ -266,6 +291,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub auth_metrics: Arc<AuthMetrics>,
     pub storage: Arc<dyn storage::Storage>,
+    pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
     pub proxy: Option<Arc<proxy::Proxy>>,
     pub proxy_cache: Option<Arc<dyn storage::Storage>>,
     // Multi-upstream: proxy/cache selected per request host.
@@ -350,6 +376,80 @@ async fn main() {
             let _report = crate::audit::print_audit(&cfg);
             return;
         }
+        CliCommand::RefIndex { command } => {
+            // CLI utilities should not panic; keep errors user-friendly.
+            let cfg = match std::panic::catch_unwind(|| {
+                if config_paths.is_empty() {
+                    Config::from_env()
+                } else {
+                    Config::from_env_with_files(&config_paths)
+                }
+            }) {
+                Ok(c) => c,
+                Err(err) => {
+                    let msg = if let Some(s) = err.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = err.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else {
+                        "<non-string panic>".to_string()
+                    };
+                    eprintln!("ref-index: failed to load config: {msg}");
+                    std::process::exit(2);
+                }
+            };
+
+            if !cfg.ref_index.enabled {
+                eprintln!("ref-index is disabled (storage.ref_index.enabled=false)");
+                std::process::exit(2);
+            }
+
+            let idx = match blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("ref-index: failed to open {}: {e}", cfg.ref_index.path.display());
+                    std::process::exit(1);
+                }
+            };
+
+            match command {
+                RefIndexCommand::Check => match idx.check_health() {
+                    Ok(()) => {
+                        println!("OK");
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("ref-index: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                RefIndexCommand::Rebuild => {
+                    let storage = storage::from_config(&cfg);
+                    if let Err(e) = idx.rebuild(&storage).await {
+                        eprintln!("ref-index: rebuild failed: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("OK");
+                    return;
+                }
+                RefIndexCommand::Ensure => {
+                    let storage = storage::from_config(&cfg);
+                    if let Err(e) = idx
+                        .ensure_healthy_or_rebuild(
+                            &storage,
+                            cfg.ref_index.auto_rebuild_on_corruption,
+                            cfg.ref_index.rebuild_on_start,
+                        )
+                        .await
+                    {
+                        eprintln!("ref-index: ensure failed: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("OK");
+                    return;
+                }
+            }
+        }
         CliCommand::HashSecret => {
             use std::io::Read as _;
 
@@ -410,6 +510,40 @@ async fn main() {
     maybe_generate_tls_certs(config.as_ref()).await;
     let addr = config.listen_addr;
     let storage = storage::from_config(config.as_ref());
+
+    let ref_index: Option<Arc<blob_ref_index::BlobRefIndex>> = if config.ref_index.enabled {
+        match blob_ref_index::BlobRefIndex::open(config.ref_index.path.clone()) {
+            Ok(idx) => {
+                if let Err(err) = idx
+                    .ensure_healthy_or_rebuild(
+                        &storage,
+                        config.ref_index.auto_rebuild_on_corruption,
+                        config.ref_index.rebuild_on_start,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        path = %config.ref_index.path.display(),
+                        "ref-index init failed; falling back to scan-based safe delete"
+                    );
+                    None
+                } else {
+                    Some(Arc::new(idx))
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %config.ref_index.path.display(),
+                    "ref-index open failed; falling back to scan-based safe delete"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let tls_enabled = config.tls_cert_path.is_some() && config.tls_key_path.is_some();
     let proxy_mode = if !config.proxy.enabled {
@@ -575,6 +709,7 @@ async fn main() {
         config,
         auth_metrics: Arc::new(AuthMetrics::default()),
         storage,
+        ref_index,
         proxy,
         proxy_cache,
         proxy_upstreams,

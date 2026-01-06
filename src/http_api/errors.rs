@@ -113,6 +113,17 @@ pub fn blob_unknown() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(body))
 }
 
+pub fn blob_in_use(message: &str) -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "BLOB_IN_USE",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::CONFLICT, Json(body))
+}
+
 pub fn manifest_unknown() -> impl IntoResponse {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
