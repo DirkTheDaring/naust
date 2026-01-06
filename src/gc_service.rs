@@ -48,6 +48,12 @@ pub struct GcService {
     run_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ScheduledCleanupStats {
+    pub quarantine: BlobGcStats,
+    pub delete: Option<BlobGcStats>,
+}
+
 impl GcService {
     pub fn new(
         config: Arc<crate::config::Config>,
@@ -147,6 +153,62 @@ impl GcService {
         .map_err(GcServiceError::Failed)
     }
 
+    pub async fn scheduled_cleanup_once(&self) -> Result<ScheduledCleanupStats, GcServiceError> {
+        let _guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
+
+        if !self.config.blob_gc_enabled {
+            return Err(GcServiceError::Disabled);
+        }
+
+        self.ensure_ref_index_ready().await?;
+
+        let policy = BlobGcPolicy::ManifestRooted;
+        let budgets = GcBudgets {
+            max_blobs: self.config.blob_gc_default_max_blobs,
+            max_bytes: self.config.blob_gc_default_max_bytes,
+            max_seconds: self.config.blob_gc_default_max_seconds,
+        };
+
+        let min_age = Duration::from_secs(self.config.blob_gc_default_min_age_secs);
+        let quarantine = blob_gc_quarantine(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            policy,
+            min_age,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::Failed)?;
+
+        if !self.config.blob_gc_enable_delete {
+            return Ok(ScheduledCleanupStats {
+                quarantine,
+                delete: None,
+            });
+        }
+
+        let quarantine_delay = Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
+        let delete = blob_gc_delete(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            policy,
+            quarantine_delay,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::Failed)?;
+
+        Ok(ScheduledCleanupStats {
+            quarantine,
+            delete: Some(delete),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn test_try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         self.run_lock.try_lock().ok()
@@ -158,6 +220,7 @@ mod tests {
     use super::*;
     use crate::registry::digest::Digest;
     use crate::storage::fs::FsStorage;
+    use sha2::Digest as _;
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -205,6 +268,8 @@ mod tests {
             blob_gc_default_max_blobs: 1000,
             blob_gc_default_max_bytes: u64::MAX,
             blob_gc_default_max_seconds: 60,
+            blob_gc_schedule_enabled: false,
+            blob_gc_schedule_interval_secs: 7 * 24 * 3600,
             admin_api: AdminApiConfig {
                 enabled: false,
                 username: None,
@@ -258,6 +323,58 @@ mod tests {
                 routing_trust_x_forwarded_host: false,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn scheduled_cleanup_runs_quarantine_and_delete_when_enabled() {
+        let fs_root = tmp_dir("sched-gc");
+        let ref_index_path = fs_root.join("ref-index");
+        let mut cfg = minimal_config(fs_root.clone(), ref_index_path);
+
+        cfg.blob_gc_enabled = true;
+        cfg.blob_gc_enable_delete = true;
+        cfg.blob_gc_default_min_age_secs = 0;
+        cfg.blob_gc_default_quarantine_delay_secs = 0;
+        cfg.blob_gc_default_max_blobs = 1000;
+
+        let cfg = Arc::new(cfg);
+        let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes)) as Arc<dyn storage::Storage>;
+        let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).expect("open idx"));
+        idx.ensure_healthy_or_rebuild(&storage, true, true)
+            .await
+            .expect("ensure idx");
+
+        // Create an unreferenced blob in live store.
+        let data = b"scheduled-cleanup";
+        let hex = hex::encode(sha2::Sha256::digest(data));
+        let digest = Digest::parse(&format!("sha256:{hex}")).expect("digest");
+        let live = fs_root
+            .join("blobs")
+            .join("sha256")
+            .join(&hex[0..2])
+            .join(&hex);
+        std::fs::create_dir_all(live.parent().unwrap()).expect("mkdir");
+        std::fs::write(&live, data).expect("write");
+
+        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+
+        let stats = service
+            .scheduled_cleanup_once()
+            .await
+            .expect("scheduled cleanup");
+
+        assert!(stats.quarantine.scanned_blobs >= 1);
+        assert!(stats.delete.is_some());
+        assert!(!live.exists(), "blob should be moved out of live");
+
+        let q = fs_root
+            .join("quarantine")
+            .join("blobs")
+            .join("sha256")
+            .join(&hex[0..2])
+            .join(&hex);
+        assert!(!q.exists(), "blob should be deleted from quarantine");
+        let _ = digest;
     }
 
     async fn write_blob(fs_root: &PathBuf, digest: &Digest, bytes: &[u8]) {

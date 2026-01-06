@@ -164,6 +164,11 @@ enabled = true
 # default_max_bytes = 18446744073709551615 # u64::MAX (effectively unlimited)
 # default_max_seconds = 60
 
+# Optional: run scheduled cleanup in the background (server only).
+# When enabled, the server triggers online GC periodically using the defaults above.
+# schedule_enabled = false
+# schedule_interval_secs = 604800 # 7d
+
 # Admin-only HTTP endpoints (disabled by default)
 #
 # Enables:

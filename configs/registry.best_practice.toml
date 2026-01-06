@@ -61,8 +61,14 @@ enabled = true
 #
 # Default per-run budgets (used by admin endpoints if omitted)
 # default_max_blobs = 1000
-# default_max_bytes = 18446744073709551615 # u64::MAX (effectively unlimited)
+# default_max_bytes = 9223372036854775807  # i64::MAX (TOML ints are i64)
 # default_max_seconds = 60
+
+# Optional periodic online GC (disabled by default)
+# When enabled, the server will run a quarantine pass every interval and (if enable_delete=true)
+# a delete pass immediately after.
+# schedule_enabled = false
+# schedule_interval_secs = 604800 # 7d
 
 # Admin-only HTTP endpoints for online blob GC (disabled by default)
 [admin_api]

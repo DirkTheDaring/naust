@@ -227,6 +227,13 @@ password = "change-me"
 [blob_gc]
 enabled = true         # allows quarantine
 enable_delete = false  # keep false until you've validated quarantine behavior
+
+# Optional: periodic background cleanup (disabled by default)
+# When enabled, the server runs an automatic quarantine pass every interval and (if enable_delete=true)
+# a delete pass immediately after, using the default policy/budgets from this section.
+# Note: the first scheduled run happens after one full interval.
+# schedule_enabled = false
+# schedule_interval_secs = 604800 # 7d
 ```
 
 Endpoints:

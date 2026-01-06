@@ -88,6 +88,11 @@ pub struct Config {
     pub blob_gc_default_max_bytes: u64,
     pub blob_gc_default_max_seconds: u64,
 
+    // Optional background scheduling for online blob GC (server only).
+    // Disabled by default.
+    pub blob_gc_schedule_enabled: bool,
+    pub blob_gc_schedule_interval_secs: u64,
+
     // Admin-only HTTP endpoints (e.g. online blob GC triggers). Disabled by default.
     pub admin_api: AdminApiConfig,
 
@@ -463,6 +468,12 @@ struct FileBlobGc {
 
     #[serde(default)]
     default_max_seconds: Option<u64>,
+
+    #[serde(default)]
+    schedule_enabled: Option<bool>,
+
+    #[serde(default)]
+    schedule_interval_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1408,6 +1419,18 @@ impl Config {
         .or(file_cfg.blob_gc.default_max_seconds)
         .unwrap_or(60);
 
+        let blob_gc_schedule_enabled =
+            env_bool_opt(&["REGISTRY__BLOB_GC__SCHEDULE_ENABLED", "BLOB_GC_SCHEDULE_ENABLED"])
+                .or(file_cfg.blob_gc.schedule_enabled)
+                .unwrap_or(false);
+
+        let blob_gc_schedule_interval_secs = env_u64_any(&[
+            "REGISTRY__BLOB_GC__SCHEDULE_INTERVAL_SECS",
+            "BLOB_GC_SCHEDULE_INTERVAL_SECS",
+        ])
+        .or(file_cfg.blob_gc.schedule_interval_secs)
+        .unwrap_or(7 * 24 * 3600);
+
         let max_upload_bytes =
             env_u64_any(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])
                 .or(file_cfg.limits.max_upload_bytes)
@@ -1901,6 +1924,8 @@ impl Config {
             blob_gc_default_max_blobs,
             blob_gc_default_max_bytes,
             blob_gc_default_max_seconds,
+            blob_gc_schedule_enabled,
+            blob_gc_schedule_interval_secs,
             admin_api: AdminApiConfig {
                 enabled: admin_api_enabled,
                 username: admin_api_username,

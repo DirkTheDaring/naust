@@ -997,6 +997,7 @@ async fn main() {
     let tls_key_path = state.config.tls_key_path.clone();
 
     spawn_upload_gc(state.clone());
+    spawn_blob_gc_scheduler(state.clone());
     spawn_proxy_gc(state.clone());
     spawn_proxy_scrub(state.clone());
 
@@ -1811,6 +1812,59 @@ fn spawn_upload_gc(state: AppState) {
 
             if removed > 0 {
                 tracing::info!(scanned, removed, path = %uploads_dir.display(), "upload gc: removed stale temp files");
+            }
+        }
+    });
+}
+
+fn spawn_blob_gc_scheduler(state: AppState) {
+    if state.config.storage_backend != StorageBackend::Filesystem {
+        return;
+    }
+    if !state.config.blob_gc_schedule_enabled {
+        return;
+    }
+
+    let Some(service) = state.gc_service.clone() else {
+        tracing::warn!("blob gc scheduler enabled but gc service unavailable");
+        return;
+    };
+
+    let interval = Duration::from_secs(state.config.blob_gc_schedule_interval_secs.max(1));
+
+    tokio::spawn(async move {
+        // Delay first run until after one full interval.
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // consume immediate tick
+        loop {
+            ticker.tick().await;
+            tracing::info!(event = "blob_gc", action = "scheduled_cleanup", "starting scheduled blob gc cleanup");
+
+            match service.scheduled_cleanup_once().await {
+                Ok(stats) => {
+                    tracing::info!(
+                        event = "blob_gc",
+                        action = "scheduled_cleanup",
+                        quarantined_blobs = stats.quarantine.quarantined_blobs,
+                        quarantined_bytes = stats.quarantine.quarantined_bytes,
+                        restored_blobs = stats.quarantine.restored_blobs,
+                        restored_bytes = stats.quarantine.restored_bytes,
+                        deleted_blobs = stats
+                            .delete
+                            .as_ref()
+                            .map(|s| s.deleted_blobs)
+                            .unwrap_or(0),
+                        deleted_bytes = stats
+                            .delete
+                            .as_ref()
+                            .map(|s| s.deleted_bytes)
+                            .unwrap_or(0),
+                        "scheduled blob gc cleanup finished"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(event = "blob_gc", action = "scheduled_cleanup", error = %err, "scheduled blob gc cleanup failed");
+                }
             }
         }
     });

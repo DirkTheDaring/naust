@@ -2769,6 +2769,8 @@ mod tests {
             blob_gc_default_max_blobs: 1000,
             blob_gc_default_max_bytes: u64::MAX,
             blob_gc_default_max_seconds: 60,
+            blob_gc_schedule_enabled: false,
+            blob_gc_schedule_interval_secs: 7 * 24 * 3600,
             admin_api: crate::config::AdminApiConfig {
                 enabled: false,
                 username: None,
