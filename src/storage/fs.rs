@@ -291,6 +291,16 @@ impl FsStorage {
             .join(digest.hex())
     }
 
+    fn quarantine_blob_path(&self, digest: &Digest) -> PathBuf {
+        // data/quarantine/blobs/sha256/ab/<hex>
+        self.root
+            .join("quarantine")
+            .join("blobs")
+            .join("sha256")
+            .join(digest.prefix2())
+            .join(digest.hex())
+    }
+
     fn manifest_path(&self, name: &str, digest: &Digest) -> PathBuf {
         // data/repos/<name>/manifests/<hex>
         self.root
@@ -532,7 +542,14 @@ impl Storage for FsStorage {
         let path = self.blob_path(digest);
         match tokio::fs::metadata(&path).await {
             Ok(meta) => Ok(BlobMeta { size: meta.len() }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let qpath = self.quarantine_blob_path(digest);
+                match tokio::fs::metadata(&qpath).await {
+                    Ok(meta) => Ok(BlobMeta { size: meta.len() }),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
+                    Err(err) => Err(StorageError::Internal(err.to_string())),
+                }
+            }
             Err(err) => Err(StorageError::Internal(err.to_string())),
         }
     }
@@ -545,7 +562,14 @@ impl Storage for FsStorage {
         let file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
+                let qpath = self.quarantine_blob_path(digest);
+                match tokio::fs::File::open(&qpath).await {
+                    Ok(f) => f,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(StorageError::NotFound);
+                    }
+                    Err(err) => return Err(StorageError::Internal(err.to_string())),
+                }
             }
             Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
@@ -998,5 +1022,80 @@ impl Storage for FsStorage {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn tmp_fs_root() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "registry-rust-fsstorage-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&p).expect("create temp fs_root");
+        p
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(path, bytes).expect("write file");
+    }
+
+    #[tokio::test]
+    async fn head_and_open_blob_fall_back_to_quarantine() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let digest = Digest::parse(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("valid digest");
+
+        let content = b"hello from quarantine";
+        let qpath = storage.quarantine_blob_path(&digest);
+        write_file(&qpath, content);
+
+        let meta = storage.head_blob(&digest).await.expect("head_blob");
+        assert_eq!(meta.size, content.len() as u64);
+
+        let (meta, mut reader) = storage.open_blob(&digest).await.expect("open_blob");
+        assert_eq!(meta.size, content.len() as u64);
+
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("read blob");
+        assert_eq!(buf, content);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn open_blob_prefers_live_over_quarantine() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let digest = Digest::parse(
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("valid digest");
+
+        let live_content = b"live";
+        let quarantine_content = b"quarantine";
+
+        write_file(&storage.blob_path(&digest), live_content);
+        write_file(&storage.quarantine_blob_path(&digest), quarantine_content);
+
+        let (meta, mut reader) = storage.open_blob(&digest).await.expect("open_blob");
+        assert_eq!(meta.size, live_content.len() as u64);
+
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("read blob");
+        assert_eq!(buf, live_content);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
