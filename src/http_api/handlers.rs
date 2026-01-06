@@ -5,6 +5,7 @@ use crate::{
 };
 use axum::{
     body::Body,
+    extract::Json,
     extract::Query,
     extract::RawQuery,
     extract::{Path, State},
@@ -15,6 +16,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use headers::{Authorization, HeaderMapExt, authorization::Basic};
 use sha2::Digest as _;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -358,6 +360,319 @@ pub async fn token(
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct AdminGcBudgetsRequest {
+    #[serde(default)]
+    max_blobs: Option<usize>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    max_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct AdminGcPlanRequest {
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(default)]
+    min_age_secs: Option<u64>,
+    #[serde(default)]
+    budgets: Option<AdminGcBudgetsRequest>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct AdminGcDeleteRequest {
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(default)]
+    quarantine_delay_secs: Option<u64>,
+    #[serde(default)]
+    budgets: Option<AdminGcBudgetsRequest>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AdminGcStatsResponse {
+    scanned_blobs: u64,
+    scanned_bytes: u64,
+    eligible_blobs: u64,
+    eligible_bytes: u64,
+    quarantined_blobs: u64,
+    quarantined_bytes: u64,
+    restored_blobs: u64,
+    restored_bytes: u64,
+    deleted_blobs: u64,
+    deleted_bytes: u64,
+}
+
+impl From<crate::blob_gc::BlobGcStats> for AdminGcStatsResponse {
+    fn from(s: crate::blob_gc::BlobGcStats) -> Self {
+        Self {
+            scanned_blobs: s.scanned_blobs,
+            scanned_bytes: s.scanned_bytes,
+            eligible_blobs: s.eligible_blobs,
+            eligible_bytes: s.eligible_bytes,
+            quarantined_blobs: s.quarantined_blobs,
+            quarantined_bytes: s.quarantined_bytes,
+            restored_blobs: s.restored_blobs,
+            restored_bytes: s.restored_bytes,
+            deleted_blobs: s.deleted_blobs,
+            deleted_bytes: s.deleted_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AdminGcResponse {
+    run_id: u64,
+    stats: AdminGcStatsResponse,
+}
+
+fn admin_basic_subject(cfg: &crate::config::Config, headers: &HeaderMap) -> Result<String, Response> {
+    if !cfg.admin_api.enabled {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+
+    let expected_user = cfg.admin_api.username.as_deref();
+    let expected_pass = cfg.admin_api.password.as_deref();
+    if expected_user.is_none() || expected_pass.is_none() {
+        return Err((StatusCode::FORBIDDEN, "admin api enabled but no credentials configured")
+            .into_response());
+    }
+
+    let basic = headers
+        .typed_get::<Authorization<Basic>>()
+        .map(|v| (v.username().to_string(), v.password().to_string()));
+    let Some((user, pass)) = basic else {
+        let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+        resp.headers_mut().append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Basic realm=\"registry-admin\""),
+        );
+        return Err(resp);
+    };
+
+    if Some(user.as_str()) != expected_user || Some(pass.as_str()) != expected_pass {
+        let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+        resp.headers_mut().append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Basic realm=\"registry-admin\""),
+        );
+        return Err(resp);
+    }
+
+    Ok(user)
+}
+
+fn parse_admin_policy(s: &str) -> Result<crate::blob_gc::BlobGcPolicy, Response> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tag_rooted" | "tag" => Ok(crate::blob_gc::BlobGcPolicy::TagRooted),
+        "manifest_rooted" | "manifest" => Ok(crate::blob_gc::BlobGcPolicy::ManifestRooted),
+        _ => Err((StatusCode::BAD_REQUEST, "invalid policy (expected tag_rooted or manifest_rooted)")
+            .into_response()),
+    }
+}
+
+fn defaults_budgets(cfg: &crate::config::Config, b: Option<AdminGcBudgetsRequest>) -> crate::gc_service::GcBudgets {
+    let b = b.unwrap_or_default();
+    crate::gc_service::GcBudgets {
+        max_blobs: b.max_blobs.unwrap_or(cfg.blob_gc_default_max_blobs),
+        max_bytes: b.max_bytes.unwrap_or(cfg.blob_gc_default_max_bytes),
+        max_seconds: b.max_seconds.unwrap_or(cfg.blob_gc_default_max_seconds),
+    }
+}
+
+pub async fn admin_gc_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminGcPlanRequest>,
+) -> Response {
+    let subject = match admin_basic_subject(&state.config, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let Some(service) = state.gc_service.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    };
+
+    let policy = match req.policy.as_deref() {
+        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
+        Some(s) => match parse_admin_policy(s) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        },
+    };
+
+    let run_id = state
+        .gc_run_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+
+    let budgets = defaults_budgets(&state.config, req.budgets);
+    let min_age_secs = req.min_age_secs.unwrap_or(state.config.blob_gc_default_min_age_secs);
+    let min_age = Duration::from_secs(min_age_secs);
+
+    tracing::info!(event = "admin_gc", action = "plan", %subject, run_id, policy = ?policy, min_age_secs);
+
+    match service.plan(policy, min_age, budgets).await {
+        Ok(stats) => Json(AdminGcResponse {
+            run_id,
+            stats: stats.into(),
+        })
+        .into_response(),
+        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
+            (StatusCode::CONFLICT, "gc already running").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::Disabled)
+        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
+            (StatusCode::FORBIDDEN, "gc disabled").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        }
+        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
+            .into_response(),
+    }
+}
+
+pub async fn admin_gc_quarantine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminGcPlanRequest>,
+) -> Response {
+    let subject = match admin_basic_subject(&state.config, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let Some(service) = state.gc_service.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    };
+
+    let policy = match req.policy.as_deref() {
+        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
+        Some(s) => match parse_admin_policy(s) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        },
+    };
+
+    let run_id = state
+        .gc_run_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+
+    let budgets = defaults_budgets(&state.config, req.budgets);
+    let min_age_secs = req.min_age_secs.unwrap_or(state.config.blob_gc_default_min_age_secs);
+    let min_age = Duration::from_secs(min_age_secs);
+
+    tracing::info!(event = "admin_gc", action = "quarantine", %subject, run_id, policy = ?policy, min_age_secs);
+
+    match service.quarantine(policy, min_age, budgets).await {
+        Ok(stats) => Json(AdminGcResponse {
+            run_id,
+            stats: stats.into(),
+        })
+        .into_response(),
+        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
+            (StatusCode::CONFLICT, "gc already running").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::Disabled) => {
+            (StatusCode::FORBIDDEN, "gc disabled").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
+            (StatusCode::FORBIDDEN, "gc disabled").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        }
+        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
+            .into_response(),
+    }
+}
+
+pub async fn admin_gc_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminGcDeleteRequest>,
+) -> Response {
+    let subject = match admin_basic_subject(&state.config, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let Some(service) = state.gc_service.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    };
+
+    let policy = match req.policy.as_deref() {
+        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
+        Some(s) => match parse_admin_policy(s) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        },
+    };
+
+    let run_id = state
+        .gc_run_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+
+    let budgets = defaults_budgets(&state.config, req.budgets);
+    let quarantine_delay_secs = req
+        .quarantine_delay_secs
+        .unwrap_or(state.config.blob_gc_default_quarantine_delay_secs);
+    let quarantine_delay = Duration::from_secs(quarantine_delay_secs);
+
+    tracing::info!(event = "admin_gc", action = "delete", %subject, run_id, policy = ?policy, quarantine_delay_secs);
+
+    match service.delete(policy, quarantine_delay, budgets).await {
+        Ok(stats) => Json(AdminGcResponse {
+            run_id,
+            stats: stats.into(),
+        })
+        .into_response(),
+        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
+            (StatusCode::CONFLICT, "gc already running").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::Disabled) => {
+            (StatusCode::FORBIDDEN, "gc disabled").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
+            (StatusCode::FORBIDDEN, "gc delete disabled").into_response()
+        }
+        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        }
+        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
+            .into_response(),
+    }
+}
+
+pub async fn admin_gc_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let _subject = match admin_basic_subject(&state.config, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let Some(service) = state.gc_service.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    };
+
+    match service.health().await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        }
+        Err(crate::gc_service::GcServiceError::AlreadyRunning) => (StatusCode::OK, "gc running")
+            .into_response(),
+        Err(crate::gc_service::GcServiceError::Disabled)
+        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => StatusCode::OK.into_response(),
+        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
+            .into_response(),
+    }
 }
 
 fn service_param_is_valid(service_param: Option<&str>, configured_service: &str) -> bool {
@@ -2052,10 +2367,217 @@ fn is_valid_tag(tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_token_scopes_for_request, is_valid_repo_name, is_valid_tag, parse_scopes,
-        sanitize_token_scopes, service_param_is_valid, token_scope_requests_repo_action,
-        wants_push_from_token_scopes,
+        AdminGcDeleteRequest, AdminGcPlanRequest, admin_gc_plan, decide_token_scopes_for_request,
+        is_valid_repo_name, is_valid_tag, parse_scopes, sanitize_token_scopes,
+        service_param_is_valid, token_scope_requests_repo_action, wants_push_from_token_scopes,
     };
+    use crate::AppState;
+    use axum::extract::{Json, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use headers::{Authorization, HeaderMapExt};
+    use std::sync::Arc;
+
+    fn with_admin_creds(mut cfg: Config) -> Config {
+        cfg.admin_api = crate::config::AdminApiConfig {
+            enabled: true,
+            username: Some("admin".to_string()),
+            password: Some("secret".to_string()),
+        };
+        cfg
+    }
+
+    fn admin_headers_ok() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let auth = Authorization::basic("admin", "secret");
+        headers.typed_insert(auth);
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_gc_requires_auth() {
+        let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: None,
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let req = AdminGcPlanRequest::default();
+
+        let resp = admin_gc_plan(State(state), HeaderMap::new(), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_returns_503_when_service_missing() {
+        let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: None,
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let req = AdminGcPlanRequest::default();
+
+        let resp = admin_gc_plan(State(state), admin_headers_ok(), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_maps_already_running_to_conflict() {
+        let fs_root = std::env::temp_dir().join(format!(
+            "registry-rust-admin-gc-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let ref_index_path = fs_root.join("ref-index");
+        let _ = std::fs::create_dir_all(&ref_index_path);
+
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        cfg.ref_index.path = ref_index_path.clone();
+        let cfg = Arc::new(with_admin_creds(cfg));
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
+        idx.rebuild(&storage).await.expect("rebuild");
+        let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
+        let service_for_state = service.clone();
+        let held = service.test_try_lock().expect("lock");
+
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: Some(service_for_state),
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let req = AdminGcPlanRequest::default();
+
+        let resp = admin_gc_plan(State(state), admin_headers_ok(), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_quarantine_blocked_when_kill_switch_off() {
+        let fs_root = std::env::temp_dir().join(format!(
+            "registry-rust-admin-gc-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let ref_index_path = fs_root.join("ref-index");
+        let _ = std::fs::create_dir_all(&ref_index_path);
+
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        cfg.ref_index.path = ref_index_path.clone();
+        cfg.blob_gc_enabled = false;
+        let cfg = Arc::new(with_admin_creds(cfg));
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
+        idx.rebuild(&storage).await.expect("rebuild");
+        let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
+
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: Some(service),
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let resp = super::admin_gc_quarantine(State(state), admin_headers_ok(), Json(AdminGcPlanRequest::default())).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_delete_blocked_when_delete_gate_off() {
+        let fs_root = std::env::temp_dir().join(format!(
+            "registry-rust-admin-gc-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let ref_index_path = fs_root.join("ref-index");
+        let _ = std::fs::create_dir_all(&ref_index_path);
+
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        cfg.ref_index.path = ref_index_path.clone();
+        cfg.blob_gc_enabled = true;
+        cfg.blob_gc_enable_delete = false;
+        let cfg = Arc::new(with_admin_creds(cfg));
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
+        idx.rebuild(&storage).await.expect("rebuild");
+        let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
+
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: Some(service),
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let resp = super::admin_gc_delete(
+            State(state),
+            admin_headers_ok(),
+            Json(AdminGcDeleteRequest::default()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
     use crate::config::{Config, ProxyConfig, ProxyMode, RobotsConfig, UploadPolicyConfig};
     use crate::rbac::Grant;
     use crate::robot_secrets;
@@ -2240,6 +2762,18 @@ mod tests {
             upload_gc_interval_secs: 3600,
             upload_gc_max_age_secs: 86400,
             blob_gc_finalize_grace_secs: 72 * 3600,
+            blob_gc_enabled: true,
+            blob_gc_enable_delete: true,
+            blob_gc_default_min_age_secs: 7 * 24 * 3600,
+            blob_gc_default_quarantine_delay_secs: 24 * 3600,
+            blob_gc_default_max_blobs: 1000,
+            blob_gc_default_max_bytes: u64::MAX,
+            blob_gc_default_max_seconds: 60,
+            admin_api: crate::config::AdminApiConfig {
+                enabled: false,
+                username: None,
+                password: None,
+            },
             max_upload_bytes: 5 * 1024 * 1024 * 1024,
             max_request_body_bytes: 32 * 1024 * 1024,
             max_concurrent_buffered_requests: 8,

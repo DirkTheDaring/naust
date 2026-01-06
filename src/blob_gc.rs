@@ -5,7 +5,7 @@ use crate::storage;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -36,16 +36,35 @@ pub struct BlobGcStats {
     pub deleted_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BlobGcLimits {
+    pub max_per_run: usize,
+    pub max_bytes: u64,
+    pub max_seconds: u64,
+}
+
+impl BlobGcLimits {
+    pub fn unlimited(max_per_run: usize) -> Self {
+        Self {
+            max_per_run,
+            max_bytes: u64::MAX,
+            max_seconds: u64::MAX,
+        }
+    }
+}
+
 pub async fn blob_gc_plan(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
     idx: &BlobRefIndex,
     policy: BlobGcPolicy,
     min_age: Duration,
-    max_per_run: usize,
+    limits: BlobGcLimits,
 ) -> Result<BlobGcStats, String> {
     let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
     let mut stats = BlobGcStats::default();
+
+    let t0 = Instant::now();
 
     let root = cfg.fs_root.join("blobs").join("sha256");
     let now = SystemTime::now();
@@ -55,7 +74,11 @@ pub async fn blob_gc_plan(
         Err(e) => return Err(format!("read_dir {}: {e}", root.display())),
     };
 
-    while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
+    'prefixes: while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
+        if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
+            break;
+        }
+
         let ft = match prefix_ent.file_type().await {
             Ok(t) => t,
             Err(_) => continue,
@@ -70,6 +93,10 @@ pub async fn blob_gc_plan(
         };
 
         while let Ok(Some(ent)) = dir.next_entry().await {
+            if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
+                break 'prefixes;
+            }
+
             let ft = match ent.file_type().await {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -102,13 +129,21 @@ pub async fn blob_gc_plan(
                 Err(_) => continue,
             };
 
+            if policy_ctx.is_pinned(&digest, now)? {
+                continue;
+            }
+
             stats.scanned_blobs += 1;
             stats.scanned_bytes = stats.scanned_bytes.saturating_add(meta.len());
 
-            if stats.eligible_blobs as usize >= max_per_run {
+            if stats.eligible_blobs as usize >= limits.max_per_run {
                 continue;
             }
             if policy_ctx.is_referenced(&digest).await? {
+                continue;
+            }
+
+            if stats.eligible_bytes >= limits.max_bytes {
                 continue;
             }
             stats.eligible_blobs += 1;
@@ -125,10 +160,12 @@ pub async fn blob_gc_quarantine(
     idx: &BlobRefIndex,
     policy: BlobGcPolicy,
     min_age: Duration,
-    max_per_run: usize,
+    limits: BlobGcLimits,
 ) -> Result<BlobGcStats, String> {
     let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
     let mut stats = BlobGcStats::default();
+
+    let t0 = Instant::now();
 
     let now = SystemTime::now();
 
@@ -141,7 +178,13 @@ pub async fn blob_gc_quarantine(
     };
 
     while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
-        if stats.quarantined_blobs as usize >= max_per_run {
+        if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
+            break;
+        }
+        if stats.quarantined_blobs as usize >= limits.max_per_run {
+            break;
+        }
+        if stats.quarantined_bytes >= limits.max_bytes {
             break;
         }
 
@@ -159,7 +202,13 @@ pub async fn blob_gc_quarantine(
         };
 
         while let Ok(Some(ent)) = dir.next_entry().await {
-            if stats.quarantined_blobs as usize >= max_per_run {
+            if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
+                break;
+            }
+            if stats.quarantined_blobs as usize >= limits.max_per_run {
+                break;
+            }
+            if stats.quarantined_bytes >= limits.max_bytes {
                 break;
             }
 
@@ -197,6 +246,10 @@ pub async fn blob_gc_quarantine(
                 Err(_) => continue,
             };
 
+            if policy_ctx.is_pinned(&digest, now_for_age)? {
+                continue;
+            }
+
             stats.scanned_blobs += 1;
             stats.scanned_bytes = stats.scanned_bytes.saturating_add(meta.len());
 
@@ -204,6 +257,9 @@ pub async fn blob_gc_quarantine(
                 continue;
             }
 
+            if stats.quarantined_bytes >= limits.max_bytes {
+                continue;
+            }
             match quarantine_blob(cfg, &digest, now).await {
                 Ok(QuarantineOutcome::Moved { size }) => {
                     stats.quarantined_blobs += 1;
@@ -224,10 +280,12 @@ pub async fn blob_gc_delete(
     idx: &BlobRefIndex,
     policy: BlobGcPolicy,
     quarantine_delay: Duration,
-    max_per_run: usize,
+    limits: BlobGcLimits,
 ) -> Result<BlobGcStats, String> {
     let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
     let mut stats = BlobGcStats::default();
+
+    let t0 = Instant::now();
 
     let now = SystemTime::now();
 
@@ -244,7 +302,13 @@ pub async fn blob_gc_delete(
     }; 
 
     while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
-        if stats.deleted_blobs as usize >= max_per_run {
+        if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
+            break;
+        }
+        if stats.deleted_blobs as usize >= limits.max_per_run {
+            break;
+        }
+        if stats.deleted_bytes >= limits.max_bytes {
             break;
         }
 
@@ -262,7 +326,13 @@ pub async fn blob_gc_delete(
         };
 
         while let Ok(Some(ent)) = dir.next_entry().await {
-            if stats.deleted_blobs as usize >= max_per_run {
+            if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
+                break;
+            }
+            if stats.deleted_blobs as usize >= limits.max_per_run {
+                break;
+            }
+            if stats.deleted_bytes >= limits.max_bytes {
                 break;
             }
 
@@ -293,6 +363,11 @@ pub async fn blob_gc_delete(
                 Err(_) => continue,
             };
 
+            // Never delete (or churn) pinned blobs.
+            if policy_ctx.is_pinned(&digest, now)? {
+                continue;
+            }
+
             let Some(q_at) = read_quarantine_time(cfg, &digest).await? else {
                 continue;
             };
@@ -314,6 +389,9 @@ pub async fn blob_gc_delete(
                 continue;
             }
 
+            if stats.deleted_bytes >= limits.max_bytes {
+                continue;
+            }
             match delete_quarantined_blob(cfg, &digest).await {
                 Ok(Some(size)) => {
                     stats.deleted_blobs += 1;
@@ -380,6 +458,12 @@ impl PolicyContext {
         }
 
         Ok(false)
+    }
+
+    fn is_pinned(&self, digest: &Digest, now: SystemTime) -> Result<bool, String> {
+        self.idx
+            .is_blob_pinned(digest, now)
+            .map_err(|e| format!("ref-index: {e}"))
     }
 }
 

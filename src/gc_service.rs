@@ -1,0 +1,417 @@
+use crate::blob_gc::{blob_gc_delete, blob_gc_plan, blob_gc_quarantine, BlobGcLimits, BlobGcPolicy, BlobGcStats};
+use crate::blob_ref_index::BlobRefIndex;
+use crate::storage;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+#[derive(Debug, thiserror::Error)]
+pub enum GcServiceError {
+    #[error("gc already running")]
+    AlreadyRunning,
+
+    #[error("gc disabled")]
+    Disabled,
+
+    #[error("gc delete disabled")]
+    DeleteDisabled,
+
+    #[error("ref-index unhealthy: {0}")]
+    RefIndexUnhealthy(String),
+
+    #[error("gc failed: {0}")]
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct GcBudgets {
+    pub max_blobs: usize,
+    pub max_bytes: u64,
+    pub max_seconds: u64,
+}
+
+impl GcBudgets {
+    pub fn to_limits(&self) -> BlobGcLimits {
+        BlobGcLimits {
+            max_per_run: self.max_blobs,
+            max_bytes: self.max_bytes,
+            max_seconds: self.max_seconds,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GcService {
+    config: Arc<crate::config::Config>,
+    storage: Arc<dyn storage::Storage>,
+    idx: Arc<BlobRefIndex>,
+    run_lock: Arc<Mutex<()>>,
+}
+
+impl GcService {
+    pub fn new(
+        config: Arc<crate::config::Config>,
+        storage: Arc<dyn storage::Storage>,
+        idx: Arc<BlobRefIndex>,
+    ) -> Self {
+        Self {
+            config,
+            storage,
+            idx,
+            run_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    async fn ensure_ref_index_ready(&self) -> Result<(), GcServiceError> {
+        let auto = self.config.ref_index.auto_rebuild_on_corruption;
+        match self
+            .idx
+            .ensure_healthy_or_rebuild(&self.storage, auto, false)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(GcServiceError::RefIndexUnhealthy(e.to_string())),
+        }
+    }
+
+    pub async fn health(&self) -> Result<(), GcServiceError> {
+        self.ensure_ref_index_ready().await
+    }
+
+    pub async fn plan(
+        &self,
+        policy: BlobGcPolicy,
+        min_age: Duration,
+        budgets: GcBudgets,
+    ) -> Result<BlobGcStats, GcServiceError> {
+        let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        self.ensure_ref_index_ready().await?;
+        blob_gc_plan(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            policy,
+            min_age,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::Failed)
+    }
+
+    pub async fn quarantine(
+        &self,
+        policy: BlobGcPolicy,
+        min_age: Duration,
+        budgets: GcBudgets,
+    ) -> Result<BlobGcStats, GcServiceError> {
+        let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        if !self.config.blob_gc_enabled {
+            return Err(GcServiceError::Disabled);
+        }
+        self.ensure_ref_index_ready().await?;
+        blob_gc_quarantine(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            policy,
+            min_age,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::Failed)
+    }
+
+    pub async fn delete(
+        &self,
+        policy: BlobGcPolicy,
+        quarantine_delay: Duration,
+        budgets: GcBudgets,
+    ) -> Result<BlobGcStats, GcServiceError> {
+        let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        if !self.config.blob_gc_enabled {
+            return Err(GcServiceError::Disabled);
+        }
+        if !self.config.blob_gc_enable_delete {
+            return Err(GcServiceError::DeleteDisabled);
+        }
+        self.ensure_ref_index_ready().await?;
+        blob_gc_delete(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            policy,
+            quarantine_delay,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::Failed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.run_lock.try_lock().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::digest::Digest;
+    use crate::storage::fs::FsStorage;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    fn tmp_dir(prefix: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    fn minimal_config(fs_root: PathBuf, ref_index_path: PathBuf) -> crate::config::Config {
+        use crate::config::*;
+        use std::net::SocketAddr;
+
+        Config {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 5000)),
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_acme: None,
+            push_username: None,
+            push_password: None,
+            push_allow_repos: None,
+            push_auth_mode: PushAuthMode::DenyIfNoBasic,
+            storage_backend: StorageBackend::Filesystem,
+            fs_root,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_bucket: None,
+            s3_prefix: "registry".to_string(),
+            ref_index: RefIndexConfig {
+                enabled: true,
+                path: ref_index_path,
+                rebuild_on_start: false,
+                auto_rebuild_on_corruption: true,
+            },
+            allow_tag_overwrite: false,
+            automatic_crossmount: false,
+            upload_gc_enabled: false,
+            upload_gc_interval_secs: 3600,
+            upload_gc_max_age_secs: 86400,
+            blob_gc_finalize_grace_secs: 72 * 3600,
+            blob_gc_enabled: true,
+            blob_gc_enable_delete: true,
+            blob_gc_default_min_age_secs: 7 * 24 * 3600,
+            blob_gc_default_quarantine_delay_secs: 24 * 3600,
+            blob_gc_default_max_blobs: 1000,
+            blob_gc_default_max_bytes: u64::MAX,
+            blob_gc_default_max_seconds: 60,
+            admin_api: AdminApiConfig {
+                enabled: false,
+                username: None,
+                password: None,
+            },
+            max_upload_bytes: 5 * 1024 * 1024,
+            max_request_body_bytes: 1024 * 1024,
+            max_concurrent_buffered_requests: 1,
+            max_concurrent_requests: 1,
+            request_timeout_secs: 60,
+            upload_request_timeout_secs: 60,
+            disallow_monolithic_uploads: false,
+            upload_policy: UploadPolicyConfig {
+                abort_on_error: false,
+                abort_on_digest_mismatch: false,
+                repo_rules: vec![],
+            },
+            catalog_requires_auth: false,
+            public_url: None,
+            token_service: "registry-rust".to_string(),
+            token_signing_key: "test".to_string(),
+            token_signing_keys: vec![crate::security::TokenSigningKey {
+                kid: "default".to_string(),
+                key: "test".to_string(),
+            }],
+            token_ttl_secs: 600,
+            robots: RobotsConfig::default(),
+            users: UsersConfig::default(),
+            proxy: ProxyConfig {
+                enabled: false,
+                mode: ProxyMode::Allowlist,
+                upstream_base_url: None,
+                upstream_username: None,
+                upstream_password: None,
+                allowed_upstream_hosts: vec![],
+                allowed_repo_prefixes: vec![],
+                block_private_networks: true,
+                redirect_policy: RedirectPolicy::AnyPublic,
+                max_concurrent_upstream: 1,
+                index_path: PathBuf::from("./data/proxy-index"),
+                cache_fs_root: None,
+                cache_s3_prefix: None,
+                gc_interval_secs: 3600,
+                scrub_enabled: false,
+                scrub_interval_secs: 3600,
+                scrub_max_files_per_run: 1,
+                max_cache_bytes: None,
+                repo_rules: vec![],
+                upstreams: vec![],
+                routing_proxy_hosts: vec![],
+                routing_trust_x_forwarded_host: false,
+            },
+        }
+    }
+
+    async fn write_blob(fs_root: &PathBuf, digest: &Digest, bytes: &[u8]) {
+        let dir = fs_root
+            .join("blobs")
+            .join("sha256")
+            .join(digest.prefix2());
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        tokio::fs::write(dir.join(digest.hex()), bytes)
+            .await
+            .expect("write blob");
+    }
+
+    async fn write_tag_and_manifest(
+        fs_root: &PathBuf,
+        repo: &str,
+        tag: &str,
+        root_manifest: &Digest,
+        manifest_bytes: &[u8],
+    ) {
+        let repo_dir = fs_root.join("repos").join(repo);
+        let tags_dir = repo_dir.join("tags");
+        let manifests_dir = repo_dir.join("manifests");
+        tokio::fs::create_dir_all(&tags_dir).await.expect("mkdir tags");
+        tokio::fs::create_dir_all(&manifests_dir).await.expect("mkdir manifests");
+
+        tokio::fs::write(tags_dir.join(tag), format!("{}\n", root_manifest.as_str()))
+            .await
+            .expect("write tag");
+        tokio::fs::write(manifests_dir.join(root_manifest.hex()), manifest_bytes)
+            .await
+            .expect("write manifest");
+    }
+
+    #[tokio::test]
+    async fn quarantine_then_restore_when_becomes_referenced() {
+        let fs_root = tmp_dir("gc-fsroot");
+        let ref_index_path = tmp_dir("gc-refindex");
+
+        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
+        let storage: Arc<dyn storage::Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+
+        let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
+        idx.rebuild(&storage).await.expect("rebuild empty");
+
+        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+
+        let blob = Digest::parse(&format!("sha256:{}", "a".repeat(64))).expect("digest");
+        write_blob(&fs_root, &blob, b"blobdata").await;
+
+        let budgets = GcBudgets {
+            max_blobs: 1000,
+            max_bytes: u64::MAX,
+            max_seconds: u64::MAX,
+        };
+
+        let q = service
+            .quarantine(BlobGcPolicy::TagRooted, Duration::from_secs(0), budgets.clone())
+            .await
+            .expect("quarantine");
+        assert_eq!(q.quarantined_blobs, 1);
+
+        // Now create a tag root manifest referencing this blob, and rebuild the index.
+        let root = Digest::parse(&format!("sha256:{}", "b".repeat(64))).expect("digest");
+        let cfg_digest = Digest::parse(&format!("sha256:{}", "c".repeat(64))).expect("digest");
+        let manifest = format!(
+            "{{\"schemaVersion\":2,\"config\":{{\"digest\":\"{}\"}},\"layers\":[{{\"digest\":\"{}\"}}]}}",
+            cfg_digest.as_str(),
+            blob.as_str()
+        );
+        write_tag_and_manifest(&fs_root, "org/repo", "latest", &root, manifest.as_bytes()).await;
+
+        idx.rebuild(&storage).await.expect("rebuild with tag");
+
+        // With quarantine_delay=0, delete phase should restore instead of deleting.
+        let d = service
+            .delete(BlobGcPolicy::TagRooted, Duration::from_secs(0), budgets)
+            .await
+            .expect("delete");
+        assert_eq!(d.restored_blobs, 1);
+        assert_eq!(d.deleted_blobs, 0);
+
+        // Sanity: blob should be readable from live path now.
+        let live_path = fs_root
+            .join("blobs")
+            .join("sha256")
+            .join(blob.prefix2())
+            .join(blob.hex());
+        assert!(tokio::fs::metadata(&live_path).await.is_ok());
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+        let _ = std::fs::remove_dir_all(&ref_index_path);
+    }
+
+    #[tokio::test]
+    async fn pinned_blobs_are_skipped() {
+        let fs_root = tmp_dir("gc-fsroot2");
+        let ref_index_path = tmp_dir("gc-refindex2");
+
+        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
+        let storage: Arc<dyn storage::Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
+        idx.rebuild(&storage).await.expect("rebuild");
+
+        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+
+        let blob = Digest::parse(&format!("sha256:{}", "d".repeat(64))).expect("digest");
+        write_blob(&fs_root, &blob, b"blobdata").await;
+
+        idx.pin_blob(&blob, SystemTime::now() + Duration::from_secs(10_000), "test")
+            .expect("pin");
+
+        let budgets = GcBudgets {
+            max_blobs: 1000,
+            max_bytes: u64::MAX,
+            max_seconds: u64::MAX,
+        };
+
+        let q = service
+            .quarantine(BlobGcPolicy::TagRooted, Duration::from_secs(0), budgets)
+            .await
+            .expect("quarantine");
+        assert_eq!(q.quarantined_blobs, 0);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+        let _ = std::fs::remove_dir_all(&ref_index_path);
+    }
+
+    #[tokio::test]
+    async fn service_is_single_run() {
+        let fs_root = tmp_dir("gc-fsroot3");
+        let ref_index_path = tmp_dir("gc-refindex3");
+
+        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
+        let storage: Arc<dyn storage::Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
+        idx.rebuild(&storage).await.expect("rebuild");
+
+        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+
+        // Hold the lock manually, then ensure plan refuses.
+        let _held = service.run_lock.try_lock().expect("lock");
+        let budgets = GcBudgets {
+            max_blobs: 1,
+            max_bytes: 1,
+            max_seconds: 1,
+        };
+        let err = service
+            .plan(BlobGcPolicy::TagRooted, Duration::from_secs(0), budgets)
+            .await
+            .expect_err("should refuse");
+        assert!(matches!(err, GcServiceError::AlreadyRunning));
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+        let _ = std::fs::remove_dir_all(&ref_index_path);
+    }
+}

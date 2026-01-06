@@ -76,6 +76,21 @@ pub struct Config {
     // This covers the common "finalized blob exists but tag/manifest not yet written" window.
     pub blob_gc_finalize_grace_secs: u64,
 
+    // Online blob GC operational safety toggles + defaults.
+    // - enabled gates quarantine/delete (plan remains available).
+    // - enable_delete gates the delete phase specifically.
+    // - defaults are used by admin endpoints when request fields are omitted.
+    pub blob_gc_enabled: bool,
+    pub blob_gc_enable_delete: bool,
+    pub blob_gc_default_min_age_secs: u64,
+    pub blob_gc_default_quarantine_delay_secs: u64,
+    pub blob_gc_default_max_blobs: usize,
+    pub blob_gc_default_max_bytes: u64,
+    pub blob_gc_default_max_seconds: u64,
+
+    // Admin-only HTTP endpoints (e.g. online blob GC triggers). Disabled by default.
+    pub admin_api: AdminApiConfig,
+
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
     // Concurrency guard for endpoints that buffer full bodies into memory (e.g. manifest PUT,
@@ -113,6 +128,13 @@ pub struct Config {
     pub users: UsersConfig,
 
     pub proxy: ProxyConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AdminApiConfig {
+    pub enabled: bool,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -410,6 +432,9 @@ struct FileConfig {
     blob_gc: FileBlobGc,
 
     #[serde(default)]
+    admin_api: FileAdminApi,
+
+    #[serde(default)]
     proxy: FileProxy,
 }
 
@@ -417,6 +442,39 @@ struct FileConfig {
 struct FileBlobGc {
     #[serde(default)]
     finalize_grace_secs: Option<u64>,
+
+    #[serde(default)]
+    enabled: Option<bool>,
+
+    #[serde(default)]
+    enable_delete: Option<bool>,
+
+    #[serde(default)]
+    default_min_age_secs: Option<u64>,
+
+    #[serde(default)]
+    default_quarantine_delay_secs: Option<u64>,
+
+    #[serde(default)]
+    default_max_blobs: Option<usize>,
+
+    #[serde(default)]
+    default_max_bytes: Option<u64>,
+
+    #[serde(default)]
+    default_max_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileAdminApi {
+    #[serde(default)]
+    enabled: Option<bool>,
+
+    #[serde(default)]
+    username: Option<String>,
+
+    #[serde(default)]
+    password: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1216,6 +1274,20 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data"));
 
+        let admin_api_enabled = env_bool_opt(&["REGISTRY__ADMIN_API__ENABLED", "ADMIN_API_ENABLED"])
+            .or(file_cfg.admin_api.enabled)
+            .unwrap_or(false);
+        let admin_api_username = env_str_any(&[
+            "REGISTRY__ADMIN_API__USERNAME",
+            "ADMIN_API_USERNAME",
+        ])
+        .or_else(|| file_cfg.admin_api.username.clone());
+        let admin_api_password = env_str_any(&[
+            "REGISTRY__ADMIN_API__PASSWORD",
+            "ADMIN_API_PASSWORD",
+        ])
+        .or_else(|| file_cfg.admin_api.password.clone());
+
         let s3_endpoint = env_str_any(&["REGISTRY__STORAGE__S3__ENDPOINT", "STORAGE_S3_ENDPOINT"])
             .or_else(|| file_cfg.storage.s3.endpoint.clone());
         let s3_region = env_str_any(&["REGISTRY__STORAGE__S3__REGION", "STORAGE_S3_REGION"])
@@ -1296,6 +1368,45 @@ impl Config {
         ])
         .or(file_cfg.blob_gc.finalize_grace_secs)
         .unwrap_or(72 * 3600);
+
+        // Online blob GC safety toggles + defaults.
+        // Defaults are conservative and match docs/blob-gc-online.md.
+        let blob_gc_enabled = env_bool_opt(&["REGISTRY__BLOB_GC__ENABLED", "BLOB_GC_ENABLED"])
+            .or(file_cfg.blob_gc.enabled)
+            .unwrap_or(false);
+        let blob_gc_enable_delete =
+            env_bool_opt(&["REGISTRY__BLOB_GC__ENABLE_DELETE", "BLOB_GC_ENABLE_DELETE"])
+                .or(file_cfg.blob_gc.enable_delete)
+                .unwrap_or(false);
+        let blob_gc_default_min_age_secs =
+            env_u64_any(&["REGISTRY__BLOB_GC__DEFAULT_MIN_AGE_SECS", "BLOB_GC_DEFAULT_MIN_AGE_SECS"])
+                .or(file_cfg.blob_gc.default_min_age_secs)
+                .unwrap_or(7 * 24 * 3600);
+        let blob_gc_default_quarantine_delay_secs = env_u64_any(&[
+            "REGISTRY__BLOB_GC__DEFAULT_QUARANTINE_DELAY_SECS",
+            "BLOB_GC_DEFAULT_QUARANTINE_DELAY_SECS",
+        ])
+        .or(file_cfg.blob_gc.default_quarantine_delay_secs)
+        .unwrap_or(24 * 3600);
+
+        let blob_gc_default_max_blobs = env_usize_any(&[
+            "REGISTRY__BLOB_GC__DEFAULT_MAX_BLOBS",
+            "BLOB_GC_DEFAULT_MAX_BLOBS",
+        ])
+        .or(file_cfg.blob_gc.default_max_blobs)
+        .unwrap_or(1000);
+        let blob_gc_default_max_bytes = env_u64_any(&[
+            "REGISTRY__BLOB_GC__DEFAULT_MAX_BYTES",
+            "BLOB_GC_DEFAULT_MAX_BYTES",
+        ])
+        .or(file_cfg.blob_gc.default_max_bytes)
+        .unwrap_or(u64::MAX);
+        let blob_gc_default_max_seconds = env_u64_any(&[
+            "REGISTRY__BLOB_GC__DEFAULT_MAX_SECONDS",
+            "BLOB_GC_DEFAULT_MAX_SECONDS",
+        ])
+        .or(file_cfg.blob_gc.default_max_seconds)
+        .unwrap_or(60);
 
         let max_upload_bytes =
             env_u64_any(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])
@@ -1783,6 +1894,18 @@ impl Config {
             upload_gc_interval_secs,
             upload_gc_max_age_secs,
             blob_gc_finalize_grace_secs,
+            blob_gc_enabled,
+            blob_gc_enable_delete,
+            blob_gc_default_min_age_secs,
+            blob_gc_default_quarantine_delay_secs,
+            blob_gc_default_max_blobs,
+            blob_gc_default_max_bytes,
+            blob_gc_default_max_seconds,
+            admin_api: AdminApiConfig {
+                enabled: admin_api_enabled,
+                username: admin_api_username,
+                password: admin_api_password,
+            },
             max_upload_bytes,
             max_request_body_bytes,
             max_concurrent_buffered_requests,

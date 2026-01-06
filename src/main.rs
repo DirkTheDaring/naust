@@ -3,6 +3,7 @@ mod auth;
 mod blob_delete_safety;
 mod blob_gc;
 mod blob_ref_index;
+mod gc_service;
 mod config;
 mod fs_root_lock;
 mod http_api;
@@ -23,7 +24,7 @@ use axum::{
     http::Request,
     middleware::Next,
     response::IntoResponse,
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use clap::{Parser, Subcommand};
 use config::{Config, StorageBackend};
@@ -347,6 +348,8 @@ pub struct AppState {
     pub auth_metrics: Arc<AuthMetrics>,
     pub storage: Arc<dyn storage::Storage>,
     pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
+    pub gc_service: Option<Arc<gc_service::GcService>>,
+    pub gc_run_seq: Arc<AtomicU64>,
     pub proxy: Option<Arc<proxy::Proxy>>,
     pub proxy_cache: Option<Arc<dyn storage::Storage>>,
     // Multi-upstream: proxy/cache selected per request host.
@@ -594,7 +597,7 @@ async fn main() {
                         &idx,
                         policy,
                         Duration::from_secs(min_age_secs),
-                        max_per_run,
+                        crate::blob_gc::BlobGcLimits::unlimited(max_per_run),
                     )
                     .await
                     {
@@ -622,7 +625,7 @@ async fn main() {
                         &idx,
                         policy,
                         Duration::from_secs(min_age_secs),
-                        max_per_run,
+                        crate::blob_gc::BlobGcLimits::unlimited(max_per_run),
                     )
                     .await
                     {
@@ -650,7 +653,7 @@ async fn main() {
                         &idx,
                         policy,
                         Duration::from_secs(quarantine_delay_secs),
-                        max_per_run,
+                        crate::blob_gc::BlobGcLimits::unlimited(max_per_run),
                     )
                     .await
                     {
@@ -939,11 +942,22 @@ async fn main() {
     ));
     let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
 
+    let gc_service = match (&ref_index, &config.storage_backend) {
+        (Some(idx), StorageBackend::Filesystem) => Some(Arc::new(gc_service::GcService::new(
+            config.clone(),
+            storage.clone(),
+            idx.clone(),
+        ))),
+        _ => None,
+    };
+
     let state = AppState {
         config,
         auth_metrics: Arc::new(AuthMetrics::default()),
         storage,
         ref_index,
+        gc_service,
+        gc_run_seq: Arc::new(AtomicU64::new(0)),
         proxy,
         proxy_cache,
         proxy_upstreams,
@@ -1017,8 +1031,20 @@ async fn main() {
                 async move { limit_token_requests(limiter, req, next).await }
             }));
 
+    // Admin-only endpoints (disabled by default).
+    let admin = if state.config.admin_api.enabled {
+        Router::new()
+            .route("/_admin/gc/health", get(handlers::admin_gc_health))
+            .route("/_admin/gc/plan", post(handlers::admin_gc_plan))
+            .route("/_admin/gc/quarantine", post(handlers::admin_gc_quarantine))
+            .route("/_admin/gc/delete", post(handlers::admin_gc_delete))
+    } else {
+        Router::new()
+    };
+
     let app = Router::new()
         .merge(token)
+        .merge(admin)
         .merge(meta)
         .merge(v2)
         .with_state(state.clone())
