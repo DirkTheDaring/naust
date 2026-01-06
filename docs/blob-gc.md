@@ -1,5 +1,9 @@
 # Safe dangling-blob GC concept
 
+This document describes the **general GC safety model** and the current **offline maintenance** approach.
+
+For the fully online (while-running, in-process) design, see `docs/blob-gc-online.md`.
+
 This document defines a **safe** approach to reclaim storage from **dangling (unreferenced) blobs** without risking deletion of blobs needed by:
 
 - existing images/tags
@@ -16,6 +20,7 @@ It is written for the **filesystem backend** first (where we can enumerate blobs
 - **Reachable**: a blob is reachable if it is referenced by a root manifest/tag directly or through a chain of manifests/indexes/artifacts.
 - **Dangling blob**: a blob present on disk but not reachable from any root.
 - **In-flight push window**: time where a client has already finalized some blobs, but has not yet uploaded the manifest / applied the tag.
+- **Pin / lease**: a short-lived “treat as in-use” record for a digest (used to protect in-flight pushes and recently finalized blobs in online mode).
 
 ## What can create dangling blobs
 
@@ -75,6 +80,8 @@ The safe concept is:
 2. **Quarantine phase**: move candidates out of the live blob store first (atomic rename). Do not permanently delete immediately.
 3. **Recheck before final delete**: if a blob becomes reachable after quarantine, restore it.
 
+For a fully online system (no downtime), this is typically combined with **pins/leases** and a **read fallback to quarantine**; see `docs/blob-gc-online.md`.
+
 This converts a risky destructive operation into a reversible, observable process.
 
 ### Why quarantine helps
@@ -110,10 +117,16 @@ Steps:
 ### Step 0: Preconditions
 
 - Only supported for filesystem backend initially.
+
+Offline maintenance mode (current implementation):
 - **Must not run concurrently with a live registry process** that uses the same `fs_root`.
-  - The implementation enforces this by taking an exclusive lock file: `fs_root/.locks/registry-rust.lock`.
+  - Enforced by an exclusive lock file: `fs_root/.locks/registry-rust.lock`.
   - The registry server holds this lock for its whole runtime (filesystem backend).
   - `registry-rust blob-gc ...` and `registry-rust ref-index ...` refuse to run if the lock is held.
+
+Online mode:
+- Do not use the external CLI to mutate storage while the server is live.
+- Use an in-process GC service and make quarantine readable; see `docs/blob-gc-online.md`.
 - If ref-index is enabled:
   - run `ref-index ensure` behavior: check health; rebuild if corrupted/forced.
 - If ref-index is disabled:
@@ -164,18 +177,19 @@ This ensures that a push which completes after quarantine can still recover cont
 
 ## Handling in-flight pushes explicitly (extra belt-and-suspenders)
 
-Grace period is usually enough, but we can strengthen safety further by tracking recently finalized blobs:
+Grace period is usually enough for offline runs, but online designs typically need a stronger primitive:
 
-- On `finalize_upload`, write `digest -> finalized_at` to a sled tree (`upload_finalized`), with a TTL-like cleanup.
-- GC must skip any blob where `now - finalized_at < min_age` even if mtime is misleading.
+- **Pins/leases**: on `finalize_upload`, record `digest -> pinned_until` (e.g. `finalize_grace`) so GC treats the blob as in-use even if no tag exists yet.
+- GC must skip pinned blobs even if reachability says “unreferenced”.
 
-This avoids relying solely on filesystem timestamps.
+This avoids relying solely on filesystem timestamps and better covers the finalized-but-not-yet-tagged window.
 
 ## Concurrency considerations
 
 - Reads: deleting a blob currently being served can break clients. Quarantine-first reduces risk:
   - If you quarantine by rename, a currently-open file descriptor can still be read to completion on Unix, but new opens will fail.
   - Therefore, run final deletion only after a delay.
+  - For true online operation, the server must also check quarantine on reads to avoid transient 404s (see `docs/blob-gc-online.md`).
 - Writes: a blob can become referenced at any time after its layers exist.
   - Quarantine + recheck ensures we don’t permanently delete blobs that became referenced after the first check.
 - Multiple registry instances:
@@ -190,11 +204,14 @@ This avoids relying solely on filesystem timestamps.
 
 ## Operator UX (recommended)
 
-Implement as a CLI (not a background daemon initially):
+Offline maintenance UX (current):
 
 - `blob-gc plan --min-age-secs ...` (dry-run summary)
 - `blob-gc quarantine --min-age-secs ... --max-per-run ...`
 - `blob-gc delete --quarantine-delay-secs ... --max-per-run ...`
+
+Online UX (preferred long-term):
+- An authenticated admin trigger that runs the same phases **in-process**, to keep a single writer for sled/ref-index and avoid live read races.
 
 Defaults should be conservative:
 
