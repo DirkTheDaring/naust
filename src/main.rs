@@ -1835,6 +1835,7 @@ fn spawn_blob_gc_scheduler(state: AppState) {
     tokio::spawn(async move {
         // Delay first run until after one full interval.
         let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // consume immediate tick
         loop {
             ticker.tick().await;
@@ -1861,6 +1862,13 @@ fn spawn_blob_gc_scheduler(state: AppState) {
                             .unwrap_or(0),
                         "scheduled blob gc cleanup finished"
                     );
+                }
+                Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
+                    tracing::info!(event = "blob_gc", action = "scheduled_cleanup", "scheduled blob gc skipped (already running)");
+                }
+                Err(crate::gc_service::GcServiceError::Disabled) => {
+                    tracing::warn!(event = "blob_gc", action = "scheduled_cleanup", "blob gc scheduler enabled but blob_gc.enabled=false; stopping scheduler");
+                    return;
                 }
                 Err(err) => {
                     tracing::warn!(event = "blob_gc", action = "scheduled_cleanup", error = %err, "scheduled blob gc cleanup failed");

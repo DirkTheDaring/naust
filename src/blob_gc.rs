@@ -368,15 +368,8 @@ pub async fn blob_gc_delete(
                 continue;
             }
 
-            let Some(q_at) = read_quarantine_time(cfg, &digest).await? else {
-                continue;
-            };
-
-            let age = now.duration_since(q_at).unwrap_or(Duration::from_secs(0));
-            if age < quarantine_delay {
-                continue;
-            }
-
+            // If a quarantined blob becomes referenced again, restore it regardless of its
+            // quarantine timestamp metadata.
             if policy_ctx.is_referenced(&digest).await? {
                 match restore_blob(cfg, &digest).await {
                     Ok(Some(size)) => {
@@ -386,6 +379,22 @@ pub async fn blob_gc_delete(
                     Ok(None) => {}
                     Err(e) => return Err(e),
                 }
+                continue;
+            }
+
+            // Crash/outage recovery: if the quarantine timestamp is missing or invalid,
+            // self-heal it conservatively (treat as newly quarantined) so the blob can be
+            // deleted in a later run without risking premature deletes.
+            let q_at = match read_quarantine_time(cfg, &digest).await? {
+                Some(t) => t,
+                None => {
+                    let _ = write_quarantine_time(cfg, &digest, now).await;
+                    continue;
+                }
+            };
+
+            let age = now.duration_since(q_at).unwrap_or(Duration::from_secs(0));
+            if age < quarantine_delay {
                 continue;
             }
 

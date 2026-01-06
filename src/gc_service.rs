@@ -1,6 +1,9 @@
 use crate::blob_gc::{blob_gc_delete, blob_gc_plan, blob_gc_quarantine, BlobGcLimits, BlobGcPolicy, BlobGcStats};
 use crate::blob_ref_index::BlobRefIndex;
 use crate::storage;
+use fs2::FileExt;
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -48,6 +51,10 @@ pub struct GcService {
     run_lock: Arc<Mutex<()>>,
 }
 
+struct FsGcLock {
+    _file: std::fs::File,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScheduledCleanupStats {
     pub quarantine: BlobGcStats,
@@ -80,6 +87,44 @@ impl GcService {
         }
     }
 
+    async fn try_acquire_fs_gc_lock(&self) -> Result<Option<FsGcLock>, GcServiceError> {
+        if self.config.storage_backend != crate::config::StorageBackend::Filesystem {
+            return Ok(None);
+        }
+
+        let lock_path: PathBuf = self
+            .config
+            .fs_root
+            .join("quarantine")
+            .join("gc.lock");
+
+        let res = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&lock_path)?;
+
+            match file.try_lock_exclusive() {
+                Ok(()) => Ok(Some(FsGcLock { _file: file })),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| GcServiceError::Failed(e.to_string()))?;
+
+        match res {
+            Ok(Some(lock)) => Ok(Some(lock)),
+            Ok(None) => Err(GcServiceError::AlreadyRunning),
+            Err(e) => Err(GcServiceError::Failed(format!("gc lock: {e}"))),
+        }
+    }
+
     pub async fn health(&self) -> Result<(), GcServiceError> {
         self.ensure_ref_index_ready().await
     }
@@ -91,6 +136,7 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         self.ensure_ref_index_ready().await?;
         blob_gc_plan(
             &self.config,
@@ -111,6 +157,7 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
         }
@@ -134,6 +181,7 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
         }
@@ -158,6 +206,8 @@ impl GcService {
             .run_lock
             .try_lock()
             .map_err(|_| GcServiceError::AlreadyRunning)?;
+
+        let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
 
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
