@@ -50,3 +50,4 @@ storage-s3 = []
 
 [dev-dependencies]
 tempfile = "3"
+http-body-util = "0.1"

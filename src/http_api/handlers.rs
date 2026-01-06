@@ -827,6 +827,12 @@ fn url_encode_component(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>()
 }
 
+fn query_bool(map: &HashMap<String, String>, key: &str) -> bool {
+    map.get(key)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 pub async fn v2_dispatch(
     State(state): State<AppState>,
     method: Method,
@@ -1155,9 +1161,24 @@ pub async fn meta_org_repos(
     let has_more = end_idx < total;
 
     let mut repos_out: Vec<serde_json::Value> = Vec::new();
+    let include_tags = query_bool(&query, "include_tags");
     for repo in &page {
         match state.storage.repo_timestamps(repo).await {
-            Ok(ts) => repos_out.push(repo_meta_from_timestamps(repo, ts)),
+            Ok(ts) => {
+                let mut meta = repo_meta_from_timestamps(repo, ts);
+                if include_tags {
+                    let tags = match state.storage.list_tags(repo).await {
+                        Ok(t) => t,
+                        Err(StorageError::NotFound) => Vec::new(),
+                        Err(_) => return errors::internal_error().into_response(),
+                    };
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
+                        obj.insert("tags".to_string(), serde_json::json!(tags));
+                    }
+                }
+                repos_out.push(meta);
+            }
             Err(StorageError::NotFound) => {
                 repos_out.push(serde_json::json!({"name": repo, "org": repo_org(repo)}));
             }
@@ -1195,14 +1216,28 @@ pub async fn meta_repo(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
         return crate::auth::unauthorized_catalog_challenge(&state).into_response();
     }
 
+    let include_tags = query_bool(&query, "include_tags");
+
     match state.storage.repo_timestamps(&name).await {
         Ok(ts) => {
-            let payload = repo_meta_from_timestamps(&name, ts);
+            let mut payload = repo_meta_from_timestamps(&name, ts);
+            if include_tags {
+                let tags = match state.storage.list_tags(&name).await {
+                    Ok(t) => t,
+                    Err(StorageError::NotFound) => Vec::new(),
+                    Err(_) => return errors::internal_error().into_response(),
+                };
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
+                    obj.insert("tags".to_string(), serde_json::json!(tags));
+                }
+            }
             let bytes = match serde_json::to_vec(&payload) {
                 Ok(b) => b,
                 Err(_) => return errors::internal_error().into_response(),
@@ -1255,9 +1290,24 @@ pub async fn meta_catalog(
     let has_more = end_idx < total;
 
     let mut repos_out: Vec<serde_json::Value> = Vec::new();
+    let include_tags = query_bool(&query, "include_tags");
     for repo in &page {
         match state.storage.repo_timestamps(repo).await {
-            Ok(ts) => repos_out.push(repo_meta_from_timestamps(repo, ts)),
+            Ok(ts) => {
+                let mut meta = repo_meta_from_timestamps(repo, ts);
+                if include_tags {
+                    let tags = match state.storage.list_tags(repo).await {
+                        Ok(t) => t,
+                        Err(StorageError::NotFound) => Vec::new(),
+                        Err(_) => return errors::internal_error().into_response(),
+                    };
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
+                        obj.insert("tags".to_string(), serde_json::json!(tags));
+                    }
+                }
+                repos_out.push(meta);
+            }
             Err(StorageError::NotFound) => {
                 repos_out.push(serde_json::json!({"name": repo, "org": repo_org(repo)}));
             }
@@ -2375,6 +2425,7 @@ mod tests {
     use axum::extract::{Json, State};
     use axum::http::{HeaderMap, StatusCode};
     use headers::{Authorization, HeaderMapExt};
+    use http_body_util::BodyExt;
     use std::sync::Arc;
 
     fn with_admin_creds(mut cfg: Config) -> Config {
@@ -2575,6 +2626,64 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
+
+    #[tokio::test]
+    async fn meta_catalog_include_tags_adds_tags_and_tag_count() {
+        let fs_root = std::env::temp_dir().join(format!(
+            "registry-rust-meta-tags-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&fs_root);
+
+        // Create repos + tags on disk.
+        let repo_dir = fs_root.join("repos").join("org1").join("repoa").join("tags");
+        let _ = std::fs::create_dir_all(&repo_dir);
+        std::fs::write(repo_dir.join("latest"), "sha256:deadbeef\n").unwrap();
+        std::fs::write(repo_dir.join("v1"), "sha256:cafebabe\n").unwrap();
+
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        cfg.catalog_requires_auth = false;
+        let cfg = Arc::new(cfg);
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: None,
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let mut q = std::collections::HashMap::new();
+        q.insert("include_tags".to_string(), "1".to_string());
+
+        let resp = super::meta_catalog(State(state), HeaderMap::new(), axum::extract::Query(q)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let repos = v.get("repositories").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(repos.len(), 1);
+        let repo0 = repos[0].as_object().unwrap();
+        assert_eq!(repo0.get("name").and_then(|x| x.as_str()), Some("org1/repoa"));
+        assert_eq!(repo0.get("tag_count").and_then(|x| x.as_u64()), Some(2));
+
+        let tags = repo0.get("tags").and_then(|x| x.as_array()).unwrap();
+        let tags: Vec<&str> = tags.iter().filter_map(|x| x.as_str()).collect();
+        assert_eq!(tags, vec!["latest", "v1"]);
 
         let _ = std::fs::remove_dir_all(&fs_root);
     }
