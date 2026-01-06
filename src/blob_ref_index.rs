@@ -38,6 +38,14 @@ pub struct BlobRefIndex {
     pins: sled::Tree,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TagRootedRefreshStats {
+    pub repos_scanned: u64,
+    pub tags_scanned: u64,
+    pub roots_ingested: u64,
+    pub tags_updated: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PinRecord {
     until_unix_secs: u64,
@@ -359,6 +367,60 @@ impl BlobRefIndex {
         self.meta.insert(META_STATE, META_STATE_READY)?;
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Best-effort, conservative refresh for tag-rooted GC.
+    ///
+    /// This ensures the current on-disk tag roots are represented in the index so
+    /// `is_blob_referenced()` won't produce false negatives due to stale/missed updates.
+    ///
+    /// It is conservative under concurrent writes:
+    /// - it ingests reachable manifests for current roots (adds edges)
+    /// - it sets tag->root when it differs
+    /// - it increments root refcounts for new roots
+    /// - it never decrements counts or deletes old mappings (may over-retain, but is safe)
+    pub async fn refresh_tag_rooted_conservative(
+        &self,
+        storage: &Arc<dyn Storage>,
+    ) -> Result<TagRootedRefreshStats, RefIndexError> {
+        self.check_health()?;
+
+        let mut stats = TagRootedRefreshStats::default();
+        let repos = storage.list_repositories().await?;
+        for repo in repos {
+            stats.repos_scanned += 1;
+            let tags = match storage.list_tags(&repo).await {
+                Ok(t) => t,
+                Err(StorageError::NotFound) => continue,
+                Err(e) => return Err(e.into()),
+            };
+
+            for tag in tags {
+                stats.tags_scanned += 1;
+                let root = match storage.resolve_tag(&repo, &tag).await {
+                    Ok(d) => d,
+                    Err(StorageError::NotFound) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+
+                self.ingest_root(storage, &repo, &root).await?;
+                stats.roots_ingested += 1;
+
+                let key = tag_key(&repo, &tag);
+                let new_val = root.as_str().as_bytes().to_vec();
+
+                let cur = self.tag_to_root.get(&key)?;
+                let needs_update = cur.as_ref().map(|v| v.as_ref()) != Some(new_val.as_slice());
+                if needs_update {
+                    self.tag_to_root.insert(&key, new_val)?;
+                    self.inc_root_count(root.as_str().as_bytes())?;
+                    stats.tags_updated += 1;
+                }
+            }
+        }
+
+        self.db.flush()?;
+        Ok(stats)
     }
 
     async fn ingest_root(

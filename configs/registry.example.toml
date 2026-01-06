@@ -161,7 +161,7 @@ enabled = true
 #
 # Default per-run budgets (used by admin endpoints if omitted)
 # default_max_blobs = 1000
-# default_max_bytes = 18446744073709551615 # u64::MAX (effectively unlimited)
+# default_max_bytes = 9223372036854775807  # i64::MAX (TOML ints are i64)
 # default_max_seconds = 60
 
 # Optional: run scheduled cleanup in the background (server only).

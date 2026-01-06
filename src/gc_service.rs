@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +88,35 @@ impl GcService {
         }
     }
 
+    async fn refresh_tag_rooted_index_if_needed(
+        &self,
+        policy: BlobGcPolicy,
+    ) -> Result<(), GcServiceError> {
+        if policy != BlobGcPolicy::TagRooted {
+            return Ok(());
+        }
+
+        let t0 = Instant::now();
+        let stats = self
+            .idx
+            .refresh_tag_rooted_conservative(&self.storage)
+            .await
+            .map_err(|e| GcServiceError::RefIndexUnhealthy(e.to_string()))?;
+
+        tracing::info!(
+            event = "blob_gc",
+            action = "tag_rooted_refresh",
+            refresh_ms = t0.elapsed().as_millis() as u64,
+            repos_scanned = stats.repos_scanned,
+            tags_scanned = stats.tags_scanned,
+            roots_ingested = stats.roots_ingested,
+            tags_updated = stats.tags_updated,
+            "ref-index refreshed conservatively for tag-rooted gc"
+        );
+
+        Ok(())
+    }
+
     async fn try_acquire_fs_gc_lock(&self) -> Result<Option<FsGcLock>, GcServiceError> {
         if self.config.storage_backend != crate::config::StorageBackend::Filesystem {
             return Ok(None);
@@ -135,9 +165,11 @@ impl GcService {
         min_age: Duration,
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
+        let t0 = Instant::now();
         let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         self.ensure_ref_index_ready().await?;
+        self.refresh_tag_rooted_index_if_needed(policy).await?;
         blob_gc_plan(
             &self.config,
             &self.storage,
@@ -148,6 +180,19 @@ impl GcService {
         )
         .await
         .map_err(GcServiceError::Failed)
+        .inspect(|stats| {
+            tracing::info!(
+                event = "blob_gc",
+                action = "plan",
+                policy = ?policy,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                scanned_blobs = stats.scanned_blobs,
+                scanned_bytes = stats.scanned_bytes,
+                eligible_blobs = stats.eligible_blobs,
+                eligible_bytes = stats.eligible_bytes,
+                "blob gc plan finished"
+            );
+        })
     }
 
     pub async fn quarantine(
@@ -156,12 +201,14 @@ impl GcService {
         min_age: Duration,
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
+        let t0 = Instant::now();
         let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
         }
         self.ensure_ref_index_ready().await?;
+        self.refresh_tag_rooted_index_if_needed(policy).await?;
         blob_gc_quarantine(
             &self.config,
             &self.storage,
@@ -172,6 +219,21 @@ impl GcService {
         )
         .await
         .map_err(GcServiceError::Failed)
+        .inspect(|stats| {
+            tracing::info!(
+                event = "blob_gc",
+                action = "quarantine",
+                policy = ?policy,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                scanned_blobs = stats.scanned_blobs,
+                scanned_bytes = stats.scanned_bytes,
+                quarantined_blobs = stats.quarantined_blobs,
+                quarantined_bytes = stats.quarantined_bytes,
+                restored_blobs = stats.restored_blobs,
+                restored_bytes = stats.restored_bytes,
+                "blob gc quarantine finished"
+            );
+        })
     }
 
     pub async fn delete(
@@ -180,6 +242,7 @@ impl GcService {
         quarantine_delay: Duration,
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
+        let t0 = Instant::now();
         let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         if !self.config.blob_gc_enabled {
@@ -189,6 +252,7 @@ impl GcService {
             return Err(GcServiceError::DeleteDisabled);
         }
         self.ensure_ref_index_ready().await?;
+        self.refresh_tag_rooted_index_if_needed(policy).await?;
         blob_gc_delete(
             &self.config,
             &self.storage,
@@ -199,6 +263,19 @@ impl GcService {
         )
         .await
         .map_err(GcServiceError::Failed)
+        .inspect(|stats| {
+            tracing::info!(
+                event = "blob_gc",
+                action = "delete",
+                policy = ?policy,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                restored_blobs = stats.restored_blobs,
+                restored_bytes = stats.restored_bytes,
+                deleted_blobs = stats.deleted_blobs,
+                deleted_bytes = stats.deleted_bytes,
+                "blob gc delete finished"
+            );
+        })
     }
 
     pub async fn scheduled_cleanup_once(&self) -> Result<ScheduledCleanupStats, GcServiceError> {

@@ -22,6 +22,30 @@ backend = "fs"
 [storage.fs]
 root = "./data"
 
+# Online blob GC (admin API, filesystem backend only)
+#
+# Disabled by default; enable in staged steps:
+# 1) enabled=true (allows quarantine)
+# 2) observe and validate
+# 3) enable_delete=true (allows delete)
+#
+# [blob_gc]
+# enabled = false
+# enable_delete = false
+# finalize_grace_secs = 259200 # 72h
+# default_min_age_secs = 604800             # 7d
+# default_quarantine_delay_secs = 86400     # 24h
+# default_max_blobs = 1000
+# default_max_bytes = 9223372036854775807  # i64::MAX (TOML ints are i64)
+# default_max_seconds = 60
+# schedule_enabled = false
+# schedule_interval_secs = 604800 # 7d
+#
+# [admin_api]
+# enabled = false
+# username = "admin"
+# password = "change-me"
+
 # Harbor-lite Phase 2 (implemented): users + groups.
 [auth.users]
 enabled = true
