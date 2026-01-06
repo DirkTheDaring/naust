@@ -3,9 +3,11 @@ use crate::{
     registry::digest::Digest,
     storage::{Storage, StorageError},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -33,6 +35,25 @@ pub struct BlobRefIndex {
     tag_to_root: sled::Tree,
     root_counts: sled::Tree,
     rev_edges: sled::Tree,
+    pins: sled::Tree,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PinRecord {
+    until_unix_secs: u64,
+    reason: String,
+}
+
+fn system_time_to_unix_secs(t: SystemTime) -> Option<u64> {
+    t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+fn decode_pin_record(bytes: &[u8]) -> Option<PinRecord> {
+    serde_json::from_slice(bytes).ok()
+}
+
+fn encode_pin_record(rec: &PinRecord) -> Result<Vec<u8>, RefIndexError> {
+    serde_json::to_vec(rec).map_err(|e| RefIndexError::Corrupt(format!("invalid pin record: {e}")))
 }
 
 impl BlobRefIndex {
@@ -42,6 +63,7 @@ impl BlobRefIndex {
         let tag_to_root = db.open_tree("tag_to_root")?;
         let root_counts = db.open_tree("root_counts")?;
         let rev_edges = db.open_tree("rev_edges")?;
+        let pins = db.open_tree("pins")?;
 
         Ok(Self {
             db,
@@ -49,7 +71,80 @@ impl BlobRefIndex {
             tag_to_root,
             root_counts,
             rev_edges,
+            pins,
         })
+    }
+
+    // Pin/lease store (for online blob GC safety): best-effort and conservative.
+    // - The server owns the sled DB; external tools must not mutate it.
+    // - Pinning should never break pushes; callers should treat errors as non-fatal.
+    pub fn pin_blob(&self, digest: &Digest, until: SystemTime, reason: &str) -> Result<(), RefIndexError> {
+        let Some(until_secs) = system_time_to_unix_secs(until) else {
+            // System time before UNIX_EPOCH (or otherwise invalid): skip pinning.
+            return Ok(());
+        };
+
+        let key = digest.as_str();
+
+        if let Some(existing) = self.pins.get(key.as_bytes())? {
+            if let Some(old) = decode_pin_record(&existing) {
+                // Never shorten an existing pin.
+                if old.until_unix_secs >= until_secs {
+                    return Ok(());
+                }
+            }
+        }
+
+        let rec = PinRecord {
+            until_unix_secs: until_secs,
+            reason: reason.to_string(),
+        };
+        self.pins.insert(key.as_bytes(), encode_pin_record(&rec)?)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn is_blob_pinned(&self, digest: &Digest, now: SystemTime) -> Result<bool, RefIndexError> {
+        let Some(now_secs) = system_time_to_unix_secs(now) else {
+            // Clock backwards / invalid: conservative.
+            return Ok(true);
+        };
+
+        let key = digest.as_str();
+        let Some(v) = self.pins.get(key.as_bytes())? else {
+            return Ok(false);
+        };
+
+        let Some(rec) = decode_pin_record(&v) else {
+            // Corrupt record: conservative.
+            return Ok(true);
+        };
+
+        Ok(rec.until_unix_secs > now_secs)
+    }
+
+    pub fn purge_expired_pins(&self, now: SystemTime) -> Result<u64, RefIndexError> {
+        let Some(now_secs) = system_time_to_unix_secs(now) else {
+            // If time is invalid, do not purge.
+            return Ok(0);
+        };
+
+        let mut removed = 0u64;
+        for item in self.pins.iter() {
+            let (k, v) = item?;
+            let Some(rec) = decode_pin_record(&v) else {
+                continue;
+            };
+            if rec.until_unix_secs <= now_secs {
+                let _ = self.pins.remove(k);
+                removed = removed.saturating_add(1);
+            }
+        }
+
+        if removed > 0 {
+            self.db.flush()?;
+        }
+        Ok(removed)
     }
 
     pub fn check_health(&self) -> Result<(), RefIndexError> {
@@ -447,6 +542,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::time::{Duration, UNIX_EPOCH};
     use tokio::io::AsyncRead;
 
     #[derive(Default)]
@@ -667,6 +763,56 @@ mod tests {
             subject.as_str(),
             blob.as_str()
         ))
+    }
+
+    #[tokio::test]
+    async fn pins_are_conservative_and_purge_expired() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+
+        let digest = d('e');
+
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let until = UNIX_EPOCH + Duration::from_secs(110);
+
+        idx.pin_blob(&digest, until, "finalize_upload").expect("pin");
+
+        assert!(idx.is_blob_pinned(&digest, now).expect("is_pinned"));
+        assert!(!idx
+            .is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(111))
+            .expect("is_pinned"));
+
+        let removed = idx
+            .purge_expired_pins(UNIX_EPOCH + Duration::from_secs(111))
+            .expect("purge");
+        assert_eq!(removed, 1);
+
+        assert!(!idx
+            .is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(200))
+            .expect("is_pinned"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn pin_does_not_shorten_existing_pin() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+
+        let digest = d('f');
+
+        idx.pin_blob(&digest, UNIX_EPOCH + Duration::from_secs(200), "first")
+            .expect("pin");
+
+        // Attempt to shorten to 150; should be ignored.
+        idx.pin_blob(&digest, UNIX_EPOCH + Duration::from_secs(150), "shorten")
+            .expect("pin");
+
+        assert!(idx
+            .is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(160))
+            .expect("is_pinned"));
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[tokio::test]

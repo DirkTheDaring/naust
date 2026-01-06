@@ -2239,6 +2239,7 @@ mod tests {
             upload_gc_enabled: true,
             upload_gc_interval_secs: 3600,
             upload_gc_max_age_secs: 86400,
+            blob_gc_finalize_grace_secs: 72 * 3600,
             max_upload_bytes: 5 * 1024 * 1024 * 1024,
             max_request_body_bytes: 32 * 1024 * 1024,
             max_concurrent_buffered_requests: 8,
@@ -3272,6 +3273,20 @@ async fn upload_create(
 
         return match state.storage.finalize_upload(&meta.uuid, &digest).await {
             Ok(final_meta) => {
+                if let Some(idx) = state.ref_index.as_ref() {
+                    let grace = std::time::Duration::from_secs(state.config.blob_gc_finalize_grace_secs);
+                    if let Some(until) = std::time::SystemTime::now().checked_add(grace) {
+                        if let Err(err) = idx.pin_blob(&digest, until, "finalize_upload") {
+                            tracing::warn!(
+                                error = %err,
+                                digest = %digest.as_str(),
+                                grace_secs = state.config.blob_gc_finalize_grace_secs,
+                                "ref-index: failed to pin blob on finalize"
+                            );
+                        }
+                    }
+                }
+
                 let mut headers = registry_headers();
                 headers.insert(
                     "Location",

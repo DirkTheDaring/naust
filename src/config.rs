@@ -72,6 +72,10 @@ pub struct Config {
     pub upload_gc_interval_secs: u64,
     pub upload_gc_max_age_secs: u64,
 
+    // Online blob GC safety: keep newly finalized blobs pinned for at least this long.
+    // This covers the common "finalized blob exists but tag/manifest not yet written" window.
+    pub blob_gc_finalize_grace_secs: u64,
+
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
     // Concurrency guard for endpoints that buffer full bodies into memory (e.g. manifest PUT,
@@ -403,7 +407,16 @@ struct FileConfig {
     catalog: FileCatalog,
 
     #[serde(default)]
+    blob_gc: FileBlobGc,
+
+    #[serde(default)]
     proxy: FileProxy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileBlobGc {
+    #[serde(default)]
+    finalize_grace_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1277,6 +1290,13 @@ impl Config {
         .or(file_cfg.uploads.gc_max_age_secs)
         .unwrap_or(24 * 3600);
 
+        let blob_gc_finalize_grace_secs = env_u64_any(&[
+            "REGISTRY__BLOB_GC__FINALIZE_GRACE_SECS",
+            "BLOB_GC_FINALIZE_GRACE_SECS",
+        ])
+        .or(file_cfg.blob_gc.finalize_grace_secs)
+        .unwrap_or(72 * 3600);
+
         let max_upload_bytes =
             env_u64_any(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])
                 .or(file_cfg.limits.max_upload_bytes)
@@ -1762,6 +1782,7 @@ impl Config {
             upload_gc_enabled,
             upload_gc_interval_secs,
             upload_gc_max_age_secs,
+            blob_gc_finalize_grace_secs,
             max_upload_bytes,
             max_request_body_bytes,
             max_concurrent_buffered_requests,
