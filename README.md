@@ -206,6 +206,10 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 - `registry-rust check-config [--config <PATH>]`: parse/validate config and exit
 - `registry-rust audit-permissions [--config <PATH>]`: print effective RBAC permissions and exit
 - `registry-rust hash-secret`: read a secret from stdin and print an Argon2id hash (for robots/users)
+- `registry-rust ref-index check [--config <PATH>]`: verify the blob reference index is healthy
+- `registry-rust ref-index rebuild [--config <PATH>]`: rebuild the blob reference index from storage
+- `registry-rust ref-index ensure [--config <PATH>]`: check and rebuild the blob reference index if needed
+- `registry-rust blob-gc plan|quarantine|delete [--config <PATH>]`: reclaim storage by quarantining/deleting unreferenced blobs (filesystem backend only; refuses to run while the server is active on the same `fs_root`)
 
 ### Config file (TOML)
 
@@ -421,6 +425,10 @@ key = "<old-long-random-secret>"
 | Users/groups (RBAC) | `auth.users` / `auth.groups` | (n/a) | (n/a) | disabled |
 | Storage backend | `storage.backend` | `REGISTRY__STORAGE__BACKEND` | `STORAGE_BACKEND` | `fs` |
 | FS root | `storage.fs.root` | `REGISTRY__STORAGE__FS__ROOT` | `STORAGE_FS_ROOT` | `./data` |
+| Blob ref index enabled | `storage.ref_index.enabled` | `REGISTRY__STORAGE__REF_INDEX__ENABLED` | `STORAGE_REF_INDEX_ENABLED` | `true` |
+| Blob ref index path | `storage.ref_index.path` | `REGISTRY__STORAGE__REF_INDEX__PATH` | `STORAGE_REF_INDEX_PATH` | `<fs_root>/ref-index` |
+| Blob ref index rebuild on start | `storage.ref_index.rebuild_on_start` | `REGISTRY__STORAGE__REF_INDEX__REBUILD_ON_START` | `STORAGE_REF_INDEX_REBUILD_ON_START` | `false` |
+| Blob ref index auto rebuild | `storage.ref_index.auto_rebuild_on_corruption` | `REGISTRY__STORAGE__REF_INDEX__AUTO_REBUILD_ON_CORRUPTION` | `STORAGE_REF_INDEX_AUTO_REBUILD_ON_CORRUPTION` | `true` |
 | S3 endpoint | `storage.s3.endpoint` | `REGISTRY__STORAGE__S3__ENDPOINT` | `STORAGE_S3_ENDPOINT` | unset |
 | S3 region | `storage.s3.region` | `REGISTRY__STORAGE__S3__REGION` | `STORAGE_S3_REGION` | unset |
 | S3 bucket | `storage.s3.bucket` | `REGISTRY__STORAGE__S3__BUCKET` | `STORAGE_S3_BUCKET` | unset |
@@ -457,6 +465,8 @@ Proxy cache maintenance:
 - `REGISTRY_PUSH_ALLOW_REPOS` (optional, comma-separated; supports `org/*` prefixes and `*`)
 - `STORAGE_BACKEND` (`fs` or `s3`)
 - `STORAGE_FS_ROOT` (default `./data`)
+- `STORAGE_REF_INDEX_ENABLED` (`1`/`0`; default `1`) — if disabled, safe blob delete falls back to scanning manifests
+- `STORAGE_REF_INDEX_PATH` (default `<fs_root>/ref-index`)
 - `ALLOW_TAG_OVERWRITE` (`1`/`0`)
 - `REGISTRY_AUTOMATIC_CROSSMOUNT` (`1`/`0`; default `0`)
 - `MAX_UPLOAD_BYTES` (default `5368709120`)

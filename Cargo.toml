@@ -13,6 +13,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 futures-util = "0.3"
 bytes = "1"
+fs2 = "0.4"
 headers = "0.4"
 hex = "0.4"
 hmac = "0.12"

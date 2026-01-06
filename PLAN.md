@@ -123,6 +123,10 @@ Map errors to correct HTTP status codes.
 - Path normalization (avoid traversal)
 - Structured logging (`tracing`)
 
+## Blob GC (concept)
+
+Safe deletion of dangling (unreferenced) blobs is documented in `docs/blob-gc.md`.
+
 ## Acceptance Checks (MVP)
 1) Ping:
 - `curl -i http://localhost:<port>/v2/` returns `200` and header `Docker-Distribution-API-Version: registry/2.0`

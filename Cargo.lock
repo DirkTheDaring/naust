@@ -2272,6 +2272,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "fs2",
  "futures-util",
  "headers",
  "hex",

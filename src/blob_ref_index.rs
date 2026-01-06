@@ -438,3 +438,448 @@ fn decode_parent_list(v: &[u8]) -> Option<Vec<String>> {
 fn _path_exists(p: &Path) -> bool {
     p.exists()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::collections::{HashMap, HashSet};
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use tokio::io::AsyncRead;
+
+    #[derive(Default)]
+    struct MockStorage {
+        repos: Mutex<HashSet<String>>,
+        tags: Mutex<HashMap<String, HashMap<String, Digest>>>,
+        manifests: Mutex<HashMap<(String, String), Bytes>>,
+    }
+
+    impl MockStorage {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn add_repo(&self, repo: &str) {
+            self.repos.lock().unwrap().insert(repo.to_string());
+        }
+
+        fn set_tag(&self, repo: &str, tag: &str, digest: Digest) {
+            self.add_repo(repo);
+            self.tags
+                .lock()
+                .unwrap()
+                .entry(repo.to_string())
+                .or_default()
+                .insert(tag.to_string(), digest);
+        }
+
+        fn remove_tag(&self, repo: &str, tag: &str) {
+            if let Some(m) = self.tags.lock().unwrap().get_mut(repo) {
+                m.remove(tag);
+            }
+        }
+
+        fn put_manifest_bytes(&self, repo: &str, digest: &Digest, bytes: Bytes) {
+            self.add_repo(repo);
+            self.manifests
+                .lock()
+                .unwrap()
+                .insert((repo.to_string(), digest.as_str().to_string()), bytes);
+        }
+    }
+
+    #[async_trait]
+    impl Storage for MockStorage {
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+            let mut v: Vec<String> = self.repos.lock().unwrap().iter().cloned().collect();
+            v.sort();
+            Ok(v)
+        }
+
+        async fn repo_timestamps(
+            &self,
+            _name: &str,
+        ) -> Result<crate::storage::RepoTimestamps, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn head_blob(&self, _digest: &Digest) -> Result<crate::storage::BlobMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn open_blob(
+            &self,
+            _digest: &Digest,
+        ) -> Result<(crate::storage::BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
+            self.tags
+                .lock()
+                .unwrap()
+                .get(name)
+                .and_then(|m| m.get(tag).cloned())
+                .ok_or(StorageError::NotFound)
+        }
+
+        async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+            let mut v: Vec<String> = self
+                .tags
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            v.sort();
+            Ok(v)
+        }
+
+        async fn head_manifest(
+            &self,
+            _name: &str,
+            _digest: &Digest,
+        ) -> Result<crate::storage::ManifestMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn get_manifest(
+            &self,
+            name: &str,
+            digest: &Digest,
+        ) -> Result<(crate::storage::ManifestMeta, Bytes), StorageError> {
+            let key = (name.to_string(), digest.as_str().to_string());
+            let bytes = self
+                .manifests
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(StorageError::NotFound)?;
+            let meta = crate::storage::ManifestMeta {
+                size: bytes.len() as u64,
+                media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            };
+            Ok((meta, bytes))
+        }
+
+        async fn put_manifest(
+            &self,
+            _name: &str,
+            _digest: &Digest,
+            _bytes: Bytes,
+        ) -> Result<crate::storage::ManifestMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn set_tag(&self, _name: &str, _tag: &str, _digest: &Digest) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn create_upload(&self) -> Result<crate::storage::UploadMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn upload_status(&self, _uuid: &str) -> Result<crate::storage::UploadMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn append_upload(&self, _uuid: &str, _chunk: Bytes) -> Result<crate::storage::UploadMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn finalize_upload(&self, _uuid: &str, _digest: &Digest) -> Result<crate::storage::BlobMeta, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn abort_upload(&self, _uuid: &str) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn delete_blob(&self, _digest: &Digest) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn list_referrers(
+            &self,
+            _name: &str,
+            _subject: &Digest,
+        ) -> Result<Vec<crate::storage::ReferrerDescriptor>, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn add_referrer(
+            &self,
+            _name: &str,
+            _subject: &Digest,
+            _descriptor: crate::storage::ReferrerDescriptor,
+        ) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
+        async fn delete_manifest(&self, _name: &str, _digest: &Digest) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+    }
+
+    fn temp_index_path() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "registry-rust-ref-index-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    fn d(ch: char) -> Digest {
+        let hex: String = std::iter::repeat(ch).take(64).collect();
+        Digest::parse(&format!("sha256:{hex}")).expect("valid sha256")
+    }
+
+    fn bytes(s: String) -> Bytes {
+        Bytes::from(s.into_bytes())
+    }
+
+    fn index_manifest(child: &Digest) -> Bytes {
+        bytes(format!(
+            "{{\"schemaVersion\":2,\"manifests\":[{{\"digest\":\"{}\"}}]}}",
+            child.as_str()
+        ))
+    }
+
+    fn image_manifest(config: &Digest, layer: &Digest) -> Bytes {
+        bytes(format!(
+            "{{\"schemaVersion\":2,\"config\":{{\"digest\":\"{}\"}},\"layers\":[{{\"digest\":\"{}\"}}]}}",
+            config.as_str(),
+            layer.as_str()
+        ))
+    }
+
+    fn artifact_manifest(subject: &Digest, blob: &Digest) -> Bytes {
+        bytes(format!(
+            "{{\"schemaVersion\":2,\"subject\":{{\"digest\":\"{}\"}},\"blobs\":[{{\"digest\":\"{}\"}}]}}",
+            subject.as_str(),
+            blob.as_str()
+        ))
+    }
+
+    #[tokio::test]
+    async fn check_health_before_rebuild_is_corrupt() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+
+        let err = idx.check_health().expect_err("should be corrupt");
+        match err {
+            RefIndexError::Corrupt(_) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn rebuild_then_check_health_ok_and_references_resolve() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        let repo = "org/repo";
+        let root = d('a');
+        let cfg = d('b');
+        let layer = d('c');
+
+        mock.set_tag(repo, "latest", root.clone());
+        mock.put_manifest_bytes(repo, &root, image_manifest(&cfg, &layer));
+
+        idx.rebuild(&storage).await.expect("rebuild");
+        idx.check_health().expect("healthy");
+
+        assert!(idx.is_blob_referenced(&layer).expect("lookup"));
+        assert!(idx.is_blob_referenced(&cfg).expect("lookup"));
+        assert!(!idx.is_blob_referenced(&d('d')).expect("lookup"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn index_manifest_to_child_manifest_traversal_works() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        let repo = "org/repo";
+        let root_index = d('a');
+        let child = d('b');
+        let layer = d('c');
+
+        mock.set_tag(repo, "v1", root_index.clone());
+        mock.put_manifest_bytes(repo, &root_index, index_manifest(&child));
+        mock.put_manifest_bytes(repo, &child, image_manifest(&d('d'), &layer));
+
+        idx.rebuild(&storage).await.expect("rebuild");
+
+        assert!(idx.is_blob_referenced(&layer).expect("lookup"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn artifact_subject_and_blobs_are_indexed() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        let repo = "org/repo";
+        let root = d('a');
+        let subject = d('b');
+        let blob = d('c');
+
+        mock.set_tag(repo, "artifact", root.clone());
+        mock.put_manifest_bytes(repo, &root, artifact_manifest(&subject, &blob));
+
+        idx.rebuild(&storage).await.expect("rebuild");
+        assert!(idx.is_blob_referenced(&blob).expect("lookup"));
+        assert!(idx.is_blob_referenced(&subject).expect("lookup"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn on_tag_set_is_idempotent_for_same_digest() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        // Bring index to a healthy state.
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .expect("meta");
+        idx.meta.insert(META_STATE, META_STATE_READY).expect("meta");
+
+        let repo = "org/repo";
+        let root = d('a');
+        mock.put_manifest_bytes(repo, &root, image_manifest(&d('b'), &d('c')));
+
+        idx.on_tag_set(&storage, repo, "latest", &root, None)
+            .await
+            .expect("set");
+        idx.on_tag_set(&storage, repo, "latest", &root, None)
+            .await
+            .expect("set idempotent");
+
+        let v = idx
+            .root_counts
+            .get(root.as_str().as_bytes())
+            .expect("get")
+            .expect("present");
+        let n = decode_u64(&v).expect("decode");
+        assert_eq!(n, 1, "refcount should not double on same tag->digest");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn sync_repo_tags_updates_counts_and_removes_deleted_tags() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        let repo = "org/repo";
+        let r1 = d('a');
+        let r2 = d('b');
+        mock.set_tag(repo, "t1", r1.clone());
+        mock.set_tag(repo, "t2", r2.clone());
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('c'), &d('d')));
+        mock.put_manifest_bytes(repo, &r2, image_manifest(&d('e'), &d('f')));
+
+        idx.rebuild(&storage).await.expect("rebuild");
+
+        // Remove one tag in storage; sync should drop its root count.
+        mock.remove_tag(repo, "t2");
+        idx.sync_repo_tags(&storage, repo).await.expect("sync");
+
+        assert!(idx.root_counts.contains_key(r1.as_str().as_bytes()).expect("contains"));
+        assert!(!idx.root_counts.contains_key(r2.as_str().as_bytes()).expect("contains"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn corruption_detection_and_auto_rebuild() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        let repo = "org/repo";
+        let root = d('a');
+        mock.set_tag(repo, "latest", root.clone());
+        mock.put_manifest_bytes(repo, &root, image_manifest(&d('b'), &d('c')));
+
+        // Simulate an incomplete prior rebuild.
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .expect("meta");
+        idx.meta.insert(META_STATE, META_STATE_BUILDING).expect("meta");
+
+        let err = idx
+            .ensure_healthy_or_rebuild(&storage, false, false)
+            .await
+            .expect_err("should refuse when auto rebuild disabled");
+        match err {
+            RefIndexError::Corrupt(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        idx.ensure_healthy_or_rebuild(&storage, true, false)
+            .await
+            .expect("auto rebuild");
+        idx.check_health().expect("healthy");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn corrupted_rev_edges_entry_is_detected() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage: Arc<dyn Storage> = mock.clone();
+
+        let repo = "org/repo";
+        let root = d('a');
+        let layer = d('b');
+        mock.set_tag(repo, "latest", root.clone());
+        mock.put_manifest_bytes(repo, &root, image_manifest(&d('c'), &layer));
+
+        idx.rebuild(&storage).await.expect("rebuild");
+
+        // Corrupt the rev_edges value for the layer.
+        idx.rev_edges
+            .insert(layer.as_str().as_bytes(), b"\xff\xff\xff")
+            .expect("corrupt");
+
+        let err = idx
+            .is_blob_referenced(&layer)
+            .expect_err("should be corrupt");
+        match err {
+            RefIndexError::Corrupt(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+}

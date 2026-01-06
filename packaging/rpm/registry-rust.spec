@@ -22,6 +22,9 @@ Requires(pre):  systemd
 %description
 registry-rust is a minimal Docker/OCI registry implementation in Rust.
 
+It also provides maintenance subcommands via the same binary, e.g.
+`registry-rust ref-index ...` and `registry-rust blob-gc ...`.
+
 %prep
 %setup -q
 
@@ -46,10 +49,12 @@ install -D -m 0644 tmpfiles.d/registry-rust.conf %{buildroot}%{_tmpfilesdir}/reg
 install -D -m 0644 sysconfig/registry-rust %{buildroot}%{_sysconfdir}/sysconfig/registry-rust
 
 install -D -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
+install -D -m 0644 blob-gc.md %{buildroot}%{_docdir}/%{name}/blob-gc.md
 install -D -m 0644 man/registry-rust.1 %{buildroot}%{_mandir}/man1/registry-rust.1
 
 %files
 %doc %{_docdir}/%{name}/README.md
+%doc %{_docdir}/%{name}/blob-gc.md
 %{_bindir}/registry-rust
 %config(noreplace) %{_sysconfdir}/registry-rust/registry.core.toml
 %config(noreplace) %{_sysconfdir}/registry-rust/registry.auth.toml

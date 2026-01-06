@@ -61,6 +61,7 @@ $(TARBALL): rpm-dirs
 	@cp -a packaging/systemd/tmpfiles.d/registry-rust.conf dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d/registry-rust.conf
 	@cp -a packaging/sysconfig/registry-rust dist/rpmstage/$(NAME)-$(VERSION)/sysconfig/registry-rust
 	@cp -a README.md dist/rpmstage/$(NAME)-$(VERSION)/README.md
+	@cp -a docs/blob-gc.md dist/rpmstage/$(NAME)-$(VERSION)/blob-gc.md
 	@cp -a packaging/deb/doc/registry-rust.1 dist/rpmstage/$(NAME)-$(VERSION)/man/registry-rust.1
 	@tar -C dist/rpmstage -czf $(TARBALL) $(NAME)-$(VERSION)
 	@cp -a $(SPEC) $(SPECS)/$(NAME).spec
@@ -150,6 +151,7 @@ deb: deb-dirs
 	@install -m 0644 packaging/deb/default/registry-rust $(DEB_STAGE)/etc/default/registry-rust
 	@install -m 0644 packaging/deb/systemd/registry-rust.service $(DEB_STAGE)/usr/lib/systemd/system/registry-rust.service
 	@install -m 0644 README.md $(DEB_STAGE)/usr/share/doc/registry-rust/README.md
+	@install -m 0644 docs/blob-gc.md $(DEB_STAGE)/usr/share/doc/registry-rust/blob-gc.md
 	@install -m 0644 packaging/deb/doc/copyright $(DEB_STAGE)/usr/share/doc/registry-rust/copyright
 	@install -m 0644 packaging/deb/doc/changelog.Debian $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian
 	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian; fi

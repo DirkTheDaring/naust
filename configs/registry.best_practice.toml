@@ -33,6 +33,14 @@ ttl_secs = 600
 [storage]
 backend = "fs"
 
+# Persistent blob reference index (sled on local disk).
+# Enabled by default even if you omit this block.
+[storage.ref_index]
+enabled = true
+# path = "/data/ref-index"
+# rebuild_on_start = false
+# auto_rebuild_on_corruption = true
+
 [storage.fs]
 root = "/data"
 

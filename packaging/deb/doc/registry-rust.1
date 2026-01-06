@@ -4,6 +4,15 @@ registry-rust \- OCI/Docker registry server
 .SH SYNOPSIS
 .B registry-rust
 .RI [OPTIONS] " server"
+.br
+.B registry-rust
+.RI [OPTIONS] " check-config"
+.br
+.B registry-rust
+.RI [OPTIONS] " ref-index " "check|ensure|rebuild"
+.br
+.B registry-rust
+.RI [OPTIONS] " blob-gc " "plan|quarantine|delete" " [--policy ...]"
 .SH DESCRIPTION
 .B registry-rust
 is a lightweight OCI/Docker registry implementation in Rust.
@@ -11,6 +20,18 @@ is a lightweight OCI/Docker registry implementation in Rust.
 For the full CLI and configuration options, run:
 .PP
 .B registry-rust --help
+.PP
+Maintenance commands:
+.TP
+.B registry-rust ref-index check|ensure|rebuild
+Inspect/rebuild the persistent blob reference index.
+.TP
+.B registry-rust blob-gc plan|quarantine|delete
+Reclaim disk space by quarantining/deleting unreferenced blobs (filesystem backend only).
+
+.PP
+Note: for safety, these maintenance commands refuse to run while a live
+registry server is active on the same filesystem root.
 .SH FILES
 .TP
 .I /etc/registry-rust/registry.core.toml

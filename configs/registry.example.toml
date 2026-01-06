@@ -128,6 +128,17 @@ key = "change-me-secondary"
 [storage]
 backend = "fs"  # "fs" or "s3"
 
+# Persistent blob reference index (sled on local disk).
+#
+# Enabled by default even if you omit this block.
+# You can disable it (enabled=false) to avoid any local disk writes; safe blob delete then falls back
+# to scanning manifests/tags.
+[storage.ref_index]
+enabled = true
+# path = "./data/ref-index"
+# rebuild_on_start = false
+# auto_rebuild_on_corruption = true
+
 [storage.fs]
 root = "./data"
 

@@ -1,8 +1,10 @@
 mod audit;
 mod auth;
 mod blob_delete_safety;
+mod blob_gc;
 mod blob_ref_index;
 mod config;
+mod fs_root_lock;
 mod http_api;
 mod manifest_refs;
 mod proxy;
@@ -246,6 +248,13 @@ enum CliCommand {
         #[command(subcommand)]
         command: RefIndexCommand,
     },
+
+    /// Reclaim storage by quarantining/deleting unreferenced blobs (filesystem backend only).
+    #[command(name = "blob-gc")]
+    BlobGc {
+        #[command(subcommand)]
+        command: BlobGcCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -261,6 +270,52 @@ enum RefIndexCommand {
     /// Check and rebuild if corrupt (respects auto-rebuild config).
     #[command(name = "ensure")]
     Ensure,
+}
+
+#[derive(Debug, Subcommand)]
+enum BlobGcCommand {
+    /// Print what would be quarantined (dry-run).
+    #[command(name = "plan")]
+    Plan {
+        /// Reference policy to decide whether a blob is considered in use.
+        #[arg(long, value_enum, default_value_t = crate::blob_gc::BlobGcPolicy::ManifestRooted)]
+        policy: crate::blob_gc::BlobGcPolicy,
+
+        /// Only consider blobs older than this age.
+        #[arg(long, default_value_t = 7 * 24 * 3600)]
+        min_age_secs: u64,
+
+        /// Maximum number of blobs to report.
+        #[arg(long, default_value_t = 10_000)]
+        max_per_run: usize,
+    },
+
+    /// Move eligible blobs into quarantine (reversible).
+    #[command(name = "quarantine")]
+    Quarantine {
+        #[arg(long, value_enum, default_value_t = crate::blob_gc::BlobGcPolicy::ManifestRooted)]
+        policy: crate::blob_gc::BlobGcPolicy,
+
+        #[arg(long, default_value_t = 7 * 24 * 3600)]
+        min_age_secs: u64,
+
+        #[arg(long, default_value_t = 10_000)]
+        max_per_run: usize,
+    },
+
+    /// Permanently delete blobs from quarantine after a delay (re-checks reachability).
+    #[command(name = "delete")]
+    Delete {
+        #[arg(long, value_enum, default_value_t = crate::blob_gc::BlobGcPolicy::ManifestRooted)]
+        policy: crate::blob_gc::BlobGcPolicy,
+
+        /// A quarantined blob must be at least this old before it can be deleted.
+        #[arg(long, default_value_t = 24 * 3600)]
+        quarantine_delay_secs: u64,
+
+        #[arg(long, default_value_t = 10_000)]
+        max_per_run: usize,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -404,6 +459,20 @@ async fn main() {
                 std::process::exit(2);
             }
 
+            let _fs_root_lock = if cfg.storage_backend == StorageBackend::Filesystem {
+                match crate::fs_root_lock::FsRootLock::try_acquire(&cfg.fs_root) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        eprintln!(
+                            "ref-index: refusing to run while registry is active ({e}); stop the server first"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                None
+            };
+
             let idx = match blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()) {
                 Ok(i) => i,
                 Err(e) => {
@@ -446,6 +515,156 @@ async fn main() {
                         std::process::exit(1);
                     }
                     println!("OK");
+                    return;
+                }
+            }
+        }
+        CliCommand::BlobGc { command } => {
+            let cfg = match std::panic::catch_unwind(|| {
+                if config_paths.is_empty() {
+                    Config::from_env()
+                } else {
+                    Config::from_env_with_files(&config_paths)
+                }
+            }) {
+                Ok(c) => c,
+                Err(err) => {
+                    let msg = if let Some(s) = err.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = err.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else {
+                        "<non-string panic>".to_string()
+                    };
+                    eprintln!("blob-gc: failed to load config: {msg}");
+                    std::process::exit(2);
+                }
+            };
+
+            if cfg.storage_backend != StorageBackend::Filesystem {
+                eprintln!("blob-gc: only filesystem backend is supported");
+                std::process::exit(2);
+            }
+
+            if !cfg.ref_index.enabled {
+                eprintln!("blob-gc: ref-index is disabled (storage.ref_index.enabled=false)");
+                std::process::exit(2);
+            }
+
+            let _fs_root_lock = match crate::fs_root_lock::FsRootLock::try_acquire(&cfg.fs_root) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "blob-gc: refusing to run while registry is active ({e}); stop the server first"
+                    );
+                    std::process::exit(2);
+                }
+            };
+
+            let idx = match blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("blob-gc: failed to open ref-index {}: {e}", cfg.ref_index.path.display());
+                    std::process::exit(1);
+                }
+            };
+
+            let storage = storage::from_config(&cfg);
+            if let Err(e) = idx
+                .ensure_healthy_or_rebuild(
+                    &storage,
+                    cfg.ref_index.auto_rebuild_on_corruption,
+                    cfg.ref_index.rebuild_on_start,
+                )
+                .await
+            {
+                eprintln!("blob-gc: ref-index ensure failed: {e}");
+                std::process::exit(1);
+            }
+
+            match command {
+                BlobGcCommand::Plan {
+                    policy,
+                    min_age_secs,
+                    max_per_run,
+                } => {
+                    let stats = match crate::blob_gc::blob_gc_plan(
+                        &cfg,
+                        &storage,
+                        &idx,
+                        policy,
+                        Duration::from_secs(min_age_secs),
+                        max_per_run,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("blob-gc: plan failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    println!(
+                        "scanned_blobs={} scanned_bytes={} eligible_blobs={} eligible_bytes={}",
+                        stats.scanned_blobs, stats.scanned_bytes, stats.eligible_blobs, stats.eligible_bytes
+                    );
+                    return;
+                }
+                BlobGcCommand::Quarantine {
+                    policy,
+                    min_age_secs,
+                    max_per_run,
+                } => {
+                    let stats = match crate::blob_gc::blob_gc_quarantine(
+                        &cfg,
+                        &storage,
+                        &idx,
+                        policy,
+                        Duration::from_secs(min_age_secs),
+                        max_per_run,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("blob-gc: quarantine failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    println!(
+                        "scanned_blobs={} scanned_bytes={} quarantined_blobs={} quarantined_bytes={}",
+                        stats.scanned_blobs, stats.scanned_bytes, stats.quarantined_blobs, stats.quarantined_bytes
+                    );
+                    return;
+                }
+                BlobGcCommand::Delete {
+                    policy,
+                    quarantine_delay_secs,
+                    max_per_run,
+                } => {
+                    let stats = match crate::blob_gc::blob_gc_delete(
+                        &cfg,
+                        &storage,
+                        &idx,
+                        policy,
+                        Duration::from_secs(quarantine_delay_secs),
+                        max_per_run,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("blob-gc: delete failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    println!(
+                        "restored_blobs={} restored_bytes={} deleted_blobs={} deleted_bytes={}",
+                        stats.restored_blobs, stats.restored_bytes, stats.deleted_blobs, stats.deleted_bytes
+                    );
                     return;
                 }
             }
@@ -509,6 +728,21 @@ async fn main() {
     // This runs only when [server.tls.acme] is enabled.
     maybe_generate_tls_certs(config.as_ref()).await;
     let addr = config.listen_addr;
+
+    let _fs_root_lock = if config.storage_backend == StorageBackend::Filesystem {
+        match crate::fs_root_lock::FsRootLock::try_acquire(&config.fs_root) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "server: failed to acquire exclusive filesystem lock ({e}); is another registry or blob-gc running?"
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let storage = storage::from_config(config.as_ref());
 
     let ref_index: Option<Arc<blob_ref_index::BlobRefIndex>> = if config.ref_index.enabled {

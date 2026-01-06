@@ -2228,6 +2228,12 @@ mod tests {
             s3_region: None,
             s3_bucket: None,
             s3_prefix: "registry".to_string(),
+            ref_index: crate::config::RefIndexConfig {
+                enabled: true,
+                path: PathBuf::from("./data/ref-index"),
+                rebuild_on_start: false,
+                auto_rebuild_on_corruption: true,
+            },
             allow_tag_overwrite: true,
             automatic_crossmount: false,
             upload_gc_enabled: true,
