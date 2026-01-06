@@ -4126,6 +4126,20 @@ async fn upload_session(
 
             match state.storage.finalize_upload(uuid, &digest).await {
                 Ok(meta) => {
+                    if let Some(idx) = state.ref_index.as_ref() {
+                        let grace = std::time::Duration::from_secs(state.config.blob_gc_finalize_grace_secs);
+                        if let Some(until) = std::time::SystemTime::now().checked_add(grace) {
+                            if let Err(err) = idx.pin_blob(&digest, until, "finalize_upload") {
+                                tracing::warn!(
+                                    error = %err,
+                                    digest = %digest.as_str(),
+                                    grace_secs = state.config.blob_gc_finalize_grace_secs,
+                                    "ref-index: failed to pin blob on finalize"
+                                );
+                            }
+                        }
+                    }
+
                     let mut headers = registry_headers();
                     headers.insert(
                         "Location",

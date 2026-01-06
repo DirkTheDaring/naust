@@ -47,3 +47,6 @@ acmecert-core = { path = "../acmecert/crates/acmecert-core" }
 default = ["storage-fs"]
 storage-fs = []
 storage-s3 = []
+
+[dev-dependencies]
+tempfile = "3"

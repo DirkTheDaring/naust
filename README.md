@@ -211,6 +211,80 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 - `registry-rust ref-index ensure [--config <PATH>]`: check and rebuild the blob reference index if needed
 - `registry-rust blob-gc plan|quarantine|delete [--config <PATH>]`: reclaim storage by quarantining/deleting unreferenced blobs (filesystem backend only; refuses to run while the server is active on the same `fs_root`)
 
+## Online blob GC (admin API)
+
+This repo also implements an *in-process* online-safe blob GC (see `docs/blob-gc-online.md`).
+It is driven via admin-only HTTP endpoints and is disabled by default.
+
+To enable it in TOML:
+
+```toml
+[admin_api]
+enabled = true
+username = "admin"
+password = "change-me"
+
+[blob_gc]
+enabled = true         # allows quarantine
+enable_delete = false  # keep false until you've validated quarantine behavior
+```
+
+Endpoints:
+- `GET /_admin/gc/health` (checks ref-index readiness; no side effects)
+- `POST /_admin/gc/plan`
+- `POST /_admin/gc/quarantine` (requires `blob_gc.enabled=true`)
+- `POST /_admin/gc/delete` (requires `blob_gc.enabled=true` and `blob_gc.enable_delete=true`)
+
+Minimal example (defaults are taken from `[blob_gc]` when fields are omitted):
+
+```sh
+curl -u admin:change-me http://127.0.0.1:5000/_admin/gc/health
+curl -u admin:change-me -X POST http://127.0.0.1:5000/_admin/gc/plan -H 'content-type: application/json' -d '{}'
+curl -u admin:change-me -X POST http://127.0.0.1:5000/_admin/gc/quarantine -H 'content-type: application/json' -d '{}'
+```
+
+Staged rollout example (explicit request fields; safe budgets):
+
+```sh
+# 1) Plan (no side effects). Policy defaults to "manifest_rooted" if omitted.
+curl -u admin:change-me -X POST http://127.0.0.1:5000/_admin/gc/plan \
+  -H 'content-type: application/json' \
+  -d '{
+    "policy": "manifest_rooted",
+    "min_age_secs": 604800,
+    "budgets": { "max_blobs": 2000, "max_bytes": 10737418240, "max_seconds": 30 }
+  }'
+
+# 2) Quarantine eligible blobs (requires: blob_gc.enabled=true)
+curl -u admin:change-me -X POST http://127.0.0.1:5000/_admin/gc/quarantine \
+  -H 'content-type: application/json' \
+  -d '{
+    "policy": "manifest_rooted",
+    "min_age_secs": 604800,
+    "budgets": { "max_blobs": 2000, "max_bytes": 10737418240, "max_seconds": 30 }
+  }'
+
+# 3) Observe for at least `quarantine_delay_secs` (default: 24h).
+#    Pulls should continue to work while blobs are quarantined.
+
+# 4) Enable delete only after you are satisfied with quarantine behavior:
+#    [blob_gc]
+#    enable_delete = true
+
+# 5) Delete old quarantined blobs (requires: blob_gc.enabled=true AND blob_gc.enable_delete=true)
+curl -u admin:change-me -X POST http://127.0.0.1:5000/_admin/gc/delete \
+  -H 'content-type: application/json' \
+  -d '{
+    "policy": "manifest_rooted",
+    "quarantine_delay_secs": 86400,
+    "budgets": { "max_blobs": 2000, "max_bytes": 10737418240, "max_seconds": 30 }
+  }'
+```
+
+Policy values:
+- `manifest_rooted` (default): keep any blob reachable from any manifest
+- `tag_rooted`: keep only blobs reachable from current tags
+
 ### Config file (TOML)
 
 You can optionally load configuration from a TOML file and still override any value via environment variables.

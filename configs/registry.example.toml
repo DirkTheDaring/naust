@@ -139,6 +139,43 @@ enabled = true
 # rebuild_on_start = false
 # auto_rebuild_on_corruption = true
 
+# Online blob GC (in-process, safe-by-default)
+#
+# This is the *online* GC described in docs/blob-gc-online.md, driven via admin-only HTTP endpoints.
+# It is disabled by default.
+#
+# Notes:
+# - Only applies to filesystem backend.
+# - Quarantine/delete phases are gated by `enabled` / `enable_delete`.
+# - Admin endpoints use these defaults when request fields are omitted.
+[blob_gc]
+# enabled = false
+# enable_delete = false
+#
+# Safety: newly finalized blobs are pinned for at least this long.
+# finalize_grace_secs = 259200 # 72h
+#
+# Default policy knobs (used by admin endpoints if omitted in request JSON)
+# default_min_age_secs = 604800             # 7d
+# default_quarantine_delay_secs = 86400     # 24h
+#
+# Default per-run budgets (used by admin endpoints if omitted)
+# default_max_blobs = 1000
+# default_max_bytes = 18446744073709551615 # u64::MAX (effectively unlimited)
+# default_max_seconds = 60
+
+# Admin-only HTTP endpoints (disabled by default)
+#
+# Enables:
+# - GET  /_admin/gc/health
+# - POST /_admin/gc/plan
+# - POST /_admin/gc/quarantine
+# - POST /_admin/gc/delete
+[admin_api]
+# enabled = false
+# username = "admin"
+# password = "change-me"
+
 [storage.fs]
 root = "./data"
 
