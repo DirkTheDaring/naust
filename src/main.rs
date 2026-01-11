@@ -34,6 +34,7 @@ use sha2::Digest as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
@@ -356,6 +357,12 @@ pub struct AppState {
     pub proxy_upstreams: Vec<ProxyContext>,
     pub buffered_body_sem: Arc<Semaphore>,
     pub request_sem: Arc<Semaphore>,
+    pub upload_request_sem: Arc<Semaphore>,
+
+    // Diagnostics: in-flight request counters and rate-limited saturation logs.
+    pub active_non_upload_requests: Arc<AtomicU64>,
+    pub active_upload_requests: Arc<AtomicU64>,
+    pub last_sem_saturation_log_unix_secs: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -702,6 +709,8 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "registry-rust starting");
+
     let config = match std::panic::catch_unwind(|| {
         if config_paths.is_empty() {
             Config::from_env()
@@ -941,6 +950,9 @@ async fn main() {
         config.max_concurrent_buffered_requests.max(1),
     ));
     let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
+    let upload_request_sem = Arc::new(Semaphore::new(
+        config.max_concurrent_upload_requests.max(1),
+    ));
 
     let gc_service = match (&ref_index, &config.storage_backend) {
         (Some(idx), StorageBackend::Filesystem) => Some(Arc::new(gc_service::GcService::new(
@@ -963,6 +975,10 @@ async fn main() {
         proxy_upstreams,
         buffered_body_sem,
         request_sem,
+        upload_request_sem,
+        active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+        active_upload_requests: Arc::new(AtomicU64::new(0)),
+        last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
     };
 
     // For large blobs we stream request bodies; enforce blob size via MAX_UPLOAD_BYTES and
@@ -1000,6 +1016,7 @@ async fn main() {
     spawn_blob_gc_scheduler(state.clone());
     spawn_proxy_gc(state.clone());
     spawn_proxy_scrub(state.clone());
+    spawn_fd_diagnostics_logger(state.clone());
 
     // Token endpoint hardening: rate limit expensive credential checks.
     // Defaults are conservative and should not impact normal clients.
@@ -1054,7 +1071,8 @@ async fn main() {
             request_timeout_by_path,
         ))
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(log_server_errors));
 
     tracing::info!(%addr, tls = tls_enabled, "registry listening");
 
@@ -1083,6 +1101,27 @@ async fn main() {
             .await
             .expect("serve http");
     }
+}
+
+async fn log_server_errors(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = Instant::now();
+
+    let response = next.run(req).await;
+    let status = response.status();
+
+    if status.is_server_error() {
+        tracing::error!(
+            method = %method,
+            path = %path,
+            status = %status,
+            latency_ms = start.elapsed().as_millis(),
+            "request returned 5xx"
+        );
+    }
+
+    response
 }
 
 fn spawn_proxy_gc(state: AppState) {
@@ -1679,8 +1718,9 @@ async fn request_timeout_by_path(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
-    let path = req.uri().path();
-    let timeout_secs = if is_upload_path(path) {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let timeout_secs = if is_upload_path(&path) {
         state.config.upload_request_timeout_secs
     } else {
         state.config.request_timeout_secs
@@ -1688,7 +1728,29 @@ async fn request_timeout_by_path(
 
     match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
         Ok(resp) => resp,
-        Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
+        Err(_) => {
+            tracing::warn!(%method, path = %path, timeout_secs, "request timed out");
+            axum::http::StatusCode::REQUEST_TIMEOUT.into_response()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_fd_count_linux() -> Option<u64> {
+    // Best-effort diagnostic only.
+    let rd = std::fs::read_dir("/proc/self/fd").ok()?;
+    Some(rd.count() as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_fd_count_linux() -> Option<u64> {
+    None
+}
+
+fn unix_seconds_now() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => 0,
     }
 }
 
@@ -1698,20 +1760,61 @@ async fn concurrency_limit_v2_non_upload(
     next: Next,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    let _permit: Option<OwnedSemaphorePermit> = if is_upload_path(path) {
-        None
+    let (is_upload, sem, active_counter, sem_name, sem_limit) = if is_upload_path(path) {
+        (
+            true,
+            state.upload_request_sem.clone(),
+            state.active_upload_requests.clone(),
+            "upload",
+            state.config.max_concurrent_upload_requests,
+        )
     } else {
-        Some(
-            state
-                .request_sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("request semaphore unexpectedly closed"),
+        (
+            false,
+            state.request_sem.clone(),
+            state.active_non_upload_requests.clone(),
+            "non_upload",
+            state.config.max_concurrent_requests,
         )
     };
 
-    next.run(req).await
+    // Fast path: if permits are available, avoid any extra logging overhead.
+    let _permit: OwnedSemaphorePermit = match sem.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            // Semaphore is saturated; rate-limit warnings to avoid log spam.
+            let now = unix_seconds_now();
+            let last = state
+                .last_sem_saturation_log_unix_secs
+                .load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 10 {
+                state
+                    .last_sem_saturation_log_unix_secs
+                    .store(now, Ordering::Relaxed);
+                tracing::warn!(
+                    sem = sem_name,
+                    is_upload,
+                    sem_limit,
+                    available_permits = sem.available_permits(),
+                    active_non_upload = state.active_non_upload_requests.load(Ordering::Relaxed),
+                    active_upload = state.active_upload_requests.load(Ordering::Relaxed),
+                    open_fds = open_fd_count_linux(),
+                    "concurrency limit reached; waiting for permit"
+                );
+            }
+
+            sem.acquire_owned()
+                .await
+                .expect("request semaphore unexpectedly closed")
+        }
+    };
+
+    active_counter.fetch_add(1, Ordering::Relaxed);
+    let response = next.run(req).await;
+    active_counter.fetch_sub(1, Ordering::Relaxed);
+
+    response
+
 }
 
 fn is_upload_path(path: &str) -> bool {
@@ -1813,6 +1916,33 @@ fn spawn_upload_gc(state: AppState) {
             if removed > 0 {
                 tracing::info!(scanned, removed, path = %uploads_dir.display(), "upload gc: removed stale temp files");
             }
+        }
+    });
+}
+
+fn spawn_fd_diagnostics_logger(state: AppState) {
+    let interval_secs = std::env::var("REGISTRY_DIAG_FD_LOG_INTERVAL_SECS")
+        .ok()
+        .or_else(|| std::env::var("FD_LOG_INTERVAL_SECS").ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if interval_secs == 0 {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        loop {
+            ticker.tick().await;
+            tracing::info!(
+                open_fds = open_fd_count_linux(),
+                active_non_upload = state.active_non_upload_requests.load(Ordering::Relaxed),
+                active_upload = state.active_upload_requests.load(Ordering::Relaxed),
+                non_upload_available_permits = state.request_sem.available_permits(),
+                upload_available_permits = state.upload_request_sem.available_permits(),
+                "fd diagnostics"
+            );
         }
     });
 }

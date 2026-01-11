@@ -63,6 +63,7 @@ max_upload_bytes = 5368709120
 max_request_body_bytes = 33554432
 max_concurrent_buffered_requests = 8
 max_concurrent_requests = 256
+max_concurrent_upload_requests = 32
 
 [proxy]
 enabled = true

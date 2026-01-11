@@ -159,6 +159,7 @@ max_upload_bytes = 5368709120          # 5 GiB
 max_request_body_bytes = 33554432      # 32 MiB (manifests are read with a cap)
 max_concurrent_buffered_requests = 8   # caps concurrent manifest buffering
 max_concurrent_requests = 256          # caps in-flight /v2 requests (uploads excluded)
+max_concurrent_upload_requests = 32    # caps in-flight upload requests (/v2/*/blobs/uploads*)
 
 [timeouts]
 request_timeout_secs = 300

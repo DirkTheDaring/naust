@@ -3,6 +3,10 @@ services:
     build: .
     ports:
       - "5000:5000"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       RUST_LOG: "info,tower_http=debug"
       PUBLIC_URL: "http://127.0.0.1:5000"

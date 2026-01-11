@@ -100,6 +100,7 @@ max_upload_bytes = 1099511627776       # 1 TiB
 max_request_body_bytes = 33554432
 max_concurrent_buffered_requests = 4
 max_concurrent_requests = 64
+max_concurrent_upload_requests = 32
 
 [timeouts]
 # Normal API calls should fail fast.

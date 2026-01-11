@@ -248,13 +248,26 @@ pub async fn require_push_basic_auth(
         .get(http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("<none>");
-    info!(
-        method = %request.method(),
-        uri = %request.uri(),
-        auth_scheme = auth_scheme,
-        user_agent = user_agent,
-        "push auth denied"
-    );
+
+    // Docker clients commonly probe upload endpoints without Authorization first,
+    // then fetch a Bearer token after the 401 challenge. Keep that noise at DEBUG.
+    if auth_scheme == "<none>" {
+        tracing::debug!(
+            method = %request.method(),
+            uri = %request.uri(),
+            auth_scheme = auth_scheme,
+            user_agent = user_agent,
+            "push auth denied"
+        );
+    } else {
+        info!(
+            method = %request.method(),
+            uri = %request.uri(),
+            auth_scheme = auth_scheme,
+            user_agent = user_agent,
+            "push auth denied"
+        );
+    }
 
     unauthorized_registry_challenge(&state, Some(repo_name))
 }

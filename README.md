@@ -77,6 +77,24 @@ docker compose up --build
 
 This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`registry-data`).
 
+### File descriptor limits (important)
+
+Registry workloads can open many concurrent sockets (clients, reverse proxies) and many blob files.
+If the process hits the OS file descriptor limit, you may see logs like:
+
+`ERROR axum::serve: accept error: Too many open files (os error 24)`
+
+- **systemd**: set `LimitNOFILE` in the service unit (the packaged unit sets `65536`).
+- **docker-compose**: set `ulimits.nofile` (the example compose sets it).
+
+To inspect at runtime:
+
+```sh
+systemctl show registry-rust -p LimitNOFILE
+cat /proc/$(pidof registry-rust)/limits | grep -i "open files"
+ls /proc/$(pidof registry-rust)/fd | wc -l
+```
+
 ## Build RPM (containerized, Fedora)
 
 The default `make rpm` builds on the host.

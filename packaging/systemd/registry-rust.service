@@ -11,6 +11,10 @@ ExecStart=/usr/bin/registry-rust --config /etc/registry-rust/registry.core.toml 
 Restart=on-failure
 RestartSec=2s
 
+# Avoid EMFILE ("Too many open files") under concurrent pushes/pulls.
+# Connections and open blob files both consume file descriptors.
+LimitNOFILE=65536
+
 # Run as a dedicated system user.
 User=registry
 Group=registry

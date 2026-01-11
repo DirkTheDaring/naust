@@ -2426,6 +2426,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use headers::{Authorization, HeaderMapExt};
     use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     fn with_admin_creds(mut cfg: Config) -> Config {
@@ -2460,6 +2461,10 @@ mod tests {
             proxy_upstreams: vec![],
             buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -2485,6 +2490,10 @@ mod tests {
             proxy_upstreams: vec![],
             buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -2528,6 +2537,10 @@ mod tests {
             proxy_upstreams: vec![],
             buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -2573,6 +2586,10 @@ mod tests {
             proxy_upstreams: vec![],
             buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -2616,6 +2633,10 @@ mod tests {
             proxy_upstreams: vec![],
             buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -2663,6 +2684,10 @@ mod tests {
             proxy_upstreams: vec![],
             buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
@@ -2889,6 +2914,7 @@ mod tests {
             max_request_body_bytes: 32 * 1024 * 1024,
             max_concurrent_buffered_requests: 8,
             max_concurrent_requests: 256,
+            max_concurrent_upload_requests: 256,
             request_timeout_secs: 300,
             upload_request_timeout_secs: 3600,
             disallow_monolithic_uploads: false,
@@ -3850,11 +3876,18 @@ async fn upload_create(
 
         let first_chunk = match first {
             Ok(c) => c,
-            Err(_) => {
+            Err(err) => {
+                tracing::warn!(
+                    repo = name,
+                    uuid = %meta.uuid,
+                    error = %err,
+                    "monolithic blob upload: failed to read request body"
+                );
                 if policy.abort_on_error {
                     let _ = state.storage.abort_upload(&meta.uuid).await;
                 }
-                return errors::internal_error().into_response();
+                return errors::request_timeout("upload aborted while reading request body")
+                    .into_response();
             }
         };
 
@@ -3884,11 +3917,18 @@ async fn upload_create(
         while let Some(next) = stream.next().await {
             let chunk = match next {
                 Ok(c) => c,
-                Err(_) => {
+                Err(err) => {
+                    tracing::warn!(
+                        repo = name,
+                        uuid = %meta.uuid,
+                        error = %err,
+                        "monolithic blob upload: failed to read request body"
+                    );
                     if policy.abort_on_error {
                         let _ = state.storage.abort_upload(&meta.uuid).await;
                     }
-                    return errors::internal_error().into_response();
+                    return errors::request_timeout("upload aborted while reading request body")
+                        .into_response();
                 }
             };
             if chunk.is_empty() {
@@ -4063,11 +4103,18 @@ async fn upload_session(
             while let Some(next) = stream.next().await {
                 let chunk = match next {
                     Ok(c) => c,
-                    Err(_) => {
+                    Err(err) => {
+                        tracing::warn!(
+                            repo = name,
+                            uuid = uuid,
+                            error = %err,
+                            "blob upload PATCH: failed to read request body"
+                        );
                         if policy.abort_on_error {
                             let _ = state.storage.abort_upload(uuid).await;
                         }
-                        return errors::internal_error().into_response();
+                        return errors::request_timeout("upload aborted while reading request body")
+                            .into_response();
                     }
                 };
                 if chunk.is_empty() {
@@ -4155,11 +4202,19 @@ async fn upload_session(
 
                 let first_chunk = match first {
                     Ok(c) => c,
-                    Err(_) => {
+                    Err(err) => {
+                        tracing::warn!(
+                            repo = name,
+                            uuid = uuid,
+                            digest = digest.as_str(),
+                            error = %err,
+                            "monolithic finalize-on-PUT: failed to read request body"
+                        );
                         if policy.abort_on_error {
                             let _ = state.storage.abort_upload(uuid).await;
                         }
-                        return errors::internal_error().into_response();
+                        return errors::request_timeout("upload aborted while reading request body")
+                            .into_response();
                     }
                 };
                 if !first_chunk.is_empty() {
@@ -4195,11 +4250,19 @@ async fn upload_session(
                 while let Some(next) = stream.next().await {
                     let chunk = match next {
                         Ok(c) => c,
-                        Err(_) => {
+                        Err(err) => {
+                            tracing::warn!(
+                                repo = name,
+                                uuid = uuid,
+                                digest = digest.as_str(),
+                                error = %err,
+                                "monolithic finalize-on-PUT: failed to read request body"
+                            );
                             if policy.abort_on_error {
                                 let _ = state.storage.abort_upload(uuid).await;
                             }
-                            return errors::internal_error().into_response();
+                            return errors::request_timeout("upload aborted while reading request body")
+                                .into_response();
                         }
                     };
                     if chunk.is_empty() {

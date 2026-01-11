@@ -178,3 +178,14 @@ pub fn internal_error() -> impl IntoResponse {
     };
     (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
 }
+
+pub fn request_timeout(message: &str) -> impl IntoResponse {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "UNKNOWN",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    (StatusCode::REQUEST_TIMEOUT, Json(body))
+}
