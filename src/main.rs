@@ -995,7 +995,7 @@ async fn main() {
         .layer(v2_body_limit)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            auth::require_push_basic_auth,
+            auth::require_auth_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

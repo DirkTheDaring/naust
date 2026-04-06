@@ -48,7 +48,8 @@ pub struct Config {
     pub push_password: Option<String>,
     pub push_allow_repos: Option<Vec<String>>,
 
-    pub push_auth_mode: PushAuthMode,
+    pub auth_strategy: AuthStrategy,
+    pub anonymous_pull: bool,
 
     pub storage_backend: StorageBackend,
 
@@ -153,14 +154,12 @@ pub struct RefIndexConfig {
     pub auto_rebuild_on_corruption: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PushAuthMode {
-    /// Current safe default: if `auth.push.username/password` are not configured, reject pushes.
-    DenyIfNoBasic,
-    /// Allow pushes with either a valid Bearer token OR the configured Basic credentials.
-    BasicOrToken,
-    /// Token-only: allow pushes only with valid Bearer tokens; ignore/disable Basic push creds.
-    TokenOnly,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AuthStrategy {
+    #[default]
+    Token,
+    Basic,
+    Both,
 }
 
 impl Config {
@@ -767,6 +766,12 @@ struct FileTlsAcmeExec {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileAuth {
     #[serde(default)]
+    strategy: Option<String>,
+
+    #[serde(default)]
+    anonymous_pull: Option<bool>,
+
+    #[serde(default)]
     push: FilePushAuth,
 
     #[serde(default)]
@@ -839,9 +844,6 @@ struct FileRobotGrant {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FilePushAuth {
-    #[serde(default)]
-    mode: Option<String>,
-
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
@@ -1244,18 +1246,22 @@ impl Config {
         let push_password = env_str_any(&["REGISTRY__AUTH__PUSH__PASSWORD", "REGISTRY_PASSWORD"])
             .or_else(|| file_cfg.auth.push.password.clone());
 
-        let push_auth_mode_raw = env_str_any(&["REGISTRY__AUTH__PUSH__MODE", "PUSH_AUTH_MODE"])
-            .or_else(|| file_cfg.auth.push.mode.clone())
+        let auth_strategy_raw = env_str_any(&["REGISTRY__AUTH__STRATEGY", "AUTH_STRATEGY"])
+            .or_else(|| file_cfg.auth.strategy.clone())
             .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "token_only".to_string());
-        let push_auth_mode = match push_auth_mode_raw.as_str() {
-            "deny_if_no_basic" | "deny" => PushAuthMode::DenyIfNoBasic,
-            "basic_or_token" | "basic+token" | "basic" => PushAuthMode::BasicOrToken,
-            "token_only" | "token" => PushAuthMode::TokenOnly,
+            .unwrap_or_else(|| "token".to_string());
+        let auth_strategy = match auth_strategy_raw.as_str() {
+            "bearer" | "token" => AuthStrategy::Token,
+            "basic" => AuthStrategy::Basic,
+            "both" | "basic_and_token" => AuthStrategy::Both,
             other => panic!(
-                "Unknown auth.push.mode '{other}': expected 'deny_if_no_basic', 'basic_or_token', or 'token_only'"
+                "Unknown auth.strategy '{other}': expected 'token', 'basic', or 'both'"
             ),
         };
+
+        let anonymous_pull = env_bool_opt(&["REGISTRY__AUTH__ANONYMOUS_PULL", "AUTH_ANONYMOUS_PULL"])
+            .or_else(|| file_cfg.auth.anonymous_pull)
+            .unwrap_or(true);
 
         let push_allow_repos = env_str_any(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
@@ -1912,7 +1918,8 @@ impl Config {
             push_username,
             push_password,
             push_allow_repos,
-            push_auth_mode,
+            auth_strategy,
+            anonymous_pull,
             storage_backend,
             fs_root,
             s3_endpoint,
@@ -1987,8 +1994,9 @@ impl Config {
             abort_on_digest_mismatch: self.upload_policy.abort_on_digest_mismatch,
         }
     }
-    pub fn push_auth_configured(&self) -> bool {
-        (self.push_username.is_some() && self.push_password.is_some())
+    pub fn auth_configured(&self) -> bool {
+        !self.anonymous_pull
+            || (self.push_username.is_some() && self.push_password.is_some())
             || (self.robots.enabled && !self.robots.accounts.is_empty())
             || (self.users.enabled && !self.users.accounts.is_empty())
     }

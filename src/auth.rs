@@ -92,17 +92,18 @@ fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Resp
         bearer.push_str(&format!(",scope=\"repository:{repo}:pull,push\""));
     }
 
-    if let Ok(v) = http::HeaderValue::from_str(&bearer) {
-        resp.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
+    if state.config.auth_strategy == crate::config::AuthStrategy::Token || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+        if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+            resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
+        }
     }
-    // Also advertise Basic so curl workflows keep working, unless token-only mode is configured.
-    if state.config.push_auth_mode != crate::config::PushAuthMode::TokenOnly {
+    
+    if state.config.auth_strategy == crate::config::AuthStrategy::Basic || state.config.auth_strategy == crate::config::AuthStrategy::Both {
         resp.headers_mut().append(
             http::header::WWW_AUTHENTICATE,
             http::HeaderValue::from_static("Basic realm=\"registry\""),
         );
     }
-
     resp.headers_mut().insert(
         http::header::HeaderName::from_static("docker-distribution-api-version"),
         http::HeaderValue::from_static("registry/2.0"),
@@ -112,6 +113,32 @@ fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Resp
 
 pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
     unauthorized_registry_challenge(state, None)
+}
+
+fn verify_any_basic_credentials(
+    cfg: &crate::config::Config,
+    user: &str,
+    pass: &str,
+) -> bool {
+    if cfg.robots.enabled {
+        if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
+            return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
+        }
+    }
+    if cfg.users.enabled {
+        if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
+            return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
+        }
+    }
+    if let (Some(expected_user), Some(expected_pass)) = (
+        cfg.push_username.as_deref(),
+        cfg.push_password.as_deref(),
+    ) {
+        if user == expected_user && pass == expected_pass {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
@@ -129,33 +156,81 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
         }
     }
 
-    if state.config.push_auth_mode == crate::config::PushAuthMode::TokenOnly {
+    if state.config.auth_strategy == crate::config::AuthStrategy::Token {
         return false;
     }
 
-    let (Some(expected_user), Some(expected_pass)) = (
-        state.config.push_username.as_deref(),
-        state.config.push_password.as_deref(),
-    ) else {
-        return false;
-    };
-
-    // Basic: accept configured push credentials.
+    // Basic: accept configured push credentials, user credentials, or robot credentials.
     if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
-        return basic.username() == expected_user && basic.password() == expected_pass;
+        return verify_any_basic_credentials(&state.config, basic.username(), basic.password());
     }
 
     false
 }
 
-pub async fn require_push_basic_auth(
+fn verify_direct_basic_access(
+    cfg: &crate::config::Config,
+    user: &str,
+    pass: &str,
+    repo_name: &str,
+    action: &str,
+) -> bool {
+    let token_scopes = [crate::security::TokenScope {
+        typ: "repository".to_string(),
+        name: repo_name.to_string(),
+        actions: vec![action.to_string()],
+    }];
+
+    // 1. Try Robots
+    if cfg.robots.enabled {
+        if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
+            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+                let granted = crate::rbac::grant_scopes_by_prefix(&token_scopes, &account.grants);
+                return !granted.is_empty();
+            }
+            return false;
+        }
+    }
+
+    // 2. Try Users
+    if cfg.users.enabled {
+        if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
+            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+                let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
+                for group_name in &account.groups {
+                    if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name) {
+                        union_grants.extend(group.grants.clone());
+                    }
+                }
+                let granted = crate::rbac::grant_scopes_by_prefix(&token_scopes, &union_grants);
+                return !granted.is_empty();
+            }
+            return false;
+        }
+    }
+
+    // 3. Fallback to global basic auth
+    if let (Some(expected_user), Some(expected_pass)) = (
+        cfg.push_username.as_deref(),
+        cfg.push_password.as_deref(),
+    ) {
+        if user == expected_user && pass == expected_pass {
+            if let Some(allowlist) = cfg.push_allow_repos.as_deref() {
+                return repo_allowed(allowlist, repo_name);
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
+pub async fn require_auth_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     // If this request is routed to proxy-only mode, disallow all write methods.
-    // This prevents ambiguous behavior where a push could populate local storage while pulls
-    // on the same repo are expected to come from proxy/cache.
     if crate::request_routing::v2_route_mode_for_request(&state.config.proxy, request.headers())
         == crate::request_routing::V2RouteMode::ProxyOnly
     {
@@ -165,28 +240,20 @@ pub async fn require_push_basic_auth(
         }
     }
 
-    // Policy: anonymous pull. Only gate push (write) methods.
-    // This keeps `/v2/` ping and all GET/HEAD endpoints anonymous.
-    match *request.method() {
-        http::Method::GET | http::Method::HEAD => return next.run(request).await,
-        _ => {}
-    }
+    let action = match *request.method() {
+        http::Method::GET | http::Method::HEAD => {
+            if state.config.anonymous_pull {
+                return next.run(request).await;
+            }
+            "pull"
+        }
+        _ => "push",
+    };
 
     let repo = extract_repo_from_v2_path(request.uri().path());
     let Some(repo_name) = repo.as_deref() else {
         return unauthorized_registry_challenge(&state, None);
     };
-
-    // Default safe behavior: deny pushes if basic creds aren't configured.
-    // Token-only mode explicitly allows push via Bearer without separate Basic creds.
-    let (expected_user, expected_pass) = match state.config.push_auth_mode {
-        crate::config::PushAuthMode::TokenOnly => (None, None),
-        crate::config::PushAuthMode::BasicOrToken | crate::config::PushAuthMode::DenyIfNoBasic => (
-            state.config.push_username.as_deref(),
-            state.config.push_password.as_deref(),
-        ),
-    };
-
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
         if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
@@ -199,11 +266,14 @@ pub async fn require_push_basic_auth(
                 return unauthorized_registry_challenge(&state, Some(repo_name));
             }
 
-            if security::token_allows_repo_action(&claims, repo_name, security::RepoAction::Push) {
-                if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                    if !repo_allowed(allowlist, repo_name) {
-                        return errors::denied("push not allowed for this repository")
-                            .into_response();
+            let required_action = if action == "push" { security::RepoAction::Push } else { security::RepoAction::Pull };
+            if security::token_allows_repo_action(&claims, repo_name, required_action) {
+                if action == "push" {
+                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+                        if !repo_allowed(allowlist, repo_name) {
+                            return errors::denied("push not allowed for this repository")
+                                .into_response();
+                        }
                     }
                 }
                 return next.run(request).await;
@@ -211,28 +281,17 @@ pub async fn require_push_basic_auth(
         }
     }
 
-    // If token-only mode is enabled, do not accept Basic for pushes.
-    if state.config.push_auth_mode != crate::config::PushAuthMode::TokenOnly {
-        // In the default mode, missing creds means deny pushes.
-        if state.config.push_auth_mode == crate::config::PushAuthMode::DenyIfNoBasic
-            && (expected_user.is_none() || expected_pass.is_none())
-        {
-            return unauthorized_registry_challenge(&state, Some(repo_name));
-        }
-
-        if let (Some(expected_user), Some(expected_pass)) = (expected_user, expected_pass) {
-            if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
-                let user_ok = basic.username() == expected_user;
-                let pass_ok = basic.password() == expected_pass;
-                if user_ok && pass_ok {
-                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                        if !repo_allowed(allowlist, repo_name) {
-                            return errors::denied("push not allowed for this repository")
-                                .into_response();
-                        }
-                    }
-                    return next.run(request).await;
-                }
+    // If token-only mode is enabled, do not accept Basic for directly authenticating data requests.
+    if state.config.auth_strategy != crate::config::AuthStrategy::Token {
+        if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
+            if verify_direct_basic_access(
+                &state.config,
+                basic.username(),
+                basic.password(),
+                repo_name,
+                action,
+            ) {
+                return next.run(request).await;
             }
         }
     }

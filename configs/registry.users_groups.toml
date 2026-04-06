@@ -46,6 +46,18 @@ root = "./data"
 # username = "admin"
 # password = "change-me"
 
+[auth]
+# Authentication transport mechanism:
+# - "token" (default): strictly advertises and requires Docker/OCI token endpoints.
+# - "basic": advertises and requires standard HTTP Basic Auth for pushes/pulls. 
+# - "both": advertises and accepts both methods.
+# strategy = "token"
+
+# Allow unauthenticated users to download images?
+# Default is true (backward compatible).
+# If set to false, ALL pulls and API reads will require authentication.
+# anonymous_pull = true
+
 # Harbor-lite Phase 2 (implemented): users + groups.
 [auth.users]
 enabled = true

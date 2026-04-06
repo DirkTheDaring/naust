@@ -18,8 +18,19 @@ public_url = "https://registry.example.com"
 cert_path = "/certs/cert.pem"
 key_path  = "/certs/key.pem"
 
+[auth]
+# Authentication transport mechanism:
+# - "token" (default): strictly advertises and requires Docker/OCI token endpoints.
+# - "basic": advertises and requires standard HTTP Basic Auth for pushes/pulls. 
+# - "both": advertises and accepts both methods.
+# strategy = "token"
+
+# Allow unauthenticated users to download images?
+# Default is true (backward compatible).
+# If set to false, ALL pulls and API reads will require authentication.
+# anonymous_pull = true
+
 [auth.push]
-mode = "basic_or_token"
 username = "demo"
 password = "demo"
 # allow_repos = ["org/*"]

@@ -1,3 +1,39 @@
+registry-rust (0.6.11-1) unstable; urgency=medium
+
+  * Bump version to 0.6.11.
+
+ -- Registry Rust Maintainers <registry-rust@example.com>  Mon, 06 Apr 2026 13:41:26 +0200
+
+registry-rust (0.6.10-1) unstable; urgency=medium
+
+  * Bump version to 0.6.10.
+
+ -- Registry Rust Maintainers <registry-rust@example.com>  Mon, 06 Apr 2026 13:16:00 +0200
+
+registry-rust (0.6.9-1) unstable; urgency=medium
+
+  * Bump version to 0.6.9.
+
+ -- Registry Rust Maintainers <registry-rust@example.com>  Mon, 06 Apr 2026 12:50:30 +0200
+
+registry-rust (0.6.8-1) unstable; urgency=medium
+
+  * Bump version to 0.6.8.
+
+ -- Registry Rust Maintainers <registry-rust@example.com>  Mon, 06 Apr 2026 12:46:04 +0200
+
+registry-rust (0.6.7-1) unstable; urgency=medium
+
+  * Bump version to 0.6.7.
+
+ -- Registry Rust Maintainers <registry-rust@example.com>  Mon, 06 Apr 2026 12:36:39 +0200
+
+registry-rust (0.6.6-1) unstable; urgency=medium
+
+  * Bump version to 0.6.6.
+
+ -- Registry Rust Maintainers <registry-rust@example.com>  Mon, 06 Apr 2026 12:12:16 +0200
+
 registry-rust (0.6.5-1) unstable; urgency=medium
 
   * Bump version to 0.6.5.

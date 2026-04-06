@@ -18,10 +18,12 @@ use headers::{Authorization, HeaderMapExt, authorization::Basic};
 use sha2::Digest as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 
@@ -48,10 +50,11 @@ fn decide_token_scopes_for_request(
     basic: Option<(String, String)>,
 ) -> Result<TokenDecision, TokenRejection> {
     let wants_push = wants_push_from_token_scopes(token_scopes);
+    let requires_auth = wants_push || !cfg.anonymous_pull;
 
     // Pull-only tokens: keep behavior simple and backwards compatible.
     // (No auth required; we mint exactly the sanitized requested scopes.)
-    if !wants_push {
+    if !requires_auth {
         return Ok(TokenDecision {
             subject: None,
             scopes: token_scopes.to_vec(),
@@ -65,16 +68,19 @@ fn decide_token_scopes_for_request(
         if let Some((user, pass)) = basic.as_ref() {
             if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == *user) {
                 if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                    let granted =
-                        crate::rbac::grant_scopes_by_prefix(token_scopes, &account.grants);
-                    if granted.is_empty() {
-                        return Err(TokenRejection::Denied("push not allowed by robot policy"));
+                    let granted = if token_scopes.is_empty() {
+                        Vec::new() // identity checking only
+                    } else {
+                        crate::rbac::grant_scopes_by_prefix(token_scopes, &account.grants)
+                    };
+                    if !token_scopes.is_empty() && granted.is_empty() {
+                        return Err(TokenRejection::Denied("action not allowed by robot policy"));
                     }
 
                     // Ensure we did not implicitly drop all requested push actions.
                     // (If push was requested, at least one push must remain granted.)
                     let granted_wants_push = wants_push_from_token_scopes(&granted);
-                    if !granted_wants_push {
+                    if wants_push && !granted_wants_push {
                         return Err(TokenRejection::Denied("push not allowed by robot policy"));
                     }
 
@@ -105,13 +111,17 @@ fn decide_token_scopes_for_request(
                         }
                     }
 
-                    let granted = crate::rbac::grant_scopes_by_prefix(token_scopes, &union_grants);
-                    if granted.is_empty() {
-                        return Err(TokenRejection::Denied("push not allowed by user policy"));
+                    let granted = if token_scopes.is_empty() {
+                        Vec::new()
+                    } else {
+                        crate::rbac::grant_scopes_by_prefix(token_scopes, &union_grants)
+                    };
+                    if !token_scopes.is_empty() && granted.is_empty() {
+                        return Err(TokenRejection::Denied("action not allowed by user policy"));
                     }
 
                     let granted_wants_push = wants_push_from_token_scopes(&granted);
-                    if !granted_wants_push {
+                    if wants_push && !granted_wants_push {
                         return Err(TokenRejection::Denied("push not allowed by user policy"));
                     }
 
@@ -162,9 +172,13 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
         .and_then(|s| s.split_whitespace().next())
         .unwrap_or("<none>");
     tracing::info!(auth_scheme = auth_scheme, "v2 ping");
-    let has_auth = auth_scheme != "<none>";
 
-    if state.config.push_auth_configured() && !has_auth {
+    let mut is_valid_auth = false;
+    if auth_scheme != "<none>" {
+        is_valid_auth = crate::auth::is_authenticated(&state, &req_headers);
+    }
+
+    if state.config.auth_configured() && !is_valid_auth {
         let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
 
         let realm = state
@@ -177,13 +191,17 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
             "Bearer realm=\"{realm}/token\",service=\"{}\"",
             state.config.token_service
         );
-        if let Ok(v) = http::HeaderValue::from_str(&bearer) {
-            resp.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
+        if state.config.auth_strategy == crate::config::AuthStrategy::Token || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+            if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+                resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
+            }
         }
-        resp.headers_mut().append(
-            http::header::WWW_AUTHENTICATE,
-            http::HeaderValue::from_static("Basic realm=\"registry\""),
-        );
+        if state.config.auth_strategy == crate::config::AuthStrategy::Basic || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+            resp.headers_mut().append(
+                http::header::WWW_AUTHENTICATE,
+                http::HeaderValue::from_static("Basic realm=\"registry\""),
+            );
+        }
         resp.headers_mut().insert(
             http::header::HeaderName::from_static("docker-distribution-api-version"),
             http::HeaderValue::from_static("registry/2.0"),
@@ -258,7 +276,7 @@ pub async fn token(
                 wants_push = requested_wants_push,
                 token_denied_total = denied_total,
             );
-            return token_unauthorized(&state);
+            return token_unauthorized();
         }
         Err(TokenRejection::Denied(msg)) => {
             let denied_total = state.auth_metrics.inc_token_denied();
@@ -682,7 +700,7 @@ fn service_param_is_valid(service_param: Option<&str>, configured_service: &str)
     }
 }
 
-fn token_unauthorized(state: &AppState) -> Response {
+fn token_unauthorized() -> Response {
     let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
     // Challenge so the client knows it can present Basic creds to obtain a token.
     resp.headers_mut().insert(
@@ -693,19 +711,6 @@ fn token_unauthorized(state: &AppState) -> Response {
         http::header::HeaderName::from_static("docker-distribution-api-version"),
         http::HeaderValue::from_static("registry/2.0"),
     );
-    // Also include Bearer parameters for completeness.
-    let realm = state
-        .config
-        .public_url
-        .as_deref()
-        .unwrap_or("http://127.0.0.1:5000")
-        .trim_end_matches('/');
-    if let Ok(v) = http::HeaderValue::from_str(&format!(
-        "Bearer realm=\"{realm}/token\",service=\"{}\"",
-        state.config.token_service
-    )) {
-        resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
-    }
     resp
 }
 
@@ -831,6 +836,108 @@ fn query_bool(map: &HashMap<String, String>, key: &str) -> bool {
     map.get(key)
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+fn platform_triplet(os: &str, arch: &str, variant: Option<&str>) -> String {
+    let os = os.trim();
+    let arch = arch.trim();
+    let variant = variant.map(|v| v.trim()).filter(|v| !v.is_empty());
+    match variant {
+        Some(v) => format!("{os}/{arch}/{v}"),
+        None => format!("{os}/{arch}"),
+    }
+}
+
+async fn read_storage_blob_limited_json(
+    storage: &Arc<dyn crate::storage::Storage>,
+    digest: &Digest,
+    max_bytes: usize,
+) -> Result<serde_json::Value, ()> {
+    let (meta, mut reader) = storage.open_blob(digest).await.map_err(|_| ())?;
+    // Defensive: config blobs are expected to be small. Refuse to read very large blobs.
+    if meta.size as usize > max_bytes {
+        return Err(());
+    }
+
+    let mut buf = Vec::with_capacity(meta.size as usize);
+    let mut chunk = [0u8; 8192];
+    while buf.len() <= max_bytes {
+        let n = reader.read(&mut chunk).await.map_err(|_| ())?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > max_bytes {
+            return Err(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    serde_json::from_slice(&buf).map_err(|_| ())
+}
+
+async fn tag_platforms_for_repo(
+    storage: &Arc<dyn crate::storage::Storage>,
+    repo: &str,
+    tag: &str,
+) -> Result<serde_json::Value, StorageError> {
+    let digest = storage.resolve_tag(repo, tag).await?;
+    let (meta, bytes) = storage.get_manifest(repo, &digest).await?;
+
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+
+    let mut platforms: HashSet<String> = HashSet::new();
+    let mut kind: &str = "other";
+
+    // Index/list: manifests[].platform.{os,architecture,variant}
+    if let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) {
+        kind = "index";
+        for m in manifests {
+            let p = m.get("platform");
+            let Some(os) = p.and_then(|p| p.get("os")).and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(arch) = p
+                .and_then(|p| p.get("architecture"))
+                .and_then(|x| x.as_str())
+            else {
+                continue;
+            };
+            let variant = p.and_then(|p| p.get("variant")).and_then(|x| x.as_str());
+            platforms.insert(platform_triplet(os, arch, variant));
+        }
+    } else {
+        // Single manifest: try to infer platform from config blob.
+        kind = "manifest";
+        if let Some(cfg_digest) = v
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|d| d.as_str())
+        {
+            if let Ok(cfg_d) = Digest::parse(cfg_digest) {
+                if let Ok(cfg) = read_storage_blob_limited_json(storage, &cfg_d, 1024 * 1024).await
+                {
+                    if let (Some(os), Some(arch)) = (
+                        cfg.get("os").and_then(|x| x.as_str()),
+                        cfg.get("architecture").and_then(|x| x.as_str()),
+                    ) {
+                        let variant = cfg.get("variant").and_then(|x| x.as_str());
+                        platforms.insert(platform_triplet(os, arch, variant));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut platforms: Vec<String> = platforms.into_iter().collect();
+    platforms.sort();
+
+    Ok(serde_json::json!({
+        "tag": tag,
+        "digest": digest.as_str(),
+        "media_type": meta.media_type,
+        "kind": kind,
+        "platforms": platforms,
+    }))
 }
 
 pub async fn v2_dispatch(
@@ -1290,7 +1397,9 @@ pub async fn meta_catalog(
     let has_more = end_idx < total;
 
     let mut repos_out: Vec<serde_json::Value> = Vec::new();
-    let include_tags = query_bool(&query, "include_tags");
+    let include_platforms = query_bool(&query, "include_platforms");
+    // include_platforms implies include_tags because platform info is per-tag.
+    let include_tags = query_bool(&query, "include_tags") || include_platforms;
     for repo in &page {
         match state.storage.repo_timestamps(repo).await {
             Ok(ts) => {
@@ -1304,6 +1413,33 @@ pub async fn meta_catalog(
                     if let Some(obj) = meta.as_object_mut() {
                         obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
                         obj.insert("tags".to_string(), serde_json::json!(tags));
+
+                        if include_platforms {
+                            let storage = state.storage.clone();
+                            let repo = repo.to_string();
+                            let tag_details = futures_util::stream::iter(
+                                obj.get("tags")
+                                    .and_then(|t| t.as_array())
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .map(|tag| {
+                                let storage = storage.clone();
+                                let repo = repo.clone();
+                                async move { tag_platforms_for_repo(&storage, &repo, &tag).await }
+                            })
+                            .buffer_unordered(16)
+                            .collect::<Vec<_>>()
+                            .await;
+
+                            let tag_details = tag_details
+                                .into_iter()
+                                .filter_map(Result::ok)
+                                .collect::<Vec<_>>();
+                            obj.insert("tag_details".to_string(), serde_json::json!(tag_details));
+                        }
                     }
                 }
                 repos_out.push(meta);
@@ -2712,6 +2848,167 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&fs_root);
     }
+
+    #[tokio::test]
+    async fn meta_catalog_include_platforms_adds_tag_details_with_platforms() {
+        let fs_root = std::env::temp_dir().join(format!(
+            "registry-rust-meta-platforms-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::create_dir_all(&fs_root);
+
+        let repo = "org1/repoa";
+
+        let idx_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let single_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let cfg_digest =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        // Tags.
+        let tags_dir = fs_root
+            .join("repos")
+            .join("org1")
+            .join("repoa")
+            .join("tags");
+        let _ = std::fs::create_dir_all(&tags_dir);
+        std::fs::write(tags_dir.join("multi"), format!("{idx_digest}\n")).unwrap();
+        std::fs::write(tags_dir.join("single"), format!("{single_digest}\n")).unwrap();
+
+        // Manifests.
+        let manifests_dir = fs_root
+            .join("repos")
+            .join("org1")
+            .join("repoa")
+            .join("manifests");
+        let _ = std::fs::create_dir_all(&manifests_dir);
+
+        let idx_hex = idx_digest.split_once(':').unwrap().1;
+        let single_hex = single_digest.split_once(':').unwrap().1;
+
+        let idx_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "size": 1,
+                    "platform": {"os": "linux", "architecture": "amd64"}
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "size": 1,
+                    "platform": {"os": "linux", "architecture": "arm64"}
+                }
+            ]
+        });
+        std::fs::write(
+            manifests_dir.join(idx_hex),
+            serde_json::to_vec(&idx_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let single_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": cfg_digest,
+                "size": 123
+            },
+            "layers": []
+        });
+        std::fs::write(
+            manifests_dir.join(single_hex),
+            serde_json::to_vec(&single_manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Config blob for single-manifest platform inference.
+        let cfg_hex = cfg_digest.split_once(':').unwrap().1;
+        let cfg_prefix2 = &cfg_hex[..2];
+        let cfg_blob_dir = fs_root.join("blobs").join("sha256").join(cfg_prefix2);
+        let _ = std::fs::create_dir_all(&cfg_blob_dir);
+        let cfg_json = serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux"
+        });
+        std::fs::write(cfg_blob_dir.join(cfg_hex), serde_json::to_vec(&cfg_json).unwrap()).unwrap();
+
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        cfg.catalog_requires_auth = false;
+        let cfg = Arc::new(cfg);
+
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+
+        let state = AppState {
+            config: cfg,
+            auth_metrics: Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: None,
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
+            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let mut q = std::collections::HashMap::new();
+        q.insert("include_platforms".to_string(), "1".to_string());
+
+        let resp = super::meta_catalog(State(state), HeaderMap::new(), axum::extract::Query(q)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let repos = v.get("repositories").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(repos.len(), 1);
+        let repo0 = repos[0].as_object().unwrap();
+        assert_eq!(repo0.get("name").and_then(|x| x.as_str()), Some(repo));
+        assert_eq!(repo0.get("tag_count").and_then(|x| x.as_u64()), Some(2));
+
+        let tag_details = repo0
+            .get("tag_details")
+            .and_then(|x| x.as_array())
+            .unwrap();
+        assert_eq!(tag_details.len(), 2);
+
+        let mut by_tag: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for d in tag_details {
+            let tag = d.get("tag").and_then(|x| x.as_str()).unwrap().to_string();
+            let plats = d
+                .get("platforms")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
+            by_tag.insert(tag, plats);
+        }
+
+        assert_eq!(
+            by_tag.get("multi").cloned().unwrap(),
+            vec!["linux/amd64".to_string(), "linux/arm64".to_string()]
+        );
+        assert_eq!(
+            by_tag.get("single").cloned().unwrap(),
+            vec!["linux/amd64".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
     use crate::config::{Config, ProxyConfig, ProxyMode, RobotsConfig, UploadPolicyConfig};
     use crate::rbac::Grant;
     use crate::robot_secrets;
@@ -2874,7 +3171,8 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             tls_acme: None,
-            push_auth_mode: crate::config::PushAuthMode::TokenOnly,
+            auth_strategy: crate::config::AuthStrategy::Token,
+            anonymous_pull: true,
             push_username: None,
             push_password: None,
             push_allow_repos: Some(vec!["*".to_string()]),
@@ -3046,7 +3344,7 @@ mod tests {
 
         assert_eq!(
             err,
-            super::TokenRejection::Denied("push not allowed by robot policy")
+            super::TokenRejection::Denied("action not allowed by robot policy")
         );
     }
 
@@ -3193,7 +3491,7 @@ mod tests {
 
         assert_eq!(
             err,
-            super::TokenRejection::Denied("push not allowed by user policy")
+            super::TokenRejection::Denied("action not allowed by user policy")
         );
     }
 
@@ -3245,7 +3543,7 @@ mod tests {
 
         assert_eq!(
             err,
-            super::TokenRejection::Denied("push not allowed by robot policy")
+            super::TokenRejection::Denied("action not allowed by robot policy")
         );
     }
 }

@@ -15,10 +15,21 @@
 listen_addr = "0.0.0.0:5000"
 public_url = "http://127.0.0.1:5000"
 
+[auth]
+# Authentication transport mechanism:
+# - "token" (default): strictly advertises and requires Docker/OCI token endpoints.
+# - "basic": advertises and requires standard HTTP Basic Auth for pushes/pulls. 
+# - "both": advertises and accepts both methods.
+# strategy = "token"
+
+# Allow unauthenticated users to download images?
+# Default is true (backward compatible).
+# If set to false, ALL pulls and API reads will require authentication.
+# anonymous_pull = true
+
 [auth.push]
 # Configure if you also want to allow pushes to local storage on other hostnames.
 # Proxy-only hosts (matching [[proxy.upstreams]].hosts) always reject writes.
-mode = "basic_or_token"
 username = "demo"
 password = "demo"
 allow_repos = ["myrepo"]

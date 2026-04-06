@@ -56,15 +56,19 @@ key_path  = ""
 # #   <exec_path> cleanup <record_fqdn> <txt_value>
 # exec_path = "/usr/local/bin/acme-dns-hook"
 
+[auth]
+# Authentication transport mechanism:
+# - "token" (default): strictly advertises and requires Docker/OCI token endpoints.
+# - "basic": advertises and requires standard HTTP Basic Auth for pushes/pulls. 
+# - "both": advertises and accepts both methods.
+# strategy = "token"
+
+# Allow unauthenticated users to download images?
+# Default is true (backward compatible).
+# If set to false, ALL pulls and API reads will require authentication.
+# anonymous_pull = true
+
 [auth.push]
-# Push authorization mode.
-#
-# - "token_only" (default): pushes allowed via Bearer token only; Basic creds are ignored.
-# - "basic_or_token": pushes allowed via Bearer token OR Basic creds (if configured).
-# - "token_only": pushes allowed via Bearer token only; Basic creds are ignored.
-#
-# This example includes Basic creds, so we opt into allowing them.
-mode = "basic_or_token"
 
 # If mode is not "token_only" and username/password are unset, pushes are rejected.
 username = "demo"

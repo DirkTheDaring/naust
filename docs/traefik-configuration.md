@@ -112,6 +112,153 @@ If you cannot change the shared `https` entryPoint, you have two common options:
 - **Dedicated IP + entryPoint on `:443`** for registry only.
   - Requires an additional IP address on the host.
 
+## Kubernetes (no file edits; configure via Helm/CRDs/annotations)
+
+In Kubernetes you typically cannot edit on-disk Traefik config files. Instead, you configure:
+
+- **Static settings** (entryPoints, timeouts) via Traefik deployment args / Helm values.
+- **Dynamic settings** (per-service `serversTransport`) via Traefik CRDs (recommended) or
+  (depending on your setup) Ingress annotations.
+
+The goal is the same as above:
+
+1. Allow long request bodies (uploads) on the entryPoint (**client → Traefik**).
+2. Use a dedicated `ServersTransport` for the registry service (**Traefik → backend**).
+
+### 1) Static entryPoint timeouts via Helm (Traefik chart)
+
+If you install Traefik via the official Helm chart, add these as `additionalArguments`.
+
+This is global *per entryPoint* (e.g. `websecure`), so consider using a dedicated entryPoint if you need strict isolation.
+
+```yaml
+# values.yaml
+additionalArguments:
+  # Client -> Traefik timeouts for long uploads (Docker Registry blobs).
+  - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=7200s"
+  - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=7200s"
+  - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=7200s"
+```
+
+If you need isolation, create a dedicated entryPoint (example: `registry`) and bind only the registry router to it:
+
+```yaml
+# values.yaml
+additionalArguments:
+  - "--entrypoints.registry.address=:8443"
+  - "--entrypoints.registry.transport.respondingTimeouts.readTimeout=7200s"
+  - "--entrypoints.registry.transport.respondingTimeouts.writeTimeout=7200s"
+  - "--entrypoints.registry.transport.respondingTimeouts.idleTimeout=7200s"
+```
+
+### 2) Dynamic per-service timeouts via a `ServersTransport` CRD (recommended)
+
+Create a `ServersTransport` object and reference it from your router/service.
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: registry-transport
+  namespace: traefik
+spec:
+  forwardingTimeouts:
+    dialTimeout: 30s
+    responseHeaderTimeout: 7200s
+    idleConnTimeout: 7200s
+```
+
+### 3) Wire it up: IngressRoute (Traefik CRD)
+
+If you use `IngressRoute`, you can attach the transport directly to the service reference.
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`registry.example.com`)
+      kind: Rule
+      services:
+        - name: registry-service
+          port: 8082
+          # Per-service backend timeouts (Traefik -> registry).
+          serversTransport: registry-transport@kubernetescrd
+  tls:
+    certResolver: letsencrypt
+```
+
+### 4) Alternative: Kubernetes Ingress annotations
+
+If you use plain Kubernetes `Ingress` (provider: *Kubernetes Ingress*), Traefik supports annotations on both the **Ingress** and the **Service**.
+
+Key point: the `serversTransport` reference is a **Service annotation**:
+
+- `traefik.ingress.kubernetes.io/service.serverstransport: registry-transport@kubernetescrd`
+
+Example `Service` for the registry (note the transport reference):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: registry
+  annotations:
+    # Per-service backend timeouts (Traefik -> registry).
+    # Reference the ServersTransport CRD using provider namespace syntax.
+    traefik.ingress.kubernetes.io/service.serverstransport: registry-transport@kubernetescrd
+spec:
+  selector:
+    app: registry
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+```
+
+Example `Ingress` for the registry (router-level settings):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: registry
+  namespace: registry
+  annotations:
+    # Choose the entryPoint (typically websecure for :443).
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+
+    # Enable TLS on the router.
+    traefik.ingress.kubernetes.io/router.tls: "true"
+
+    # If you use ACME certResolver in Traefik, you can reference it here.
+    # (Optional if TLS is enabled globally on the entryPoint.)
+    traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt
+spec:
+  rules:
+    - host: registry.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: registry
+                port:
+                  number: 8082
+```
+
+Notes:
+
+- These annotations cover **routing and backend transport selection**.
+- They do **not** replace entryPoint (static) `respondingTimeouts` for long client uploads; that part still must be set via Helm args / static config.
+
 ## Suggested starting values
 
 - For uploads: values like `3600s` to `7200s` are typical for home-lab / WAN conditions.
