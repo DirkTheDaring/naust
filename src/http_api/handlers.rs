@@ -985,6 +985,9 @@ pub async fn v2_dispatch(
     // Registry catalog:
     //   GET/HEAD /v2/_catalog
     if segments.len() == 1 && segments[0] == "_catalog" {
+        if method != Method::GET && method != Method::HEAD {
+            return errors::method_not_allowed("GET, HEAD");
+        }
         let auth_required = state.config.catalog_requires_auth
             || !state.config.anonymous_pull
             || state.config.push_username.is_some()
@@ -1022,6 +1025,9 @@ pub async fn v2_dispatch(
             && segments[segments.len() - 2] == "ext"
             && segments[segments.len() - 1] == "discover")
     {
+        if method != Method::GET && method != Method::HEAD {
+            return errors::method_not_allowed("GET, HEAD");
+        }
         return oci_extension_discover(method).await;
     }
     // Uploads:
@@ -1031,14 +1037,20 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 1] == "uploads"
         && segments[segments.len() - 2] == "blobs"
     {
+        if method != Method::POST {
+            return errors::method_not_allowed("POST");
+        }
         let name = segments[..segments.len() - 2].join("/");
-        return upload_create(state, method, &name, &query, body).await;
+        return upload_create(state, &headers, method, &name, &query, body).await;
     }
 
     if segments.len() >= 3
         && segments[segments.len() - 2] == "uploads"
         && segments[segments.len() - 3] == "blobs"
     {
+        if method != Method::GET && method != Method::HEAD && method != Method::PATCH && method != Method::PUT && method != Method::DELETE {
+            return errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE");
+        }
         let uuid = segments[segments.len() - 1];
         let name = segments[..segments.len() - 3].join("/");
         return upload_session(state, method, &headers, &name, uuid, query, body).await;
@@ -1050,6 +1062,9 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 2] == "tags"
         && segments[segments.len() - 1] == "list"
     {
+        if method != Method::GET && method != Method::HEAD {
+            return errors::method_not_allowed("GET, HEAD");
+        }
         let name = segments[..segments.len() - 2].join("/");
         return tags_list(state, method, &name, &query, route_mode, proxy_ctx.clone()).await;
     }
@@ -1060,6 +1075,9 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 3] == "tags"
         && segments[segments.len() - 2] == "reference"
     {
+        if method != Method::DELETE {
+            return errors::method_not_allowed("DELETE");
+        }
         let tag = segments[segments.len() - 1];
         let name = segments[..segments.len() - 3].join("/");
         return tag_delete(state, method, &name, tag).await;
@@ -1068,6 +1086,9 @@ pub async fn v2_dispatch(
     // Referrers:
     //   GET/HEAD /v2/<name>/referrers/<digest>
     if segments.len() >= 2 && segments[segments.len() - 2] == "referrers" {
+        if method != Method::GET && method != Method::HEAD {
+            return errors::method_not_allowed("GET, HEAD");
+        }
         let digest_str = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
         return referrers_list(
@@ -1088,6 +1109,9 @@ pub async fn v2_dispatch(
         if method == Method::PUT {
             return manifest_put(state, &headers, &name, reference, body).await;
         }
+        if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
+            return errors::method_not_allowed("GET, HEAD, PUT, DELETE");
+        }
         return manifest_by_reference(
             state,
             method,
@@ -1105,6 +1129,9 @@ pub async fn v2_dispatch(
         && segments[segments.len() - 2] == "blobs"
         && segments[segments.len() - 1] != "uploads"
     {
+        if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
+            return errors::method_not_allowed("GET, HEAD, DELETE");
+        }
         let digest_str = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
         return blob_by_digest(
@@ -1197,7 +1224,7 @@ async fn catalog_list(
                 Err(_) => errors::internal_error().into_response(),
             }
         }
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD"),
     }
 }
 
@@ -1632,7 +1659,23 @@ async fn tags_list(
                 }
                 (StatusCode::OK, headers, Body::from(bytes)).into_response()
             }
-            Err(StorageError::NotFound) => errors::name_unknown().into_response(),
+            Err(StorageError::NotFound) => {
+                let payload = serde_json::json!({
+                    "name": name,
+                    "tags": Vec::<String>::new(),
+                });
+                let bytes = match serde_json::to_vec(&payload) {
+                    Ok(b) => b,
+                    Err(_) => return errors::internal_error().into_response(),
+                };
+                let mut headers = registry_headers();
+                headers.insert("Content-Type", "application/json".parse().unwrap());
+                headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+                if method == Method::HEAD {
+                    return (StatusCode::OK, headers).into_response();
+                }
+                (StatusCode::OK, headers, Body::from(bytes)).into_response()
+            }
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::InsufficientStorage) => {
                 errors::insufficient_storage().into_response()
@@ -1641,7 +1684,7 @@ async fn tags_list(
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD"),
     }
 }
 
@@ -1652,7 +1695,7 @@ async fn tag_delete(
     tag: &str,
 ) -> Response {
     if method != Method::DELETE {
-        return errors::not_implemented().into_response();
+        return errors::method_not_allowed("DELETE");
     }
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
@@ -1946,7 +1989,7 @@ async fn blob_by_digest(
             }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD, DELETE"),
     }
 }
 
@@ -2400,7 +2443,7 @@ async fn manifest_by_reference(
             }
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD, DELETE"),
     }
 }
 
@@ -2639,7 +2682,7 @@ async fn manifest_by_reference_proxy_only(
 
             errors::manifest_unknown().into_response()
         }
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD, DELETE"),
     }
 }
 
@@ -3888,7 +3931,7 @@ async fn manifest_put(
     // If reference is a digest, it must match the computed digest.
     if let Ok(ref_digest) = Digest::parse(reference) {
         if ref_digest.hex() != computed.hex() {
-            return errors::digest_invalid().into_response();
+            return errors::manifest_unverified("manifest digest mismatch");
         }
     } else {
         // Otherwise treat it as a tag.
@@ -4209,7 +4252,7 @@ async fn referrers_list(
             }
             (StatusCode::OK, headers, Body::from(bytes)).into_response()
         }
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD"),
     }
 }
 
@@ -4271,6 +4314,7 @@ async fn read_body_limited(
 
 async fn upload_create(
     state: AppState,
+    headers: &HeaderMap,
     method: Method,
     name: &str,
     query: &HashMap<String, String>,
@@ -4281,33 +4325,44 @@ async fn upload_create(
     }
 
     if method != Method::POST {
-        return errors::not_implemented().into_response();
+        return errors::method_not_allowed("POST");
     }
 
     // Cross-repository blob mount:
     //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
-    // If the blob exists, registry may respond 201 and skip upload.
+    // If the blob exists and client has pull authorization on source repo, respond 201.
+    // Otherwise, fall back to standard 202 upload session per spec.
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
-        let digest = match Digest::parse(mount_str) {
-            Ok(d) => d,
-            Err(_) => return errors::digest_invalid().into_response(),
-        };
+        if let Ok(digest) = Digest::parse(mount_str) {
+            let mut mount_allowed = true;
+            if let Some(from_repo) = query.get("from") {
+                if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
+                    if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
+                        &state.config.token_signing_keys,
+                        token,
+                        &state.config.token_service,
+                        state.config.token_ttl_secs,
+                    ) {
+                        if !crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull) {
+                            mount_allowed = false;
+                        }
+                    }
+                }
+            } else if !state.config.automatic_crossmount {
+                mount_allowed = false;
+            }
 
-        let has_from = query.get("from").is_some();
-        let allow_without_from = state.config.automatic_crossmount;
-
-        if has_from || allow_without_from {
-            if state.storage.head_blob(&digest).await.is_ok() {
-                let mut headers = registry_headers();
-                headers.insert(
+            if mount_allowed && state.storage.head_blob(&digest).await.is_ok() {
+                let mut resp_headers = registry_headers();
+                resp_headers.insert(
                     "Location",
                     format!("/v2/{name}/blobs/{}", digest.as_str())
                         .parse()
                         .unwrap(),
                 );
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Length", "0".parse().unwrap());
-                return (StatusCode::CREATED, headers).into_response();
+                resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                resp_headers.insert("Content-Length", "0".parse().unwrap());
+                return (StatusCode::CREATED, resp_headers).into_response();
             }
         }
     }
@@ -4597,9 +4652,13 @@ async fn upload_session(
             }
         },
         Method::DELETE => match state.storage.abort_upload(uuid).await {
-            Ok(()) => (StatusCode::NO_CONTENT, registry_headers()).into_response(),
+            Ok(()) => {
+                let mut headers = registry_headers();
+                headers.insert("Docker-Upload-UUID", uuid.parse().unwrap());
+                (StatusCode::NO_CONTENT, headers).into_response()
+            }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(StorageError::Unsupported) => errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE"),
             Err(_) => errors::internal_error().into_response(),
         },
         Method::PATCH => {
@@ -4894,7 +4953,7 @@ async fn upload_session(
                 Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
             }
         }
-        _ => errors::not_implemented().into_response(),
+        _ => errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE"),
     }
 }
 

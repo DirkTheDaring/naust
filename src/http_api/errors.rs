@@ -47,6 +47,35 @@ pub fn not_implemented() -> Response {
     error_response(StatusCode::NOT_IMPLEMENTED, body)
 }
 
+pub fn method_not_allowed(allow: &'static str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "UNSUPPORTED",
+            message: "method not allowed".to_string(),
+            detail: None,
+        }],
+    };
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("docker-distribution-api-version"),
+        HeaderValue::from_static("registry/2.0"),
+    );
+    headers.insert(
+        header::ALLOW,
+        HeaderValue::from_static(allow),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+    );
+    (StatusCode::METHOD_NOT_ALLOWED, headers, Body::from(bytes)).into_response()
+}
+
 pub fn insufficient_storage() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {

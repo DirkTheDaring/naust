@@ -52,7 +52,7 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
 
     let marker_idx = segments
         .iter()
-        .position(|s| *s == "blobs" || *s == "manifests" || *s == "tags");
+        .position(|s| *s == "blobs" || *s == "manifests" || *s == "tags" || *s == "referrers");
     let Some(marker_idx) = marker_idx else {
         return None;
     };
@@ -271,17 +271,69 @@ pub async fn require_auth_middleware(
         }
     }
 
-    let action = match *request.method() {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+
+    // Enforce 405 Method Not Allowed on read-only/specific endpoints before auth challenge
+    if path == "/v2/_catalog" || path == "/v2/_oci/ext/discover" {
+        if method != http::Method::GET && method != http::Method::HEAD {
+            return crate::http_api::errors::method_not_allowed("GET, HEAD");
+        }
+    } else if path.contains("/referrers/") {
+        if method != http::Method::GET && method != http::Method::HEAD {
+            return crate::http_api::errors::method_not_allowed("GET, HEAD");
+        }
+    } else if path.ends_with("/tags/list") {
+        if method != http::Method::GET && method != http::Method::HEAD {
+            return crate::http_api::errors::method_not_allowed("GET, HEAD");
+        }
+    } else if path.contains("/tags/reference/") {
+        if method != http::Method::DELETE {
+            return crate::http_api::errors::method_not_allowed("DELETE");
+        }
+    }
+
+    let action = match method {
         http::Method::GET | http::Method::HEAD => {
-            if state.config.anonymous_pull {
-                return next.run(request).await;
+            if path == "/v2/_catalog" {
+                if !state.config.catalog_requires_auth && state.config.anonymous_pull {
+                    return next.run(request).await;
+                }
+                "catalog"
+            } else {
+                if state.config.anonymous_pull {
+                    return next.run(request).await;
+                }
+                "pull"
             }
-            "pull"
         }
         _ => "push",
     };
 
-    let repo = extract_repo_from_v2_path(request.uri().path());
+    if action == "catalog" {
+        if let Some(token) = bearer_token_from_headers(request.headers()) {
+            if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+                &state.config.token_signing_keys,
+                token,
+                &state.config.token_service,
+                state.config.token_ttl_secs,
+            ) {
+                if bearer_claims_are_authenticated(&claims) && security::token_allows_catalog_action(&claims) {
+                    return next.run(request).await;
+                }
+            }
+        }
+        if state.config.auth_strategy != crate::config::AuthStrategy::Token {
+            if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
+                if verify_any_basic_credentials(&state.config, basic.username(), basic.password()) {
+                    return next.run(request).await;
+                }
+            }
+        }
+        return unauthorized_catalog_challenge(&state);
+    }
+
+    let repo = extract_repo_from_v2_path(&path);
     let Some(repo_name) = repo.as_deref() else {
         return unauthorized_registry_challenge(&state, None);
     };

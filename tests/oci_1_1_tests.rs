@@ -1095,7 +1095,7 @@ async fn test_audit_remediation_suite() {
         .put(format!("{base_url}/v2/{repo}/manifests/valid-tag"))
         .basic_auth("demo", Some("demo"))
         .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
-        .body(valid_manifest_bytes)
+        .body(valid_manifest_bytes.clone())
         .send()
         .await
         .expect("put valid manifest");
@@ -1130,5 +1130,121 @@ async fn test_audit_remediation_suite() {
     assert!(tags_resp.headers().get(header::LINK).is_none());
     let tags_body: serde_json::Value = tags_resp.json().await.expect("json");
     assert_eq!(tags_body["tags"].as_array().unwrap().len(), 0);
+
+    // 11. Tags on empty repo returns 200 OK with empty array
+    let empty_tags_resp = client
+        .get(format!("{base_url}/v2/nonexistent/empty/tags/list"))
+        .send()
+        .await
+        .expect("get empty tags");
+    assert_eq!(empty_tags_resp.status(), reqwest::StatusCode::OK);
+    let empty_tags_body: serde_json::Value = empty_tags_resp.json().await.expect("json");
+    assert_eq!(empty_tags_body["tags"].as_array().unwrap().len(), 0);
+
+    // 12. HTTP 405 Method Not Allowed on mutation methods
+    // Catalog mutation -> 405
+    let cat_post = client.post(format!("{base_url}/v2/_catalog")).send().await.expect("cat post");
+    assert_eq!(cat_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let cat_put = client.put(format!("{base_url}/v2/_catalog")).send().await.expect("cat put");
+    assert_eq!(cat_put.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let cat_del = client.delete(format!("{base_url}/v2/_catalog")).send().await.expect("cat del");
+    assert_eq!(cat_del.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+    // Tags list mutation -> 405
+    let tags_post = client.post(format!("{base_url}/v2/{repo}/tags/list")).send().await.expect("tags post");
+    assert_eq!(tags_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let tags_put = client.put(format!("{base_url}/v2/{repo}/tags/list")).send().await.expect("tags put");
+    assert_eq!(tags_put.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let tags_del = client.delete(format!("{base_url}/v2/{repo}/tags/list")).send().await.expect("tags del");
+    assert_eq!(tags_del.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+    // Referrers mutation -> 405
+    let ref_post = client.post(format!("{base_url}/v2/{repo}/referrers/{computed_digest}")).send().await.expect("ref post");
+    assert_eq!(ref_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let ref_del = client.delete(format!("{base_url}/v2/{repo}/referrers/{computed_digest}")).send().await.expect("ref del");
+    assert_eq!(ref_del.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+    // Tag reference invalid method -> 405
+    let tag_ref_post = client.post(format!("{base_url}/v2/{repo}/tags/reference/dummy")).send().await.expect("tag ref post");
+    assert_eq!(tag_ref_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+    // 13. Referrers for subject with 0 attached referrers -> 200 OK with empty index
+    let zero_ref_resp = client
+        .get(format!("{base_url}/v2/{repo}/referrers/{computed_digest}"))
+        .send()
+        .await
+        .expect("get zero referrers");
+    assert_eq!(zero_ref_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        zero_ref_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        "application/vnd.oci.image.index.v1+json"
+    );
+    let zero_ref_body: serde_json::Value = zero_ref_resp.json().await.expect("json");
+    assert_eq!(zero_ref_body["manifests"].as_array().unwrap().len(), 0);
+
+    // 14. Cross-Repository Blob Mount
+    // 14a. Mount existing blob -> 201 Created
+    let mount_resp = client
+        .post(format!("{base_url}/v2/target/repo/blobs/uploads/?mount={layer_digest}&from={repo}"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("mount existing");
+    assert_eq!(mount_resp.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        mount_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+        format!("/v2/target/repo/blobs/{layer_digest}")
+    );
+
+    // 14b. Mount non-existent blob -> fallback to 202 Accepted upload session
+    let missing_digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let fallback_resp = client
+        .post(format!("{base_url}/v2/target/repo/blobs/uploads/?mount={missing_digest}&from={repo}"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("mount fallback");
+    assert_eq!(fallback_resp.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(fallback_resp.headers().get(header::LOCATION).is_some());
+
+    // 15. Blob upload cancellation DELETE returns Docker-Upload-UUID
+    let new_upload = client
+        .post(format!("{base_url}/v2/{repo}/blobs/uploads/"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("new upload");
+    let new_loc = new_upload.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    let new_uuid = new_upload.headers().get("docker-upload-uuid").unwrap().to_str().unwrap();
+    let new_upload_url = if new_loc.starts_with("http") { new_loc.to_string() } else { format!("{base_url}{new_loc}") };
+    let del_resp = client
+        .delete(&new_upload_url)
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("del upload");
+    assert_eq!(del_resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        del_resp.headers().get("docker-upload-uuid").unwrap().to_str().unwrap(),
+        new_uuid
+    );
+
+    // 16. Manifest PUT with mismatching digest -> 400 MANIFEST_UNVERIFIED
+    let bad_digest_ref = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let unverified_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/{bad_digest_ref}"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(valid_manifest_bytes)
+        .send()
+        .await
+        .expect("put mismatch");
+    assert_eq!(unverified_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unverified_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        "application/json"
+    );
+    let unverified_err: serde_json::Value = unverified_resp.json().await.expect("json");
+    assert_eq!(unverified_err["errors"][0]["code"], "MANIFEST_UNVERIFIED");
 }
 
