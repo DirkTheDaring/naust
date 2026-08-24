@@ -3,6 +3,15 @@ use std::{net::SocketAddr, path::PathBuf};
 use url::Url;
 use toml::Value;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SlowConnectionPolicy {
+    #[default]
+    Enforce,
+    AuditOnly,
+    Disabled,
+}
+
 fn sanitize_for_path_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -114,6 +123,26 @@ pub struct Config {
 
     // Longer timeout for upload endpoints (PATCH/PUT/POST blobs/uploads).
     pub upload_request_timeout_secs: u64,
+
+    // Maximum silence between data chunks during streaming uploads (seconds).
+    pub upload_chunk_idle_timeout_secs: u64,
+    // Window duration for rolling throughput calculation (seconds).
+    pub upload_rate_window_secs: u64,
+    // Grace period before minimum throughput is enforced (seconds).
+    pub upload_rate_grace_period_secs: u64,
+    // Minimum required throughput during sliding window (bytes/second).
+    pub min_upload_bytes_per_sec: u64,
+    // Timeout for receiving complete HTTP request headers (seconds).
+    pub header_read_timeout_secs: u64,
+    // Slow connection enforcement mode ("enforce", "audit_only", "disabled").
+    pub slow_connection_policy: SlowConnectionPolicy,
+
+    // Max concurrent TCP/TLS connections per normalized client IP (/32 IPv4, /64 IPv6).
+    pub max_connections_per_ip: usize,
+    // CIDR subnets exempt from per-IP connection limits (e.g. CI/CD runners).
+    pub trusted_bypass_cidrs: Vec<ipnet::IpNet>,
+    // Upstream reverse proxy subnets trusted to provide client IP in X-Forwarded-For.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 
     // If true, reject monolithic blob uploads (body on POST ?digest or PUT finalize).
     // This forces clients to use PATCH-based chunked uploads.
@@ -968,6 +997,12 @@ struct FileLimits {
     max_concurrent_requests: Option<usize>,
     #[serde(default)]
     max_concurrent_upload_requests: Option<usize>,
+    #[serde(default)]
+    max_connections_per_ip: Option<usize>,
+    #[serde(default)]
+    trusted_bypass_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    trusted_proxies: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -976,6 +1011,18 @@ struct FileTimeouts {
     request_timeout_secs: Option<u64>,
     #[serde(default)]
     upload_request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    upload_chunk_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    upload_rate_window_secs: Option<u64>,
+    #[serde(default)]
+    upload_rate_grace_period_secs: Option<u64>,
+    #[serde(default)]
+    min_upload_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    header_read_timeout_secs: Option<u64>,
+    #[serde(default)]
+    slow_connection_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1504,6 +1551,76 @@ impl Config {
         .or(file_cfg.timeouts.upload_request_timeout_secs)
         .unwrap_or(if best_practice { 7200 } else { 3600 });
 
+        let upload_chunk_idle_timeout_secs = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__UPLOAD_CHUNK_IDLE_TIMEOUT_SECS",
+            "UPLOAD_CHUNK_IDLE_TIMEOUT_SECS",
+        ])
+        .or(file_cfg.timeouts.upload_chunk_idle_timeout_secs)
+        .unwrap_or(20);
+
+        let upload_rate_window_secs = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__UPLOAD_RATE_WINDOW_SECS",
+            "UPLOAD_RATE_WINDOW_SECS",
+        ])
+        .or(file_cfg.timeouts.upload_rate_window_secs)
+        .unwrap_or(10);
+
+        let upload_rate_grace_period_secs = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__UPLOAD_RATE_GRACE_PERIOD_SECS",
+            "UPLOAD_RATE_GRACE_PERIOD_SECS",
+        ])
+        .or(file_cfg.timeouts.upload_rate_grace_period_secs)
+        .unwrap_or(15);
+
+        let min_upload_bytes_per_sec = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__MIN_UPLOAD_BYTES_PER_SEC",
+            "MIN_UPLOAD_BYTES_PER_SEC",
+        ])
+        .or(file_cfg.timeouts.min_upload_bytes_per_sec)
+        .unwrap_or(32768);
+
+        let header_read_timeout_secs = env_u64_any(&[
+            "REGISTRY__TIMEOUTS__HEADER_READ_TIMEOUT_SECS",
+            "HEADER_READ_TIMEOUT_SECS",
+        ])
+        .or(file_cfg.timeouts.header_read_timeout_secs)
+        .unwrap_or(10);
+
+        let slow_connection_policy_str = env_str_any(&[
+            "REGISTRY__TIMEOUTS__SLOW_CONNECTION_POLICY",
+            "SLOW_CONNECTION_POLICY",
+        ])
+        .or(file_cfg.timeouts.slow_connection_policy.clone());
+
+        let slow_connection_policy = match slow_connection_policy_str
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("audit_only") | Some("audit") => SlowConnectionPolicy::AuditOnly,
+            Some("disabled") | Some("disable") | Some("off") => SlowConnectionPolicy::Disabled,
+            _ => SlowConnectionPolicy::Enforce,
+        };
+
+        let max_connections_per_ip = env_u64_any(&[
+            "REGISTRY__LIMITS__MAX_CONNECTIONS_PER_IP",
+            "MAX_CONNECTIONS_PER_IP",
+        ])
+        .map(|v| v as usize)
+        .or(file_cfg.limits.max_connections_per_ip)
+        .unwrap_or(50);
+
+        let trusted_bypass_cidrs = parse_cidrs_opt(
+            env_str_any(&["REGISTRY__LIMITS__TRUSTED_BYPASS_CIDRS", "TRUSTED_BYPASS_CIDRS"]),
+            file_cfg.limits.trusted_bypass_cidrs.clone(),
+        );
+
+        let trusted_proxies = parse_cidrs_opt(
+            env_str_any(&["REGISTRY__LIMITS__TRUSTED_PROXIES", "TRUSTED_PROXIES"]),
+            file_cfg.limits.trusted_proxies.clone(),
+        );
+
         let disallow_monolithic_uploads = env_bool_opt(&[
             "REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS",
             "DISALLOW_MONOLITHIC_UPLOADS",
@@ -1971,6 +2088,17 @@ impl Config {
             max_concurrent_upload_requests,
             request_timeout_secs,
             upload_request_timeout_secs,
+            upload_chunk_idle_timeout_secs,
+            upload_rate_window_secs,
+            upload_rate_grace_period_secs,
+            min_upload_bytes_per_sec,
+            header_read_timeout_secs,
+            slow_connection_policy,
+
+            max_connections_per_ip,
+            trusted_bypass_cidrs,
+            trusted_proxies,
+
             disallow_monolithic_uploads,
             upload_policy,
             catalog_requires_auth,
@@ -2633,3 +2761,26 @@ fn env_usize_any(keys: &[&str]) -> Option<usize> {
 fn env_socket_addr(keys: &[&str]) -> Option<SocketAddr> {
     env_str_any(keys).and_then(|s| s.parse::<SocketAddr>().ok())
 }
+
+fn parse_cidrs_opt(env_val: Option<String>, file_val: Option<Vec<String>>) -> Vec<ipnet::IpNet> {
+    let mut out = Vec::new();
+    if let Some(s) = env_val {
+        for token in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(net) = token.parse::<ipnet::IpNet>() {
+                out.push(net);
+            } else if let Ok(ip) = token.parse::<std::net::IpAddr>() {
+                out.push(ipnet::IpNet::from(ip));
+            }
+        }
+    } else if let Some(list) = file_val {
+        for token in list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Ok(net) = token.parse::<ipnet::IpNet>() {
+                out.push(net);
+            } else if let Ok(ip) = token.parse::<std::net::IpAddr>() {
+                out.push(ipnet::IpNet::from(ip));
+            }
+        }
+    }
+    out
+}
+

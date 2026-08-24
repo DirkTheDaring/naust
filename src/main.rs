@@ -7,6 +7,7 @@ mod gc_service;
 mod config;
 mod fs_root_lock;
 mod http_api;
+mod ip_concurrency;
 mod manifest_refs;
 mod proxy;
 mod rbac;
@@ -363,6 +364,10 @@ pub struct AppState {
     pub active_non_upload_requests: Arc<AtomicU64>,
     pub active_upload_requests: Arc<AtomicU64>,
     pub last_sem_saturation_log_unix_secs: Arc<AtomicU64>,
+
+    // Security & Anti-Slowloris:
+    pub ip_limiter: Arc<ip_concurrency::IpConcurrencyLimiter>,
+    pub is_high_pressure: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -389,6 +394,40 @@ impl AppState {
                 cache: cache.clone(),
             }),
             _ => None,
+        }
+    }
+
+    pub fn current_stream_guard_params(&self) -> (Duration, u64) {
+        let total_permits = self.config.max_concurrent_upload_requests.max(1) as f64;
+        let active = self.active_upload_requests.load(Ordering::Relaxed) as f64;
+        let load_ratio = active / total_permits;
+
+        let currently_high = self.is_high_pressure.load(Ordering::Relaxed);
+        let new_high = if currently_high {
+            load_ratio >= 0.70
+        } else {
+            load_ratio >= 0.85
+        };
+
+        if new_high != currently_high {
+            self.is_high_pressure.store(new_high, Ordering::Relaxed);
+            tracing::info!(
+                high_pressure = new_high,
+                load_ratio = %format!("{:.1}%", load_ratio * 100.0),
+                "adaptive slowloris defense mode transitioned"
+            );
+        }
+
+        if new_high {
+            (
+                Duration::from_secs(self.config.upload_chunk_idle_timeout_secs.min(8)),
+                self.config.min_upload_bytes_per_sec.saturating_mul(2),
+            )
+        } else {
+            (
+                Duration::from_secs(self.config.upload_chunk_idle_timeout_secs),
+                self.config.min_upload_bytes_per_sec,
+            )
         }
     }
 }
@@ -963,6 +1002,12 @@ async fn main() {
         _ => None,
     };
 
+    let ip_limiter = Arc::new(ip_concurrency::IpConcurrencyLimiter::new(
+        config.max_connections_per_ip,
+        config.trusted_bypass_cidrs.clone(),
+    ));
+    let is_high_pressure = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let state = AppState {
         config,
         auth_metrics: Arc::new(AuthMetrics::default()),
@@ -979,6 +1024,8 @@ async fn main() {
         active_non_upload_requests: Arc::new(AtomicU64::new(0)),
         active_upload_requests: Arc::new(AtomicU64::new(0)),
         last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
+        ip_limiter,
+        is_high_pressure,
     };
 
     // For large blobs we stream request bodies; enforce blob size via MAX_UPLOAD_BYTES and
@@ -1068,6 +1115,10 @@ async fn main() {
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            ip_concurrency_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             request_timeout_by_path,
         ))
         .layer(CatchPanicLayer::new())
@@ -1089,17 +1140,20 @@ async fn main() {
 
         axum_server::bind_rustls(addr, tls)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("serve https");
     } else {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .expect("bind listen addr");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .expect("serve http");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("serve http");
     }
 }
 
@@ -1734,6 +1788,56 @@ async fn request_timeout_by_path(
         }
     }
 }
+
+async fn ip_concurrency_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    if path == "/v2"
+        || path == "/v2/"
+        || path.starts_with("/_meta/")
+        || path.starts_with("/_admin/gc/health")
+    {
+        return next.run(req).await;
+    }
+
+    let peer_addr = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+
+    let effective_ip = crate::request_routing::resolve_trusted_client_ip(
+        peer_addr,
+        req.headers(),
+        &state.config.trusted_proxies,
+    );
+
+    match state.ip_limiter.acquire(effective_ip) {
+        Ok(guard) => {
+            let resp = next.run(req).await;
+            drop(guard);
+            resp
+        }
+        Err(()) => {
+            tracing::warn!(
+                client_ip = %effective_ip,
+                peer_ip = %peer_addr,
+                max = state.config.max_connections_per_ip,
+                "connection limit per IP exceeded"
+            );
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", "5")],
+                "Too many concurrent requests from your IP",
+            )
+                .into_response()
+        }
+    }
+}
+
 
 #[cfg(target_os = "linux")]
 fn open_fd_count_linux() -> Option<u64> {

@@ -153,11 +153,33 @@ pub fn v2_route_mode_for_request(proxy: &ProxyConfig, headers: &HeaderMap) -> V2
     }
 }
 
+pub fn resolve_trusted_client_ip(
+    peer_addr: std::net::IpAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[ipnet::IpNet],
+) -> std::net::IpAddr {
+    let is_peer_trusted = trusted_proxies.iter().any(|net| net.contains(&peer_addr));
+    if !is_peer_trusted {
+        return peer_addr;
+    }
+
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for ip_str in xff.split(',').map(str::trim).rev() {
+            if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
+                    return ip;
+                }
+            }
+        }
+    }
+    peer_addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         V2RouteMode, effective_host_for_request, proxy_upstream_index_for_request,
-        v2_route_mode_for_request, wildcard_match,
+        resolve_trusted_client_ip, v2_route_mode_for_request, wildcard_match,
     };
     use crate::config::{ProxyConfig, ProxyMode, RedirectPolicy};
     use axum::http::HeaderMap;
@@ -313,4 +335,33 @@ mod tests {
             V2RouteMode::ProxyOnly
         );
     }
+
+    #[test]
+    fn trusted_client_ip_resolution_and_anti_spoofing() {
+        use std::str::FromStr;
+        let trusted_proxies = vec![
+            ipnet::IpNet::from_str("10.0.0.0/8").unwrap(),
+            ipnet::IpNet::from_str("127.0.0.1/32").unwrap(),
+        ];
+
+        // 1. Untrusted peer sending spoofed X-Forwarded-For: must return peer IP
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.1.1.1, 10.0.0.5".parse().unwrap());
+        let untrusted_peer: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        assert_eq!(
+            resolve_trusted_client_ip(untrusted_peer, &headers, &trusted_proxies),
+            untrusted_peer
+        );
+
+        // 2. Trusted peer sending valid chain: must return last untrusted client IP
+        let trusted_peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let expected_client: std::net::IpAddr = "203.0.113.50".parse().unwrap();
+        headers.insert("x-forwarded-for", "203.0.113.50, 10.0.0.2".parse().unwrap());
+        assert_eq!(
+            resolve_trusted_client_ip(trusted_peer, &headers, &trusted_proxies),
+            expected_client
+        );
+    }
 }
+
+

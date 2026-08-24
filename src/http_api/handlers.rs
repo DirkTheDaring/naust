@@ -2610,17 +2610,21 @@ mod tests {
         headers
     }
 
-    #[tokio::test]
-    async fn admin_gc_requires_auth() {
-        let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
-        let state = AppState {
+    fn test_app_state(
+        cfg: Arc<Config>,
+        storage: Arc<dyn crate::storage::Storage>,
+        gc_service: Option<Arc<crate::gc_service::GcService>>,
+    ) -> AppState {
+        let ip_limiter = Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
+            cfg.max_connections_per_ip,
+            cfg.trusted_bypass_cidrs.clone(),
+        ));
+        AppState {
             config: cfg,
             auth_metrics: Arc::new(crate::AuthMetrics::default()),
             storage,
             ref_index: None,
-            gc_service: None,
+            gc_service,
             proxy: None,
             proxy_cache: None,
             proxy_upstreams: vec![],
@@ -2631,7 +2635,17 @@ mod tests {
             active_upload_requests: Arc::new(AtomicU64::new(0)),
             last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+            ip_limiter,
+            is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_gc_requires_auth() {
+        let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
+        let storage: Arc<dyn crate::storage::Storage> =
+            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let state = test_app_state(cfg, storage, None);
 
         let req = AdminGcPlanRequest::default();
 
@@ -2644,23 +2658,7 @@ mod tests {
         let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
         let storage: Arc<dyn crate::storage::Storage> =
             Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
-        let state = AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
-            ref_index: None,
-            gc_service: None,
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let state = test_app_state(cfg, storage, None);
 
         let req = AdminGcPlanRequest::default();
 
@@ -2691,23 +2689,7 @@ mod tests {
         let service_for_state = service.clone();
         let held = service.test_try_lock().expect("lock");
 
-        let state = AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
-            ref_index: None,
-            gc_service: Some(service_for_state),
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let state = test_app_state(cfg, storage, Some(service_for_state));
 
         let req = AdminGcPlanRequest::default();
 
@@ -2740,23 +2722,7 @@ mod tests {
         idx.rebuild(&storage).await.expect("rebuild");
         let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
 
-        let state = AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
-            ref_index: None,
-            gc_service: Some(service),
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let state = test_app_state(cfg, storage, Some(service));
 
         let resp = super::admin_gc_quarantine(State(state), admin_headers_ok(), Json(AdminGcPlanRequest::default())).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2787,23 +2753,7 @@ mod tests {
         idx.rebuild(&storage).await.expect("rebuild");
         let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
 
-        let state = AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
-            ref_index: None,
-            gc_service: Some(service),
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let state = test_app_state(cfg, storage, Some(service));
 
         let resp = super::admin_gc_delete(
             State(state),
@@ -2838,23 +2788,7 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> =
             Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
 
-        let state = AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
-            ref_index: None,
-            gc_service: None,
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let state = test_app_state(cfg, storage, None);
 
         let mut q = std::collections::HashMap::new();
         q.insert("include_tags".to_string(), "1".to_string());
@@ -2975,23 +2909,7 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> =
             Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
 
-        let state = AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
-            ref_index: None,
-            gc_service: None,
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        };
+        let state = test_app_state(cfg, storage, None);
 
         let mut q = std::collections::HashMap::new();
         q.insert("include_platforms".to_string(), "1".to_string());
@@ -3245,6 +3163,15 @@ mod tests {
             max_concurrent_upload_requests: 256,
             request_timeout_secs: 300,
             upload_request_timeout_secs: 3600,
+            upload_chunk_idle_timeout_secs: 20,
+            upload_rate_window_secs: 10,
+            upload_rate_grace_period_secs: 15,
+            min_upload_bytes_per_sec: 32768,
+            header_read_timeout_secs: 10,
+            slow_connection_policy: crate::config::SlowConnectionPolicy::Enforce,
+            max_connections_per_ip: 50,
+            trusted_bypass_cidrs: vec![],
+            trusted_proxies: vec![],
             disallow_monolithic_uploads: false,
             upload_policy: UploadPolicyConfig {
                 abort_on_error: false,
@@ -3778,11 +3705,24 @@ async fn manifest_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
 
-    let bytes =
-        match read_body_limited(body, content_length, state.config.max_request_body_bytes).await {
-            Ok(b) => b,
-            Err(resp) => return resp,
-        };
+    let (idle_timeout, min_rate) = state.current_stream_guard_params();
+    let audit_only =
+        state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
+    let bytes = match read_body_limited(
+        body,
+        content_length,
+        state.config.max_request_body_bytes,
+        idle_timeout,
+        Duration::from_secs(state.config.upload_rate_grace_period_secs),
+        Duration::from_secs(state.config.upload_rate_window_secs),
+        min_rate,
+        audit_only,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
 
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
@@ -4149,6 +4089,11 @@ async fn read_body_limited(
     body: Body,
     content_length: Option<usize>,
     limit: usize,
+    idle_timeout: Duration,
+    grace_period: Duration,
+    window_duration: Duration,
+    min_bytes_per_sec: u64,
+    audit_only: bool,
 ) -> Result<Bytes, Response> {
     if let Some(len) = content_length {
         if len > limit {
@@ -4158,10 +4103,22 @@ async fn read_body_limited(
 
     let initial_capacity = content_length.unwrap_or(0).min(limit).min(1024 * 1024);
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
-    let mut stream = body.into_data_stream();
+    let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
+        body.into_data_stream(),
+        idle_timeout,
+        grace_period,
+        window_duration,
+        min_bytes_per_sec,
+        audit_only,
+    );
     while let Some(next) = stream.next().await {
         let chunk = match next {
             Ok(c) => c,
+            Err(crate::http_api::stream_guard::StreamGuardError::IdleTimeout(_))
+            | Err(crate::http_api::stream_guard::StreamGuardError::InsufficientThroughput { .. }) => {
+                return Err(errors::request_timeout("request stream timed out or throughput too low")
+                    .into_response());
+            }
             Err(_) => return Err(errors::internal_error().into_response()),
         };
         if chunk.is_empty() {
@@ -4243,7 +4200,17 @@ async fn upload_create(
         }
 
         // Stream monolithic upload (no buffering of multi-GB body).
-        let mut stream = body.into_data_stream();
+        let (idle_timeout, min_rate) = state.current_stream_guard_params();
+        let audit_only =
+            state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
+        let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
+            body.into_data_stream(),
+            idle_timeout,
+            Duration::from_secs(state.config.upload_rate_grace_period_secs),
+            Duration::from_secs(state.config.upload_rate_window_secs),
+            min_rate,
+            audit_only,
+        );
         let first = stream.next().await;
         let Some(first) = first else {
             // No body -> behave like normal upload creation.
@@ -4279,6 +4246,19 @@ async fn upload_create(
             .into_response();
         }
 
+        let first_chunk = match first {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!(
+                    repo = name,
+                    error = %err,
+                    "monolithic blob upload: failed to read initial request body chunk"
+                );
+                return errors::request_timeout("upload aborted while reading request body")
+                    .into_response();
+            }
+        };
+
         let meta = match state.storage.create_upload().await {
             Ok(meta) => meta,
             Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
@@ -4290,23 +4270,6 @@ async fn upload_create(
                 return errors::internal_error().into_response();
             }
             Err(_) => return errors::internal_error().into_response(),
-        };
-
-        let first_chunk = match first {
-            Ok(c) => c,
-            Err(err) => {
-                tracing::warn!(
-                    repo = name,
-                    uuid = %meta.uuid,
-                    error = %err,
-                    "monolithic blob upload: failed to read request body"
-                );
-                if policy.abort_on_error {
-                    let _ = state.storage.abort_upload(&meta.uuid).await;
-                }
-                return errors::request_timeout("upload aborted while reading request body")
-                    .into_response();
-            }
         };
 
         if !first_chunk.is_empty() {
@@ -4512,7 +4475,17 @@ async fn upload_session(
                 }
             }
 
-            let mut stream = body.into_data_stream();
+            let (idle_timeout, min_rate) = state.current_stream_guard_params();
+            let audit_only =
+                state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
+            let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
+                body.into_data_stream(),
+                idle_timeout,
+                Duration::from_secs(state.config.upload_rate_grace_period_secs),
+                Duration::from_secs(state.config.upload_rate_window_secs),
+                min_rate,
+                audit_only,
+            );
             let mut last_meta = match state.storage.upload_status(uuid).await {
                 Ok(m) => m,
                 Err(StorageError::NotFound) => {
@@ -4613,7 +4586,17 @@ async fn upload_session(
             }
 
             // Stream any body bytes into the upload (some clients do monolithic finalize-on-PUT).
-            let mut stream = body.into_data_stream();
+            let (idle_timeout, min_rate) = state.current_stream_guard_params();
+            let audit_only =
+                state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
+            let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
+                body.into_data_stream(),
+                idle_timeout,
+                Duration::from_secs(state.config.upload_rate_grace_period_secs),
+                Duration::from_secs(state.config.upload_rate_window_secs),
+                min_rate,
+                audit_only,
+            );
             let first = stream.next().await;
             if let Some(first) = first {
                 tracing::warn!(

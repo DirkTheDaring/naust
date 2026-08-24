@@ -1,0 +1,1 @@
+docker buildx imagetools create --tag registry.synology.kaupon.de/nginx:latest docker.io/library/nginx:latest

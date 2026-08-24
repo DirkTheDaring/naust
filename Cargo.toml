@@ -1,6 +1,6 @@
 [package]
 name = "registry-rust"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 
 [dependencies]
@@ -18,6 +18,7 @@ headers = "0.4"
 hex = "0.4"
 hmac = "0.12"
 http = "1"
+ipnet = "2"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream"] }
@@ -51,3 +52,5 @@ storage-s3 = []
 [dev-dependencies]
 tempfile = "3"
 http-body-util = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
