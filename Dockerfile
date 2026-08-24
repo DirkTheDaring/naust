@@ -2,7 +2,7 @@
 
 # NOTE: This repo targets Rust 2024 edition.
 # We use Alpine images here because this environment's Podman setup cannot run glibc-based images.
-FROM rust:1.88-alpine AS build
+FROM rust:alpine AS build
 WORKDIR /app
 
 RUN apk add --no-cache build-base musl-dev

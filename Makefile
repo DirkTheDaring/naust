@@ -1,6 +1,15 @@
 NAME := registry-rust
+VERSION_FILE ?= $(shell if [ -f VERSION ]; then echo VERSION; elif [ -f version ]; then echo version; else echo ""; fi)
+ifneq ($(VERSION_FILE),)
+VERSION := $(shell tr -d '[:space:]' < $(VERSION_FILE))
+else
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+endif
 RELEASE ?= 1
+
+CONTAINER_ENGINE ?= $(shell (command -v podman >/dev/null 2>&1 && echo podman) || (command -v docker >/dev/null 2>&1 && echo docker) || echo podman)
+IMAGE_NAME ?= registry-rust
+IMAGE_TAG ?= $(VERSION)
 
 DEB_VERSION := $(VERSION)-$(RELEASE)
 DEB_ARCH := $(shell (command -v dpkg >/dev/null 2>&1 && dpkg --print-architecture) || (uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/' -e 's/armv7l/armhf/'))
@@ -13,7 +22,7 @@ SPECS := $(TOPDIR)/SPECS
 SPEC := packaging/rpm/$(NAME).spec
 TARBALL := $(SOURCES)/$(NAME)-$(VERSION).tar.gz
 
-.PHONY: sync-version bump-version
+.PHONY: sync-version bump-version container image docker-build
 
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 
@@ -206,9 +215,23 @@ deb-container:
 		packaging/docker/build-deb-in-debian.sh $(DEB_CONTAINER_SUITE); \
 	fi
 
+container: sync-version
+	$(CONTAINER_ENGINE) build -t $(IMAGE_NAME):$(IMAGE_TAG) -t $(IMAGE_NAME):latest .
+
+image: container
+
+docker-build: container
+
 sync-version:
 	@set -euo pipefail; \
 	ver="$(VERSION)"; rel="$(RELEASE)"; debver="$(DEB_VERSION)"; maint="$(DEB_MAINTAINER)"; \
+	cargo_ver="$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"; \
+	if [ "$$cargo_ver" != "$$ver" ]; then \
+		echo "Updating Cargo.toml version: $$cargo_ver -> $$ver"; \
+		tmp="$$(mktemp)"; \
+		awk -v new_ver="$$ver" 'BEGIN{in_pkg=0; done=0} /^\[package\][[:space:]]*$$/{in_pkg=1; print; next} /^\[[^]]+\][[:space:]]*$$/ && $$0 !~ /^\[package\][[:space:]]*$$/{in_pkg=0; print; next} in_pkg && !done && $$0 ~ /^version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$$/{print "version = \"" new_ver "\""; done=1; next} {print} END{if(!done) exit 3}' Cargo.toml > "$$tmp"; \
+		mv "$$tmp" Cargo.toml; \
+	fi; \
 	spec_file="$(SPEC)"; \
 	if [ -f "$$spec_file" ]; then \
 		sed -i -E "s/^(Version:[[:space:]]+%\{\?version_override\}%\{!\?version_override:)[0-9][0-9A-Za-z\._-]*(\})/\1$${ver}\2/" "$$spec_file"; \
@@ -246,7 +269,11 @@ bump-version:
 	fi
 	@set -euo pipefail; \
 	new_ver="$(NEW)"; \
-	tmp="$$(mktemp)"; \
-	awk -v new_ver="$$new_ver" 'BEGIN{in_pkg=0; done=0} /^\[package\][[:space:]]*$$/{in_pkg=1; print; next} /^\[[^]]+\][[:space:]]*$$/ && $$0 !~ /^\[package\][[:space:]]*$$/{in_pkg=0; print; next} in_pkg && !done && $$0 ~ /^version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$$/{print "version = \"" new_ver "\""; done=1; next} {print} END{if(!done) exit 3}' Cargo.toml > "$$tmp"; \
-	mv "$$tmp" Cargo.toml; \
-	$(MAKE) sync-version
+	if [ -f VERSION ]; then \
+		echo "$$new_ver" > VERSION; \
+	elif [ -f version ]; then \
+		echo "$$new_ver" > version; \
+	else \
+		echo "$$new_ver" > VERSION; \
+	fi; \
+	$(MAKE) sync-version VERSION="$$new_ver"
