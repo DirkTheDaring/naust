@@ -1334,5 +1334,33 @@ async fn test_audit_remediation_suite() {
         .await
         .expect("del tag with bearer");
     assert_eq!(del_tag_resp.status(), reqwest::StatusCode::ACCEPTED);
+
+    // 23. Deny push operation on target repository when token is scoped for a different repository -> 403 Forbidden
+    let wrong_token_resp = client
+        .get(format!("{base_url}/token?service=registry-rust&scope=repository:other-repo:push"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("get token for other-repo");
+    assert_eq!(wrong_token_resp.status(), reqwest::StatusCode::OK);
+    let wrong_token_body: serde_json::Value = wrong_token_resp.json().await.expect("token json");
+    let other_repo_token = wrong_token_body["token"].as_str().unwrap();
+
+    let denied_upload_resp = client
+        .post(format!("{base_url}/v2/{repo}/blobs/uploads/"))
+        .bearer_auth(other_repo_token)
+        .send()
+        .await
+        .expect("denied upload create");
+    assert_eq!(denied_upload_resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // 24. Unauthenticated request to private or uppercase repo returns 401 challenge
+    let challenge_resp = client
+        .get(format!("{base_url}/v2/PRIVATE_TEST_REPO/tags/list"))
+        .send()
+        .await
+        .expect("unauth private tags");
+    assert_eq!(challenge_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(challenge_resp.headers().get(header::WWW_AUTHENTICATE).is_some());
 }
 

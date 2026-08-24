@@ -15,11 +15,24 @@ use crate::security;
 pub(crate) fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     const MAX_BEARER_TOKEN_LEN: usize = 65536;
 
-    let token = headers
+    let auth_header = headers
         .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::trim)?;
+        .and_then(|v| v.to_str().ok())?
+        .trim();
+
+    let token = if let Some(rest) = auth_header.strip_prefix("Bearer ") {
+        rest
+    } else if let Some(rest) = auth_header.strip_prefix("bearer ") {
+        rest
+    } else if auth_header.len() >= 7
+        && auth_header[..6].eq_ignore_ascii_case("bearer")
+        && auth_header.as_bytes()[6] == b' '
+    {
+        &auth_header[7..]
+    } else {
+        return None;
+    }
+    .trim();
 
     if token.is_empty() || token.len() > MAX_BEARER_TOKEN_LEN {
         return None;
@@ -307,7 +320,12 @@ pub async fn require_auth_middleware(
     }
 
     let repo = extract_repo_from_v2_path(&path);
-    let is_private_repo = repo.as_deref().map(|r| r.to_ascii_lowercase().contains("private") || r.starts_with('<')).unwrap_or(false);
+    let is_private_repo = repo.as_deref().map(|r| {
+        let r_lower = r.to_ascii_lowercase();
+        r_lower.contains("private")
+            || r.starts_with('<')
+            || r_lower.starts_with("%3c")
+    }).unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 
     let action = match method {

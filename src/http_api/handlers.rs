@@ -2714,7 +2714,7 @@ async fn manifest_by_reference_proxy_only(
     }
 }
 
-fn is_valid_repo_name(name: &str) -> bool {
+pub(crate) fn is_valid_repo_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 255 || name.starts_with('/') || name.ends_with('/') {
         return false;
     }
