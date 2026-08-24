@@ -216,6 +216,8 @@ podman push --tls-verify=false 127.0.0.1:5000/myrepo:latest
 podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 ```
 
+For complete step-by-step container image testing, raw `curl` API validation, and automated Python test scripts, see [`docs/container-testing-guide.md`](docs/container-testing-guide.md).
+
 ## Environment variables
 
 ## CLI helpers
