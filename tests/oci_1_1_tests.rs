@@ -1131,15 +1131,15 @@ async fn test_audit_remediation_suite() {
     let tags_body: serde_json::Value = tags_resp.json().await.expect("json");
     assert_eq!(tags_body["tags"].as_array().unwrap().len(), 0);
 
-    // 11. Tags on empty repo returns 200 OK with empty array
+    // 11. Tags on nonexistent repo returns 404 NAME_UNKNOWN per OCI Spec
     let empty_tags_resp = client
         .get(format!("{base_url}/v2/nonexistent/empty/tags/list"))
         .send()
         .await
         .expect("get empty tags");
-    assert_eq!(empty_tags_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(empty_tags_resp.status(), reqwest::StatusCode::NOT_FOUND);
     let empty_tags_body: serde_json::Value = empty_tags_resp.json().await.expect("json");
-    assert_eq!(empty_tags_body["tags"].as_array().unwrap().len(), 0);
+    assert_eq!(empty_tags_body["errors"][0]["code"], "NAME_UNKNOWN");
 
     // 12. HTTP 405 Method Not Allowed on mutation methods
     // Catalog mutation -> 405

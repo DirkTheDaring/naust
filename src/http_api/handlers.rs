@@ -1612,23 +1612,7 @@ async fn tags_list(
                 }
                 (StatusCode::OK, headers, Body::from(bytes)).into_response()
             }
-            Err(StorageError::NotFound) => {
-                let payload = serde_json::json!({
-                    "name": name,
-                    "tags": Vec::<String>::new(),
-                });
-                let bytes = match serde_json::to_vec(&payload) {
-                    Ok(b) => b,
-                    Err(_) => return errors::internal_error().into_response(),
-                };
-                let mut headers = registry_headers();
-                headers.insert("Content-Type", "application/json".parse().unwrap());
-                headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-                if method == Method::HEAD {
-                    return (StatusCode::OK, headers).into_response();
-                }
-                (StatusCode::OK, headers, Body::from(bytes)).into_response()
-            }
+            Err(StorageError::NotFound) => errors::name_unknown().into_response(),
             Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
             Err(StorageError::InsufficientStorage) => {
                 errors::insufficient_storage().into_response()
