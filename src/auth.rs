@@ -8,7 +8,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use headers::{Authorization, HeaderMapExt, authorization::Basic};
-use tracing::info;
 
 use crate::security;
 
@@ -44,6 +43,7 @@ fn bearer_claims_are_authenticated(claims: &security::TokenClaims) -> bool {
     claims.sub.as_deref().is_some_and(|s| !s.is_empty())
 }
 
+#[allow(dead_code)]
 pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     // Path is expected to look like:
     //   /v2/<name>/blobs/...
@@ -264,9 +264,14 @@ pub async fn require_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // If this request is routed to proxy-only mode, disallow all write methods.
-    if crate::request_routing::v2_route_mode_for_request(&state.config.proxy, request.headers())
-        == crate::request_routing::V2RouteMode::ProxyOnly
+    // Legacy metrics endpoints (unauthenticated)
+    let path = request.uri().path().to_string();
+    if path == "/metrics"
+        || path == "/metrics/security"
+        || path == "/metrics/proxy"
+        || path == "/metrics/ip"
+        || path == "/metrics/connections"
+        || path == "/metrics/stream"
     {
         match *request.method() {
             http::Method::GET | http::Method::HEAD => {}
@@ -274,33 +279,37 @@ pub async fn require_auth_middleware(
         }
     }
 
-    let path = request.uri().path().to_string();
     let method = request.method().clone();
 
     if path == "/v2" {
         return crate::http_api::handlers::v2_redirect().await;
     }
 
-    // Enforce 405 Method Not Allowed on read-only/specific endpoints before auth challenge
-    if path == "/v2/_catalog" || path == "/v2/_oci/ext/discover" {
-        if method != http::Method::GET && method != http::Method::HEAD {
-            return crate::http_api::errors::method_not_allowed("GET, HEAD");
-        }
-    } else if path.contains("/referrers/") {
-        if method != http::Method::GET && method != http::Method::HEAD {
-            return crate::http_api::errors::method_not_allowed("GET, HEAD");
-        }
-    } else if path.ends_with("/tags/list") {
-        if method != http::Method::GET && method != http::Method::HEAD {
-            return crate::http_api::errors::method_not_allowed("GET, HEAD");
-        }
-    } else if path.contains("/tags/reference/") {
-        if method != http::Method::DELETE {
-            return crate::http_api::errors::method_not_allowed("DELETE");
-        }
+    let route = crate::http_api::routing::OciRoute::parse(&path);
+
+    // V2 ping and extension discovery are public discovery endpoints
+    if matches!(route, crate::http_api::routing::OciRoute::V2Ping | crate::http_api::routing::OciRoute::ExtensionDiscovery { .. }) {
+        return next.run(request).await;
     }
 
-    let repo = extract_repo_from_v2_path(&path);
+    // Enforce 405 Method Not Allowed on read-only/specific endpoints before auth challenge
+    match &route {
+        crate::http_api::routing::OciRoute::Catalog
+        | crate::http_api::routing::OciRoute::TagsList { .. }
+        | crate::http_api::routing::OciRoute::Referrers { .. } => {
+            if method != http::Method::GET && method != http::Method::HEAD {
+                return crate::http_api::errors::method_not_allowed("GET, HEAD");
+            }
+        }
+        crate::http_api::routing::OciRoute::TagDelete { .. } => {
+            if method != http::Method::DELETE {
+                return crate::http_api::errors::method_not_allowed("DELETE");
+            }
+        }
+        _ => {}
+    }
+
+    let repo = route.repository().map(|s| s.to_string());
     let is_private_repo = repo.as_deref().map(|r| {
         let r_lower = r.to_ascii_lowercase();
         r_lower.contains("private")
@@ -311,31 +320,25 @@ pub async fn require_auth_middleware(
     }).unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 
-    let action = match method {
-        http::Method::GET | http::Method::HEAD => {
-            if path == "/v2/_catalog" {
-                if !state.config.catalog_requires_auth && state.config.anonymous_pull {
-                    return next.run(request).await;
-                }
-                "catalog"
-            } else {
-                if !pull_needs_auth && bearer_token_from_headers(request.headers()).is_none() {
-                    return next.run(request).await;
-                }
-                "pull"
+    let required_action = match &route {
+        crate::http_api::routing::OciRoute::Catalog => {
+            let auth_required = state.config.catalog_requires_auth
+                || !state.config.anonymous_pull
+                || state.config.push_username.is_some()
+                || state.config.users.enabled
+                || state.config.robots.enabled;
+            if !auth_required {
+                return next.run(request).await;
             }
+            security::RepoAction::Pull
         }
-        http::Method::DELETE => {
-            if path.contains("/blobs/uploads/") {
-                "push"
-            } else {
-                "delete"
-            }
-        }
-        _ => "push",
+        _ => match route.required_action(&method) {
+            Some(action) => action,
+            None => security::RepoAction::Pull,
+        },
     };
 
-    if action == "catalog" {
+    if matches!(route, crate::http_api::routing::OciRoute::Catalog) {
         if let Some(token) = bearer_token_from_headers(request.headers()) {
             if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
                 &state.config.token_signing_keys,
@@ -365,6 +368,11 @@ pub async fn require_auth_middleware(
     let Some(repo_name) = repo.as_deref() else {
         return unauthorized_registry_challenge(&state, None);
     };
+
+    if required_action == security::RepoAction::Pull && !pull_needs_auth && bearer_token_from_headers(request.headers()).is_none() {
+        return next.run(request).await;
+    }
+
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
         match security::verify_bearer_token_bound_with_keys(
@@ -374,16 +382,11 @@ pub async fn require_auth_middleware(
             state.config.token_ttl_secs,
         ) {
             Ok(claims) => {
-                let required_action = match action {
-                    "push" => security::RepoAction::Push,
-                    "delete" => security::RepoAction::Delete,
-                    _ => security::RepoAction::Pull,
-                };
                 if !security::token_allows_repo_action(&claims, repo_name, required_action) {
                     return errors::denied("access to repository denied").into_response();
                 }
 
-                if action == "push" {
+                if required_action == security::RepoAction::Push {
                     if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
                         if !repo_allowed(allowlist, repo_name) {
                             return errors::denied("push not allowed for this repository")
@@ -402,48 +405,17 @@ pub async fn require_auth_middleware(
     // If token-only mode is enabled, do not accept Basic for directly authenticating data requests.
     if state.config.auth_strategy != crate::config::AuthStrategy::Token {
         if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
+            let action_str = required_action.as_str();
             if verify_direct_basic_access(
                 &state.config,
                 basic.username(),
                 basic.password(),
                 repo_name,
-                action,
+                action_str,
             ) {
                 return next.run(request).await;
             }
         }
-    }
-
-    let auth_scheme = request
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split_whitespace().next())
-        .unwrap_or("<none>");
-    let user_agent = request
-        .headers()
-        .get(http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("<none>");
-
-    // Docker clients commonly probe upload endpoints without Authorization first,
-    // then fetch a Bearer token after the 401 challenge. Keep that noise at DEBUG.
-    if auth_scheme == "<none>" {
-        tracing::debug!(
-            method = %request.method(),
-            uri = %request.uri(),
-            auth_scheme = auth_scheme,
-            user_agent = user_agent,
-            "push auth denied"
-        );
-    } else {
-        info!(
-            method = %request.method(),
-            uri = %request.uri(),
-            auth_scheme = auth_scheme,
-            user_agent = user_agent,
-            "push auth denied"
-        );
     }
 
     unauthorized_registry_challenge(&state, Some(repo_name))

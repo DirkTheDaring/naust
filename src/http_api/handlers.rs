@@ -1005,172 +1005,92 @@ pub async fn v2_dispatch(
     let route_mode = v2_route_mode_for_request(&state.config.proxy, &headers);
     let proxy_ctx = state.proxy_context_for_request(&headers);
 
-    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    let full_path = format!("/v2/{rest}");
+    let route = crate::http_api::routing::OciRoute::parse(&full_path);
 
-    // Registry catalog:
-    //   GET/HEAD /v2/_catalog
-    if segments.len() == 1 && segments[0] == "_catalog" {
-        if method != Method::GET && method != Method::HEAD {
-            return errors::method_not_allowed("GET, HEAD");
-        }
-        let auth_required = state.config.catalog_requires_auth
-            || !state.config.anonymous_pull
-            || state.config.push_username.is_some()
-            || state.config.users.enabled
-            || state.config.robots.enabled;
-        if auth_required {
-            if let Some(token) = crate::auth::bearer_token_from_headers(&headers) {
-                if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
-                    &state.config.token_signing_keys,
-                    token,
-                    &state.config.token_service,
-                    state.config.token_ttl_secs,
-                ) {
-                    if !crate::security::token_allows_catalog_action(&claims) {
-                        return errors::denied("catalog access denied").into_response();
-                    }
-                } else {
-                    return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-                }
-            } else if crate::auth::is_authenticated(&state, &headers) {
-                // Direct basic auth or authenticated session
-            } else {
-                return crate::auth::unauthorized_catalog_challenge(&state).into_response();
+    match route {
+        crate::http_api::routing::OciRoute::Catalog => {
+            if method != Method::GET && method != Method::HEAD {
+                return errors::method_not_allowed("GET, HEAD");
             }
+            catalog_list(state, method, &query, route_mode, proxy_ctx.clone()).await
         }
-        return catalog_list(state, method, &query, route_mode, proxy_ctx.clone()).await;
+        crate::http_api::routing::OciRoute::ExtensionDiscovery { .. } => {
+            if method != Method::GET && method != Method::HEAD {
+                return errors::method_not_allowed("GET, HEAD");
+            }
+            oci_extension_discover(method).await
+        }
+        crate::http_api::routing::OciRoute::UploadInitiate { repo } => {
+            if method != Method::POST {
+                return errors::method_not_allowed("POST");
+            }
+            upload_create(state, &headers, method, &repo, &query, body).await
+        }
+        crate::http_api::routing::OciRoute::UploadSession { repo, uuid } => {
+            if method != Method::GET
+                && method != Method::HEAD
+                && method != Method::PATCH
+                && method != Method::PUT
+                && method != Method::DELETE
+            {
+                return errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE");
+            }
+            upload_session(state, method, &headers, &repo, &uuid, query, body).await
+        }
+        crate::http_api::routing::OciRoute::TagsList { repo } => {
+            if method != Method::GET && method != Method::HEAD {
+                return errors::method_not_allowed("GET, HEAD");
+            }
+            tags_list(state, method, &repo, &query, route_mode, proxy_ctx.clone()).await
+        }
+        crate::http_api::routing::OciRoute::TagDelete { repo, tag } => {
+            if method != Method::DELETE {
+                return errors::method_not_allowed("DELETE");
+            }
+            tag_delete(state, method, &repo, &tag).await
+        }
+        crate::http_api::routing::OciRoute::Referrers { repo, digest } => {
+            if method != Method::GET && method != Method::HEAD {
+                return errors::method_not_allowed("GET, HEAD");
+            }
+            referrers_list(
+                state,
+                method,
+                &repo,
+                &digest,
+                &query,
+                route_mode,
+                proxy_ctx.clone(),
+            )
+            .await
+        }
+        crate::http_api::routing::OciRoute::Manifest { repo, reference } => {
+            if method == Method::PUT {
+                return manifest_put(state, &headers, &repo, &reference, body).await;
+            }
+            if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
+                return errors::method_not_allowed("GET, HEAD, PUT, DELETE");
+            }
+            manifest_by_reference(
+                state,
+                method,
+                &repo,
+                &reference,
+                route_mode,
+                proxy_ctx.clone(),
+                request_host,
+            )
+            .await
+        }
+        crate::http_api::routing::OciRoute::Blob { repo, digest } => {
+            if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
+                return errors::method_not_allowed("GET, HEAD, DELETE");
+            }
+            blob_by_digest(state, method, &repo, &digest, route_mode, proxy_ctx.clone()).await
+        }
+        _ => errors::not_implemented().into_response(),
     }
-
-    // Extension discovery:
-    //   GET/HEAD /v2/_oci/ext/discover
-    //   GET/HEAD /v2/<name>/_oci/ext/discover
-    if (segments.len() == 3 && segments[0] == "_oci" && segments[1] == "ext" && segments[2] == "discover")
-        || (segments.len() >= 4
-            && segments[segments.len() - 3] == "_oci"
-            && segments[segments.len() - 2] == "ext"
-            && segments[segments.len() - 1] == "discover")
-    {
-        if method != Method::GET && method != Method::HEAD {
-            return errors::method_not_allowed("GET, HEAD");
-        }
-        return oci_extension_discover(method).await;
-    }
-    // Uploads:
-    //   POST /v2/<name>/blobs/uploads/
-    //   PATCH/PUT/GET/HEAD/DELETE /v2/<name>/blobs/uploads/<uuid>
-    if segments.len() >= 2
-        && segments[segments.len() - 1] == "uploads"
-        && segments[segments.len() - 2] == "blobs"
-    {
-        if method != Method::POST {
-            return errors::method_not_allowed("POST");
-        }
-        let name = segments[..segments.len() - 2].join("/");
-        return upload_create(state, &headers, method, &name, &query, body).await;
-    }
-
-    if segments.len() >= 3
-        && segments[segments.len() - 2] == "uploads"
-        && segments[segments.len() - 3] == "blobs"
-    {
-        if method != Method::GET && method != Method::HEAD && method != Method::PATCH && method != Method::PUT && method != Method::DELETE {
-            return errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE");
-        }
-        let uuid = segments[segments.len() - 1];
-        let name = segments[..segments.len() - 3].join("/");
-        return upload_session(state, method, &headers, &name, uuid, query, body).await;
-    }
-
-    // Tags list:
-    //   GET/HEAD /v2/<name>/tags/list
-    if segments.len() >= 2
-        && segments[segments.len() - 2] == "tags"
-        && segments[segments.len() - 1] == "list"
-    {
-        if method != Method::GET && method != Method::HEAD {
-            return errors::method_not_allowed("GET, HEAD");
-        }
-        let name = segments[..segments.len() - 2].join("/");
-        return tags_list(state, method, &name, &query, route_mode, proxy_ctx.clone()).await;
-    }
-
-    // OCI 1.1 Tag deletion:
-    //   DELETE /v2/<name>/tags/reference/<tag>
-    if segments.len() >= 3
-        && segments[segments.len() - 3] == "tags"
-        && segments[segments.len() - 2] == "reference"
-    {
-        if method != Method::DELETE {
-            return errors::method_not_allowed("DELETE");
-        }
-        let tag = segments[segments.len() - 1];
-        let name = segments[..segments.len() - 3].join("/");
-        return tag_delete(state, method, &name, tag).await;
-    }
-
-    // Referrers:
-    //   GET/HEAD /v2/<name>/referrers/<digest>
-    if segments.len() >= 2 && segments[segments.len() - 2] == "referrers" {
-        if method != Method::GET && method != Method::HEAD {
-            return errors::method_not_allowed("GET, HEAD");
-        }
-        let digest_str = segments[segments.len() - 1];
-        let name = segments[..segments.len() - 2].join("/");
-        return referrers_list(
-            state,
-            method,
-            &name,
-            digest_str,
-            &query,
-            route_mode,
-            proxy_ctx.clone(),
-        )
-        .await;
-    }
-
-    if segments.len() >= 2 && segments[segments.len() - 2] == "manifests" {
-        let reference = segments[segments.len() - 1];
-        let name = segments[..segments.len() - 2].join("/");
-        if method == Method::PUT {
-            return manifest_put(state, &headers, &name, reference, body).await;
-        }
-        if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
-            return errors::method_not_allowed("GET, HEAD, PUT, DELETE");
-        }
-        return manifest_by_reference(
-            state,
-            method,
-            &name,
-            reference,
-            route_mode,
-            proxy_ctx.clone(),
-            request_host,
-        )
-        .await;
-    }
-
-    // /v2/<name>/blobs/<digest>
-    if segments.len() >= 2
-        && segments[segments.len() - 2] == "blobs"
-        && segments[segments.len() - 1] != "uploads"
-    {
-        if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
-            return errors::method_not_allowed("GET, HEAD, DELETE");
-        }
-        let digest_str = segments[segments.len() - 1];
-        let name = segments[..segments.len() - 2].join("/");
-        return blob_by_digest(
-            state,
-            method,
-            &name,
-            digest_str,
-            route_mode,
-            proxy_ctx.clone(),
-        )
-        .await;
-    }
-
-    errors::not_implemented().into_response()
 }
 
 async fn catalog_list(
