@@ -1235,7 +1235,7 @@ async fn test_audit_remediation_suite() {
         .put(format!("{base_url}/v2/{repo}/manifests/{bad_digest_ref}"))
         .basic_auth("demo", Some("demo"))
         .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
-        .body(valid_manifest_bytes)
+        .body(valid_manifest_bytes.clone())
         .send()
         .await
         .expect("put mismatch");
@@ -1301,5 +1301,38 @@ async fn test_audit_remediation_suite() {
         .await
         .expect("priv tags");
     assert_eq!(priv_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 22. Token endpoint issues delete action in scopes
+    let token_resp = client
+        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push,delete"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("get token with delete");
+    assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
+    let token_body: serde_json::Value = token_resp.json().await.expect("token json");
+    let delete_token = token_body["token"].as_str().unwrap();
+    let scopes_arr = token_body["scopes"].as_array().unwrap();
+    assert!(scopes_arr[0]["actions"].as_array().unwrap().iter().any(|a| a.as_str() == Some("delete")));
+
+    // Push tag to delete
+    let put_del_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/delete-me"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(valid_manifest_bytes)
+        .send()
+        .await
+        .expect("put manifest");
+    assert_eq!(put_del_resp.status(), reqwest::StatusCode::CREATED);
+
+    // Delete tag using the issued delete token
+    let del_tag_resp = client
+        .delete(format!("{base_url}/v2/{repo}/tags/reference/delete-me"))
+        .bearer_auth(delete_token)
+        .send()
+        .await
+        .expect("del tag with bearer");
+    assert_eq!(del_tag_resp.status(), reqwest::StatusCode::ACCEPTED);
 }
 

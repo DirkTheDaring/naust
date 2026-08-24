@@ -17,8 +17,8 @@ fn normalize_action(action: &str) -> Option<&'static str> {
     match action.trim().to_ascii_lowercase().as_str() {
         "pull" => Some("pull"),
         "push" => Some("push"),
-        // Reserved for future use. Not currently supported by the registry handlers.
-        // Keeping it out of the allowlist ensures we never mint unexpected permissions.
+        "delete" => Some("delete"),
+        "*" => Some("*"),
         _ => None,
     }
 }
@@ -110,7 +110,7 @@ pub fn grant_scopes_by_prefix(
         let mut granted_actions: Vec<String> = Vec::new();
         for a in &req.actions {
             let a_norm = a.trim().to_ascii_lowercase();
-            if allowed.iter().any(|x| *x == a_norm) && !granted_actions.iter().any(|x| x == &a_norm)
+            if (allowed.iter().any(|x| *x == "*" || *x == a_norm)) && !granted_actions.iter().any(|x| x == &a_norm)
             {
                 granted_actions.push(a_norm);
             }

@@ -46,8 +46,9 @@ struct TokenDecision {
 
 fn wants_auth_from_token_scopes(cfg: &crate::config::Config, token_scopes: &[security::TokenScope]) -> bool {
     let wants_push = wants_push_from_token_scopes(token_scopes);
+    let wants_delete = token_scopes.iter().any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete));
     let wants_catalog = token_scopes.iter().any(|s| s.typ == "registry" && (s.name == "catalog" || s.name == "*"));
-    wants_push || (wants_catalog && cfg.catalog_requires_auth)
+    wants_push || wants_delete || (wants_catalog && cfg.catalog_requires_auth)
 }
 
 fn decide_token_scopes_for_request(
@@ -379,11 +380,24 @@ pub async fn token(
         token_issued_total = issued_total,
     );
 
+    let scopes_json: Vec<serde_json::Value> = decision
+        .scopes
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "type": s.typ,
+                "name": s.name,
+                "actions": s.actions,
+            })
+        })
+        .collect();
+
     let body = serde_json::json!({
         "token": token,
         "access_token": token,
         "expires_in": decision.ttl_secs,
         "issued_at": format_rfc3339(now),
+        "scopes": scopes_json,
     });
 
     let bytes = match serde_json::to_vec(&body) {
@@ -781,6 +795,7 @@ fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
         for a in &s.actions {
             if a == security::RepoAction::Pull.as_str()
                 || a == security::RepoAction::Push.as_str()
+                || a == security::RepoAction::Delete.as_str()
                 || a == "*"
             {
                 actions.push(a.clone());
@@ -1712,6 +1727,9 @@ async fn tag_delete(
     }
     if !is_valid_tag(tag) {
         return errors::tag_invalid().into_response();
+    }
+    if !state.config.allow_tag_overwrite {
+        return errors::denied("tag is immutable and cannot be deleted").into_response();
     }
 
     match state.storage.delete_tag(name, tag).await {
@@ -3228,7 +3246,7 @@ mod tests {
 
     #[test]
     fn sanitize_token_scopes_drops_unknown_actions() {
-        let scopes = parse_scopes("repository:org/repo:pull,delete,push");
+        let scopes = parse_scopes("repository:org/repo:pull,unknown,push");
         let token_scopes = sanitize_token_scopes(&scopes);
         assert_eq!(token_scopes.len(), 1);
         assert_eq!(
@@ -3238,8 +3256,19 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_token_scopes_preserves_delete_action() {
+        let scopes = parse_scopes("repository:org/repo:pull,push,delete");
+        let token_scopes = sanitize_token_scopes(&scopes);
+        assert_eq!(token_scopes.len(), 1);
+        assert_eq!(
+            token_scopes[0].actions,
+            vec!["pull".to_string(), "push".to_string(), "delete".to_string()]
+        );
+    }
+
+    #[test]
     fn sanitize_token_scopes_drops_empty_scopes() {
-        let scopes = parse_scopes("repository:org/repo:delete");
+        let scopes = parse_scopes("repository:org/repo:unknown");
         let token_scopes = sanitize_token_scopes(&scopes);
         assert!(token_scopes.is_empty());
     }
@@ -4366,13 +4395,27 @@ async fn upload_create(
         return errors::method_not_allowed("POST");
     }
 
+    if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
+        if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
+            &state.config.token_signing_keys,
+            token,
+            &state.config.token_service,
+            state.config.token_ttl_secs,
+        ) {
+            if !crate::security::token_allows_repo_action(&claims, name, crate::security::RepoAction::Push) {
+                return errors::denied("push permission denied on target repository").into_response();
+            }
+        }
+    }
+
     // Cross-repository blob mount:
     //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
     // If the blob exists and client has pull authorization on source repo, respond 201.
+    // If client lacks pull permission on source repo, return 403.
     // Otherwise, gracefully fall back to standard 202 upload session per spec.
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
         if let Ok(digest) = Digest::parse(mount_str) {
-            let can_mount = if let Some(from_repo) = query.get("from") {
+            if let Some(from_repo) = query.get("from") {
                 if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
                     if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
                         &state.config.token_signing_keys,
@@ -4380,30 +4423,39 @@ async fn upload_create(
                         &state.config.token_service,
                         state.config.token_ttl_secs,
                     ) {
-                        crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull)
-                    } else {
-                        false
+                        if !crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull) {
+                            return errors::denied("pull permission denied on source repository").into_response();
+                        }
                     }
-                } else {
-                    true
                 }
-            } else {
-                state.config.automatic_crossmount
-            };
 
-            if can_mount && state.storage.head_blob(&digest).await.is_ok() {
-                let mut resp_headers = registry_headers();
-                resp_headers.insert(
-                    "Location",
-                    format!("/v2/{name}/blobs/{}", digest.as_str())
-                        .parse()
-                        .unwrap(),
-                );
-                resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                resp_headers.insert("Content-Length", "0".parse().unwrap());
-                return (StatusCode::CREATED, resp_headers).into_response();
+                if state.storage.head_blob(&digest).await.is_ok() {
+                    let mut resp_headers = registry_headers();
+                    resp_headers.insert(
+                        "Location",
+                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                            .parse()
+                            .unwrap(),
+                    );
+                    resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    resp_headers.insert("Content-Length", "0".parse().unwrap());
+                    return (StatusCode::CREATED, resp_headers).into_response();
+                }
+                // Fallback to normal upload session if blob doesn't exist.
+            } else if state.config.automatic_crossmount {
+                if state.storage.head_blob(&digest).await.is_ok() {
+                    let mut resp_headers = registry_headers();
+                    resp_headers.insert(
+                        "Location",
+                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                            .parse()
+                            .unwrap(),
+                    );
+                    resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    resp_headers.insert("Content-Length", "0".parse().unwrap());
+                    return (StatusCode::CREATED, resp_headers).into_response();
+                }
             }
-            // Graceful fallback to normal upload session if blob doesn't exist or client lacks from_repo pull.
         }
     }
 
