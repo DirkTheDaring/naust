@@ -37,6 +37,7 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     //   /v2/<name>/manifests/...
     //   /v2/<name>/tags/list
     //   /v2/<name>/tags/reference/...
+    //   /v2/<name>/referrers/...
     // where <name> may contain '/'.
     if !path.starts_with("/v2/") {
         return None;
@@ -74,7 +75,7 @@ pub(crate) fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
     })
 }
 
-fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Response {
+pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Response {
     let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
 
     let realm = state
@@ -109,6 +110,10 @@ fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Resp
         http::header::HeaderName::from_static("docker-distribution-api-version"),
         http::HeaderValue::from_static("registry/2.0"),
     );
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
     resp
 }
 
@@ -142,6 +147,10 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
     resp.headers_mut().insert(
         http::header::HeaderName::from_static("docker-distribution-api-version"),
         http::HeaderValue::from_static("registry/2.0"),
+    );
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
     );
     resp
 }
