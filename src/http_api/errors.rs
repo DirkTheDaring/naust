@@ -261,7 +261,7 @@ pub fn size_invalid(message: &str) -> Response {
             detail: None,
         }],
     };
-    error_response(StatusCode::RANGE_NOT_SATISFIABLE, body)
+    error_response(StatusCode::BAD_REQUEST, body)
 }
 
 pub fn denied(message: &str) -> Response {

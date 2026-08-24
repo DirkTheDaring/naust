@@ -304,10 +304,12 @@ pub async fn require_auth_middleware(
     let is_private_repo = repo.as_deref().map(|r| {
         let r_lower = r.to_ascii_lowercase();
         r_lower.contains("private")
-            || r.starts_with('<')
-            || r.ends_with('>')
-            || r_lower.starts_with("%3c")
-            || r_lower.ends_with("%3e")
+            || r_lower.contains("secret")
+            || r_lower.contains("restricted")
+            || r.contains('<')
+            || r.contains('>')
+            || r_lower.contains("%3c")
+            || r_lower.contains("%3e")
     }).unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 

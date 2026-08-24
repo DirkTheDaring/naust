@@ -1436,5 +1436,28 @@ async fn test_audit_remediation_suite() {
     );
     let manifest_err_body: serde_json::Value = manifest_resp.json().await.expect("manifest err json");
     assert_eq!(manifest_err_body["errors"][0]["code"], "MANIFEST_UNVERIFIED");
+
+    // 29. Upload initiation with token scoped for a different repository -> 403 Forbidden (DENIED)
+    let other_repo = "other-unauthorized-repo";
+    let token_other_resp = client
+        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{other_repo}:pull,push"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("get token for other_repo");
+    assert_eq!(token_other_resp.status(), reqwest::StatusCode::OK);
+    let token_other_body: serde_json::Value = token_other_resp.json().await.expect("token json");
+    let other_token = token_other_body["token"].as_str().unwrap();
+
+    let target_repo = "target-enforced-repo";
+    let denied_upload_resp = client
+        .post(format!("{base_url}/v2/{target_repo}/blobs/uploads/"))
+        .bearer_auth(other_token)
+        .send()
+        .await
+        .expect("upload with wrong token");
+    assert_eq!(denied_upload_resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let denied_body: serde_json::Value = denied_upload_resp.json().await.expect("denied json");
+    assert_eq!(denied_body["errors"][0]["code"], "DENIED");
 }
 
