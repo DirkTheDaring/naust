@@ -314,20 +314,20 @@ impl FsStorage {
     }
 
     fn blob_path(&self, digest: &Digest) -> PathBuf {
-        // data/blobs/sha256/ab/<hex>
+        // data/blobs/<algo>/ab/<hex>
         self.root
             .join("blobs")
-            .join("sha256")
+            .join(digest.algorithm())
             .join(digest.prefix2())
             .join(digest.hex())
     }
 
     fn quarantine_blob_path(&self, digest: &Digest) -> PathBuf {
-        // data/quarantine/blobs/sha256/ab/<hex>
+        // data/quarantine/blobs/<algo>/ab/<hex>
         self.root
             .join("quarantine")
             .join("blobs")
-            .join("sha256")
+            .join(digest.algorithm())
             .join(digest.prefix2())
             .join(digest.hex())
     }
@@ -727,6 +727,21 @@ impl Storage for FsStorage {
         Ok(())
     }
 
+    async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
+        let tag_file = self.tag_path(name, tag);
+        match tokio::fs::remove_file(&tag_file).await {
+            Ok(_) => {
+                let tags_dir = self.root.join("repos").join(name).join("tags");
+                let _ = fsync_dir(tags_dir.as_path()).await;
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(StorageError::NotFound)
+            }
+            Err(err) => Err(StorageError::Internal(err.to_string())),
+        }
+    }
+
     async fn create_upload(&self) -> Result<super::UploadMeta, StorageError> {
         let dir = self.uploads_dir();
         ensure_dir(&dir);
@@ -871,7 +886,21 @@ impl Storage for FsStorage {
             _ => self.ensure_upload_hash_state(uuid, upload_size_bytes).await,
         };
 
-        let (computed_hex, hash_elapsed) = if let Some(st) = state {
+        let (computed_hex, hash_elapsed) = if digest.algorithm() == "sha512" {
+            let mut hasher = sha2::Sha512::new();
+            let mut buf = vec![0u8; 1024 * 64];
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|err| StorageError::Internal(err.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            (hex::encode(hasher.finalize()), t_hash.elapsed())
+        } else if let Some(st) = state {
             if st.total_len == upload_size_bytes {
                 hash_source = "saved_state";
                 (st.finalize_hex(), t_hash.elapsed())
@@ -922,7 +951,7 @@ impl Storage for FsStorage {
         let dest_dir = self
             .root
             .join("blobs")
-            .join("sha256")
+            .join(digest.algorithm())
             .join(digest.prefix2());
         ensure_dir(&dest_dir);
 

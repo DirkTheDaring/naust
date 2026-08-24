@@ -109,7 +109,8 @@ impl S3Storage {
 
     fn blob_key2(&self, digest: &Digest) -> String {
         self.key(&format!(
-            "blobs/sha256/{}/{}",
+            "blobs/{}/{}/{}",
+            digest.algorithm(),
             digest.prefix2(),
             digest.hex()
         ))
@@ -506,6 +507,20 @@ impl Storage for S3Storage {
         Ok(())
     }
 
+    async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+        let key = self.tag_key(name, tag);
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
     async fn create_upload(&self) -> Result<UploadMeta, StorageError> {
         let client = self.client().await?;
         let bucket = self.bucket()?;
@@ -661,20 +676,35 @@ impl Storage for S3Storage {
             .await
             .map_err(|err| map_s3_err(err))?;
 
-        let mut hasher = sha2::Sha256::new();
         let mut reader = get.body.into_async_read();
         let mut buf = vec![0u8; 1024 * 64];
-        loop {
-            let n = reader
-                .read(&mut buf)
-                .await
-                .map_err(|err| StorageError::Internal(err.to_string()))?;
-            if n == 0 {
-                break;
+        let computed_hex = if digest.algorithm() == "sha512" {
+            let mut hasher = sha2::Sha512::new();
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(|err| StorageError::Internal(err.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
             }
-            hasher.update(&buf[..n]);
-        }
-        let computed_hex = hex::encode(hasher.finalize());
+            hex::encode(hasher.finalize())
+        } else {
+            let mut hasher = sha2::Sha256::new();
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(|err| StorageError::Internal(err.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            hex::encode(hasher.finalize())
+        };
         if computed_hex != digest.hex() {
             // Best-effort cleanup.
             let _ = client

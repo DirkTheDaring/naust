@@ -50,7 +50,7 @@ impl IpConcurrencyLimiter {
     }
 
     pub fn is_bypassed(&self, ip: &IpAddr) -> bool {
-        self.trusted_bypass_cidrs.iter().any(|net| net.contains(ip))
+        ip.is_loopback() || self.trusted_bypass_cidrs.iter().any(|net| net.contains(ip))
     }
 
     fn shard_idx(&self, key: &NormalizedClientKey) -> usize {

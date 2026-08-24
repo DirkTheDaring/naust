@@ -1,4 +1,8 @@
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{
+    body::Body,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -14,7 +18,25 @@ pub struct RegistryErrorItem {
     pub detail: Option<serde_json::Value>,
 }
 
-pub fn not_implemented() -> impl IntoResponse {
+fn error_response(status: StatusCode, body: ErrorBody) -> Response {
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("docker-distribution-api-version"),
+        HeaderValue::from_static("registry/2.0"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+    );
+    (status, headers, Body::from(bytes)).into_response()
+}
+
+pub fn not_implemented() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "UNSUPPORTED",
@@ -22,10 +44,10 @@ pub fn not_implemented() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::NOT_IMPLEMENTED, Json(body))
+    error_response(StatusCode::NOT_IMPLEMENTED, body)
 }
 
-pub fn insufficient_storage() -> impl IntoResponse {
+pub fn insufficient_storage() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "INSUFFICIENT_STORAGE",
@@ -33,10 +55,10 @@ pub fn insufficient_storage() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::INSUFFICIENT_STORAGE, Json(body))
+    error_response(StatusCode::INSUFFICIENT_STORAGE, body)
 }
 
-pub fn payload_too_large() -> impl IntoResponse {
+pub fn payload_too_large() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "TOO_LARGE",
@@ -44,10 +66,10 @@ pub fn payload_too_large() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
+    error_response(StatusCode::PAYLOAD_TOO_LARGE, body)
 }
 
-pub fn name_invalid() -> impl IntoResponse {
+pub fn name_invalid() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "NAME_INVALID",
@@ -55,10 +77,10 @@ pub fn name_invalid() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::BAD_REQUEST, Json(body))
+    error_response(StatusCode::BAD_REQUEST, body)
 }
 
-pub fn name_unknown() -> impl IntoResponse {
+pub fn name_unknown() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "NAME_UNKNOWN",
@@ -66,10 +88,10 @@ pub fn name_unknown() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::NOT_FOUND, Json(body))
+    error_response(StatusCode::NOT_FOUND, body)
 }
 
-pub fn digest_invalid() -> impl IntoResponse {
+pub fn digest_invalid() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "DIGEST_INVALID",
@@ -77,10 +99,10 @@ pub fn digest_invalid() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::BAD_REQUEST, Json(body))
+    error_response(StatusCode::BAD_REQUEST, body)
 }
 
-pub fn tag_invalid() -> impl IntoResponse {
+pub fn tag_invalid() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "TAG_INVALID",
@@ -88,10 +110,21 @@ pub fn tag_invalid() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::BAD_REQUEST, Json(body))
+    error_response(StatusCode::BAD_REQUEST, body)
 }
 
-pub fn manifest_invalid() -> impl IntoResponse {
+pub fn tag_unknown() -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "TAG_UNKNOWN",
+            message: "tag unknown".to_string(),
+            detail: None,
+        }],
+    };
+    error_response(StatusCode::NOT_FOUND, body)
+}
+
+pub fn manifest_invalid() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "MANIFEST_INVALID",
@@ -99,10 +132,33 @@ pub fn manifest_invalid() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::BAD_REQUEST, Json(body))
+    error_response(StatusCode::BAD_REQUEST, body)
 }
 
-pub fn blob_unknown() -> impl IntoResponse {
+pub fn manifest_blob_unknown(digest: &str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "MANIFEST_BLOB_UNKNOWN",
+            message: "blob unknown to registry".to_string(),
+            detail: Some(serde_json::json!({ "digest": digest })),
+        }],
+    };
+    error_response(StatusCode::BAD_REQUEST, body)
+}
+
+#[allow(dead_code)]
+pub fn manifest_unverified(message: &str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "MANIFEST_UNVERIFIED",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    error_response(StatusCode::BAD_REQUEST, body)
+}
+
+pub fn blob_unknown() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "BLOB_UNKNOWN",
@@ -110,10 +166,10 @@ pub fn blob_unknown() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::NOT_FOUND, Json(body))
+    error_response(StatusCode::NOT_FOUND, body)
 }
 
-pub fn blob_in_use(message: &str) -> impl IntoResponse {
+pub fn blob_in_use(message: &str) -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "BLOB_IN_USE",
@@ -121,10 +177,10 @@ pub fn blob_in_use(message: &str) -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::CONFLICT, Json(body))
+    error_response(StatusCode::CONFLICT, body)
 }
 
-pub fn manifest_unknown() -> impl IntoResponse {
+pub fn manifest_unknown() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "MANIFEST_UNKNOWN",
@@ -132,10 +188,10 @@ pub fn manifest_unknown() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::NOT_FOUND, Json(body))
+    error_response(StatusCode::NOT_FOUND, body)
 }
 
-pub fn blob_upload_unknown() -> impl IntoResponse {
+pub fn blob_upload_unknown() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "BLOB_UPLOAD_UNKNOWN",
@@ -143,10 +199,10 @@ pub fn blob_upload_unknown() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::NOT_FOUND, Json(body))
+    error_response(StatusCode::NOT_FOUND, body)
 }
 
-pub fn blob_upload_invalid(message: &str) -> impl IntoResponse {
+pub fn blob_upload_invalid(message: &str) -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "BLOB_UPLOAD_INVALID",
@@ -154,10 +210,10 @@ pub fn blob_upload_invalid(message: &str) -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
+    error_response(StatusCode::PAYLOAD_TOO_LARGE, body)
 }
 
-pub fn denied(message: &str) -> impl IntoResponse {
+pub fn denied(message: &str) -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "DENIED",
@@ -165,10 +221,10 @@ pub fn denied(message: &str) -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::FORBIDDEN, Json(body))
+    error_response(StatusCode::FORBIDDEN, body)
 }
 
-pub fn internal_error() -> impl IntoResponse {
+pub fn internal_error() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "UNKNOWN",
@@ -176,10 +232,10 @@ pub fn internal_error() -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, body)
 }
 
-pub fn request_timeout(message: &str) -> impl IntoResponse {
+pub fn request_timeout(message: &str) -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "UNKNOWN",
@@ -187,7 +243,7 @@ pub fn request_timeout(message: &str) -> impl IntoResponse {
             detail: None,
         }],
     };
-    (StatusCode::REQUEST_TIMEOUT, Json(body))
+    error_response(StatusCode::REQUEST_TIMEOUT, body)
 }
 
 #[allow(dead_code)]

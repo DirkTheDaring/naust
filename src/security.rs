@@ -61,7 +61,7 @@ pub struct TokenSigningKey {
 }
 
 fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), TokenError> {
-    const MAX_TOKEN_LEN: usize = 8192;
+    const MAX_TOKEN_LEN: usize = 65536;
     if token.is_empty() || token.len() > MAX_TOKEN_LEN {
         return Err(TokenError::InvalidFormat);
     }
@@ -300,7 +300,14 @@ pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAc
     claims
         .scopes
         .iter()
-        .any(|s| s.typ == "repository" && s.name == repo && s.actions.iter().any(|a| a == action))
+        .any(|s| s.typ == "repository" && (s.name == repo || s.name == "*") && s.actions.iter().any(|a| a == action || a == "*"))
+}
+
+pub fn token_allows_catalog_action(claims: &TokenClaims) -> bool {
+    claims.scopes.iter().any(|s| {
+        (s.typ == "registry" && (s.name == "catalog" || s.name == "*") && s.actions.iter().any(|a| a == "*" || a == "pull" || a == "push" || a == "read"))
+            || (s.typ == "repository" && s.name == "*" && s.actions.iter().any(|a| a == "*"))
+    })
 }
 
 #[cfg(test)]

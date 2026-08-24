@@ -12,8 +12,8 @@ use tracing::info;
 
 use crate::security;
 
-fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
-    const MAX_BEARER_TOKEN_LEN: usize = 8192;
+pub(crate) fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    const MAX_BEARER_TOKEN_LEN: usize = 65536;
 
     let token = headers
         .get(http::header::AUTHORIZATION)
@@ -36,6 +36,7 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     //   /v2/<name>/blobs/...
     //   /v2/<name>/manifests/...
     //   /v2/<name>/tags/list
+    //   /v2/<name>/tags/reference/...
     // where <name> may contain '/'.
     if !path.starts_with("/v2/") {
         return None;
@@ -112,7 +113,37 @@ fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Resp
 }
 
 pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
-    unauthorized_registry_challenge(state, None)
+    let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+
+    let realm = state
+        .config
+        .public_url
+        .as_deref()
+        .unwrap_or("http://127.0.0.1:5000")
+        .trim_end_matches('/');
+
+    let bearer = format!(
+        "Bearer realm=\"{realm}/token\",service=\"{}\",scope=\"registry:catalog:*\"",
+        state.config.token_service
+    );
+
+    if state.config.auth_strategy == crate::config::AuthStrategy::Token || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+        if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+            resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
+        }
+    }
+    
+    if state.config.auth_strategy == crate::config::AuthStrategy::Basic || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+        resp.headers_mut().append(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Basic realm=\"registry\""),
+        );
+    }
+    resp.headers_mut().insert(
+        http::header::HeaderName::from_static("docker-distribution-api-version"),
+        http::HeaderValue::from_static("registry/2.0"),
+    );
+    resp
 }
 
 fn verify_any_basic_credentials(
@@ -432,7 +463,7 @@ mod tests {
         headers.insert(http::header::AUTHORIZATION, "Bearer ".parse().unwrap());
         assert!(bearer_token_from_headers(&headers).is_none());
 
-        let huge = format!("Bearer {}", "a".repeat(9000));
+        let huge = format!("Bearer {}", "a".repeat(70000));
         headers.insert(http::header::AUTHORIZATION, huge.parse().unwrap());
         assert!(bearer_token_from_headers(&headers).is_none());
     }

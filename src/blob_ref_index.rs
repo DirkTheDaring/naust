@@ -740,6 +740,10 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
+        async fn delete_tag(&self, _name: &str, _tag: &str) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
         async fn create_upload(&self) -> Result<crate::storage::UploadMeta, StorageError> {
             Err(StorageError::Unsupported)
         }

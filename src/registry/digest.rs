@@ -2,6 +2,7 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Digest {
+    algo: String,
     hex: String,
 }
 
@@ -19,30 +20,34 @@ pub enum DigestParseError {
 
 impl Digest {
     pub fn parse(input: &str) -> Result<Self, DigestParseError> {
-        // For MVP we primarily support sha256.
-        // Some tooling (e.g. Buildx attestations) uses the algorithm label `intoto-sha256`
-        // while still providing a standard 32-byte SHA-256 hex digest.
-        // Treat it as an alias of sha256 so pushes/pulls work.
         let (algo, hex) = input
             .split_once(':')
             .ok_or(DigestParseError::InvalidFormat)?;
         let algo_lc = algo.trim().to_ascii_lowercase();
-        if algo_lc != "sha256" && algo_lc != "intoto-sha256" {
-            return Err(DigestParseError::UnsupportedAlgorithm);
-        }
-        if hex.len() != 64 {
+        let (normalized_algo, expected_len) = match algo_lc.as_str() {
+            "sha256" | "intoto-sha256" => ("sha256".to_string(), 64),
+            "sha512" => ("sha512".to_string(), 128),
+            _ => return Err(DigestParseError::UnsupportedAlgorithm),
+        };
+
+        if hex.len() != expected_len {
             return Err(DigestParseError::InvalidFormat);
         }
         if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(DigestParseError::InvalidHex);
         }
         Ok(Self {
+            algo: normalized_algo,
             hex: hex.to_ascii_lowercase(),
         })
     }
 
     pub fn as_str(&self) -> String {
-        format!("sha256:{}", self.hex)
+        format!("{}:{}", self.algo, self.hex)
+    }
+
+    pub fn algorithm(&self) -> &str {
+        &self.algo
     }
 
     pub fn hex(&self) -> &str {
@@ -50,7 +55,7 @@ impl Digest {
     }
 
     pub fn prefix2(&self) -> &str {
-        // safe because hex length is 64
+        // safe because hex length is at least 64
         &self.hex[..2]
     }
 }
@@ -70,6 +75,7 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(d.prefix2(), "01");
+        assert_eq!(d.algorithm(), "sha256");
         assert_eq!(
             d.as_str(),
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -77,12 +83,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_non_sha256() {
+    fn parse_accepts_valid_sha512() {
+        let hex512 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let d = Digest::parse(&format!("sha512:{hex512}")).expect("valid sha512 digest");
+        assert_eq!(d.hex(), hex512);
+        assert_eq!(d.prefix2(), "01");
+        assert_eq!(d.algorithm(), "sha512");
+        assert_eq!(d.as_str(), format!("sha512:{hex512}"));
+    }
+
+    #[test]
+    fn parse_rejects_non_supported_algo() {
         let err = Digest::parse("sha1:abcd").unwrap_err();
-        matches!(
+        assert!(matches!(
             err,
             DigestParseError::UnsupportedAlgorithm | DigestParseError::InvalidFormat
-        );
+        ));
     }
 
     #[test]
@@ -101,6 +117,9 @@ mod tests {
     fn parse_rejects_wrong_length() {
         let err = Digest::parse("sha256:abcd").unwrap_err();
         assert!(matches!(err, DigestParseError::InvalidFormat));
+
+        let err512 = Digest::parse("sha512:0123456789abcdef").unwrap_err();
+        assert!(matches!(err512, DigestParseError::InvalidFormat));
     }
 
     #[test]

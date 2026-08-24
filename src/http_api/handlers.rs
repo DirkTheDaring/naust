@@ -44,13 +44,20 @@ struct TokenDecision {
     ttl_secs: u64,
 }
 
+fn wants_auth_from_token_scopes(cfg: &crate::config::Config, token_scopes: &[security::TokenScope]) -> bool {
+    let wants_push = wants_push_from_token_scopes(token_scopes);
+    let wants_catalog = token_scopes.iter().any(|s| s.typ == "registry" && (s.name == "catalog" || s.name == "*"));
+    wants_push || (wants_catalog && cfg.catalog_requires_auth)
+}
+
 fn decide_token_scopes_for_request(
     cfg: &crate::config::Config,
     token_scopes: &[security::TokenScope],
     basic: Option<(String, String)>,
 ) -> Result<TokenDecision, TokenRejection> {
     let wants_push = wants_push_from_token_scopes(token_scopes);
-    let requires_auth = wants_push || !cfg.anonymous_pull;
+    let wants_auth = wants_auth_from_token_scopes(cfg, token_scopes);
+    let requires_auth = wants_auth || !cfg.anonymous_pull;
 
     // Pull-only tokens: keep behavior simple and backwards compatible.
     // (No auth required; we mint exactly the sanitized requested scopes.)
@@ -735,6 +742,23 @@ fn token_scope_requests_repo_action(
 fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
     let mut out: Vec<security::TokenScope> = Vec::new();
     for s in scopes {
+        if s.typ == "registry" && (s.name == "catalog" || s.name == "*") {
+            let mut actions: Vec<String> = Vec::new();
+            for a in &s.actions {
+                if a == "*" || a == "pull" || a == "push" || a == "read" || a == "catalog" {
+                    actions.push(a.clone());
+                }
+            }
+            if !actions.is_empty() {
+                out.push(security::TokenScope {
+                    typ: s.typ.clone(),
+                    name: s.name.clone(),
+                    actions,
+                });
+            }
+            continue;
+        }
+
         if s.typ != "repository" {
             continue;
         }
@@ -745,7 +769,9 @@ fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
 
         let mut actions: Vec<String> = Vec::new();
         for a in &s.actions {
-            if a == security::RepoAction::Pull.as_str() || a == security::RepoAction::Push.as_str()
+            if a == security::RepoAction::Pull.as_str()
+                || a == security::RepoAction::Push.as_str()
+                || a == "*"
             {
                 actions.push(a.clone());
             }
@@ -959,9 +985,30 @@ pub async fn v2_dispatch(
     // Registry catalog:
     //   GET/HEAD /v2/_catalog
     if segments.len() == 1 && segments[0] == "_catalog" {
-        // Optional privacy policy: require auth for catalog.
-        if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-            return crate::auth::unauthorized_catalog_challenge(&state).into_response();
+        let auth_required = state.config.catalog_requires_auth
+            || !state.config.anonymous_pull
+            || state.config.push_username.is_some()
+            || state.config.users.enabled
+            || state.config.robots.enabled;
+        if auth_required {
+            if let Some(token) = crate::auth::bearer_token_from_headers(&headers) {
+                if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
+                    &state.config.token_signing_keys,
+                    token,
+                    &state.config.token_service,
+                    state.config.token_ttl_secs,
+                ) {
+                    if !crate::security::token_allows_catalog_action(&claims) {
+                        return errors::denied("catalog access denied").into_response();
+                    }
+                } else {
+                    return crate::auth::unauthorized_catalog_challenge(&state).into_response();
+                }
+            } else if crate::auth::is_authenticated(&state, &headers) {
+                // Direct basic auth or authenticated session
+            } else {
+                return crate::auth::unauthorized_catalog_challenge(&state).into_response();
+            }
         }
         return catalog_list(state, method, &query, route_mode, proxy_ctx.clone()).await;
     }
@@ -979,7 +1026,7 @@ pub async fn v2_dispatch(
     }
     // Uploads:
     //   POST /v2/<name>/blobs/uploads/
-    //   PATCH/PUT/GET /v2/<name>/blobs/uploads/<uuid>
+    //   PATCH/PUT/GET/HEAD/DELETE /v2/<name>/blobs/uploads/<uuid>
     if segments.len() >= 2
         && segments[segments.len() - 1] == "uploads"
         && segments[segments.len() - 2] == "blobs"
@@ -1005,6 +1052,17 @@ pub async fn v2_dispatch(
     {
         let name = segments[..segments.len() - 2].join("/");
         return tags_list(state, method, &name, &query, route_mode, proxy_ctx.clone()).await;
+    }
+
+    // OCI 1.1 Tag deletion:
+    //   DELETE /v2/<name>/tags/reference/<tag>
+    if segments.len() >= 3
+        && segments[segments.len() - 3] == "tags"
+        && segments[segments.len() - 2] == "reference"
+    {
+        let tag = segments[segments.len() - 1];
+        let name = segments[..segments.len() - 3].join("/");
+        return tag_delete(state, method, &name, tag).await;
     }
 
     // Referrers:
@@ -1043,10 +1101,9 @@ pub async fn v2_dispatch(
     }
 
     // /v2/<name>/blobs/<digest>
-    // Avoid catching /blobs/uploads by requiring the digest format.
     if segments.len() >= 2
         && segments[segments.len() - 2] == "blobs"
-        && segments[segments.len() - 1].contains(':')
+        && segments[segments.len() - 1] != "uploads"
     {
         let digest_str = segments[segments.len() - 1];
         let name = segments[..segments.len() - 2].join("/");
@@ -1521,7 +1578,8 @@ async fn tags_list(
 
     match method {
         Method::GET | Method::HEAD => match storage.list_tags(name).await {
-            Ok(all_tags) => {
+            Ok(mut all_tags) => {
+                all_tags.sort();
                 // Pagination per OCI/Docker distribution spec:
                 // - `n` limits the number of tags
                 // - `last` starts listing after the provided tag
@@ -1529,11 +1587,10 @@ async fn tags_list(
                 let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
                 let n = n_opt.unwrap_or(usize::MAX);
 
-                let start_idx = query
-                    .get("last")
-                    .and_then(|last| all_tags.iter().position(|t| t == last))
-                    .map(|i| i.saturating_add(1))
-                    .unwrap_or(0);
+                let start_idx = match query.get("last") {
+                    Some(last) => all_tags.iter().position(|t| t > last).unwrap_or(all_tags.len()),
+                    None => 0,
+                };
 
                 let end_idx = start_idx.saturating_add(n).min(total);
                 let tags: Vec<String> = all_tags
@@ -1585,6 +1642,44 @@ async fn tags_list(
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         _ => errors::not_implemented().into_response(),
+    }
+}
+
+async fn tag_delete(
+    state: AppState,
+    method: Method,
+    name: &str,
+    tag: &str,
+) -> Response {
+    if method != Method::DELETE {
+        return errors::not_implemented().into_response();
+    }
+    if !is_valid_repo_name(name) {
+        return errors::name_invalid().into_response();
+    }
+    if !is_valid_tag(tag) {
+        return errors::tag_invalid().into_response();
+    }
+
+    match state.storage.delete_tag(name, tag).await {
+        Ok(()) => {
+            if let Some(idx) = state.ref_index.as_ref() {
+                if let Err(err) = idx.sync_repo_tags(&state.storage, name).await {
+                    tracing::warn!(
+                        error = %err,
+                        repo = name,
+                        "ref-index: failed to resync tags after tag delete"
+                    );
+                }
+            }
+            (StatusCode::ACCEPTED, registry_headers()).into_response()
+        }
+        Err(StorageError::NotFound) => errors::tag_unknown().into_response(),
+        Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+        Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
+        Err(StorageError::Internal(_)) | Err(StorageError::TooLarge) | Err(StorageError::DigestMismatch) => {
+            errors::internal_error().into_response()
+        }
     }
 }
 
@@ -3009,12 +3104,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_token_scopes_drops_non_repository_scope_types() {
-        let scopes = parse_scopes("registry:catalog:*:push repository:org/repo:pull");
+    fn sanitize_token_scopes_preserves_catalog_and_repository_scopes() {
+        let scopes = parse_scopes("registry:catalog:* repository:org/repo:pull");
         let token_scopes = sanitize_token_scopes(&scopes);
-        assert_eq!(token_scopes.len(), 1);
-        assert_eq!(token_scopes[0].typ, "repository");
-        assert_eq!(token_scopes[0].name, "org/repo");
+        assert_eq!(token_scopes.len(), 2);
+        assert_eq!(token_scopes[0].typ, "registry");
+        assert_eq!(token_scopes[0].name, "catalog");
+        assert_eq!(token_scopes[1].typ, "repository");
+        assert_eq!(token_scopes[1].name, "org/repo");
     }
 
     #[test]
@@ -3036,13 +3133,12 @@ mod tests {
 
     #[test]
     fn scope_requests_repo_action_requires_repository_type() {
-        let scopes = parse_scopes("registry:catalog:*:push repository:org/repo:pull");
+        let scopes = parse_scopes("registry:catalog:* repository:org/repo:pull");
         assert_eq!(scopes.len(), 2);
 
         let token_scopes = sanitize_token_scopes(&scopes);
-        assert_eq!(token_scopes.len(), 1);
+        assert_eq!(token_scopes.len(), 2);
 
-        // Only repository scopes are minted, and this one is pull-only.
         assert!(!token_scope_requests_repo_action(
             &token_scopes[0],
             security::RepoAction::Push
@@ -3505,6 +3601,7 @@ mod tests {
     }
 }
 
+#[allow(dead_code)]
 fn detect_media_type_from_manifest(bytes: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     value
@@ -3705,13 +3802,16 @@ async fn manifest_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
 
+    const MAX_MANIFEST_SIZE: usize = 4 * 1024 * 1024;
+    let limit = state.config.max_request_body_bytes.min(MAX_MANIFEST_SIZE);
+
     let (idle_timeout, min_rate) = state.current_stream_guard_params();
     let audit_only =
         state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
     let bytes = match read_body_limited(
         body,
         content_length,
-        state.config.max_request_body_bytes,
+        limit,
         idle_timeout,
         Duration::from_secs(state.config.upload_rate_grace_period_secs),
         Duration::from_secs(state.config.upload_rate_window_secs),
@@ -3724,6 +3824,10 @@ async fn manifest_put(
         Err(resp) => return resp,
     };
 
+    if bytes.len() > MAX_MANIFEST_SIZE {
+        return errors::payload_too_large().into_response();
+    }
+
     if !is_valid_repo_name(name) {
         return errors::name_invalid().into_response();
     }
@@ -3731,10 +3835,43 @@ async fn manifest_put(
         return errors::manifest_invalid().into_response();
     }
 
-    let media_type = detect_media_type_from_manifest(&bytes)
+    let manifest_json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return errors::manifest_invalid().into_response(),
+    };
+
+    if let Some(schema_version) = manifest_json.get("schemaVersion").and_then(|v| v.as_i64()) {
+        if schema_version == 1 {
+            return errors::manifest_invalid().into_response();
+        }
+    }
+
+    let media_type = manifest_json
+        .get("mediaType")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
         .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+    if media_type.starts_with("application/vnd.docker.distribution.manifest.v1") {
+        return errors::manifest_invalid().into_response();
+    }
     if !is_supported_manifest_media_type(&media_type) {
         return errors::not_implemented().into_response();
+    }
+
+    // Verify all referenced layer/config blobs exist in storage.
+    if let Some(refs) = crate::manifest_refs::parse_manifest_refs(&bytes) {
+        for blob_str in &refs.blobs {
+            if blob_str == "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+                || blob_str == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            {
+                continue;
+            }
+            if let Ok(blob_d) = Digest::parse(blob_str) {
+                if state.storage.head_blob(&blob_d).await.is_err() {
+                    return errors::manifest_blob_unknown(blob_str).into_response();
+                }
+            }
+        }
     }
 
     // Best-effort: pre-parse referrer info. We only persist it if the manifest is accepted.
@@ -3848,7 +3985,7 @@ async fn manifest_put(
     headers.insert("Content-Type", meta.media_type.parse().unwrap());
     headers.insert(
         "Location",
-        format!("/v2/{name}/manifests/{}", reference)
+        format!("/v2/{name}/manifests/{}", computed.as_str())
             .parse()
             .unwrap(),
     );
@@ -4439,7 +4576,7 @@ async fn upload_session(
     let policy = state.config.resolved_upload_policy_for_repo(name);
 
     match method {
-        Method::GET => match state.storage.upload_status(uuid).await {
+        Method::GET | Method::HEAD => match state.storage.upload_status(uuid).await {
             Ok(meta) => {
                 let mut headers = registry_headers();
                 headers.insert("Location", location.parse().unwrap());
@@ -4458,6 +4595,12 @@ async fn upload_session(
             Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
                 errors::internal_error().into_response()
             }
+        },
+        Method::DELETE => match state.storage.abort_upload(uuid).await {
+            Ok(()) => (StatusCode::NO_CONTENT, registry_headers()).into_response(),
+            Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
+            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
+            Err(_) => errors::internal_error().into_response(),
         },
         Method::PATCH => {
             // Enforce that Content-Range starts at the current offset.

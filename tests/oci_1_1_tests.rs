@@ -890,3 +890,245 @@ async fn test_concurrent_chunk_uploads_integrity() {
         handle.await.expect("upload task completed successfully");
     }
 }
+
+#[tokio::test]
+async fn test_audit_remediation_suite() {
+    let port = pick_unused_port();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (cfg_path, log_path) = write_config(&temp_dir, port);
+    let _server = spawn_server(&cfg_path, &log_path);
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_ready(&base_url, &log_path).await;
+
+    let repo = "audit/test-repo";
+
+    // 1. Unauthenticated GET /v2/_catalog returns 401 with WWW-Authenticate scope="registry:catalog:*"
+    let cat_resp = client.get(format!("{base_url}/v2/_catalog")).send().await.expect("get catalog");
+    assert_eq!(cat_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let auth_header = cat_resp.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap();
+    assert!(auth_header.contains("registry:catalog:*"));
+    assert_eq!(
+        cat_resp.headers().get("docker-distribution-api-version").unwrap().to_str().unwrap(),
+        "registry/2.0"
+    );
+
+    // 2. GET /v2/<repo>/blobs/notadigestformat returns 400 Bad Request with application/json
+    let invalid_blob_resp = client.get(format!("{base_url}/v2/{repo}/blobs/notadigestformat")).send().await.expect("get blob");
+    assert_eq!(invalid_blob_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_blob_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        "application/json"
+    );
+    let invalid_body: serde_json::Value = invalid_blob_resp.json().await.expect("json");
+    assert_eq!(invalid_body["errors"][0]["code"], "DIGEST_INVALID");
+
+    // 3. Blob Upload Session: HEAD and DELETE /v2/<repo>/blobs/uploads/<uuid>
+    let upload_start_resp = client
+        .post(format!("{base_url}/v2/{repo}/blobs/uploads/"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_LENGTH, "0")
+        .send()
+        .await
+        .expect("start upload");
+    assert_eq!(upload_start_resp.status(), reqwest::StatusCode::ACCEPTED);
+    let location = upload_start_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    let upload_uuid = upload_start_resp.headers().get("docker-upload-uuid").unwrap().to_str().unwrap();
+
+    let upload_url = if location.starts_with("http") {
+        location.to_string()
+    } else {
+        format!("{base_url}{location}")
+    };
+
+    // HEAD upload session -> 204 No Content
+    let head_upload_resp = client.head(&upload_url).send().await.expect("head upload");
+    assert_eq!(head_upload_resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        head_upload_resp.headers().get("docker-upload-uuid").unwrap().to_str().unwrap(),
+        upload_uuid
+    );
+
+    // DELETE upload session -> 204 No Content
+    let del_upload_resp = client
+        .delete(&upload_url)
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("delete upload");
+    assert_eq!(del_upload_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // Subsequent HEAD after DELETE -> 404 Not Found
+    let head_after_del = client.head(&upload_url).send().await.expect("head deleted upload");
+    assert_eq!(head_after_del.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 4. SHA-512 Blob Upload and Verification
+    let sha512_data = b"cryptographic sha512 payload test content";
+    let mut hasher = sha2::Sha512::new();
+    hasher.update(sha512_data);
+    let sha512_hex = hex::encode(hasher.finalize());
+    let sha512_digest = format!("sha512:{sha512_hex}");
+
+    let upload_512_start = client
+        .post(format!("{base_url}/v2/{repo}/blobs/uploads/"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_LENGTH, "0")
+        .send()
+        .await
+        .expect("start upload sha512");
+    let loc_512 = upload_512_start.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    let put_512_url = if loc_512.starts_with("http") {
+        format!("{loc_512}&digest={sha512_digest}")
+    } else {
+        format!("{base_url}{loc_512}?digest={sha512_digest}")
+    };
+
+    let put_512_resp = client
+        .put(&put_512_url)
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(sha512_data.to_vec())
+        .send()
+        .await
+        .expect("put sha512 blob");
+    assert_eq!(put_512_resp.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        put_512_resp.headers().get("docker-content-digest").unwrap().to_str().unwrap(),
+        sha512_digest
+    );
+
+    let get_512_resp = client.get(format!("{base_url}/v2/{repo}/blobs/{sha512_digest}")).send().await.expect("get sha512 blob");
+    assert_eq!(get_512_resp.status(), reqwest::StatusCode::OK);
+    let downloaded_512 = get_512_resp.bytes().await.expect("bytes");
+    assert_eq!(downloaded_512.as_ref(), sha512_data);
+
+    // 5. Manifest Upload: Missing Layer Blob Check -> 400 MANIFEST_BLOB_UNKNOWN
+    let unuploaded_blob_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    let manifest_missing_blob = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "size": 2
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": unuploaded_blob_digest,
+                "size": 100
+            }
+        ]
+    });
+    let missing_blob_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/missing-blob-tag"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(serde_json::to_vec(&manifest_missing_blob).unwrap())
+        .send()
+        .await
+        .expect("put manifest missing blob");
+    assert_eq!(missing_blob_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let missing_err: serde_json::Value = missing_blob_resp.json().await.expect("json");
+    assert_eq!(missing_err["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+
+    // 6. Manifest Upload: Schema 1 Rejection -> 400 MANIFEST_INVALID
+    let schema1_manifest = json!({
+        "schemaVersion": 1,
+        "name": repo,
+        "tag": "schema1-tag",
+        "architecture": "amd64",
+        "fsLayers": []
+    });
+    let schema1_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/schema1-tag"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.docker.distribution.manifest.v1+json")
+        .body(serde_json::to_vec(&schema1_manifest).unwrap())
+        .send()
+        .await
+        .expect("put schema1");
+    assert_eq!(schema1_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let s1_err: serde_json::Value = schema1_resp.json().await.expect("json");
+    assert_eq!(s1_err["errors"][0]["code"], "MANIFEST_INVALID");
+
+    // 7. Manifest Upload: Malformed JSON -> 400 MANIFEST_INVALID
+    let malformed_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/malformed-tag"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(b"{invalid-json:".to_vec())
+        .send()
+        .await
+        .expect("put malformed");
+    assert_eq!(malformed_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let malformed_err: serde_json::Value = malformed_resp.json().await.expect("json");
+    assert_eq!(malformed_err["errors"][0]["code"], "MANIFEST_INVALID");
+
+    // 8. Manifest Upload: Canonical Location Header returned
+    let layer_data = b"layer content for canonical location test";
+    let layer_digest = upload_blob(&client, &base_url, repo, layer_data).await;
+    let config_data = b"{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[]}}";
+    let config_digest = upload_blob(&client, &base_url, repo, config_data).await;
+
+    let valid_manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_data.len()
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer_data.len()
+            }
+        ]
+    });
+    let valid_manifest_bytes = serde_json::to_vec(&valid_manifest).unwrap();
+    let computed_digest = format!("sha256:{}", hex_sha256(&valid_manifest_bytes));
+
+    let put_valid_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/valid-tag"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(valid_manifest_bytes)
+        .send()
+        .await
+        .expect("put valid manifest");
+    assert_eq!(put_valid_resp.status(), reqwest::StatusCode::CREATED);
+    let loc_header = put_valid_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert_eq!(loc_header, format!("/v2/{repo}/manifests/{computed_digest}"));
+
+    // 9. OCI 1.1 Tag Deletion: DELETE /v2/<repo>/tags/reference/<tag>
+    let del_tag_resp = client
+        .delete(format!("{base_url}/v2/{repo}/tags/reference/valid-tag"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("delete tag");
+    assert_eq!(del_tag_resp.status(), reqwest::StatusCode::ACCEPTED);
+
+    // Subsequent GET manifest by tag -> 404
+    let get_deleted_tag = client
+        .get(format!("{base_url}/v2/{repo}/manifests/valid-tag"))
+        .send()
+        .await
+        .expect("get deleted tag");
+    assert_eq!(get_deleted_tag.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 10. Tags Pagination Cursor: last query past end returns [] with no next Link
+    let tags_resp = client
+        .get(format!("{base_url}/v2/{repo}/tags/list?last=zzzzzzzz"))
+        .send()
+        .await
+        .expect("get tags cursor");
+    assert_eq!(tags_resp.status(), reqwest::StatusCode::OK);
+    assert!(tags_resp.headers().get(header::LINK).is_none());
+    let tags_body: serde_json::Value = tags_resp.json().await.expect("json");
+    assert_eq!(tags_body["tags"].as_array().unwrap().len(), 0);
+}
+

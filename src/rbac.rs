@@ -77,6 +77,13 @@ pub fn grant_scopes_by_prefix(
     let mut out: Vec<security::TokenScope> = Vec::new();
 
     for req in requested {
+        if req.typ == "registry" && (req.name == "catalog" || req.name == "*") {
+            let has_catalog = grants.iter().any(|g| g.repo_prefix == "*");
+            if has_catalog {
+                out.push(req.clone());
+            }
+            continue;
+        }
         if req.typ != "repository" {
             continue;
         }
