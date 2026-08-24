@@ -377,28 +377,28 @@ pub async fn require_auth_middleware(
             state.config.token_ttl_secs,
         ) {
             Ok(claims) => {
-                if !bearer_claims_are_authenticated(&claims) {
-                    return unauthorized_registry_challenge(&state, Some(repo_name));
-                }
-
                 let required_action = match action {
                     "push" => security::RepoAction::Push,
                     "delete" => security::RepoAction::Delete,
                     _ => security::RepoAction::Pull,
                 };
-                if security::token_allows_repo_action(&claims, repo_name, required_action) {
-                    if action == "push" {
-                        if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                            if !repo_allowed(allowlist, repo_name) {
-                                return errors::denied("push not allowed for this repository")
-                                    .into_response();
-                            }
-                        }
-                    }
-                    return next.run(request).await;
-                } else {
+                if !security::token_allows_repo_action(&claims, repo_name, required_action) {
                     return errors::denied("access to repository denied").into_response();
                 }
+
+                if !bearer_claims_are_authenticated(&claims) && !state.config.anonymous_pull {
+                    return unauthorized_registry_challenge(&state, Some(repo_name));
+                }
+
+                if action == "push" {
+                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+                        if !repo_allowed(allowlist, repo_name) {
+                            return errors::denied("push not allowed for this repository")
+                                .into_response();
+                        }
+                    }
+                }
+                return next.run(request).await;
             }
             Err(_) => {
                 return unauthorized_registry_challenge(&state, Some(repo_name));

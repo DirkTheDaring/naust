@@ -197,16 +197,15 @@ pub fn verify_bearer_token_bound(
         }
     }
 
-    let Some(iat) = claims.iat else {
-        return Err(TokenError::InvalidPayload);
-    };
-    if claims.exp < iat {
-        return Err(TokenError::InvalidPayload);
-    }
-    if max_ttl_secs > 0 {
-        let ttl = claims.exp.saturating_sub(iat);
-        if ttl > max_ttl_secs {
+    if let Some(iat) = claims.iat {
+        if claims.exp < iat {
             return Err(TokenError::InvalidPayload);
+        }
+        if max_ttl_secs > 0 {
+            let ttl = claims.exp.saturating_sub(iat);
+            if ttl > max_ttl_secs {
+                return Err(TokenError::InvalidPayload);
+            }
         }
     }
 
@@ -231,16 +230,15 @@ pub fn verify_bearer_token_bound_with_keys(
         }
     }
 
-    let Some(iat) = claims.iat else {
-        return Err(TokenError::InvalidPayload);
-    };
-    if claims.exp < iat {
-        return Err(TokenError::InvalidPayload);
-    }
-    if max_ttl_secs > 0 {
-        let ttl = claims.exp.saturating_sub(iat);
-        if ttl > max_ttl_secs {
+    if let Some(iat) = claims.iat {
+        if claims.exp < iat {
             return Err(TokenError::InvalidPayload);
+        }
+        if max_ttl_secs > 0 {
+            let ttl = claims.exp.saturating_sub(iat);
+            if ttl > max_ttl_secs {
+                return Err(TokenError::InvalidPayload);
+            }
         }
     }
 

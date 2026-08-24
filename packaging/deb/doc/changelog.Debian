@@ -1,3 +1,9 @@
+registry-rust (0.8.5-1) unstable; urgency=medium
+
+  * Bump version to 0.8.5.
+
+ -- Baldur <baldur@email.de>  Mon, 24 Aug 2026 16:51:23 +0200
+
 registry-rust (0.8.4-1) unstable; urgency=medium
 
   * Bump version to 0.8.4.
