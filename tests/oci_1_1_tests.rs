@@ -638,3 +638,255 @@ async fn test_oci_1_1_index_referrer_and_empty_config() {
     assert_eq!(manifests[0]["mediaType"].as_str().unwrap(), "application/vnd.oci.image.index.v1+json");
     assert_eq!(manifests[0]["artifactType"].as_str().unwrap(), "application/vnd.example.attestation.v1");
 }
+
+#[tokio::test]
+async fn test_concurrent_referrers_push_race_condition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = pick_unused_port();
+    let (cfg, log_path) = write_config(&dir, port);
+    let _srv = spawn_server(&cfg, &log_path);
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_ready(&base_url, &log_path).await;
+
+    let repo = "test/concurrency";
+
+    // 1. Upload base image
+    let config_bytes = b"{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[]}}";
+    let config_digest = upload_blob(&client, &base_url, repo, config_bytes).await;
+
+    let base_manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_bytes.len()
+        },
+        "layers": []
+    });
+
+    let base_manifest_bytes = serde_json::to_vec(&base_manifest).unwrap();
+    let base_manifest_hex = hex_sha256(&base_manifest_bytes);
+    let base_manifest_digest = format!("sha256:{base_manifest_hex}");
+
+    let put_base_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/v1.0.0"))
+        .basic_auth("demo", Some("demo"))
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(base_manifest_bytes.clone())
+        .send()
+        .await
+        .expect("put base manifest");
+    assert_eq!(put_base_resp.status(), reqwest::StatusCode::CREATED);
+
+    // 2. Spawn 10 concurrent tasks simultaneously pushing 10 distinct artifacts referencing the base image
+    const CONCURRENT_ARTIFACTS: usize = 10;
+    let mut handles = Vec::new();
+
+    for i in 0..CONCURRENT_ARTIFACTS {
+        let base_url_c = base_url.clone();
+        let base_digest_c = base_manifest_digest.clone();
+        let base_size = base_manifest_bytes.len();
+
+        let handle = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let art_manifest = json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "artifactType": format!("application/vnd.example.item.{i}"),
+                "config": {
+                    "mediaType": "application/vnd.oci.empty.v1+json",
+                    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                    "size": 2
+                },
+                "layers": [],
+                "subject": {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": base_digest_c,
+                    "size": base_size
+                },
+                "annotations": {
+                    "index": format!("{i}")
+                }
+            });
+
+            let bytes = serde_json::to_vec(&art_manifest).unwrap();
+            let hex = hex_sha256(&bytes);
+            let digest = format!("sha256:{hex}");
+
+            let resp = client
+                .put(format!("{base_url_c}/v2/test/concurrency/manifests/{digest}"))
+                .basic_auth("demo", Some("demo"))
+                .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(bytes)
+                .send()
+                .await
+                .expect("put concurrent artifact");
+            assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+            digest
+        });
+        handles.push(handle);
+    }
+
+    let mut pushed_digests = Vec::new();
+    for handle in handles {
+        let d = handle.await.expect("task completed");
+        pushed_digests.push(d);
+    }
+    assert_eq!(pushed_digests.len(), CONCURRENT_ARTIFACTS);
+
+    // 3. Query referrers: verify ALL 10 artifacts are present with 0 dropped entries
+    let ref_resp = client
+        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .send()
+        .await
+        .expect("get referrers");
+    assert_eq!(ref_resp.status(), reqwest::StatusCode::OK);
+    let ref_json: serde_json::Value = ref_resp.json().await.unwrap();
+    let manifests = ref_json["manifests"].as_array().expect("manifests array");
+    assert_eq!(manifests.len(), CONCURRENT_ARTIFACTS, "all concurrent referrers must be preserved");
+
+    for digest in pushed_digests {
+        assert!(
+            manifests.iter().any(|m| m["digest"].as_str() == Some(&digest)),
+            "digest {digest} must be in referrers list"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_and_traversal_upload_uuid_rejection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = pick_unused_port();
+    let (cfg, log_path) = write_config(&dir, port);
+    let _srv = spawn_server(&cfg, &log_path);
+
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_ready(&base_url, &log_path).await;
+
+    let invalid_uuids = [
+        "not-a-valid-uuid",
+        "../../etc/passwd",
+        "..",
+        ".",
+        "12345",
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-extra",
+    ];
+
+    for bad_uuid in invalid_uuids {
+        let get_resp = client
+            .get(format!("{base_url}/v2/test/app/blobs/uploads/{bad_uuid}"))
+            .basic_auth("demo", Some("demo"))
+            .send()
+            .await
+            .expect("get bad upload uuid");
+        assert!(!get_resp.status().is_success(), "must reject bad upload uuid on GET");
+
+        let patch_resp = client
+            .patch(format!("{base_url}/v2/test/app/blobs/uploads/{bad_uuid}"))
+            .basic_auth("demo", Some("demo"))
+            .body(vec![1, 2, 3])
+            .send()
+            .await
+            .expect("patch bad upload uuid");
+        assert!(!patch_resp.status().is_success(), "must reject bad upload uuid on PATCH");
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_chunk_uploads_integrity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = pick_unused_port();
+    let (cfg, log_path) = write_config(&dir, port);
+    let _srv = spawn_server(&cfg, &log_path);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_ready(&base_url, &log_path).await;
+
+    const NUM_PARALLEL_UPLOADS: usize = 6;
+    let mut handles = Vec::new();
+
+    for i in 0..NUM_PARALLEL_UPLOADS {
+        let base_url_c = base_url.clone();
+        let handle = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let repo = format!("test/chunks-{i}");
+
+            // Start upload
+            let start_resp = client
+                .post(format!("{base_url_c}/v2/{repo}/blobs/uploads/"))
+                .basic_auth("demo", Some("demo"))
+                .header(header::CONTENT_LENGTH, "0")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(start_resp.status(), reqwest::StatusCode::ACCEPTED);
+            let location = start_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+
+            // Prepare 4 chunks of 32KB each
+            let mut total_bytes = Vec::new();
+            let mut current_offset: usize = 0;
+
+            for c in 0..4 {
+                let chunk_data = vec![(i * 10 + c) as u8; 32 * 1024];
+                total_bytes.extend_from_slice(&chunk_data);
+
+                let patch_url = if location.starts_with("http") {
+                    location.clone()
+                } else {
+                    format!("{base_url_c}{location}")
+                };
+
+                let range_hdr = format!("{}-{}", current_offset, current_offset + chunk_data.len() - 1);
+                current_offset += chunk_data.len();
+
+                let patch_resp = client
+                    .patch(&patch_url)
+                    .basic_auth("demo", Some("demo"))
+                    .header("Content-Range", range_hdr)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(chunk_data)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(patch_resp.status(), reqwest::StatusCode::ACCEPTED);
+            }
+
+            let expected_digest = format!("sha256:{}", hex_sha256(&total_bytes));
+            let put_url = if location.starts_with("http") {
+                format!("{location}&digest={expected_digest}")
+            } else {
+                format!("{base_url_c}{location}?digest={expected_digest}")
+            };
+
+            let put_resp = client
+                .put(&put_url)
+                .basic_auth("demo", Some("demo"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(put_resp.status(), reqwest::StatusCode::CREATED);
+
+            // Verify blob HEAD
+            let head_resp = client
+                .head(format!("{base_url_c}/v2/{repo}/blobs/{expected_digest}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(head_resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                head_resp.headers().get(header::CONTENT_LENGTH).unwrap().to_str().unwrap(),
+                total_bytes.len().to_string()
+            );
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.expect("upload task completed successfully");
+    }
+}

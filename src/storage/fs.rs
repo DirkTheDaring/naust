@@ -160,21 +160,51 @@ impl SerializableSha256 {
     }
 }
 
+const HASH_SHARDS: usize = 64;
+const REFERRER_SHARDS: usize = 64;
+
+fn shard_index(key: &str, num_shards: usize) -> usize {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(key, &mut hasher);
+    std::hash::Hasher::finish(&hasher) as usize % num_shards
+}
+
 #[derive(Debug)]
 pub struct FsStorage {
     root: PathBuf,
     max_upload_bytes: u64,
-    upload_hashes: Mutex<std::collections::HashMap<String, SerializableSha256>>,
+    upload_hashes: Vec<Mutex<std::collections::HashMap<String, SerializableSha256>>>,
+    referrer_locks: Vec<Mutex<()>>,
 }
 
 impl FsStorage {
     pub fn new(root: PathBuf, max_upload_bytes: u64) -> Self {
         ensure_dir(&root);
+        let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
+        for _ in 0..HASH_SHARDS {
+            upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
+        }
+        let mut referrer_locks = Vec::with_capacity(REFERRER_SHARDS);
+        for _ in 0..REFERRER_SHARDS {
+            referrer_locks.push(Mutex::new(()));
+        }
         Self {
             root,
             max_upload_bytes,
-            upload_hashes: Mutex::new(std::collections::HashMap::new()),
+            upload_hashes,
+            referrer_locks,
         }
+    }
+
+    fn upload_hash_shard(&self, uuid: &str) -> &Mutex<std::collections::HashMap<String, SerializableSha256>> {
+        let idx = shard_index(uuid, HASH_SHARDS);
+        &self.upload_hashes[idx]
+    }
+
+    fn referrer_lock_shard(&self, name: &str, subject: &Digest) -> &Mutex<()> {
+        let key = format!("{name}:{}", subject.hex());
+        let idx = shard_index(&key, REFERRER_SHARDS);
+        &self.referrer_locks[idx]
     }
 
     fn upload_hash_path(&self, uuid: &str) -> PathBuf {
@@ -243,9 +273,10 @@ impl FsStorage {
     }
 
     async fn ensure_upload_hash_state(&self, uuid: &str, current_len: u64) -> Option<SerializableSha256> {
+        let shard = self.upload_hash_shard(uuid);
         // Fast path: in-memory.
         {
-            let map = self.upload_hashes.lock().await;
+            let map = shard.lock().await;
             if let Some(st) = map.get(uuid) {
                 if st.total_len == current_len {
                     return Some(st.clone());
@@ -258,7 +289,7 @@ impl FsStorage {
             .load_upload_hash_state_from_disk(uuid, current_len)
             .await
         {
-            let mut map = self.upload_hashes.lock().await;
+            let mut map = shard.lock().await;
             map.insert(uuid.to_string(), st.clone());
             return Some(st);
         }
@@ -267,7 +298,7 @@ impl FsStorage {
         if current_len == 0 {
             let st = SerializableSha256::new();
             let _ = self.persist_upload_hash_state(uuid, &st).await;
-            let mut map = self.upload_hashes.lock().await;
+            let mut map = shard.lock().await;
             map.insert(uuid.to_string(), st.clone());
             return Some(st);
         }
@@ -277,7 +308,7 @@ impl FsStorage {
             .rebuild_upload_hash_state_from_data_file(uuid, current_len)
             .await?;
         let _ = self.persist_upload_hash_state(uuid, &st).await;
-        let mut map = self.upload_hashes.lock().await;
+        let mut map = shard.lock().await;
         map.insert(uuid.to_string(), st.clone());
         Some(st)
     }
@@ -710,7 +741,8 @@ impl Storage for FsStorage {
         // Track + persist hash state from the beginning so resumes after restart are cheap.
         let st = SerializableSha256::new();
         let _ = self.persist_upload_hash_state(&uuid, &st).await;
-        let mut map = self.upload_hashes.lock().await;
+        let shard = self.upload_hash_shard(&uuid);
+        let mut map = shard.lock().await;
         map.insert(uuid.clone(), st);
 
         Ok(super::UploadMeta { uuid, offset: 0 })
@@ -763,14 +795,15 @@ impl Storage for FsStorage {
         file.flush().await.map_err(map_fs_io_err)?;
 
         // Update hash state (persisted). If we can't keep it consistent, drop state and fall back.
+        let shard = self.upload_hash_shard(uuid);
         if let Some(mut st) = self.ensure_upload_hash_state(uuid, current_len).await {
             if st.total_len == current_len {
                 st.update(&chunk);
                 let _ = self.persist_upload_hash_state(uuid, &st).await;
-                let mut map = self.upload_hashes.lock().await;
+                let mut map = shard.lock().await;
                 map.insert(uuid.to_string(), st);
             } else {
-                let mut map = self.upload_hashes.lock().await;
+                let mut map = shard.lock().await;
                 map.remove(uuid);
             }
         }
@@ -827,8 +860,9 @@ impl Storage for FsStorage {
         let t_hash = Instant::now();
 
         // Prefer persisted state (and in-memory cache) to avoid a second full reread at finalize.
+        let shard = self.upload_hash_shard(uuid);
         let state_from_mem = {
-            let mut map = self.upload_hashes.lock().await;
+            let mut map = shard.lock().await;
             map.remove(uuid)
         };
 
@@ -939,8 +973,11 @@ impl Storage for FsStorage {
 
     async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
         // Best-effort cleanup: drop in-memory state.
-        let mut map = self.upload_hashes.lock().await;
-        map.remove(uuid);
+        let shard = self.upload_hash_shard(uuid);
+        {
+            let mut map = shard.lock().await;
+            map.remove(uuid);
+        }
 
         // Best-effort cleanup: remove persisted hash state.
         let hash_path = self.upload_hash_path(uuid);
@@ -984,6 +1021,7 @@ impl Storage for FsStorage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
+        let _lock = self.referrer_lock_shard(name, subject).lock().await;
         let dir = self.root.join("repos").join(name).join("referrers");
         ensure_dir(&dir);
 
@@ -1005,6 +1043,7 @@ impl Storage for FsStorage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
+        let _lock = self.referrer_lock_shard(name, subject).lock().await;
         let path = self.referrers_path(name, subject);
         let mut existing = self.list_referrers(name, subject).await?;
         let orig_len = existing.len();

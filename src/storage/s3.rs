@@ -15,7 +15,15 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
+
+const REFERRER_SHARDS: usize = 64;
+
+fn shard_index(key: &str, num_shards: usize) -> usize {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(key, &mut hasher);
+    std::hash::Hasher::finish(&hasher) as usize % num_shards
+}
 
 #[derive(Debug)]
 pub struct S3Storage {
@@ -25,6 +33,7 @@ pub struct S3Storage {
     prefix: String,
     max_upload_bytes: u64,
     client: OnceCell<Client>,
+    referrer_locks: Vec<Mutex<()>>,
 }
 
 impl S3Storage {
@@ -35,6 +44,10 @@ impl S3Storage {
         prefix: String,
         max_upload_bytes: u64,
     ) -> Self {
+        let mut referrer_locks = Vec::with_capacity(REFERRER_SHARDS);
+        for _ in 0..REFERRER_SHARDS {
+            referrer_locks.push(Mutex::new(()));
+        }
         Self {
             endpoint,
             region,
@@ -42,7 +55,14 @@ impl S3Storage {
             prefix,
             max_upload_bytes,
             client: OnceCell::new(),
+            referrer_locks,
         }
+    }
+
+    fn referrer_lock_shard(&self, name: &str, subject: &Digest) -> &Mutex<()> {
+        let key = format!("{name}:{}", subject.hex());
+        let idx = shard_index(&key, REFERRER_SHARDS);
+        &self.referrer_locks[idx]
     }
 
     fn bucket(&self) -> Result<&str, StorageError> {
@@ -746,6 +766,7 @@ impl Storage for S3Storage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
+        let _lock = self.referrer_lock_shard(name, subject).lock().await;
         let client = self.client().await?;
         let bucket = self.bucket()?;
         let key = self.referrers_key(name, subject);
@@ -774,6 +795,7 @@ impl Storage for S3Storage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
+        let _lock = self.referrer_lock_shard(name, subject).lock().await;
         let client = self.client().await?;
         let bucket = self.bucket()?;
         let key = self.referrers_key(name, subject);

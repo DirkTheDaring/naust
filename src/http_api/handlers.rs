@@ -4467,6 +4467,10 @@ async fn upload_session(
         return errors::name_invalid().into_response();
     }
 
+    if uuid::Uuid::parse_str(uuid).is_err() {
+        return errors::blob_upload_unknown().into_response();
+    }
+
     let location = format!("/v2/{name}/blobs/uploads/{uuid}");
 
     let policy = state.config.resolved_upload_policy_for_repo(name);

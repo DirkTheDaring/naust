@@ -7,9 +7,15 @@ WORKDIR /app
 
 RUN apk add --no-cache build-base musl-dev
 
-# Cache deps first.
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+# Copy source code and vendor dependencies
+COPY . .
+
+# Ensure path dependency for acmecert-core is available at /acmecert/crates/acmecert-core
+RUN if [ -d "vendor/acmecert" ]; then \
+      mkdir -p /acmecert/crates \
+      && cp -r vendor/acmecert/crates/acmecert-core /acmecert/crates/ \
+      && cp vendor/acmecert/Cargo.toml /acmecert/Cargo.toml; \
+    fi
 
 RUN cargo build --release
 
