@@ -274,6 +274,10 @@ pub async fn require_auth_middleware(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
+    if path == "/v2" {
+        return crate::http_api::handlers::v2_redirect().await;
+    }
+
     // Enforce 405 Method Not Allowed on read-only/specific endpoints before auth challenge
     if path == "/v2/_catalog" || path == "/v2/_oci/ext/discover" {
         if method != http::Method::GET && method != http::Method::HEAD {
@@ -301,10 +305,17 @@ pub async fn require_auth_middleware(
                 }
                 "catalog"
             } else {
-                if state.config.anonymous_pull {
+                if state.config.anonymous_pull && bearer_token_from_headers(request.headers()).is_none() {
                     return next.run(request).await;
                 }
                 "pull"
+            }
+        }
+        http::Method::DELETE => {
+            if path.contains("/blobs/uploads/") {
+                "push"
+            } else {
+                "delete"
             }
         }
         _ => "push",
@@ -318,8 +329,12 @@ pub async fn require_auth_middleware(
                 &state.config.token_service,
                 state.config.token_ttl_secs,
             ) {
-                if bearer_claims_are_authenticated(&claims) && security::token_allows_catalog_action(&claims) {
-                    return next.run(request).await;
+                if bearer_claims_are_authenticated(&claims) {
+                    if security::token_allows_catalog_action(&claims) {
+                        return next.run(request).await;
+                    } else {
+                        return errors::denied("catalog access denied").into_response();
+                    }
                 }
             }
         }
@@ -349,7 +364,11 @@ pub async fn require_auth_middleware(
                 return unauthorized_registry_challenge(&state, Some(repo_name));
             }
 
-            let required_action = if action == "push" { security::RepoAction::Push } else { security::RepoAction::Pull };
+            let required_action = match action {
+                "push" => security::RepoAction::Push,
+                "delete" => security::RepoAction::Delete,
+                _ => security::RepoAction::Pull,
+            };
             if security::token_allows_repo_action(&claims, repo_name, required_action) {
                 if action == "push" {
                     if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
@@ -360,6 +379,8 @@ pub async fn require_auth_middleware(
                     }
                 }
                 return next.run(request).await;
+            } else {
+                return errors::denied("access to repository denied").into_response();
             }
         }
     }

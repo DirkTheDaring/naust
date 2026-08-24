@@ -1036,7 +1036,7 @@ async fn main() {
     // `/v2/*rest` owns all registry API subpaths (repo names can contain `/`).
     // We gate write methods (push) via middleware; GET/HEAD stay anonymous.
     let v2 = Router::new()
-        .route("/v2", get(handlers::ping))
+        .route("/v2", get(handlers::v2_redirect))
         .route("/v2/", get(handlers::ping))
         .route("/v2/*rest", any(handlers::v2_dispatch))
         .layer(v2_body_limit)

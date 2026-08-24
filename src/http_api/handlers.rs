@@ -168,6 +168,16 @@ fn decide_token_scopes_for_request(
     })
 }
 
+pub async fn v2_redirect() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::LOCATION, http::HeaderValue::from_static("/v2/"));
+    headers.insert(
+        http::header::HeaderName::from_static("docker-distribution-api-version"),
+        http::HeaderValue::from_static("registry/2.0"),
+    );
+    (StatusCode::MOVED_PERMANENTLY, headers).into_response()
+}
+
 pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Response {
     // Many clients (Docker/Podman) perform auth negotiation via GET /v2/.
     // For "anonymous pull + authenticated push" we still advertise auth here so
@@ -2687,16 +2697,40 @@ async fn manifest_by_reference_proxy_only(
 }
 
 fn is_valid_repo_name(name: &str) -> bool {
-    if name.is_empty() || name.starts_with('/') {
+    if name.is_empty() || name.len() > 255 || name.starts_with('/') || name.ends_with('/') {
         return false;
     }
     for segment in name.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
+        if segment.is_empty() {
+            return false;
+        }
+        let mut chars = segment.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+            return false;
+        }
+        let mut prev_sep = false;
+        let mut last_char = first;
+        for c in chars {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                prev_sep = false;
+            } else if matches!(c, '.' | '_' | '-') {
+                if prev_sep {
+                    return false;
+                }
+                prev_sep = true;
+            } else {
+                return false;
+            }
+            last_char = c;
+        }
+        if prev_sep || (!last_char.is_ascii_lowercase() && !last_char.is_ascii_digit()) {
             return false;
         }
     }
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    true
 }
 
 fn is_valid_tag(tag: &str) -> bool {
@@ -3110,6 +3144,10 @@ mod tests {
         assert!(!is_valid_repo_name(".."));
         assert!(!is_valid_repo_name("a/../b"));
         assert!(!is_valid_repo_name("a b"));
+        assert!(!is_valid_repo_name("INVALID/UPPERCASE"));
+        assert!(!is_valid_repo_name("-invalid-leading-dash"));
+        assert!(!is_valid_repo_name("invalid__double_dot"));
+        assert!(!is_valid_repo_name("invalid..dots"));
     }
 
     #[test]
@@ -4331,10 +4369,9 @@ async fn upload_create(
     // Cross-repository blob mount:
     //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
     // If the blob exists and client has pull authorization on source repo, respond 201.
-    // Otherwise, fall back to standard 202 upload session per spec.
+    // Otherwise, fall back to standard 202 upload session per spec (or 403 if unauthorized).
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
         if let Ok(digest) = Digest::parse(mount_str) {
-            let mut mount_allowed = true;
             if let Some(from_repo) = query.get("from") {
                 if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
                     if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
@@ -4344,25 +4381,37 @@ async fn upload_create(
                         state.config.token_ttl_secs,
                     ) {
                         if !crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull) {
-                            mount_allowed = false;
+                            return errors::denied("pull permission denied on source repository").into_response();
                         }
                     }
                 }
-            } else if !state.config.automatic_crossmount {
-                mount_allowed = false;
-            }
 
-            if mount_allowed && state.storage.head_blob(&digest).await.is_ok() {
-                let mut resp_headers = registry_headers();
-                resp_headers.insert(
-                    "Location",
-                    format!("/v2/{name}/blobs/{}", digest.as_str())
-                        .parse()
-                        .unwrap(),
-                );
-                resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                resp_headers.insert("Content-Length", "0".parse().unwrap());
-                return (StatusCode::CREATED, resp_headers).into_response();
+                if state.storage.head_blob(&digest).await.is_ok() {
+                    let mut resp_headers = registry_headers();
+                    resp_headers.insert(
+                        "Location",
+                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                            .parse()
+                            .unwrap(),
+                    );
+                    resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    resp_headers.insert("Content-Length", "0".parse().unwrap());
+                    return (StatusCode::CREATED, resp_headers).into_response();
+                }
+                // Fallback to normal upload session if blob doesn't exist.
+            } else if state.config.automatic_crossmount {
+                if state.storage.head_blob(&digest).await.is_ok() {
+                    let mut resp_headers = registry_headers();
+                    resp_headers.insert(
+                        "Location",
+                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                            .parse()
+                            .unwrap(),
+                    );
+                    resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    resp_headers.insert("Content-Length", "0".parse().unwrap());
+                    return (StatusCode::CREATED, resp_headers).into_response();
+                }
             }
         }
     }

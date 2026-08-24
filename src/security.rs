@@ -87,6 +87,7 @@ fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), TokenErro
 pub enum RepoAction {
     Pull,
     Push,
+    Delete,
 }
 
 impl RepoAction {
@@ -94,6 +95,7 @@ impl RepoAction {
         match self {
             RepoAction::Pull => "pull",
             RepoAction::Push => "push",
+            RepoAction::Delete => "delete",
         }
     }
 }
@@ -296,11 +298,19 @@ pub fn issue_bearer_token_with_key(
 }
 
 pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAction) -> bool {
-    let action = action.as_str();
+    let action_str = action.as_str();
     claims
         .scopes
         .iter()
-        .any(|s| s.typ == "repository" && (s.name == repo || s.name == "*") && s.actions.iter().any(|a| a == action || a == "*"))
+        .any(|s| {
+            s.typ == "repository"
+                && (s.name == repo || s.name == "*")
+                && s.actions.iter().any(|a| {
+                    a == action_str
+                        || a == "*"
+                        || (action == RepoAction::Delete && (a == "push" || a == "delete"))
+                })
+        })
 }
 
 pub fn token_allows_catalog_action(claims: &TokenClaims) -> bool {

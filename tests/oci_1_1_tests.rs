@@ -1246,5 +1246,42 @@ async fn test_audit_remediation_suite() {
     );
     let unverified_err: serde_json::Value = unverified_resp.json().await.expect("json");
     assert_eq!(unverified_err["errors"][0]["code"], "MANIFEST_UNVERIFIED");
+
+    // 17. Base /v2 strict redirect to /v2/
+    let no_redirect_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let v2_resp = no_redirect_client
+        .get(format!("{base_url}/v2"))
+        .send()
+        .await
+        .expect("get /v2");
+    assert_eq!(v2_resp.status(), reqwest::StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        v2_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+        "/v2/"
+    );
+
+    // 18. Reject malformed repository names in tags route
+    for bad_name in &["INVALID/UPPERCASE", "-invalid-leading-dash", "invalid__double_dot", "invalid..dots"] {
+        let bad_repo_resp = client
+            .get(format!("{base_url}/v2/{bad_name}/tags/list"))
+            .send()
+            .await
+            .expect("get bad repo tags");
+        assert_eq!(bad_repo_resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    // 19. Delete unreferenced blob layer by digest -> 202 Accepted
+    let unreferenced_blob = b"unreferenced temporary blob data";
+    let unref_digest = upload_blob(&client, &base_url, repo, unreferenced_blob).await;
+    let del_blob_resp = client
+        .delete(format!("{base_url}/v2/{repo}/blobs/{unref_digest}"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("delete blob");
+    assert_eq!(del_blob_resp.status(), reqwest::StatusCode::ACCEPTED);
 }
 
