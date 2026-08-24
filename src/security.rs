@@ -67,20 +67,35 @@ fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), TokenErro
         return Err(TokenError::InvalidFormat);
     }
 
-    let (payload_b64, sig_b64) = token.split_once('.').ok_or(TokenError::InvalidFormat)?;
+    let parts: Vec<&str> = token.split('.').collect();
+    let (signed_input, payload_b64, sig_b64) = match parts.len() {
+        2 => (parts[0], parts[0], parts[1]),
+        3 => {
+            let signed_len = parts[0].len() + 1 + parts[1].len();
+            (&token[..signed_len], parts[1], parts[2])
+        }
+        _ => return Err(TokenError::InvalidFormat),
+    };
+
     if payload_b64.is_empty() || sig_b64.is_empty() {
         return Err(TokenError::InvalidFormat);
     }
 
     let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(sig_b64.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(sig_b64.as_bytes()))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(sig_b64.as_bytes()))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(sig_b64.as_bytes()))
         .map_err(|_| TokenError::InvalidSignature)?;
 
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload_b64.as_bytes()))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64.as_bytes()))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload_b64.as_bytes()))
         .map_err(|_| TokenError::InvalidPayload)?;
 
-    Ok((payload_b64, sig, payload_bytes))
+    Ok((signed_input, sig, payload_bytes))
 }
 
 #[allow(dead_code)]
@@ -103,13 +118,23 @@ impl RepoAction {
 
 #[cfg(test)]
 pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims, TokenError> {
-    let (payload_b64, sig, payload_bytes) = decode_token_parts(token)?;
+    let (signed_input, sig, payload_bytes) = decode_token_parts(token)?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
         .map_err(|_| TokenError::InvalidSigningKey)?;
-    mac.update(payload_b64.as_bytes());
-    mac.verify_slice(&sig)
-        .map_err(|_| TokenError::InvalidSignature)?;
+    mac.update(signed_input.as_bytes());
+    if mac.verify_slice(&sig).is_err() {
+        // Fallback check if signed over payload only
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() == 3 {
+            let mut mac2 = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
+                .map_err(|_| TokenError::InvalidSigningKey)?;
+            mac2.update(parts[1].as_bytes());
+            mac2.verify_slice(&sig).map_err(|_| TokenError::InvalidSignature)?;
+        } else {
+            return Err(TokenError::InvalidSignature);
+        }
+    }
 
     let claims: TokenClaims =
         serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
@@ -133,7 +158,7 @@ pub fn verify_bearer_token_with_keys(
         return Err(TokenError::InvalidSigningKey);
     }
 
-    let (payload_b64, sig, payload_bytes) = decode_token_parts(token)?;
+    let (signed_input, sig, payload_bytes) = decode_token_parts(token)?;
     let claims: TokenClaims =
         serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
 
@@ -152,14 +177,24 @@ pub fn verify_bearer_token_with_keys(
         }
     }
 
+    let parts: Vec<&str> = token.split('.').collect();
     let mut verified = false;
     for k in candidates {
         let mut mac = Hmac::<Sha256>::new_from_slice(k.key.as_bytes())
             .map_err(|_| TokenError::InvalidSigningKey)?;
-        mac.update(payload_b64.as_bytes());
+        mac.update(signed_input.as_bytes());
         if mac.verify_slice(&sig).is_ok() {
             verified = true;
             break;
+        }
+        if parts.len() == 3 {
+            let mut mac2 = Hmac::<Sha256>::new_from_slice(k.key.as_bytes())
+                .map_err(|_| TokenError::InvalidSigningKey)?;
+            mac2.update(parts[1].as_bytes());
+            if mac2.verify_slice(&sig).is_ok() {
+                verified = true;
+                break;
+            }
         }
     }
 
@@ -188,12 +223,8 @@ pub fn verify_bearer_token_bound(
     let claims = verify_bearer_token(signing_key, token)?;
 
     if let Some(aud) = claims.aud.as_deref() {
-        if !expected_aud.is_empty() && aud != expected_aud && aud != "registry" && aud != "registry-rust" {
-            let matches_local = (expected_aud.contains("127.0.0.1") || expected_aud.contains("localhost") || expected_aud == "registry-rust")
-                && (aud.contains("127.0.0.1") || aud.contains("localhost") || aud == "registry-rust");
-            if !matches_local {
-                return Err(TokenError::InvalidPayload);
-            }
+        if !expected_aud.is_empty() && aud != expected_aud {
+            return Err(TokenError::InvalidPayload);
         }
     }
 
@@ -244,6 +275,13 @@ pub fn issue_bearer_token(
     iat: u64,
     exp: u64,
 ) -> Result<String, TokenError> {
+    let header = serde_json::json!({
+        "typ": "JWT",
+        "alg": "HS256"
+    });
+    let header_bytes = serde_json::to_vec(&header).map_err(|_| TokenError::InvalidPayload)?;
+    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&header_bytes);
+
     let claims = TokenClaims {
         iss: Some("registry-rust".to_string()),
         sub: subject.map(|s| s.to_string()),
@@ -257,14 +295,15 @@ pub fn issue_bearer_token(
 
     let payload_bytes = serde_json::to_vec(&claims).map_err(|_| TokenError::InvalidPayload)?;
     let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
+    let signing_input = format!("{header_b64}.{payload_b64}");
 
     let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
         .map_err(|_| TokenError::InvalidSigningKey)?;
-    mac.update(payload_b64.as_bytes());
+    mac.update(signing_input.as_bytes());
     let sig = mac.finalize().into_bytes();
     let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
 
-    Ok(format!("{payload_b64}.{sig_b64}"))
+    Ok(format!("{signing_input}.{sig_b64}"))
 }
 
 pub fn issue_bearer_token_with_key(
@@ -275,6 +314,14 @@ pub fn issue_bearer_token_with_key(
     iat: u64,
     exp: u64,
 ) -> Result<String, TokenError> {
+    let header = serde_json::json!({
+        "typ": "JWT",
+        "alg": "HS256",
+        "kid": signing_key.kid
+    });
+    let header_bytes = serde_json::to_vec(&header).map_err(|_| TokenError::InvalidPayload)?;
+    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&header_bytes);
+
     let claims = TokenClaims {
         iss: Some("registry-rust".to_string()),
         sub: subject.map(|s| s.to_string()),
@@ -288,14 +335,15 @@ pub fn issue_bearer_token_with_key(
 
     let payload_bytes = serde_json::to_vec(&claims).map_err(|_| TokenError::InvalidPayload)?;
     let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
+    let signing_input = format!("{header_b64}.{payload_b64}");
 
     let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.key.as_bytes())
         .map_err(|_| TokenError::InvalidSigningKey)?;
-    mac.update(payload_b64.as_bytes());
+    mac.update(signing_input.as_bytes());
     let sig = mac.finalize().into_bytes();
     let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
 
-    Ok(format!("{payload_b64}.{sig_b64}"))
+    Ok(format!("{signing_input}.{sig_b64}"))
 }
 
 pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAction) -> bool {
@@ -490,13 +538,13 @@ mod tests {
         let token = issue_bearer_token(signing_key, aud, None, &scopes, now, now + 3600)
             .expect("issue token");
 
-        let (payload, sig) = token.split_once('.').expect("token format");
+        let (prefix, sig) = token.rsplit_once('.').expect("token format");
         let mut sig_bytes = sig.as_bytes().to_vec();
         // Flip a base64url character in a minimal way.
         if let Some(b) = sig_bytes.get_mut(0) {
             *b = if *b == b'A' { b'B' } else { b'A' };
         }
-        let tampered = format!("{payload}.{}", String::from_utf8(sig_bytes).expect("utf8"));
+        let tampered = format!("{prefix}.{}", String::from_utf8(sig_bytes).expect("utf8"));
 
         let err = verify_bearer_token(signing_key, &tampered).expect_err("invalid signature");
         match err {
