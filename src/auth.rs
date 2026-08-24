@@ -89,7 +89,7 @@ pub(crate) fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
 }
 
 pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Response {
-    let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+    let mut resp = errors::unauthorized("authentication required");
 
     let realm = state
         .config
@@ -119,19 +119,11 @@ pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&st
             http::HeaderValue::from_static("Basic realm=\"registry\""),
         );
     }
-    resp.headers_mut().insert(
-        http::header::HeaderName::from_static("docker-distribution-api-version"),
-        http::HeaderValue::from_static("registry/2.0"),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
     resp
 }
 
 pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
-    let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
+    let mut resp = errors::unauthorized("authentication required");
 
     let realm = state
         .config
@@ -157,14 +149,6 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
             http::HeaderValue::from_static("Basic realm=\"registry\""),
         );
     }
-    resp.headers_mut().insert(
-        http::header::HeaderName::from_static("docker-distribution-api-version"),
-        http::HeaderValue::from_static("registry/2.0"),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
     resp
 }
 

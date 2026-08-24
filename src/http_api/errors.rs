@@ -98,6 +98,17 @@ pub fn payload_too_large() -> Response {
     error_response(StatusCode::PAYLOAD_TOO_LARGE, body)
 }
 
+pub fn unauthorized(message: &str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "UNAUTHORIZED",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    error_response(StatusCode::UNAUTHORIZED, body)
+}
+
 pub fn name_invalid() -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
