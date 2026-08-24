@@ -99,6 +99,8 @@ pub struct Config {
 
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
+    // Optional minimum chunk size for chunked blob uploads (OCI-Chunk-Min-Length).
+    pub upload_chunk_min_bytes: Option<usize>,
     // Concurrency guard for endpoints that buffer full bodies into memory (e.g. manifest PUT,
     // proxy manifest GET when caching). Caps worst-case RAM to ~N * max_request_body_bytes.
     pub max_concurrent_buffered_requests: usize,
@@ -959,6 +961,8 @@ struct FileLimits {
     #[serde(default)]
     max_request_body_bytes: Option<usize>,
     #[serde(default)]
+    upload_chunk_min_bytes: Option<usize>,
+    #[serde(default)]
     max_concurrent_buffered_requests: Option<usize>,
     #[serde(default)]
     max_concurrent_requests: Option<usize>,
@@ -1453,6 +1457,12 @@ impl Config {
         ])
         .or(file_cfg.limits.max_request_body_bytes)
         .unwrap_or(32 * 1024 * 1024);
+
+        let upload_chunk_min_bytes = env_usize_any(&[
+            "REGISTRY__LIMITS__UPLOAD_CHUNK_MIN_BYTES",
+            "UPLOAD_CHUNK_MIN_BYTES",
+        ])
+        .or(file_cfg.limits.upload_chunk_min_bytes);
 
         let max_concurrent_buffered_requests = env_usize_any(&[
             "REGISTRY__LIMITS__MAX_CONCURRENT_BUFFERED_REQUESTS",
@@ -1955,6 +1965,7 @@ impl Config {
             },
             max_upload_bytes,
             max_request_body_bytes,
+            upload_chunk_min_bytes,
             max_concurrent_buffered_requests,
             max_concurrent_requests,
             max_concurrent_upload_requests,

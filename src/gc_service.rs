@@ -405,6 +405,7 @@ mod tests {
             },
             max_upload_bytes: 5 * 1024 * 1024,
             max_request_body_bytes: 1024 * 1024,
+            upload_chunk_min_bytes: None,
             max_concurrent_buffered_requests: 1,
             max_concurrent_requests: 1,
             max_concurrent_upload_requests: 1,

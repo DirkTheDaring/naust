@@ -781,6 +781,15 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
+        async fn remove_referrer(
+            &self,
+            _name: &str,
+            _subject: &Digest,
+            _referrer: &Digest,
+        ) -> Result<(), StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
         async fn delete_manifest(&self, _name: &str, _digest: &Digest) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }

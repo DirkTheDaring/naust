@@ -999,8 +999,48 @@ impl Storage for FsStorage {
         Ok(())
     }
 
+    async fn remove_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        referrer: &Digest,
+    ) -> Result<(), StorageError> {
+        let path = self.referrers_path(name, subject);
+        let mut existing = self.list_referrers(name, subject).await?;
+        let orig_len = existing.len();
+        let referrer_str = referrer.as_str();
+        existing.retain(|d| d.digest != referrer_str);
+        if existing.len() == orig_len {
+            return Ok(());
+        }
+
+        if existing.is_empty() {
+            let _ = tokio::fs::remove_file(&path).await;
+        } else {
+            let bytes = serde_json::to_vec(&existing)
+                .map_err(|err| StorageError::Internal(err.to_string()))?;
+            atomic_write_file(&path, &bytes).await?;
+        }
+        Ok(())
+    }
+
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
         let manifest_path = self.manifest_path(name, digest);
+
+        // Pre-read manifest bytes to extract subject if present for referrers cleanup.
+        let maybe_subject = if let Ok(bytes) = tokio::fs::read(&manifest_path).await {
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("subject")
+                        .and_then(|s| s.get("digest"))
+                        .and_then(|d| d.as_str())
+                        .and_then(|d| Digest::parse(d).ok())
+                })
+        } else {
+            None
+        };
+
         match tokio::fs::remove_file(&manifest_path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1021,6 +1061,12 @@ impl Storage for FsStorage {
                 let _ = tokio::fs::remove_file(&path).await;
             }
         }
+
+        // Clean up from referrers list if this manifest referenced a subject.
+        if let Some(subject) = maybe_subject {
+            let _ = self.remove_referrer(name, &subject, digest).await;
+        }
+
         Ok(())
     }
 }
@@ -1044,6 +1090,65 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent dirs");
         }
         std::fs::write(path, bytes).expect("write file");
+    }
+
+    #[tokio::test]
+    async fn referrers_add_list_remove_and_delete_manifest() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let subject = Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+        let ref1 = Digest::parse("sha256:2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+        let ref2 = Digest::parse("sha256:3333333333333333333333333333333333333333333333333333333333333333").unwrap();
+
+        let desc1 = ReferrerDescriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: ref1.as_str().to_string(),
+            size: 100,
+            artifact_type: Some("application/vnd.example.sbom.v1".to_string()),
+            annotations: None,
+        };
+
+        let desc2 = ReferrerDescriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: ref2.as_str().to_string(),
+            size: 200,
+            artifact_type: Some("application/vnd.example.sig.v1".to_string()),
+            annotations: None,
+        };
+
+        // Add both referrers
+        storage.add_referrer("testrepo", &subject, desc1).await.expect("add ref1");
+        storage.add_referrer("testrepo", &subject, desc2).await.expect("add ref2");
+
+        let list = storage.list_referrers("testrepo", &subject).await.expect("list referrers");
+        assert_eq!(list.len(), 2);
+
+        // Remove ref1 directly
+        storage.remove_referrer("testrepo", &subject, &ref1).await.expect("remove ref1");
+        let list = storage.list_referrers("testrepo", &subject).await.expect("list referrers");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].digest, ref2.as_str());
+
+        // Put a manifest for ref2 that declares subject
+        let manifest_ref2 = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject.as_str(),
+                "size": 500
+            }
+        });
+        let bytes = serde_json::to_vec(&manifest_ref2).unwrap();
+        storage.put_manifest("testrepo", &ref2, bytes.into()).await.expect("put manifest");
+
+        // Delete ref2 manifest -> should remove from referrers
+        storage.delete_manifest("testrepo", &ref2).await.expect("delete manifest");
+        let list = storage.list_referrers("testrepo", &subject).await.expect("list referrers");
+        assert_eq!(list.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

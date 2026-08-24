@@ -768,11 +768,60 @@ impl Storage for S3Storage {
         Ok(())
     }
 
+    async fn remove_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        referrer: &Digest,
+    ) -> Result<(), StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+        let key = self.referrers_key(name, subject);
+
+        let mut existing = self.list_referrers(name, subject).await?;
+        let orig_len = existing.len();
+        let referrer_str = referrer.as_str();
+        existing.retain(|d| d.digest != referrer_str);
+        if existing.len() == orig_len {
+            return Ok(());
+        }
+
+        if existing.is_empty() {
+            let _ = client.delete_object().bucket(bucket).key(key).send().await;
+        } else {
+            let body = serde_json::to_vec(&existing)
+                .map_err(|err| StorageError::Internal(err.to_string()))?;
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+                .map_err(|err| map_put_err(err))?;
+        }
+        Ok(())
+    }
+
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
         let client = self.client().await?;
         let bucket = self.bucket()?;
 
         let key = self.manifest_key(name, digest);
+
+        // Pre-read manifest to extract subject if present for referrers cleanup.
+        let maybe_subject = match self.get_object_bytes(&key).await {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("subject")
+                        .and_then(|s| s.get("digest"))
+                        .and_then(|d| d.as_str())
+                        .and_then(|d| Digest::parse(d).ok())
+                }),
+            Err(_) => None,
+        };
+
         // If the object doesn't exist, S3 can still return 204; treat it as success
         // unless we can clearly map it to NotFound.
         if let Err(err) = client.delete_object().bucket(bucket).key(key).send().await {
@@ -813,6 +862,12 @@ impl Storage for S3Storage {
                     .await;
             }
         }
+
+        // Clean up from referrers list if this manifest referenced a subject.
+        if let Some(subject) = maybe_subject {
+            let _ = self.remove_referrer(name, &subject, digest).await;
+        }
+
         Ok(())
     }
 }

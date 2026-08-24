@@ -886,7 +886,7 @@ async fn tag_platforms_for_repo(
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
 
     let mut platforms: HashSet<String> = HashSet::new();
-    let mut kind: &str = "other";
+    let kind: &str;
 
     // Index/list: manifests[].platform.{os,architecture,variant}
     if let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) {
@@ -964,6 +964,18 @@ pub async fn v2_dispatch(
             return crate::auth::unauthorized_catalog_challenge(&state).into_response();
         }
         return catalog_list(state, method, &query, route_mode, proxy_ctx.clone()).await;
+    }
+
+    // Extension discovery:
+    //   GET/HEAD /v2/_oci/ext/discover
+    //   GET/HEAD /v2/<name>/_oci/ext/discover
+    if (segments.len() == 3 && segments[0] == "_oci" && segments[1] == "ext" && segments[2] == "discover")
+        || (segments.len() >= 4
+            && segments[segments.len() - 3] == "_oci"
+            && segments[segments.len() - 2] == "ext"
+            && segments[segments.len() - 1] == "discover")
+    {
+        return oci_extension_discover(method).await;
     }
     // Uploads:
     //   POST /v2/<name>/blobs/uploads/
@@ -2100,17 +2112,20 @@ async fn manifest_by_reference(
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
-        Method::HEAD => match state.storage.head_manifest(name, &digest).await {
-            Ok(meta) => {
+        Method::HEAD => match state.storage.get_manifest(name, &digest).await {
+            Ok((meta, bytes)) => {
                 let mut headers = registry_headers();
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                 headers.insert("Content-Type", meta.media_type.parse().unwrap());
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                if let Some(subject) = extract_subject_digest(&bytes) {
+                    headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
+                }
                 (StatusCode::OK, headers).into_response()
             }
             Err(StorageError::NotFound) => {
                 if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok(meta) = ctx.cache.head_manifest(name, &digest).await {
+                    if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
                         ctx.proxy.note_manifest_access(name, &digest);
                         if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
                             for blob in &refs.blobs {
@@ -2123,6 +2138,9 @@ async fn manifest_by_reference(
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                         headers.insert("Content-Type", meta.media_type.parse().unwrap());
                         headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                        if let Some(subject) = extract_subject_digest(&bytes) {
+                            headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
+                        }
                         return (StatusCode::OK, headers).into_response();
                     }
                 }
@@ -2154,7 +2172,9 @@ async fn manifest_by_reference(
                             .await
                         {
                             Ok(_) => {
-                                if let Ok(meta) = ctx.cache.head_manifest(name, &digest).await {
+                                if let Ok((meta, bytes)) =
+                                    ctx.cache.get_manifest(name, &digest).await
+                                {
                                     let mut headers = registry_headers();
                                     headers.insert(
                                         "Docker-Content-Digest",
@@ -2166,6 +2186,12 @@ async fn manifest_by_reference(
                                         "Content-Length",
                                         meta.size.to_string().parse().unwrap(),
                                     );
+                                    if let Some(subject) = extract_subject_digest(&bytes) {
+                                        headers.insert(
+                                            "OCI-Subject",
+                                            subject.as_str().parse().unwrap(),
+                                        );
+                                    }
                                     return (StatusCode::OK, headers).into_response();
                                 }
                             }
@@ -2193,6 +2219,9 @@ async fn manifest_by_reference(
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                 headers.insert("Content-Type", meta.media_type.parse().unwrap());
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                if let Some(subject) = extract_subject_digest(&bytes) {
+                    headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
+                }
                 (StatusCode::OK, headers, Body::from(bytes)).into_response()
             }
             Err(StorageError::NotFound) => {
@@ -3210,6 +3239,7 @@ mod tests {
             },
             max_upload_bytes: 5 * 1024 * 1024 * 1024,
             max_request_body_bytes: 32 * 1024 * 1024,
+            upload_chunk_min_bytes: None,
             max_concurrent_buffered_requests: 8,
             max_concurrent_requests: 256,
             max_concurrent_upload_requests: 256,
@@ -3906,6 +3936,7 @@ fn parse_referrer_info(
             v.get("config")
                 .and_then(|c| c.get("mediaType"))
                 .and_then(|m| m.as_str())
+                .filter(|m| *m != "application/vnd.oci.empty.v1+json")
                 .map(|s| s.to_string())
         });
 
@@ -3921,6 +3952,48 @@ fn parse_referrer_info(
         });
 
     Some((subject, artifact_type, annotations))
+}
+
+fn extract_subject_digest(manifest_bytes: &[u8]) -> Option<Digest> {
+    let v: serde_json::Value = serde_json::from_slice(manifest_bytes).ok()?;
+    let subject_digest = v
+        .get("subject")
+        .and_then(|s| s.get("digest"))
+        .and_then(|d| d.as_str())?;
+    Digest::parse(subject_digest).ok()
+}
+
+async fn oci_extension_discover(method: Method) -> Response {
+    match method {
+        Method::GET | Method::HEAD => {
+            let payload = serde_json::json!({
+                "extensions": [
+                    {
+                        "name": "_oci",
+                        "description": "OCI standard extension discovery",
+                        "url": "https://github.com/opencontainers/distribution-spec/blob/main/extensions/README.md",
+                        "endpoints": ["discover"]
+                    },
+                    {
+                        "name": "referrers",
+                        "description": "OCI 1.1 Referrers API",
+                        "url": "https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md#listing-referrers",
+                        "endpoints": ["referrers"]
+                    }
+                ]
+            });
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let mut headers = registry_headers();
+            headers.insert("Content-Type", "application/json".parse().unwrap());
+            headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+            if method == Method::HEAD {
+                (StatusCode::OK, headers).into_response()
+            } else {
+                (StatusCode::OK, headers, Body::from(bytes)).into_response()
+            }
+        }
+        _ => errors::not_implemented().into_response(),
+    }
 }
 
 async fn referrers_list(
@@ -3970,19 +4043,44 @@ async fn referrers_list(
                 entries.retain(|d| d.artifact_type.as_deref() == Some(filter));
             }
 
+            // Sort deterministically by digest for stable pagination.
+            entries.sort_by(|a, b| a.digest.cmp(&b.digest));
+
+            // Apply pagination if `last` is provided.
+            let start_idx = if let Some(last) = query.get("last") {
+                match entries.iter().position(|d| d.digest == *last) {
+                    Some(pos) => pos + 1,
+                    None => 0,
+                }
+            } else {
+                0
+            };
+
+            let remaining = if start_idx < entries.len() {
+                &entries[start_idx..]
+            } else {
+                &[]
+            };
+
+            let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
+            let (page_entries, next_last) = match n_opt {
+                Some(n) if n < remaining.len() => (&remaining[..n], Some(&remaining[n - 1].digest)),
+                _ => (remaining, None),
+            };
+
             // Return OCI index.
-            let manifests = entries
-                .into_iter()
+            let manifests = page_entries
+                .iter()
                 .map(|d| {
                     let mut obj = serde_json::json!({
                         "mediaType": d.media_type,
                         "digest": d.digest,
                         "size": d.size,
                     });
-                    if let Some(at) = d.artifact_type {
-                        obj["artifactType"] = serde_json::Value::String(at);
+                    if let Some(at) = &d.artifact_type {
+                        obj["artifactType"] = serde_json::Value::String(at.clone());
                     }
-                    if let Some(ann) = d.annotations {
+                    if let Some(ann) = &d.annotations {
                         obj["annotations"] =
                             serde_json::to_value(ann).unwrap_or(serde_json::Value::Null);
                     }
@@ -4008,6 +4106,25 @@ async fn referrers_list(
             headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
             if artifact_type_filter.is_some() {
                 headers.insert("OCI-Filters-Applied", "artifactType".parse().unwrap());
+            }
+
+            if let (Some(n), Some(last_digest)) = (n_opt, next_last) {
+                let mut link_params = vec![format!("n={}", n)];
+                if let Some(filter) = artifact_type_filter {
+                    let encoded_filter: String =
+                        url::form_urlencoded::byte_serialize(filter.as_bytes()).collect();
+                    link_params.push(format!("artifactType={}", encoded_filter));
+                }
+                link_params.push(format!("last={}", last_digest));
+                let link_header = format!(
+                    r#"</v2/{}/referrers/{}?{}>; rel="next""#,
+                    name,
+                    subject.as_str(),
+                    link_params.join("&")
+                );
+                if let Ok(val) = link_header.parse() {
+                    headers.insert("Link", val);
+                }
             }
 
             if method == Method::HEAD {
@@ -4136,6 +4253,9 @@ async fn upload_create(
                     let location = format!("/v2/{name}/blobs/uploads/{}", meta.uuid);
                     headers.insert("Location", location.parse().unwrap());
                     headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
+                    if let Some(min_len) = state.config.upload_chunk_min_bytes {
+                        headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
+                    }
                     return (StatusCode::ACCEPTED, headers).into_response();
                 }
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
@@ -4306,6 +4426,9 @@ async fn upload_create(
             let location = format!("/v2/{name}/blobs/uploads/{}", meta.uuid);
             headers.insert("Location", location.parse().unwrap());
             headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
+            if let Some(min_len) = state.config.upload_chunk_min_bytes {
+                headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
+            }
             (StatusCode::ACCEPTED, headers).into_response()
         }
         Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
@@ -4455,6 +4578,9 @@ async fn upload_session(
                     "Range",
                     format!("0-{}", last_meta.offset - 1).parse().unwrap(),
                 );
+            }
+            if let Some(min_len) = state.config.upload_chunk_min_bytes {
+                headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
             }
             (StatusCode::ACCEPTED, headers).into_response()
         }

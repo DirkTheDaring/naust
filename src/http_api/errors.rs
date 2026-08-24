@@ -189,3 +189,8 @@ pub fn request_timeout(message: &str) -> impl IntoResponse {
     };
     (StatusCode::REQUEST_TIMEOUT, Json(body))
 }
+
+#[allow(dead_code)]
+pub fn warning_header_value(code: u16, agent: &str, text: &str) -> String {
+    format!(r#"{} {} "{}""#, code, agent, text.replace('"', "\\\""))
+}

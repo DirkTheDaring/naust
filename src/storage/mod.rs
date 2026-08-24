@@ -145,6 +145,13 @@ pub trait Storage: Send + Sync {
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError>;
 
+    async fn remove_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        referrer: &Digest,
+    ) -> Result<(), StorageError>;
+
     // Content Management: manifest deletion.
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError>;
 }
