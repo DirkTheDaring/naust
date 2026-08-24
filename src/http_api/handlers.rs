@@ -3952,8 +3952,15 @@ async fn manifest_put(
 
     if let Some(schema_version) = manifest_json.get("schemaVersion").and_then(|v| v.as_i64()) {
         if schema_version == 1 {
+            if manifest_json.get("signatures").is_some() {
+                return errors::manifest_unverified("manifest signatures unverified");
+            }
             return errors::manifest_invalid().into_response();
         }
+    }
+
+    if manifest_json.get("signatures").is_some() {
+        return errors::manifest_unverified("manifest signatures unverified");
     }
 
     let media_type = manifest_json
@@ -3962,6 +3969,9 @@ async fn manifest_put(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
     if media_type.starts_with("application/vnd.docker.distribution.manifest.v1") {
+        if media_type.contains("prettyjws") || manifest_json.get("signatures").is_some() {
+            return errors::manifest_unverified("manifest signatures unverified");
+        }
         return errors::manifest_invalid().into_response();
     }
     if !is_supported_manifest_media_type(&media_type) {

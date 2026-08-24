@@ -1390,5 +1390,51 @@ async fn test_audit_remediation_suite() {
         .await
         .expect("denied delete");
     assert_eq!(denied_delete_resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // 27. Repositories starting with 'v' or '2' work without prefix stripping corruption
+    let v_repo = "v2-compliance-test";
+    let token_v_resp = client
+        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{v_repo}:pull,push"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("get token for v_repo");
+    assert_eq!(token_v_resp.status(), reqwest::StatusCode::OK);
+    let token_v_body: serde_json::Value = token_v_resp.json().await.expect("token json");
+    let v_token = token_v_body["token"].as_str().unwrap();
+
+    let upload_v_resp = client
+        .post(format!("{base_url}/v2/{v_repo}/blobs/uploads/"))
+        .bearer_auth(v_token)
+        .send()
+        .await
+        .expect("upload to v_repo");
+    assert_eq!(upload_v_resp.status(), reqwest::StatusCode::ACCEPTED);
+
+    // 28. Manifest with schema 1 signatures returns 400 MANIFEST_UNVERIFIED with application/json
+    let signed_manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "name": repo,
+        "tag": "signed-test",
+        "signatures": [{
+            "header": { "jwk": { "kty": "RSA" } },
+            "signature": "invalid_sig"
+        }]
+    });
+    let manifest_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/signed-test"))
+        .bearer_auth(delete_token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&signed_manifest).unwrap())
+        .send()
+        .await
+        .expect("put signed manifest");
+    assert_eq!(manifest_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        manifest_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let manifest_err_body: serde_json::Value = manifest_resp.json().await.expect("manifest err json");
+    assert_eq!(manifest_err_body["errors"][0]["code"], "MANIFEST_UNVERIFIED");
 }
 

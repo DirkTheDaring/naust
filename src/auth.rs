@@ -52,11 +52,8 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     //   /v2/<name>/tags/reference/...
     //   /v2/<name>/referrers/...
     // where <name> may contain '/'.
-    if !path.starts_with("/v2/") {
-        return None;
-    }
-    let segments: Vec<&str> = path
-        .trim_start_matches("/v2/")
+    let rest = path.strip_prefix("/v2/")?;
+    let segments: Vec<&str> = rest
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();
