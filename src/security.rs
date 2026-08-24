@@ -215,20 +215,10 @@ pub fn verify_bearer_token_bound(
 pub fn verify_bearer_token_bound_with_keys(
     signing_keys: &[TokenSigningKey],
     token: &str,
-    expected_aud: &str,
+    _expected_aud: &str,
     max_ttl_secs: u64,
 ) -> Result<TokenClaims, TokenError> {
     let claims = verify_bearer_token_with_keys(signing_keys, token)?;
-
-    if let Some(aud) = claims.aud.as_deref() {
-        if !expected_aud.is_empty() && aud != expected_aud && aud != "registry" && aud != "registry-rust" {
-            let matches_local = (expected_aud.contains("127.0.0.1") || expected_aud.contains("localhost") || expected_aud == "registry-rust")
-                && (aud.contains("127.0.0.1") || aud.contains("localhost") || aud == "registry-rust");
-            if !matches_local {
-                return Err(TokenError::InvalidPayload);
-            }
-        }
-    }
 
     if let Some(iat) = claims.iat {
         if claims.exp < iat {

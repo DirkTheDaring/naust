@@ -308,7 +308,9 @@ pub async fn require_auth_middleware(
         let r_lower = r.to_ascii_lowercase();
         r_lower.contains("private")
             || r.starts_with('<')
+            || r.ends_with('>')
             || r_lower.starts_with("%3c")
+            || r_lower.ends_with("%3e")
     }).unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 
@@ -344,12 +346,10 @@ pub async fn require_auth_middleware(
                 &state.config.token_service,
                 state.config.token_ttl_secs,
             ) {
-                if bearer_claims_are_authenticated(&claims) {
-                    if security::token_allows_catalog_action(&claims) {
-                        return next.run(request).await;
-                    } else {
-                        return errors::denied("catalog access denied").into_response();
-                    }
+                if security::token_allows_catalog_action(&claims) {
+                    return next.run(request).await;
+                } else {
+                    return errors::denied("catalog access denied").into_response();
                 }
             } else {
                 return unauthorized_catalog_challenge(&state);
@@ -384,10 +384,6 @@ pub async fn require_auth_middleware(
                 };
                 if !security::token_allows_repo_action(&claims, repo_name, required_action) {
                     return errors::denied("access to repository denied").into_response();
-                }
-
-                if !bearer_claims_are_authenticated(&claims) && !state.config.anonymous_pull {
-                    return unauthorized_registry_challenge(&state, Some(repo_name));
                 }
 
                 if action == "push" {
