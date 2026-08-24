@@ -305,11 +305,7 @@ pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAc
         .any(|s| {
             s.typ == "repository"
                 && (s.name == repo || s.name == "*")
-                && s.actions.iter().any(|a| {
-                    a == action_str
-                        || a == "*"
-                        || (action == RepoAction::Delete && (a == "push" || a == "delete"))
-                })
+                && s.actions.iter().any(|a| a == action_str || a == "*")
         })
 }
 

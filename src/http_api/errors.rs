@@ -239,7 +239,18 @@ pub fn blob_upload_invalid(message: &str) -> Response {
             detail: None,
         }],
     };
-    error_response(StatusCode::PAYLOAD_TOO_LARGE, body)
+    error_response(StatusCode::BAD_REQUEST, body)
+}
+
+pub fn size_invalid(message: &str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "SIZE_INVALID",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    error_response(StatusCode::RANGE_NOT_SATISFIABLE, body)
 }
 
 pub fn denied(message: &str) -> Response {

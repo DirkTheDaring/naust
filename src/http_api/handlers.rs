@@ -4369,10 +4369,10 @@ async fn upload_create(
     // Cross-repository blob mount:
     //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
     // If the blob exists and client has pull authorization on source repo, respond 201.
-    // Otherwise, fall back to standard 202 upload session per spec (or 403 if unauthorized).
+    // Otherwise, gracefully fall back to standard 202 upload session per spec.
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
         if let Ok(digest) = Digest::parse(mount_str) {
-            if let Some(from_repo) = query.get("from") {
+            let can_mount = if let Some(from_repo) = query.get("from") {
                 if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
                     if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
                         &state.config.token_signing_keys,
@@ -4380,39 +4380,30 @@ async fn upload_create(
                         &state.config.token_service,
                         state.config.token_ttl_secs,
                     ) {
-                        if !crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull) {
-                            return errors::denied("pull permission denied on source repository").into_response();
-                        }
+                        crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull)
+                    } else {
+                        false
                     }
+                } else {
+                    true
                 }
+            } else {
+                state.config.automatic_crossmount
+            };
 
-                if state.storage.head_blob(&digest).await.is_ok() {
-                    let mut resp_headers = registry_headers();
-                    resp_headers.insert(
-                        "Location",
-                        format!("/v2/{name}/blobs/{}", digest.as_str())
-                            .parse()
-                            .unwrap(),
-                    );
-                    resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                    resp_headers.insert("Content-Length", "0".parse().unwrap());
-                    return (StatusCode::CREATED, resp_headers).into_response();
-                }
-                // Fallback to normal upload session if blob doesn't exist.
-            } else if state.config.automatic_crossmount {
-                if state.storage.head_blob(&digest).await.is_ok() {
-                    let mut resp_headers = registry_headers();
-                    resp_headers.insert(
-                        "Location",
-                        format!("/v2/{name}/blobs/{}", digest.as_str())
-                            .parse()
-                            .unwrap(),
-                    );
-                    resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                    resp_headers.insert("Content-Length", "0".parse().unwrap());
-                    return (StatusCode::CREATED, resp_headers).into_response();
-                }
+            if can_mount && state.storage.head_blob(&digest).await.is_ok() {
+                let mut resp_headers = registry_headers();
+                resp_headers.insert(
+                    "Location",
+                    format!("/v2/{name}/blobs/{}", digest.as_str())
+                        .parse()
+                        .unwrap(),
+                );
+                resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                resp_headers.insert("Content-Length", "0".parse().unwrap());
+                return (StatusCode::CREATED, resp_headers).into_response();
             }
+            // Graceful fallback to normal upload session if blob doesn't exist or client lacks from_repo pull.
         }
     }
 
@@ -4715,9 +4706,15 @@ async fn upload_session(
             if let Some((start, _end)) = parse_content_range(req_headers) {
                 match state.storage.upload_status(uuid).await {
                     Ok(meta) if meta.offset == start => {}
-                    Ok(_) => {
-                        return (StatusCode::RANGE_NOT_SATISFIABLE, registry_headers())
-                            .into_response();
+                    Ok(meta) => {
+                        let mut resp = errors::size_invalid("range not satisfiable");
+                        if meta.offset > 0 {
+                            resp.headers_mut().insert(
+                                "Range",
+                                format!("0-{}", meta.offset - 1).parse().unwrap(),
+                            );
+                        }
+                        return resp;
                     }
                     Err(StorageError::NotFound) => {
                         return errors::blob_upload_unknown().into_response();
@@ -4825,9 +4822,15 @@ async fn upload_session(
             if let Some((start, _end)) = parse_content_range(req_headers) {
                 match state.storage.upload_status(uuid).await {
                     Ok(meta) if meta.offset == start => {}
-                    Ok(_) => {
-                        return (StatusCode::RANGE_NOT_SATISFIABLE, registry_headers())
-                            .into_response();
+                    Ok(meta) => {
+                        let mut resp = errors::size_invalid("range not satisfiable");
+                        if meta.offset > 0 {
+                            resp.headers_mut().insert(
+                                "Range",
+                                format!("0-{}", meta.offset - 1).parse().unwrap(),
+                            );
+                        }
+                        return resp;
                     }
                     Err(StorageError::NotFound) => {
                         return errors::blob_upload_unknown().into_response();

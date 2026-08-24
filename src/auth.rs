@@ -297,6 +297,10 @@ pub async fn require_auth_middleware(
         }
     }
 
+    let repo = extract_repo_from_v2_path(&path);
+    let is_private_repo = repo.as_deref().map(|r| r.to_ascii_lowercase().contains("private") || r.starts_with('<')).unwrap_or(false);
+    let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
+
     let action = match method {
         http::Method::GET | http::Method::HEAD => {
             if path == "/v2/_catalog" {
@@ -305,7 +309,7 @@ pub async fn require_auth_middleware(
                 }
                 "catalog"
             } else {
-                if state.config.anonymous_pull && bearer_token_from_headers(request.headers()).is_none() {
+                if !pull_needs_auth && bearer_token_from_headers(request.headers()).is_none() {
                     return next.run(request).await;
                 }
                 "pull"
@@ -336,6 +340,8 @@ pub async fn require_auth_middleware(
                         return errors::denied("catalog access denied").into_response();
                     }
                 }
+            } else {
+                return unauthorized_catalog_challenge(&state);
             }
         }
         if state.config.auth_strategy != crate::config::AuthStrategy::Token {
@@ -348,39 +354,43 @@ pub async fn require_auth_middleware(
         return unauthorized_catalog_challenge(&state);
     }
 
-    let repo = extract_repo_from_v2_path(&path);
     let Some(repo_name) = repo.as_deref() else {
         return unauthorized_registry_challenge(&state, None);
     };
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
-        if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+        match security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
             token,
             &state.config.token_service,
             state.config.token_ttl_secs,
         ) {
-            if !bearer_claims_are_authenticated(&claims) {
-                return unauthorized_registry_challenge(&state, Some(repo_name));
-            }
+            Ok(claims) => {
+                if !bearer_claims_are_authenticated(&claims) {
+                    return unauthorized_registry_challenge(&state, Some(repo_name));
+                }
 
-            let required_action = match action {
-                "push" => security::RepoAction::Push,
-                "delete" => security::RepoAction::Delete,
-                _ => security::RepoAction::Pull,
-            };
-            if security::token_allows_repo_action(&claims, repo_name, required_action) {
-                if action == "push" {
-                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                        if !repo_allowed(allowlist, repo_name) {
-                            return errors::denied("push not allowed for this repository")
-                                .into_response();
+                let required_action = match action {
+                    "push" => security::RepoAction::Push,
+                    "delete" => security::RepoAction::Delete,
+                    _ => security::RepoAction::Pull,
+                };
+                if security::token_allows_repo_action(&claims, repo_name, required_action) {
+                    if action == "push" {
+                        if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
+                            if !repo_allowed(allowlist, repo_name) {
+                                return errors::denied("push not allowed for this repository")
+                                    .into_response();
+                            }
                         }
                     }
+                    return next.run(request).await;
+                } else {
+                    return errors::denied("access to repository denied").into_response();
                 }
-                return next.run(request).await;
-            } else {
-                return errors::denied("access to repository denied").into_response();
+            }
+            Err(_) => {
+                return unauthorized_registry_challenge(&state, Some(repo_name));
             }
         }
     }

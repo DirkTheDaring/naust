@@ -1283,5 +1283,23 @@ async fn test_audit_remediation_suite() {
         .await
         .expect("delete blob");
     assert_eq!(del_blob_resp.status(), reqwest::StatusCode::ACCEPTED);
+
+    // 20. Cross-repository blob mount graceful fallback to 202
+    let missing_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let mount_resp = client
+        .post(format!("{base_url}/v2/{repo}/blobs/uploads/?mount={missing_digest}&from=other-repo"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("mount fallback");
+    assert_eq!(mount_resp.status(), reqwest::StatusCode::ACCEPTED);
+
+    // 21. Private repository challenge before repo validation
+    let priv_resp = client
+        .get(format!("{base_url}/v2/<PRIVATE_REPO>/tags/list"))
+        .send()
+        .await
+        .expect("priv tags");
+    assert_eq!(priv_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
