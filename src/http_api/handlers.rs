@@ -1651,7 +1651,7 @@ async fn tags_list(
                     .take(end_idx.saturating_sub(start_idx))
                     .collect();
 
-                let has_more = end_idx < total;
+                let has_more = !tags.is_empty() && tags.len() == n && end_idx < total;
 
                 let payload = serde_json::json!({
                     "name": name,

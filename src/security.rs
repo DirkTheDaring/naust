@@ -21,16 +21,17 @@ pub enum TokenError {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenScope {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "typ")]
     pub typ: String,
     pub name: String,
+    #[serde(default, alias = "action")]
     pub actions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TokenClaims {
     pub exp: u64,
-    #[serde(default)]
+    #[serde(default, alias = "access")]
     pub scopes: Vec<TokenScope>,
 
     // Present in tokens we mint, but not required for verification.

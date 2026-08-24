@@ -1362,5 +1362,33 @@ async fn test_audit_remediation_suite() {
         .expect("unauth private tags");
     assert_eq!(challenge_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert!(challenge_resp.headers().get(header::WWW_AUTHENTICATE).is_some());
+
+    // 25. Tags pagination on terminal page omits Link header
+    let terminal_page_resp = client
+        .get(format!("{base_url}/v2/{repo}/tags/list?n=100"))
+        .send()
+        .await
+        .expect("get terminal tags page");
+    assert_eq!(terminal_page_resp.status(), reqwest::StatusCode::OK);
+    assert!(terminal_page_resp.headers().get(header::LINK).is_none());
+
+    // 26. Deny delete operation when token only grants pull,push scope -> 403 Forbidden
+    let pull_push_token_resp = client
+        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("get pull,push token");
+    assert_eq!(pull_push_token_resp.status(), reqwest::StatusCode::OK);
+    let pull_push_body: serde_json::Value = pull_push_token_resp.json().await.expect("token json");
+    let pull_push_token = pull_push_body["token"].as_str().unwrap();
+
+    let denied_delete_resp = client
+        .delete(format!("{base_url}/v2/{repo}/tags/reference/some-tag"))
+        .bearer_auth(pull_push_token)
+        .send()
+        .await
+        .expect("denied delete");
+    assert_eq!(denied_delete_resp.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
