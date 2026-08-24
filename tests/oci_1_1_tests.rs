@@ -1459,5 +1459,62 @@ async fn test_audit_remediation_suite() {
     assert_eq!(denied_upload_resp.status(), reqwest::StatusCode::FORBIDDEN);
     let denied_body: serde_json::Value = denied_upload_resp.json().await.expect("denied json");
     assert_eq!(denied_body["errors"][0]["code"], "DENIED");
+
+    // 30. Tags pagination subsequent page with last cursor omits Link header when no more pages
+    let page_repo = "tags-multi-page-repo";
+    let token_page_resp = client
+        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{page_repo}:pull,push"))
+        .basic_auth("demo", Some("demo"))
+        .send()
+        .await
+        .expect("get token for page_repo");
+    let token_page_body: serde_json::Value = token_page_resp.json().await.expect("token json");
+    let page_token = token_page_body["token"].as_str().unwrap();
+
+    for tag_name in &["tag-alpha", "tag-beta", "tag-gamma"] {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.empty.v1+json",
+                "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "size": 2
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": sha512_digest,
+                "size": sha512_data.len()
+            }]
+        });
+        client
+            .put(format!("{base_url}/v2/{page_repo}/manifests/{tag_name}"))
+            .bearer_auth(page_token)
+            .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(serde_json::to_vec(&manifest).unwrap())
+            .send()
+            .await
+            .expect("put manifest");
+    }
+
+    let tags_page1_resp = client
+        .get(format!("{base_url}/v2/{page_repo}/tags/list?n=1"))
+        .send()
+        .await
+        .expect("get tags page 1");
+    assert_eq!(tags_page1_resp.status(), reqwest::StatusCode::OK);
+    assert!(tags_page1_resp.headers().get(header::LINK).is_some());
+    let p1_body: serde_json::Value = tags_page1_resp.json().await.expect("p1 json");
+    assert_eq!(p1_body["tags"].as_array().unwrap().len(), 1);
+    let last_p1 = p1_body["tags"][0].as_str().unwrap();
+
+    let tags_page2_resp = client
+        .get(format!("{base_url}/v2/{page_repo}/tags/list?n=100&last={last_p1}"))
+        .send()
+        .await
+        .expect("get tags page 2");
+    assert_eq!(tags_page2_resp.status(), reqwest::StatusCode::OK);
+    assert!(tags_page2_resp.headers().get(header::LINK).is_none());
+    let p2_body: serde_json::Value = tags_page2_resp.json().await.expect("p2 json");
+    assert_eq!(p2_body["tags"].as_array().unwrap().len(), 2);
 }
 

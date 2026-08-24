@@ -19,19 +19,76 @@ pub enum TokenError {
     InvalidSigningKey,
 }
 
+fn deserialize_actions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ActionsVisitor;
+    impl<'de> serde::de::Visitor<'de> for ActionsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, list of strings, or null")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                if !item.is_empty() {
+                    list.push(item);
+                }
+            }
+            Ok(list)
+        }
+    }
+
+    deserializer.deserialize_any(ActionsVisitor)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenScope {
     #[serde(rename = "type", alias = "typ")]
     pub typ: String,
     pub name: String,
-    #[serde(default, alias = "action")]
+    #[serde(default, alias = "action", deserialize_with = "deserialize_actions")]
     pub actions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TokenClaims {
     pub exp: u64,
-    #[serde(default, alias = "access")]
+    #[serde(default, alias = "access", alias = "scopes")]
     pub scopes: Vec<TokenScope>,
 
     // Present in tokens we mint, but not required for verification.

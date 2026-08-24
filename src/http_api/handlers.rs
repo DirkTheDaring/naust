@@ -1651,7 +1651,7 @@ async fn tags_list(
                     .take(end_idx.saturating_sub(start_idx))
                     .collect();
 
-                let has_more = !tags.is_empty() && tags.len() == n && end_idx < total;
+                let has_more = n_opt.is_some() && !tags.is_empty() && tags.len() == n && end_idx < total;
 
                 let payload = serde_json::json!({
                     "name": name,
@@ -1668,10 +1668,10 @@ async fn tags_list(
 
                 // Best-effort Link header for next page.
                 if has_more {
-                    if let (Some(n_raw), Some(last_tag)) = (query.get("n"), tags.last()) {
+                    if let (Some(n_val), Some(last_tag)) = (n_opt, tags.last()) {
                         let last_tag = url_encode_component(last_tag);
                         let link = format!(
-                            "</v2/{name}/tags/list?n={n_raw}&last={last_tag}>; rel=\"next\""
+                            "</v2/{name}/tags/list?n={n_val}&last={last_tag}>; rel=\"next\""
                         );
                         if let Ok(v) = http::HeaderValue::from_str(&link) {
                             headers.insert(http::header::LINK, v);
