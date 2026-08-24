@@ -1517,14 +1517,15 @@ async fn test_audit_remediation_suite() {
     let p2_body: serde_json::Value = tags_page2_resp.json().await.expect("p2 json");
     assert_eq!(p2_body["tags"].as_array().unwrap().len(), 2);
 
-    // 31. Cross-repository blob mount without pull permissions on source repo -> 403 Forbidden
-    let mount_denied_resp = client
+    // 31. Cross-repository blob mount without pull permissions on source repo -> gracefully falls back to 202 Accepted upload session per OCI spec
+    let mount_fallback_resp = client
         .post(format!("{base_url}/v2/{repo}/blobs/uploads/?mount={sha512_digest}&from=unauthorized-secret-repo"))
         .bearer_auth(pull_push_token)
         .header(header::CONTENT_LENGTH, "0")
         .send()
         .await
-        .expect("mount unauthorized");
-    assert_eq!(mount_denied_resp.status(), reqwest::StatusCode::FORBIDDEN);
+        .expect("mount fallback");
+    assert_eq!(mount_fallback_resp.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(mount_fallback_resp.headers().get(header::LOCATION).is_some());
 }
 
