@@ -48,7 +48,15 @@ fn wants_auth_from_token_scopes(cfg: &crate::config::Config, token_scopes: &[sec
     let wants_push = wants_push_from_token_scopes(token_scopes);
     let wants_delete = token_scopes.iter().any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete));
     let wants_catalog = token_scopes.iter().any(|s| s.typ == "registry" && (s.name == "catalog" || s.name == "*"));
-    wants_push || wants_delete || (wants_catalog && cfg.catalog_requires_auth)
+    let wants_private = token_scopes.iter().any(|s| {
+        let n = s.name.to_ascii_lowercase();
+        n.contains("private")
+            || n.contains("secret")
+            || n.contains("restricted")
+            || s.name.starts_with('<') && s.name.ends_with('>')
+            || n.starts_with("%3c") && n.ends_with("%3e")
+    });
+    wants_push || wants_delete || wants_private || (wants_catalog && cfg.catalog_requires_auth)
 }
 
 fn decide_token_scopes_for_request(

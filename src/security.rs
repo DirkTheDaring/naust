@@ -88,7 +88,7 @@ pub struct TokenScope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TokenClaims {
     pub exp: u64,
-    #[serde(default, alias = "access", alias = "scopes")]
+    #[serde(default, rename = "access", alias = "scopes")]
     pub scopes: Vec<TokenScope>,
 
     // Present in tokens we mint, but not required for verification.
@@ -405,12 +405,14 @@ pub fn issue_bearer_token_with_key(
 
 pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAction) -> bool {
     let action_str = action.as_str();
+    let repo_clean = repo.trim_start_matches('/');
     claims
         .scopes
         .iter()
         .any(|s| {
-            s.typ == "repository"
-                && (s.name == repo || s.name == "*")
+            let s_name = s.name.trim_start_matches('/');
+            (s.typ == "repository" || s.typ == "repo" || s.typ == "image")
+                && (s_name == repo_clean || s_name == "*" || (s_name.ends_with("/*") && repo_clean.starts_with(&s_name[..s_name.len() - 1])))
                 && s.actions.iter().any(|a| a == action_str || a == "*")
         })
 }
@@ -418,7 +420,7 @@ pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAc
 pub fn token_allows_catalog_action(claims: &TokenClaims) -> bool {
     claims.scopes.iter().any(|s| {
         (s.typ == "registry" && (s.name == "catalog" || s.name == "*") && s.actions.iter().any(|a| a == "*" || a == "pull" || a == "push" || a == "read"))
-            || (s.typ == "repository" && s.name == "*" && s.actions.iter().any(|a| a == "*"))
+            || ((s.typ == "repository" || s.typ == "repo") && s.name == "*" && s.actions.iter().any(|a| a == "*"))
     })
 }
 
