@@ -405,6 +405,7 @@ pub async fn token(
         "access_token": token,
         "expires_in": decision.ttl_secs,
         "issued_at": format_rfc3339(now),
+        "access": scopes_json,
         "scopes": scopes_json,
     });
 
