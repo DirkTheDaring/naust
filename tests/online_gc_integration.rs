@@ -306,7 +306,11 @@ async fn push_blob_via_upload(base: &str, repo: &str, bytes: &[u8]) -> String {
     let hex = hex_sha256(bytes);
     let digest = format!("sha256:{hex}");
 
-    let put_url = format!("{upload_url}?digest={digest}");
+    let put_url = if upload_url.contains('?') {
+        format!("{upload_url}&digest={digest}")
+    } else {
+        format!("{upload_url}?digest={digest}")
+    };
     let fin = client
         .put(&put_url)
         .bearer_auth(&token)

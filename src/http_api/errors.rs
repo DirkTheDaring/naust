@@ -261,6 +261,17 @@ pub fn size_invalid(message: &str) -> Response {
             detail: None,
         }],
     };
+    error_response(StatusCode::BAD_REQUEST, body)
+}
+
+pub fn range_invalid(message: &str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "RANGE_INVALID",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
     error_response(StatusCode::RANGE_NOT_SATISFIABLE, body)
 }
 

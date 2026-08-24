@@ -362,8 +362,13 @@ async fn test_legitimate_upload_and_resumption() {
     hasher.update(&all_bytes);
     let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
 
+    let put_url = if upload_url.contains('?') {
+        format!("{upload_url}&digest={digest}")
+    } else {
+        format!("{upload_url}?digest={digest}")
+    };
     let put_resp = client
-        .put(format!("{upload_url}?digest={digest}"))
+        .put(&put_url)
         .basic_auth("demo", Some("demo"))
         .send()
         .await

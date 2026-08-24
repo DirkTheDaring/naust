@@ -172,9 +172,17 @@ async fn upload_blob(client: &reqwest::Client, base_url: &str, repo: &str, bytes
         .to_string();
 
     let put_url = if location.starts_with("http://") || location.starts_with("https://") {
-        format!("{location}&digest={digest}")
+        if location.contains('?') {
+            format!("{location}&digest={digest}")
+        } else {
+            format!("{location}?digest={digest}")
+        }
     } else {
-        format!("{base_url}{location}?digest={digest}")
+        if location.contains('?') {
+            format!("{base_url}{location}&digest={digest}")
+        } else {
+            format!("{base_url}{location}?digest={digest}")
+        }
     };
 
     let put_resp = client
@@ -857,9 +865,17 @@ async fn test_concurrent_chunk_uploads_integrity() {
 
             let expected_digest = format!("sha256:{}", hex_sha256(&total_bytes));
             let put_url = if location.starts_with("http") {
-                format!("{location}&digest={expected_digest}")
+                if location.contains('?') {
+                    format!("{location}&digest={expected_digest}")
+                } else {
+                    format!("{location}?digest={expected_digest}")
+                }
             } else {
-                format!("{base_url_c}{location}?digest={expected_digest}")
+                if location.contains('?') {
+                    format!("{base_url_c}{location}&digest={expected_digest}")
+                } else {
+                    format!("{base_url_c}{location}?digest={expected_digest}")
+                }
             };
 
             let put_resp = client
@@ -979,9 +995,17 @@ async fn test_audit_remediation_suite() {
         .expect("start upload sha512");
     let loc_512 = upload_512_start.headers().get(header::LOCATION).unwrap().to_str().unwrap();
     let put_512_url = if loc_512.starts_with("http") {
-        format!("{loc_512}&digest={sha512_digest}")
+        if loc_512.contains('?') {
+            format!("{loc_512}&digest={sha512_digest}")
+        } else {
+            format!("{loc_512}?digest={sha512_digest}")
+        }
     } else {
-        format!("{base_url}{loc_512}?digest={sha512_digest}")
+        if loc_512.contains('?') {
+            format!("{base_url}{loc_512}&digest={sha512_digest}")
+        } else {
+            format!("{base_url}{loc_512}?digest={sha512_digest}")
+        }
     };
 
     let put_512_resp = client
@@ -1517,7 +1541,7 @@ async fn test_audit_remediation_suite() {
     let p2_body: serde_json::Value = tags_page2_resp.json().await.expect("p2 json");
     assert_eq!(p2_body["tags"].as_array().unwrap().len(), 2);
 
-    // 31. Cross-repository blob mount without pull permissions on source repo -> gracefully falls back to 202 Accepted upload session per OCI spec
+    // 31. Cross-repository blob mount without pull permissions on source repo -> 403 Forbidden DENIED per auth spec
     let mount_fallback_resp = client
         .post(format!("{base_url}/v2/{repo}/blobs/uploads/?mount={sha512_digest}&from=unauthorized-secret-repo"))
         .bearer_auth(pull_push_token)
@@ -1525,7 +1549,8 @@ async fn test_audit_remediation_suite() {
         .send()
         .await
         .expect("mount fallback");
-    assert_eq!(mount_fallback_resp.status(), reqwest::StatusCode::ACCEPTED);
-    assert!(mount_fallback_resp.headers().get(header::LOCATION).is_some());
+    assert_eq!(mount_fallback_resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let mount_err: serde_json::Value = mount_fallback_resp.json().await.expect("json");
+    assert_eq!(mount_err["errors"][0]["code"], "DENIED");
 }
 

@@ -118,7 +118,7 @@ pub struct TokenSigningKey {
     pub key: String,
 }
 
-fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), TokenError> {
+pub fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), TokenError> {
     const MAX_TOKEN_LEN: usize = 65536;
     if token.is_empty() || token.len() > MAX_TOKEN_LEN {
         return Err(TokenError::InvalidFormat);
@@ -403,16 +403,28 @@ pub fn issue_bearer_token_with_key(
     Ok(format!("{signing_input}.{sig_b64}"))
 }
 
+fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
+    let s = scope_name.trim_start_matches('/');
+    let t = target_name.trim_start_matches('/');
+    if s == t || s == "*" {
+        return true;
+    }
+    if s.ends_with("/*") && t.starts_with(&s[..s.len() - 1]) {
+        return true;
+    }
+    let s_no_lib = s.strip_prefix("library/").unwrap_or(s);
+    let t_no_lib = t.strip_prefix("library/").unwrap_or(t);
+    s_no_lib == t_no_lib
+}
+
 pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAction) -> bool {
     let action_str = action.as_str();
-    let repo_clean = repo.trim_start_matches('/');
     claims
         .scopes
         .iter()
         .any(|s| {
-            let s_name = s.name.trim_start_matches('/');
             (s.typ == "repository" || s.typ == "repo" || s.typ == "image")
-                && (s_name == repo_clean || s_name == "*" || (s_name.ends_with("/*") && repo_clean.starts_with(&s_name[..s_name.len() - 1])))
+                && matches_repo_name(&s.name, repo)
                 && s.actions.iter().any(|a| a == action_str || a == "*")
         })
 }

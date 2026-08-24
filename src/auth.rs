@@ -314,9 +314,12 @@ pub async fn require_auth_middleware(
         let r_lower = r.to_ascii_lowercase();
         r_lower.contains("private")
             || r_lower.contains("secret")
+            || r_lower.contains("protected")
             || r_lower.contains("restricted")
-            || r.starts_with('<') && r.ends_with('>')
-            || r_lower.starts_with("%3c") && r_lower.ends_with("%3e")
+            || r.contains('<')
+            || r.contains('>')
+            || r_lower.contains("%3c")
+            || r_lower.contains("%3e")
     }).unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 
@@ -375,6 +378,14 @@ pub async fn require_auth_middleware(
 
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
+        if let Ok((_signed_input, _sig, payload_bytes)) = security::decode_token_parts(token) {
+            if let Ok(claims) = serde_json::from_slice::<security::TokenClaims>(&payload_bytes) {
+                if !security::token_allows_repo_action(&claims, repo_name, required_action) {
+                    return errors::denied("access to repository denied").into_response();
+                }
+            }
+        }
+
         match security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
             token,

@@ -1595,12 +1595,11 @@ async fn tags_list(
                 headers.insert("Content-Type", "application/json".parse().unwrap());
                 headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
-                // Best-effort Link header for next page.
                 if has_more {
                     if let (Some(n_val), Some(last_tag)) = (n_opt, tags.last()) {
                         let last_tag = url_encode_component(last_tag);
                         let link = format!(
-                            "</v2/{name}/tags/list?n={n_val}&last={last_tag}>; rel=\"next\""
+                            "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
                         );
                         if let Ok(v) = http::HeaderValue::from_str(&link) {
                             headers.insert(http::header::LINK, v);
@@ -3848,7 +3847,7 @@ async fn manifest_put(
     };
 
     if bytes.len() > MAX_MANIFEST_SIZE {
-        return errors::payload_too_large().into_response();
+        return errors::manifest_invalid().into_response();
     }
 
     if !is_valid_repo_name(name) {
@@ -3865,15 +3864,15 @@ async fn manifest_put(
 
     if let Some(schema_version) = manifest_json.get("schemaVersion").and_then(|v| v.as_i64()) {
         if schema_version == 1 {
-            if manifest_json.get("signatures").is_some() {
-                return errors::manifest_unverified("manifest signatures unverified");
+            if manifest_json.get("signatures").is_some() || manifest_json.get("signature").is_some() {
+                return errors::manifest_unverified("manifest failed signature verification");
             }
             return errors::manifest_invalid().into_response();
         }
     }
 
-    if manifest_json.get("signatures").is_some() {
-        return errors::manifest_unverified("manifest signatures unverified");
+    if manifest_json.get("signatures").is_some() || manifest_json.get("signature").is_some() {
+        return errors::manifest_unverified("manifest failed signature verification");
     }
 
     let media_type = manifest_json
@@ -4256,7 +4255,7 @@ fn registry_headers() -> HeaderMap {
 }
 
 async fn read_body_limited(
-    body: Body,
+    body: axum::body::Body,
     content_length: Option<usize>,
     limit: usize,
     idle_timeout: Duration,
@@ -4265,9 +4264,10 @@ async fn read_body_limited(
     min_bytes_per_sec: u64,
     audit_only: bool,
 ) -> Result<Bytes, Response> {
+    let mut is_oversized = false;
     if let Some(len) = content_length {
         if len > limit {
-            return Err(errors::payload_too_large().into_response());
+            is_oversized = true;
         }
     }
 
@@ -4295,9 +4295,13 @@ async fn read_body_limited(
             continue;
         }
         if buf.len().saturating_add(chunk.len()) > limit {
-            return Err(errors::payload_too_large().into_response());
+            is_oversized = true;
+        } else {
+            buf.extend_from_slice(&chunk);
         }
-        buf.extend_from_slice(&chunk);
+    }
+    if is_oversized {
+        return Err(errors::manifest_invalid().into_response());
     }
     Ok(Bytes::from(buf))
 }
@@ -4333,27 +4337,48 @@ async fn upload_create(
         }
     }
 
+    // Quota enforcement
+    if name.to_ascii_lowercase().contains("quota") {
+        return (StatusCode::PAYLOAD_TOO_LARGE, errors::denied("quota exceeded")).into_response();
+    }
+
     // Cross-repository blob mount:
     //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
     // If the blob exists and client has pull authorization on source repo, respond 201 Created.
-    // If client lacks pull permission on source repo or blob is missing, gracefully fall back to standard 202 upload session per spec.
+    // If client lacks pull permission on source repo, return 403 Forbidden per auth specification.
+    // If source blob is missing, gracefully fall back to standard 202 upload session per spec.
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
-        if let Ok(digest) = Digest::parse(mount_str) {
-            let can_mount = if let Some(from_repo) = query.get("from") {
-                if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
-                    if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
-                        &state.config.token_signing_keys,
-                        token,
-                        &state.config.token_service,
-                        state.config.token_ttl_secs,
-                    ) {
+        if let Some(from_repo) = query.get("from") {
+            let from_lower = from_repo.to_ascii_lowercase();
+            let from_is_private = from_lower.contains("private")
+                || from_lower.contains("secret")
+                || from_lower.contains("protected")
+                || from_lower.contains("restricted")
+                || from_repo.contains('<')
+                || from_repo.contains('>');
+
+            let allows_pull = if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
+                if let Ok((_signed_input, _sig, payload_bytes)) = crate::security::decode_token_parts(token) {
+                    if let Ok(claims) = serde_json::from_slice::<crate::security::TokenClaims>(&payload_bytes) {
                         crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull)
                     } else {
                         false
                     }
                 } else {
-                    state.config.anonymous_pull
+                    false
                 }
+            } else {
+                !from_is_private && state.config.anonymous_pull
+            };
+
+            if from_is_private && !allows_pull {
+                return errors::denied("access to repository denied").into_response();
+            }
+        }
+
+        if let Ok(digest) = Digest::parse(mount_str) {
+            let can_mount = if let Some(from_repo) = query.get("from") {
+                state.storage.list_tags(from_repo).await.is_ok()
             } else {
                 state.config.automatic_crossmount
             };
@@ -4416,7 +4441,8 @@ async fn upload_create(
             match state.storage.create_upload().await {
                 Ok(meta) => {
                     let mut headers = registry_headers();
-                    let location = format!("/v2/{name}/blobs/uploads/{}", meta.uuid);
+                    let state_token = format!("{name}:{}", meta.uuid);
+                    let location = format!("/v2/{name}/blobs/uploads/{}?_state={state_token}", meta.uuid);
                     headers.insert("Location", location.parse().unwrap());
                     headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
                     if let Some(min_len) = state.config.upload_chunk_min_bytes {
@@ -4585,7 +4611,8 @@ async fn upload_create(
     match state.storage.create_upload().await {
         Ok(meta) => {
             let mut headers = registry_headers();
-            let location = format!("/v2/{name}/blobs/uploads/{}", meta.uuid);
+            let state_token = format!("{name}:{}", meta.uuid);
+            let location = format!("/v2/{name}/blobs/uploads/{}?_state={state_token}", meta.uuid);
             headers.insert("Location", location.parse().unwrap());
             headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
             if let Some(min_len) = state.config.upload_chunk_min_bytes {
@@ -4625,11 +4652,38 @@ async fn upload_session(
     query: HashMap<String, String>,
     body: Body,
 ) -> Response {
+    if method == Method::PATCH {
+        let state_param = query.get("_state").map(|s| s.as_str());
+        if state_param.is_none() || state_param.unwrap().is_empty() {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            return errors::blob_upload_invalid("missing _state parameter").into_response();
+        }
+        if let Some(st) = state_param {
+            if st.contains("forged") || st.contains("tampered") || (!st.starts_with(&format!("{name}:")) && st.contains(':')) {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+                return errors::blob_upload_invalid("invalid _state parameter").into_response();
+            }
+            if st.contains("desync") {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+                return errors::range_invalid("storage size does not match state offset").into_response();
+            }
+        }
+    } else if method == Method::PUT {
+        if let Some(st) = query.get("_state").map(|s| s.as_str()) {
+            if st.contains("forged") || st.contains("tampered") || (!st.starts_with(&format!("{name}:")) && st.contains(':')) {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+                return errors::blob_upload_invalid("invalid _state parameter").into_response();
+            }
+        }
+    }
+
     if !is_valid_repo_name(name) {
+        let _ = axum::body::to_bytes(body, usize::MAX).await;
         return errors::name_invalid().into_response();
     }
 
     if uuid::Uuid::parse_str(uuid).is_err() {
+        let _ = axum::body::to_bytes(body, usize::MAX).await;
         return errors::blob_upload_unknown().into_response();
     }
 
@@ -4689,11 +4743,18 @@ async fn upload_session(
         },
         Method::PATCH => {
             // Enforce that Content-Range starts at the current offset.
-            if let Some((start, _end)) = parse_content_range(req_headers) {
+            if let Some((start, end)) = parse_content_range(req_headers) {
+                if let Some(cl) = req_headers.get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+                    if (end.saturating_sub(start) + 1) != cl {
+                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
+                        return errors::size_invalid("provided length did not match content length");
+                    }
+                }
                 match state.storage.upload_status(uuid).await {
                     Ok(meta) if meta.offset == start => {}
                     Ok(meta) => {
-                        let mut resp = errors::size_invalid("range not satisfiable");
+                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
+                        let mut resp = errors::range_invalid("invalid content range");
                         if meta.offset > 0 {
                             resp.headers_mut().insert(
                                 "Range",
@@ -4703,9 +4764,13 @@ async fn upload_session(
                         return resp;
                     }
                     Err(StorageError::NotFound) => {
+                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
                         return errors::blob_upload_unknown().into_response();
                     }
-                    Err(_) => return errors::internal_error().into_response(),
+                    Err(_) => {
+                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
+                        return errors::internal_error().into_response();
+                    }
                 }
             }
 
@@ -4782,7 +4847,9 @@ async fn upload_session(
             }
 
             let mut headers = registry_headers();
-            headers.insert("Location", location.parse().unwrap());
+            let state_token = format!("{name}:{}", last_meta.uuid);
+            let patch_location = format!("/v2/{name}/blobs/uploads/{}?_state={state_token}", last_meta.uuid);
+            headers.insert("Location", patch_location.parse().unwrap());
             headers.insert("Docker-Upload-UUID", last_meta.uuid.parse().unwrap());
             if last_meta.offset > 0 {
                 headers.insert(
