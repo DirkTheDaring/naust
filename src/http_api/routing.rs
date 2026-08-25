@@ -147,9 +147,10 @@ impl OciRoute {
             OciRoute::UploadInitiate { .. } => Some(RepoAction::Push),
             OciRoute::UploadSession { .. } => match *method {
                 http::Method::GET | http::Method::HEAD => Some(RepoAction::Pull),
-                http::Method::PATCH | http::Method::PUT | http::Method::POST | http::Method::DELETE => {
-                    Some(RepoAction::Push)
-                }
+                http::Method::PATCH
+                | http::Method::PUT
+                | http::Method::POST
+                | http::Method::DELETE => Some(RepoAction::Push),
                 _ => Some(RepoAction::Push),
             },
             OciRoute::Blob { .. } => match *method {

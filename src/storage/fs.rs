@@ -9,8 +9,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 const UPLOAD_SHA256_STATE_MAGIC: &[u8; 8] = b"RRSHA256";
 const UPLOAD_SHA256_STATE_VERSION: u8 = 1;
@@ -28,13 +28,7 @@ impl SerializableSha256 {
         // SHA-256 IV (FIPS 180-4)
         Self {
             state: [
-                0x6a09e667,
-                0xbb67ae85,
-                0x3c6ef372,
-                0xa54ff53a,
-                0x510e527f,
-                0x9b05688c,
-                0x1f83d9ab,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
                 0x5be0cd19,
             ],
             buffer: [0u8; 64],
@@ -196,7 +190,10 @@ impl FsStorage {
         }
     }
 
-    fn upload_hash_shard(&self, uuid: &str) -> &Mutex<std::collections::HashMap<String, SerializableSha256>> {
+    fn upload_hash_shard(
+        &self,
+        uuid: &str,
+    ) -> &Mutex<std::collections::HashMap<String, SerializableSha256>> {
         let idx = shard_index(uuid, HASH_SHARDS);
         &self.upload_hashes[idx]
     }
@@ -225,7 +222,11 @@ impl FsStorage {
         Some(st)
     }
 
-    async fn persist_upload_hash_state(&self, uuid: &str, st: &SerializableSha256) -> Result<(), StorageError> {
+    async fn persist_upload_hash_state(
+        &self,
+        uuid: &str,
+        st: &SerializableSha256,
+    ) -> Result<(), StorageError> {
         let path = self.upload_hash_path(uuid);
         let bytes = st.to_bytes();
         atomic_write_file(&path, &bytes).await
@@ -272,7 +273,11 @@ impl FsStorage {
         Some(hasher)
     }
 
-    async fn ensure_upload_hash_state(&self, uuid: &str, current_len: u64) -> Option<SerializableSha256> {
+    async fn ensure_upload_hash_state(
+        &self,
+        uuid: &str,
+        current_len: u64,
+    ) -> Option<SerializableSha256> {
         let shard = self.upload_hash_shard(uuid);
         // Fast path: in-memory.
         {
@@ -577,7 +582,9 @@ impl Storage for FsStorage {
                 let qpath = self.quarantine_blob_path(digest);
                 match tokio::fs::metadata(&qpath).await {
                     Ok(meta) => Ok(BlobMeta { size: meta.len() }),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        Err(StorageError::NotFound)
+                    }
                     Err(err) => Err(StorageError::Internal(err.to_string())),
                 }
             }
@@ -735,9 +742,7 @@ impl Storage for FsStorage {
                 let _ = fsync_dir(tags_dir.as_path()).await;
                 Ok(())
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(StorageError::NotFound)
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
             Err(err) => Err(StorageError::Internal(err.to_string())),
         }
     }
@@ -1165,9 +1170,18 @@ mod tests {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
 
-        let subject = Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111").unwrap();
-        let ref1 = Digest::parse("sha256:2222222222222222222222222222222222222222222222222222222222222222").unwrap();
-        let ref2 = Digest::parse("sha256:3333333333333333333333333333333333333333333333333333333333333333").unwrap();
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let ref1 = Digest::parse(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let ref2 = Digest::parse(
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
 
         let desc1 = ReferrerDescriptor {
             media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
@@ -1186,15 +1200,30 @@ mod tests {
         };
 
         // Add both referrers
-        storage.add_referrer("testrepo", &subject, desc1).await.expect("add ref1");
-        storage.add_referrer("testrepo", &subject, desc2).await.expect("add ref2");
+        storage
+            .add_referrer("testrepo", &subject, desc1)
+            .await
+            .expect("add ref1");
+        storage
+            .add_referrer("testrepo", &subject, desc2)
+            .await
+            .expect("add ref2");
 
-        let list = storage.list_referrers("testrepo", &subject).await.expect("list referrers");
+        let list = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .expect("list referrers");
         assert_eq!(list.len(), 2);
 
         // Remove ref1 directly
-        storage.remove_referrer("testrepo", &subject, &ref1).await.expect("remove ref1");
-        let list = storage.list_referrers("testrepo", &subject).await.expect("list referrers");
+        storage
+            .remove_referrer("testrepo", &subject, &ref1)
+            .await
+            .expect("remove ref1");
+        let list = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .expect("list referrers");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].digest, ref2.as_str());
 
@@ -1209,11 +1238,20 @@ mod tests {
             }
         });
         let bytes = serde_json::to_vec(&manifest_ref2).unwrap();
-        storage.put_manifest("testrepo", &ref2, bytes.into()).await.expect("put manifest");
+        storage
+            .put_manifest("testrepo", &ref2, bytes.into())
+            .await
+            .expect("put manifest");
 
         // Delete ref2 manifest -> should remove from referrers
-        storage.delete_manifest("testrepo", &ref2).await.expect("delete manifest");
-        let list = storage.list_referrers("testrepo", &subject).await.expect("list referrers");
+        storage
+            .delete_manifest("testrepo", &ref2)
+            .await
+            .expect("delete manifest");
+        let list = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .expect("list referrers");
         assert_eq!(list.len(), 0);
 
         let _ = std::fs::remove_dir_all(&root);

@@ -86,7 +86,12 @@ impl BlobRefIndex {
     // Pin/lease store (for online blob GC safety): best-effort and conservative.
     // - The server owns the sled DB; external tools must not mutate it.
     // - Pinning should never break pushes; callers should treat errors as non-fatal.
-    pub fn pin_blob(&self, digest: &Digest, until: SystemTime, reason: &str) -> Result<(), RefIndexError> {
+    pub fn pin_blob(
+        &self,
+        digest: &Digest,
+        until: SystemTime,
+        reason: &str,
+    ) -> Result<(), RefIndexError> {
         let Some(until_secs) = system_time_to_unix_secs(until) else {
             // System time before UNIX_EPOCH (or otherwise invalid): skip pinning.
             return Ok(());
@@ -513,7 +518,11 @@ impl BlobRefIndex {
         let updated = self.root_counts.update_and_fetch(root, |old| {
             let cur = old.and_then(|v| decode_u64(v)).unwrap_or(0);
             let next = cur.saturating_sub(1);
-            if next == 0 { None } else { Some(encode_u64(next)) }
+            if next == 0 {
+                None
+            } else {
+                Some(encode_u64(next))
+            }
         })?;
 
         // If updated == None, key was removed.
@@ -587,7 +596,12 @@ fn decode_parent_list(v: &[u8]) -> Option<Vec<String>> {
         return Some(Vec::new());
     }
     let s = std::str::from_utf8(v).ok()?;
-    Some(s.split('\n').filter(|p| !p.is_empty()).map(|p| p.to_string()).collect())
+    Some(
+        s.split('\n')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .collect(),
+    )
 }
 
 // Keep clippy happy: used by signature clarity.
@@ -667,14 +681,18 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
-        async fn head_blob(&self, _digest: &Digest) -> Result<crate::storage::BlobMeta, StorageError> {
+        async fn head_blob(
+            &self,
+            _digest: &Digest,
+        ) -> Result<crate::storage::BlobMeta, StorageError> {
             Err(StorageError::Unsupported)
         }
 
         async fn open_blob(
             &self,
             _digest: &Digest,
-        ) -> Result<(crate::storage::BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
+        ) -> Result<(crate::storage::BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError>
+        {
             Err(StorageError::Unsupported)
         }
 
@@ -736,7 +754,12 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
-        async fn set_tag(&self, _name: &str, _tag: &str, _digest: &Digest) -> Result<(), StorageError> {
+        async fn set_tag(
+            &self,
+            _name: &str,
+            _tag: &str,
+            _digest: &Digest,
+        ) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
 
@@ -748,15 +771,26 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
-        async fn upload_status(&self, _uuid: &str) -> Result<crate::storage::UploadMeta, StorageError> {
+        async fn upload_status(
+            &self,
+            _uuid: &str,
+        ) -> Result<crate::storage::UploadMeta, StorageError> {
             Err(StorageError::Unsupported)
         }
 
-        async fn append_upload(&self, _uuid: &str, _chunk: Bytes) -> Result<crate::storage::UploadMeta, StorageError> {
+        async fn append_upload(
+            &self,
+            _uuid: &str,
+            _chunk: Bytes,
+        ) -> Result<crate::storage::UploadMeta, StorageError> {
             Err(StorageError::Unsupported)
         }
 
-        async fn finalize_upload(&self, _uuid: &str, _digest: &Digest) -> Result<crate::storage::BlobMeta, StorageError> {
+        async fn finalize_upload(
+            &self,
+            _uuid: &str,
+            _digest: &Digest,
+        ) -> Result<crate::storage::BlobMeta, StorageError> {
             Err(StorageError::Unsupported)
         }
 
@@ -850,21 +884,24 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(100);
         let until = UNIX_EPOCH + Duration::from_secs(110);
 
-        idx.pin_blob(&digest, until, "finalize_upload").expect("pin");
+        idx.pin_blob(&digest, until, "finalize_upload")
+            .expect("pin");
 
         assert!(idx.is_blob_pinned(&digest, now).expect("is_pinned"));
-        assert!(!idx
-            .is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(111))
-            .expect("is_pinned"));
+        assert!(
+            !idx.is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(111))
+                .expect("is_pinned")
+        );
 
         let removed = idx
             .purge_expired_pins(UNIX_EPOCH + Duration::from_secs(111))
             .expect("purge");
         assert_eq!(removed, 1);
 
-        assert!(!idx
-            .is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(200))
-            .expect("is_pinned"));
+        assert!(
+            !idx.is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(200))
+                .expect("is_pinned")
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -883,9 +920,10 @@ mod tests {
         idx.pin_blob(&digest, UNIX_EPOCH + Duration::from_secs(150), "shorten")
             .expect("pin");
 
-        assert!(idx
-            .is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(160))
-            .expect("is_pinned"));
+        assert!(
+            idx.is_blob_pinned(&digest, UNIX_EPOCH + Duration::from_secs(160))
+                .expect("is_pinned")
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -1032,8 +1070,16 @@ mod tests {
         mock.remove_tag(repo, "t2");
         idx.sync_repo_tags(&storage, repo).await.expect("sync");
 
-        assert!(idx.root_counts.contains_key(r1.as_str().as_bytes()).expect("contains"));
-        assert!(!idx.root_counts.contains_key(r2.as_str().as_bytes()).expect("contains"));
+        assert!(
+            idx.root_counts
+                .contains_key(r1.as_str().as_bytes())
+                .expect("contains")
+        );
+        assert!(
+            !idx.root_counts
+                .contains_key(r2.as_str().as_bytes())
+                .expect("contains")
+        );
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -1054,7 +1100,9 @@ mod tests {
         idx.meta
             .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
             .expect("meta");
-        idx.meta.insert(META_STATE, META_STATE_BUILDING).expect("meta");
+        idx.meta
+            .insert(META_STATE, META_STATE_BUILDING)
+            .expect("meta");
 
         let err = idx
             .ensure_healthy_or_rebuild(&storage, false, false)

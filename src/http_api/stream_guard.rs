@@ -1,8 +1,8 @@
+use bytes::Bytes;
+use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use bytes::Bytes;
-use futures_util::Stream;
 use tokio::time::{Instant, Sleep};
 
 #[derive(Debug, thiserror::Error)]
@@ -11,10 +11,7 @@ pub enum StreamGuardError {
     IdleTimeout(Duration),
 
     #[error("upload stream throughput too low: {actual_bps} B/s < required {min_bps} B/s")]
-    InsufficientThroughput {
-        actual_bps: u64,
-        min_bps: u64,
-    },
+    InsufficientThroughput { actual_bps: u64, min_bps: u64 },
 
     #[error("underlying body stream error: {0}")]
     BodyError(String),

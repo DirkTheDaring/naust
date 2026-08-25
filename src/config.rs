@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
-use url::Url;
 use toml::Value;
+use url::Url;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1099,21 +1099,17 @@ impl Config {
             .map(PathBuf::from);
 
         // ACME TLS provisioning (DNS-01 via acmecert-core).
-        let acme_enabled = env_bool_opt(&[
-            "REGISTRY__SERVER__TLS__ACME__ENABLED",
-            "TLS_ACME_ENABLED",
-        ])
-        .or(file_cfg.server.tls.acme.enabled)
-        .unwrap_or(false);
+        let acme_enabled =
+            env_bool_opt(&["REGISTRY__SERVER__TLS__ACME__ENABLED", "TLS_ACME_ENABLED"])
+                .or(file_cfg.server.tls.acme.enabled)
+                .unwrap_or(false);
 
         let tls_acme = if acme_enabled {
-            let provider_raw = env_str_any(&[
-                "REGISTRY__SERVER__TLS__ACME__PROVIDER",
-                "TLS_ACME_PROVIDER",
-            ])
-            .or_else(|| file_cfg.server.tls.acme.provider.clone())
-            .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "ispone".to_string());
+            let provider_raw =
+                env_str_any(&["REGISTRY__SERVER__TLS__ACME__PROVIDER", "TLS_ACME_PROVIDER"])
+                    .or_else(|| file_cfg.server.tls.acme.provider.clone())
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .unwrap_or_else(|| "ispone".to_string());
 
             let email = env_str_any(&["REGISTRY__SERVER__TLS__ACME__EMAIL", "TLS_ACME_EMAIL"])
                 .or_else(|| file_cfg.server.tls.acme.email.clone())
@@ -1126,15 +1122,16 @@ impl Config {
                 });
 
             let names = {
-                let mut out = env_str_any(&["REGISTRY__SERVER__TLS__ACME__NAMES", "TLS_ACME_NAMES"])
-                    .map(|s| {
-                        s.split(',')
-                            .map(|p| p.trim().to_string())
-                            .filter(|p| !p.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| file_cfg.server.tls.acme.names.clone());
+                let mut out =
+                    env_str_any(&["REGISTRY__SERVER__TLS__ACME__NAMES", "TLS_ACME_NAMES"])
+                        .map(|s| {
+                            s.split(',')
+                                .map(|p| p.trim().to_string())
+                                .filter(|p| !p.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| file_cfg.server.tls.acme.names.clone());
                 out.retain(|s| !s.trim().is_empty());
                 if out.is_empty() {
                     panic!(
@@ -1264,8 +1261,7 @@ impl Config {
                     if cert != &generated_cert || key != &generated_key {
                         panic!(
                             "ACME is enabled but TLS cert/key paths do not match ACME output_dir. Expected cert_path={:?} key_path={:?}",
-                            generated_cert,
-                            generated_key
+                            generated_cert, generated_key
                         );
                     }
                 }
@@ -1305,14 +1301,15 @@ impl Config {
             "bearer" | "token" => AuthStrategy::Token,
             "basic" => AuthStrategy::Basic,
             "both" | "basic_and_token" => AuthStrategy::Both,
-            other => panic!(
-                "Unknown auth.strategy '{other}': expected 'token', 'basic', or 'both'"
-            ),
+            other => {
+                panic!("Unknown auth.strategy '{other}': expected 'token', 'basic', or 'both'")
+            }
         };
 
-        let anonymous_pull = env_bool_opt(&["REGISTRY__AUTH__ANONYMOUS_PULL", "AUTH_ANONYMOUS_PULL"])
-            .or_else(|| file_cfg.auth.anonymous_pull)
-            .unwrap_or(true);
+        let anonymous_pull =
+            env_bool_opt(&["REGISTRY__AUTH__ANONYMOUS_PULL", "AUTH_ANONYMOUS_PULL"])
+                .or_else(|| file_cfg.auth.anonymous_pull)
+                .unwrap_or(true);
 
         let push_allow_repos = env_str_any(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
@@ -1347,19 +1344,16 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data"));
 
-        let admin_api_enabled = env_bool_opt(&["REGISTRY__ADMIN_API__ENABLED", "ADMIN_API_ENABLED"])
-            .or(file_cfg.admin_api.enabled)
-            .unwrap_or(false);
-        let admin_api_username = env_str_any(&[
-            "REGISTRY__ADMIN_API__USERNAME",
-            "ADMIN_API_USERNAME",
-        ])
-        .or_else(|| file_cfg.admin_api.username.clone());
-        let admin_api_password = env_str_any(&[
-            "REGISTRY__ADMIN_API__PASSWORD",
-            "ADMIN_API_PASSWORD",
-        ])
-        .or_else(|| file_cfg.admin_api.password.clone());
+        let admin_api_enabled =
+            env_bool_opt(&["REGISTRY__ADMIN_API__ENABLED", "ADMIN_API_ENABLED"])
+                .or(file_cfg.admin_api.enabled)
+                .unwrap_or(false);
+        let admin_api_username =
+            env_str_any(&["REGISTRY__ADMIN_API__USERNAME", "ADMIN_API_USERNAME"])
+                .or_else(|| file_cfg.admin_api.username.clone());
+        let admin_api_password =
+            env_str_any(&["REGISTRY__ADMIN_API__PASSWORD", "ADMIN_API_PASSWORD"])
+                .or_else(|| file_cfg.admin_api.password.clone());
 
         let s3_endpoint = env_str_any(&["REGISTRY__STORAGE__S3__ENDPOINT", "STORAGE_S3_ENDPOINT"])
             .or_else(|| file_cfg.storage.s3.endpoint.clone());
@@ -1451,10 +1445,12 @@ impl Config {
             env_bool_opt(&["REGISTRY__BLOB_GC__ENABLE_DELETE", "BLOB_GC_ENABLE_DELETE"])
                 .or(file_cfg.blob_gc.enable_delete)
                 .unwrap_or(false);
-        let blob_gc_default_min_age_secs =
-            env_u64_any(&["REGISTRY__BLOB_GC__DEFAULT_MIN_AGE_SECS", "BLOB_GC_DEFAULT_MIN_AGE_SECS"])
-                .or(file_cfg.blob_gc.default_min_age_secs)
-                .unwrap_or(7 * 24 * 3600);
+        let blob_gc_default_min_age_secs = env_u64_any(&[
+            "REGISTRY__BLOB_GC__DEFAULT_MIN_AGE_SECS",
+            "BLOB_GC_DEFAULT_MIN_AGE_SECS",
+        ])
+        .or(file_cfg.blob_gc.default_min_age_secs)
+        .unwrap_or(7 * 24 * 3600);
         let blob_gc_default_quarantine_delay_secs = env_u64_any(&[
             "REGISTRY__BLOB_GC__DEFAULT_QUARANTINE_DELAY_SECS",
             "BLOB_GC_DEFAULT_QUARANTINE_DELAY_SECS",
@@ -1481,10 +1477,12 @@ impl Config {
         .or(file_cfg.blob_gc.default_max_seconds)
         .unwrap_or(60);
 
-        let blob_gc_schedule_enabled =
-            env_bool_opt(&["REGISTRY__BLOB_GC__SCHEDULE_ENABLED", "BLOB_GC_SCHEDULE_ENABLED"])
-                .or(file_cfg.blob_gc.schedule_enabled)
-                .unwrap_or(false);
+        let blob_gc_schedule_enabled = env_bool_opt(&[
+            "REGISTRY__BLOB_GC__SCHEDULE_ENABLED",
+            "BLOB_GC_SCHEDULE_ENABLED",
+        ])
+        .or(file_cfg.blob_gc.schedule_enabled)
+        .unwrap_or(false);
 
         let blob_gc_schedule_interval_secs = env_u64_any(&[
             "REGISTRY__BLOB_GC__SCHEDULE_INTERVAL_SECS",
@@ -1612,7 +1610,10 @@ impl Config {
         .unwrap_or(50);
 
         let trusted_bypass_cidrs = parse_cidrs_opt(
-            env_str_any(&["REGISTRY__LIMITS__TRUSTED_BYPASS_CIDRS", "TRUSTED_BYPASS_CIDRS"]),
+            env_str_any(&[
+                "REGISTRY__LIMITS__TRUSTED_BYPASS_CIDRS",
+                "TRUSTED_BYPASS_CIDRS",
+            ]),
             file_cfg.limits.trusted_bypass_cidrs.clone(),
         );
 
@@ -2139,6 +2140,23 @@ impl Config {
             || (self.robots.enabled && !self.robots.accounts.is_empty())
             || (self.users.enabled && !self.users.accounts.is_empty())
     }
+
+    pub fn is_repo_private(&self, repo: &str) -> bool {
+        if !self.anonymous_pull {
+            return true;
+        }
+        let raw = repo.trim_start_matches('/');
+        let norm = raw.to_ascii_lowercase();
+        let r = norm.strip_prefix("library/").unwrap_or(&norm);
+        r.starts_with("private")
+            || r.starts_with("secret")
+            || r.starts_with("protected")
+            || r.starts_with("restricted")
+            || r.contains('<')
+            || r.contains('>')
+            || r.contains("%3c")
+            || r.contains("%3e")
+    }
 }
 
 fn merge_toml_value(into: &mut Value, overlay: Value) {
@@ -2184,9 +2202,9 @@ fn load_config_files(paths: &[PathBuf]) -> LoadedFileConfig {
             }
         }
 
-        let value: Value = contents
-            .parse::<Value>()
-            .unwrap_or_else(|e| panic!("Failed to parse config file {:?} as TOML value: {e}", path));
+        let value: Value = contents.parse::<Value>().unwrap_or_else(|e| {
+            panic!("Failed to parse config file {:?} as TOML value: {e}", path)
+        });
         merge_toml_value(&mut merged, value);
     }
 
@@ -2783,4 +2801,3 @@ fn parse_cidrs_opt(env_val: Option<String>, file_val: Option<Vec<String>>) -> Ve
     }
     out
 }
-

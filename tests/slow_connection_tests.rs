@@ -7,10 +7,7 @@ use std::time::Duration;
 
 fn pick_unused_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    listener
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    listener.local_addr().expect("local_addr").port()
 }
 
 fn bin_path() -> String {
@@ -31,10 +28,7 @@ fn bin_path() -> String {
         "registry-rust"
     };
 
-    profile_dir
-        .join(bin_name)
-        .to_string_lossy()
-        .to_string()
+    profile_dir.join(bin_name).to_string_lossy().to_string()
 }
 
 struct ServerGuard {
@@ -156,7 +150,15 @@ async fn test_stream_idle_timeout_aborts_on_silence() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let port = pick_unused_port();
     let (cfg_path, log_path) = write_config(
-        &temp_dir, port, 2, 10, 5, 1000, "enforce", 50, &["127.0.0.1/32"],
+        &temp_dir,
+        port,
+        2,
+        10,
+        5,
+        1000,
+        "enforce",
+        50,
+        &["127.0.0.1/32"],
     );
 
     let _server = spawn_server(&cfg_path, &log_path);
@@ -187,7 +189,9 @@ async fn test_stream_idle_timeout_aborts_on_silence() {
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     tokio::spawn(async move {
-        let _ = tx.send(Ok(bytes::Bytes::from_static(b"initial-chunk-bytes"))).await;
+        let _ = tx
+            .send(Ok(bytes::Bytes::from_static(b"initial-chunk-bytes")))
+            .await;
         // Idle for 3.5s (exceeding the 2s idle timeout)
         tokio::time::sleep(Duration::from_millis(3500)).await;
         let _ = tx.send(Ok(bytes::Bytes::from_static(b"late-bytes"))).await;
@@ -222,7 +226,15 @@ async fn test_drip_feed_below_min_rate_aborts_after_grace() {
     let port = pick_unused_port();
     // 1s grace period, 1s rate window, required 100,000 B/s (100 KB/s)
     let (cfg_path, log_path) = write_config(
-        &temp_dir, port, 10, 1, 1, 100_000, "enforce", 50, &["127.0.0.1/32"],
+        &temp_dir,
+        port,
+        10,
+        1,
+        1,
+        100_000,
+        "enforce",
+        50,
+        &["127.0.0.1/32"],
     );
 
     let _server = spawn_server(&cfg_path, &log_path);
@@ -286,7 +298,15 @@ async fn test_legitimate_upload_and_resumption() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let port = pick_unused_port();
     let (cfg_path, log_path) = write_config(
-        &temp_dir, port, 5, 2, 2, 100, "enforce", 50, &["127.0.0.1/32"],
+        &temp_dir,
+        port,
+        5,
+        2,
+        2,
+        100,
+        "enforce",
+        50,
+        &["127.0.0.1/32"],
     );
 
     let _server = spawn_server(&cfg_path, &log_path);
@@ -325,7 +345,12 @@ async fn test_legitimate_upload_and_resumption() {
         .expect("send chunk 1");
     assert_eq!(patch_resp1.status(), reqwest::StatusCode::ACCEPTED);
     assert_eq!(
-        patch_resp1.headers().get("Range").unwrap().to_str().unwrap(),
+        patch_resp1
+            .headers()
+            .get("Range")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "0-999"
     );
 
@@ -382,7 +407,15 @@ async fn test_untrusted_xff_spoofing_prevented() {
     let port = pick_unused_port();
     // max 2 connections per IP, only 10.0.0.1 trusted as proxy
     let (cfg_path, log_path) = write_config(
-        &temp_dir, port, 30, 15, 10, 100, "enforce", 2, &["10.0.0.1/32"],
+        &temp_dir,
+        port,
+        30,
+        15,
+        10,
+        100,
+        "enforce",
+        2,
+        &["10.0.0.1/32"],
     );
 
     let _server = spawn_server(&cfg_path, &log_path);
@@ -414,7 +447,15 @@ async fn test_audit_only_policy_logs_without_dropping() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let port = pick_unused_port();
     let (cfg_path, log_path) = write_config(
-        &temp_dir, port, 1, 1, 1, 100_000, "audit_only", 50, &["127.0.0.1/32"],
+        &temp_dir,
+        port,
+        1,
+        1,
+        1,
+        100_000,
+        "audit_only",
+        50,
+        &["127.0.0.1/32"],
     );
 
     let _server = spawn_server(&cfg_path, &log_path);

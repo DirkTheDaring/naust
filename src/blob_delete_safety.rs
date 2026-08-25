@@ -4,8 +4,8 @@ use crate::{
     storage::{Storage, StorageError},
 };
 use std::{
-    collections::{HashSet, VecDeque},
     collections::HashMap,
+    collections::{HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -118,8 +118,7 @@ pub async fn find_blob_reference(
                 continue;
             };
             if let Some(r) =
-                scan_repo_for_blob(storage, &repo, root, Some(tag), target, &mut refs_cache)
-                    .await?
+                scan_repo_for_blob(storage, &repo, root, Some(tag), target, &mut refs_cache).await?
             {
                 return Ok(Some(r));
             }

@@ -56,7 +56,10 @@ where
         where
             E: serde::de::Error,
         {
-            Ok(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            Ok(v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
         }
 
         fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -147,7 +150,9 @@ pub fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), Token
 
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64.as_bytes())
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload_b64.as_bytes()))
+        .or_else(|_| {
+            base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload_b64.as_bytes())
+        })
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64.as_bytes()))
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(payload_b64.as_bytes()))
         .map_err(|_| TokenError::InvalidPayload)?;
@@ -187,7 +192,8 @@ pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims
             let mut mac2 = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
                 .map_err(|_| TokenError::InvalidSigningKey)?;
             mac2.update(parts[1].as_bytes());
-            mac2.verify_slice(&sig).map_err(|_| TokenError::InvalidSignature)?;
+            mac2.verify_slice(&sig)
+                .map_err(|_| TokenError::InvalidSignature)?;
         } else {
             return Err(TokenError::InvalidSignature);
         }
@@ -419,20 +425,23 @@ fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
 
 pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAction) -> bool {
     let action_str = action.as_str();
-    claims
-        .scopes
-        .iter()
-        .any(|s| {
-            (s.typ == "repository" || s.typ == "repo" || s.typ == "image")
-                && matches_repo_name(&s.name, repo)
-                && s.actions.iter().any(|a| a == action_str || a == "*")
-        })
+    claims.scopes.iter().any(|s| {
+        (s.typ == "repository" || s.typ == "repo" || s.typ == "image")
+            && matches_repo_name(&s.name, repo)
+            && s.actions.iter().any(|a| a == action_str || a == "*")
+    })
 }
 
 pub fn token_allows_catalog_action(claims: &TokenClaims) -> bool {
     claims.scopes.iter().any(|s| {
-        (s.typ == "registry" && (s.name == "catalog" || s.name == "*") && s.actions.iter().any(|a| a == "*" || a == "pull" || a == "push" || a == "read"))
-            || ((s.typ == "repository" || s.typ == "repo") && s.name == "*" && s.actions.iter().any(|a| a == "*"))
+        (s.typ == "registry"
+            && (s.name == "catalog" || s.name == "*")
+            && s.actions
+                .iter()
+                .any(|a| a == "*" || a == "pull" || a == "push" || a == "read"))
+            || ((s.typ == "repository" || s.typ == "repo")
+                && s.name == "*"
+                && s.actions.iter().any(|a| a == "*"))
     })
 }
 

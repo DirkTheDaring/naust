@@ -9,10 +9,7 @@ use std::time::Duration;
 
 fn pick_unused_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    listener
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    listener.local_addr().expect("local_addr").port()
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -40,10 +37,7 @@ fn bin_path() -> String {
         "registry-rust"
     };
 
-    profile_dir
-        .join(bin_name)
-        .to_string_lossy()
-        .to_string()
+    profile_dir.join(bin_name).to_string_lossy().to_string()
 }
 
 struct ServerGuard {
@@ -242,7 +236,10 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
     let put_base_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/v1.0.0"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(base_manifest_bytes.clone())
         .send()
         .await
@@ -251,7 +248,9 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
 
     // 2. Query referrers before any artifact pushed -> should return 200 with empty manifests array
     let empty_ref_resp = client
-        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .get(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}"
+        ))
         .send()
         .await
         .expect("get empty referrers");
@@ -294,16 +293,26 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
     let sbom_manifest_digest = format!("sha256:{sbom_manifest_hex}");
 
     let put_sbom_resp = client
-        .put(format!("{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"))
+        .put(format!(
+            "{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"
+        ))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(sbom_manifest_bytes.clone())
         .send()
         .await
         .expect("put sbom manifest");
     assert_eq!(put_sbom_resp.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
-        put_sbom_resp.headers().get("OCI-Subject").unwrap().to_str().unwrap(),
+        put_sbom_resp
+            .headers()
+            .get("OCI-Subject")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         base_manifest_digest
     );
 
@@ -330,28 +339,45 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
     let sig_manifest_digest = format!("sha256:{sig_manifest_hex}");
 
     let put_sig_resp = client
-        .put(format!("{base_url}/v2/{repo}/manifests/{sig_manifest_digest}"))
+        .put(format!(
+            "{base_url}/v2/{repo}/manifests/{sig_manifest_digest}"
+        ))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(sig_manifest_bytes.clone())
         .send()
         .await
         .expect("put sig manifest");
     assert_eq!(put_sig_resp.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
-        put_sig_resp.headers().get("OCI-Subject").unwrap().to_str().unwrap(),
+        put_sig_resp
+            .headers()
+            .get("OCI-Subject")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         base_manifest_digest
     );
 
     // 5. Query Referrers list -> both descriptors returned
     let ref_resp = client
-        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .get(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}"
+        ))
         .send()
         .await
         .expect("get referrers");
     assert_eq!(ref_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        ref_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        ref_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/vnd.oci.image.index.v1+json"
     );
     let ref_body: serde_json::Value = ref_resp.json().await.expect("json");
@@ -360,7 +386,9 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
 
     // 6. Query HEAD referrers
     let head_ref_resp = client
-        .head(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .head(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}"
+        ))
         .send()
         .await
         .expect("head referrers");
@@ -376,7 +404,12 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
         .expect("get filtered referrers");
     assert_eq!(filtered_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        filtered_resp.headers().get("OCI-Filters-Applied").unwrap().to_str().unwrap(),
+        filtered_resp
+            .headers()
+            .get("OCI-Filters-Applied")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "artifactType"
     );
     let filtered_body: serde_json::Value = filtered_resp.json().await.expect("json");
@@ -389,18 +422,30 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
 
     // 8. Test Pagination with `n=1` and `Link` header
     let page1_resp = client
-        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}?n=1"))
+        .get(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}?n=1"
+        ))
         .send()
         .await
         .expect("page1 referrers");
     assert_eq!(page1_resp.status(), reqwest::StatusCode::OK);
-    let link_header = page1_resp.headers().get("Link").expect("Link header").to_str().unwrap().to_string();
+    let link_header = page1_resp
+        .headers()
+        .get("Link")
+        .expect("Link header")
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(link_header.contains("rel=\"next\""));
     let page1_body: serde_json::Value = page1_resp.json().await.unwrap();
     assert_eq!(page1_body["manifests"].as_array().unwrap().len(), 1);
 
     // Extract next url from Link header
-    let link_url = link_header.trim_start_matches('<').split('>').next().unwrap();
+    let link_url = link_header
+        .trim_start_matches('<')
+        .split('>')
+        .next()
+        .unwrap();
     let page2_resp = client
         .get(format!("{base_url}{link_url}"))
         .send()
@@ -412,30 +457,46 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
 
     // 9. Pull manifest GET and HEAD -> verify OCI-Subject header
     let get_manifest_resp = client
-        .get(format!("{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"))
+        .get(format!(
+            "{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"
+        ))
         .send()
         .await
         .expect("get sbom manifest");
     assert_eq!(get_manifest_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        get_manifest_resp.headers().get("OCI-Subject").unwrap().to_str().unwrap(),
+        get_manifest_resp
+            .headers()
+            .get("OCI-Subject")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         base_manifest_digest
     );
 
     let head_manifest_resp = client
-        .head(format!("{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"))
+        .head(format!(
+            "{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"
+        ))
         .send()
         .await
         .expect("head sbom manifest");
     assert_eq!(head_manifest_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        head_manifest_resp.headers().get("OCI-Subject").unwrap().to_str().unwrap(),
+        head_manifest_resp
+            .headers()
+            .get("OCI-Subject")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         base_manifest_digest
     );
 
     // 10. Delete Artifact 1 -> verify referrer is removed from list
     let del_resp = client
-        .delete(format!("{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"))
+        .delete(format!(
+            "{base_url}/v2/{repo}/manifests/{sbom_manifest_digest}"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -443,7 +504,9 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
     assert_eq!(del_resp.status(), reqwest::StatusCode::ACCEPTED);
 
     let after_del_resp = client
-        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .get(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}"
+        ))
         .send()
         .await
         .expect("get referrers after delete");
@@ -451,7 +514,10 @@ async fn test_oci_1_1_referrers_api_full_lifecycle() {
     let after_del_body: serde_json::Value = after_del_resp.json().await.unwrap();
     let after_del_manifests = after_del_body["manifests"].as_array().unwrap();
     assert_eq!(after_del_manifests.len(), 1);
-    assert_eq!(after_del_manifests[0]["digest"].as_str().unwrap(), sig_manifest_digest);
+    assert_eq!(
+        after_del_manifests[0]["digest"].as_str().unwrap(),
+        sig_manifest_digest
+    );
 }
 
 #[tokio::test]
@@ -487,7 +553,12 @@ async fn test_oci_1_1_extension_discovery_and_resumable_upload() {
         .expect("start upload");
     assert_eq!(upload_start.status(), reqwest::StatusCode::ACCEPTED);
     assert_eq!(
-        upload_start.headers().get("OCI-Chunk-Min-Length").unwrap().to_str().unwrap(),
+        upload_start
+            .headers()
+            .get("OCI-Chunk-Min-Length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "1024"
     );
 
@@ -516,7 +587,9 @@ async fn test_oci_1_1_extension_discovery_and_resumable_upload() {
         .expect("repo extension discover");
     assert_eq!(repo_ext_resp.status(), reqwest::StatusCode::OK);
     let repo_ext_json: serde_json::Value = repo_ext_resp.json().await.expect("repo ext json");
-    let repo_extensions = repo_ext_json["extensions"].as_array().expect("extensions array");
+    let repo_extensions = repo_ext_json["extensions"]
+        .as_array()
+        .expect("extensions array");
     assert!(repo_extensions.iter().any(|e| e["name"] == "_oci"));
     assert!(repo_extensions.iter().any(|e| e["name"] == "referrers"));
 }
@@ -565,7 +638,10 @@ async fn test_oci_1_1_index_referrer_and_empty_config() {
     let put_base_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/latest"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(base_manifest_bytes.clone())
         .send()
         .await
@@ -589,7 +665,10 @@ async fn test_oci_1_1_index_referrer_and_empty_config() {
     let put_child = client
         .put(format!("{base_url}/v2/{repo}/manifests/{child_digest}"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(child_bytes.clone())
         .send()
         .await
@@ -621,20 +700,30 @@ async fn test_oci_1_1_index_referrer_and_empty_config() {
     let put_index_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/{index_digest}"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.index.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.index.v1+json",
+        )
         .body(index_bytes)
         .send()
         .await
         .expect("put index referrer");
     assert_eq!(put_index_resp.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
-        put_index_resp.headers().get("OCI-Subject").unwrap().to_str().unwrap(),
+        put_index_resp
+            .headers()
+            .get("OCI-Subject")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         base_manifest_digest
     );
 
     // 4. Query Referrers on base image -> index referrer should be returned with correct artifactType
     let ref_resp = client
-        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .get(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}"
+        ))
         .send()
         .await
         .expect("get referrers");
@@ -643,8 +732,14 @@ async fn test_oci_1_1_index_referrer_and_empty_config() {
     let manifests = ref_json["manifests"].as_array().unwrap();
     assert_eq!(manifests.len(), 1);
     assert_eq!(manifests[0]["digest"].as_str().unwrap(), index_digest);
-    assert_eq!(manifests[0]["mediaType"].as_str().unwrap(), "application/vnd.oci.image.index.v1+json");
-    assert_eq!(manifests[0]["artifactType"].as_str().unwrap(), "application/vnd.example.attestation.v1");
+    assert_eq!(
+        manifests[0]["mediaType"].as_str().unwrap(),
+        "application/vnd.oci.image.index.v1+json"
+    );
+    assert_eq!(
+        manifests[0]["artifactType"].as_str().unwrap(),
+        "application/vnd.example.attestation.v1"
+    );
 }
 
 #[tokio::test]
@@ -682,7 +777,10 @@ async fn test_concurrent_referrers_push_race_condition() {
     let put_base_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/v1.0.0"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(base_manifest_bytes.clone())
         .send()
         .await
@@ -725,9 +823,14 @@ async fn test_concurrent_referrers_push_race_condition() {
             let digest = format!("sha256:{hex}");
 
             let resp = client
-                .put(format!("{base_url_c}/v2/test/concurrency/manifests/{digest}"))
+                .put(format!(
+                    "{base_url_c}/v2/test/concurrency/manifests/{digest}"
+                ))
                 .basic_auth("demo", Some("demo"))
-                .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.oci.image.manifest.v1+json",
+                )
                 .body(bytes)
                 .send()
                 .await
@@ -747,18 +850,26 @@ async fn test_concurrent_referrers_push_race_condition() {
 
     // 3. Query referrers: verify ALL 10 artifacts are present with 0 dropped entries
     let ref_resp = client
-        .get(format!("{base_url}/v2/{repo}/referrers/{base_manifest_digest}"))
+        .get(format!(
+            "{base_url}/v2/{repo}/referrers/{base_manifest_digest}"
+        ))
         .send()
         .await
         .expect("get referrers");
     assert_eq!(ref_resp.status(), reqwest::StatusCode::OK);
     let ref_json: serde_json::Value = ref_resp.json().await.unwrap();
     let manifests = ref_json["manifests"].as_array().expect("manifests array");
-    assert_eq!(manifests.len(), CONCURRENT_ARTIFACTS, "all concurrent referrers must be preserved");
+    assert_eq!(
+        manifests.len(),
+        CONCURRENT_ARTIFACTS,
+        "all concurrent referrers must be preserved"
+    );
 
     for digest in pushed_digests {
         assert!(
-            manifests.iter().any(|m| m["digest"].as_str() == Some(&digest)),
+            manifests
+                .iter()
+                .any(|m| m["digest"].as_str() == Some(&digest)),
             "digest {digest} must be in referrers list"
         );
     }
@@ -791,7 +902,10 @@ async fn test_malformed_and_traversal_upload_uuid_rejection() {
             .send()
             .await
             .expect("get bad upload uuid");
-        assert!(!get_resp.status().is_success(), "must reject bad upload uuid on GET");
+        assert!(
+            !get_resp.status().is_success(),
+            "must reject bad upload uuid on GET"
+        );
 
         let patch_resp = client
             .patch(format!("{base_url}/v2/test/app/blobs/uploads/{bad_uuid}"))
@@ -800,7 +914,10 @@ async fn test_malformed_and_traversal_upload_uuid_rejection() {
             .send()
             .await
             .expect("patch bad upload uuid");
-        assert!(!patch_resp.status().is_success(), "must reject bad upload uuid on PATCH");
+        assert!(
+            !patch_resp.status().is_success(),
+            "must reject bad upload uuid on PATCH"
+        );
     }
 }
 
@@ -832,7 +949,13 @@ async fn test_concurrent_chunk_uploads_integrity() {
                 .await
                 .unwrap();
             assert_eq!(start_resp.status(), reqwest::StatusCode::ACCEPTED);
-            let location = start_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+            let location = start_resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
 
             // Prepare 4 chunks of 32KB each
             let mut total_bytes = Vec::new();
@@ -848,7 +971,11 @@ async fn test_concurrent_chunk_uploads_integrity() {
                     format!("{base_url_c}{location}")
                 };
 
-                let range_hdr = format!("{}-{}", current_offset, current_offset + chunk_data.len() - 1);
+                let range_hdr = format!(
+                    "{}-{}",
+                    current_offset,
+                    current_offset + chunk_data.len() - 1
+                );
                 current_offset += chunk_data.len();
 
                 let patch_resp = client
@@ -895,7 +1022,12 @@ async fn test_concurrent_chunk_uploads_integrity() {
                 .unwrap();
             assert_eq!(head_resp.status(), reqwest::StatusCode::OK);
             assert_eq!(
-                head_resp.headers().get(header::CONTENT_LENGTH).unwrap().to_str().unwrap(),
+                head_resp
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 total_bytes.len().to_string()
             );
         });
@@ -921,20 +1053,43 @@ async fn test_audit_remediation_suite() {
     let repo = "audit/test-repo";
 
     // 1. Unauthenticated GET /v2/_catalog returns 401 with WWW-Authenticate scope="registry:catalog:*"
-    let cat_resp = client.get(format!("{base_url}/v2/_catalog")).send().await.expect("get catalog");
+    let cat_resp = client
+        .get(format!("{base_url}/v2/_catalog"))
+        .send()
+        .await
+        .expect("get catalog");
     assert_eq!(cat_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-    let auth_header = cat_resp.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap();
+    let auth_header = cat_resp
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(auth_header.contains("registry:catalog:*"));
     assert_eq!(
-        cat_resp.headers().get("docker-distribution-api-version").unwrap().to_str().unwrap(),
+        cat_resp
+            .headers()
+            .get("docker-distribution-api-version")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "registry/2.0"
     );
 
     // 2. GET /v2/<repo>/blobs/notadigestformat returns 400 Bad Request with application/json
-    let invalid_blob_resp = client.get(format!("{base_url}/v2/{repo}/blobs/notadigestformat")).send().await.expect("get blob");
+    let invalid_blob_resp = client
+        .get(format!("{base_url}/v2/{repo}/blobs/notadigestformat"))
+        .send()
+        .await
+        .expect("get blob");
     assert_eq!(invalid_blob_resp.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(
-        invalid_blob_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        invalid_blob_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/json"
     );
     let invalid_body: serde_json::Value = invalid_blob_resp.json().await.expect("json");
@@ -949,8 +1104,18 @@ async fn test_audit_remediation_suite() {
         .await
         .expect("start upload");
     assert_eq!(upload_start_resp.status(), reqwest::StatusCode::ACCEPTED);
-    let location = upload_start_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    let upload_uuid = upload_start_resp.headers().get("docker-upload-uuid").unwrap().to_str().unwrap();
+    let location = upload_start_resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let upload_uuid = upload_start_resp
+        .headers()
+        .get("docker-upload-uuid")
+        .unwrap()
+        .to_str()
+        .unwrap();
 
     let upload_url = if location.starts_with("http") {
         location.to_string()
@@ -962,7 +1127,12 @@ async fn test_audit_remediation_suite() {
     let head_upload_resp = client.head(&upload_url).send().await.expect("head upload");
     assert_eq!(head_upload_resp.status(), reqwest::StatusCode::NO_CONTENT);
     assert_eq!(
-        head_upload_resp.headers().get("docker-upload-uuid").unwrap().to_str().unwrap(),
+        head_upload_resp
+            .headers()
+            .get("docker-upload-uuid")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         upload_uuid
     );
 
@@ -976,7 +1146,11 @@ async fn test_audit_remediation_suite() {
     assert_eq!(del_upload_resp.status(), reqwest::StatusCode::NO_CONTENT);
 
     // Subsequent HEAD after DELETE -> 404 Not Found
-    let head_after_del = client.head(&upload_url).send().await.expect("head deleted upload");
+    let head_after_del = client
+        .head(&upload_url)
+        .send()
+        .await
+        .expect("head deleted upload");
     assert_eq!(head_after_del.status(), reqwest::StatusCode::NOT_FOUND);
 
     // 4. SHA-512 Blob Upload and Verification
@@ -993,7 +1167,12 @@ async fn test_audit_remediation_suite() {
         .send()
         .await
         .expect("start upload sha512");
-    let loc_512 = upload_512_start.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    let loc_512 = upload_512_start
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
     let put_512_url = if loc_512.starts_with("http") {
         if loc_512.contains('?') {
             format!("{loc_512}&digest={sha512_digest}")
@@ -1018,17 +1197,27 @@ async fn test_audit_remediation_suite() {
         .expect("put sha512 blob");
     assert_eq!(put_512_resp.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
-        put_512_resp.headers().get("docker-content-digest").unwrap().to_str().unwrap(),
+        put_512_resp
+            .headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         sha512_digest
     );
 
-    let get_512_resp = client.get(format!("{base_url}/v2/{repo}/blobs/{sha512_digest}")).send().await.expect("get sha512 blob");
+    let get_512_resp = client
+        .get(format!("{base_url}/v2/{repo}/blobs/{sha512_digest}"))
+        .send()
+        .await
+        .expect("get sha512 blob");
     assert_eq!(get_512_resp.status(), reqwest::StatusCode::OK);
     let downloaded_512 = get_512_resp.bytes().await.expect("bytes");
     assert_eq!(downloaded_512.as_ref(), sha512_data);
 
     // 5. Manifest Upload: Missing Layer Blob Check -> 400 MANIFEST_BLOB_UNKNOWN
-    let unuploaded_blob_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    let unuploaded_blob_digest =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001";
     let manifest_missing_blob = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -1048,7 +1237,10 @@ async fn test_audit_remediation_suite() {
     let missing_blob_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/missing-blob-tag"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(serde_json::to_vec(&manifest_missing_blob).unwrap())
         .send()
         .await
@@ -1068,7 +1260,10 @@ async fn test_audit_remediation_suite() {
     let schema1_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/schema1-tag"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.docker.distribution.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.docker.distribution.manifest.v1+json",
+        )
         .body(serde_json::to_vec(&schema1_manifest).unwrap())
         .send()
         .await
@@ -1081,7 +1276,10 @@ async fn test_audit_remediation_suite() {
     let malformed_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/malformed-tag"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(b"{invalid-json:".to_vec())
         .send()
         .await
@@ -1118,14 +1316,25 @@ async fn test_audit_remediation_suite() {
     let put_valid_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/valid-tag"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(valid_manifest_bytes.clone())
         .send()
         .await
         .expect("put valid manifest");
     assert_eq!(put_valid_resp.status(), reqwest::StatusCode::CREATED);
-    let loc_header = put_valid_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert_eq!(loc_header, format!("/v2/{repo}/manifests/{computed_digest}"));
+    let loc_header = put_valid_resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        loc_header,
+        format!("/v2/{repo}/manifests/{computed_digest}")
+    );
 
     // 9. OCI 1.1 Tag Deletion: DELETE /v2/<repo>/tags/reference/<tag>
     let del_tag_resp = client
@@ -1167,30 +1376,69 @@ async fn test_audit_remediation_suite() {
 
     // 12. HTTP 405 Method Not Allowed on mutation methods
     // Catalog mutation -> 405
-    let cat_post = client.post(format!("{base_url}/v2/_catalog")).send().await.expect("cat post");
+    let cat_post = client
+        .post(format!("{base_url}/v2/_catalog"))
+        .send()
+        .await
+        .expect("cat post");
     assert_eq!(cat_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    let cat_put = client.put(format!("{base_url}/v2/_catalog")).send().await.expect("cat put");
+    let cat_put = client
+        .put(format!("{base_url}/v2/_catalog"))
+        .send()
+        .await
+        .expect("cat put");
     assert_eq!(cat_put.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    let cat_del = client.delete(format!("{base_url}/v2/_catalog")).send().await.expect("cat del");
+    let cat_del = client
+        .delete(format!("{base_url}/v2/_catalog"))
+        .send()
+        .await
+        .expect("cat del");
     assert_eq!(cat_del.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 
     // Tags list mutation -> 405
-    let tags_post = client.post(format!("{base_url}/v2/{repo}/tags/list")).send().await.expect("tags post");
+    let tags_post = client
+        .post(format!("{base_url}/v2/{repo}/tags/list"))
+        .send()
+        .await
+        .expect("tags post");
     assert_eq!(tags_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    let tags_put = client.put(format!("{base_url}/v2/{repo}/tags/list")).send().await.expect("tags put");
+    let tags_put = client
+        .put(format!("{base_url}/v2/{repo}/tags/list"))
+        .send()
+        .await
+        .expect("tags put");
     assert_eq!(tags_put.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    let tags_del = client.delete(format!("{base_url}/v2/{repo}/tags/list")).send().await.expect("tags del");
+    let tags_del = client
+        .delete(format!("{base_url}/v2/{repo}/tags/list"))
+        .send()
+        .await
+        .expect("tags del");
     assert_eq!(tags_del.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 
     // Referrers mutation -> 405
-    let ref_post = client.post(format!("{base_url}/v2/{repo}/referrers/{computed_digest}")).send().await.expect("ref post");
+    let ref_post = client
+        .post(format!("{base_url}/v2/{repo}/referrers/{computed_digest}"))
+        .send()
+        .await
+        .expect("ref post");
     assert_eq!(ref_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    let ref_del = client.delete(format!("{base_url}/v2/{repo}/referrers/{computed_digest}")).send().await.expect("ref del");
+    let ref_del = client
+        .delete(format!("{base_url}/v2/{repo}/referrers/{computed_digest}"))
+        .send()
+        .await
+        .expect("ref del");
     assert_eq!(ref_del.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 
     // Tag reference invalid method -> 405
-    let tag_ref_post = client.post(format!("{base_url}/v2/{repo}/tags/reference/dummy")).send().await.expect("tag ref post");
-    assert_eq!(tag_ref_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    let tag_ref_post = client
+        .post(format!("{base_url}/v2/{repo}/tags/reference/dummy"))
+        .send()
+        .await
+        .expect("tag ref post");
+    assert_eq!(
+        tag_ref_post.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
 
     // 13. Referrers for subject with 0 attached referrers -> 200 OK with empty index
     let zero_ref_resp = client
@@ -1200,7 +1448,12 @@ async fn test_audit_remediation_suite() {
         .expect("get zero referrers");
     assert_eq!(zero_ref_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        zero_ref_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        zero_ref_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/vnd.oci.image.index.v1+json"
     );
     let zero_ref_body: serde_json::Value = zero_ref_resp.json().await.expect("json");
@@ -1209,21 +1462,30 @@ async fn test_audit_remediation_suite() {
     // 14. Cross-Repository Blob Mount
     // 14a. Mount existing blob -> 201 Created
     let mount_resp = client
-        .post(format!("{base_url}/v2/target/repo/blobs/uploads/?mount={layer_digest}&from={repo}"))
+        .post(format!(
+            "{base_url}/v2/target/repo/blobs/uploads/?mount={layer_digest}&from={repo}"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
         .expect("mount existing");
     assert_eq!(mount_resp.status(), reqwest::StatusCode::CREATED);
     assert_eq!(
-        mount_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+        mount_resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         format!("/v2/target/repo/blobs/{layer_digest}")
     );
 
     // 14b. Mount non-existent blob -> fallback to 202 Accepted upload session
     let missing_digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let fallback_resp = client
-        .post(format!("{base_url}/v2/target/repo/blobs/uploads/?mount={missing_digest}&from={repo}"))
+        .post(format!(
+            "{base_url}/v2/target/repo/blobs/uploads/?mount={missing_digest}&from={repo}"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1238,9 +1500,23 @@ async fn test_audit_remediation_suite() {
         .send()
         .await
         .expect("new upload");
-    let new_loc = new_upload.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    let new_uuid = new_upload.headers().get("docker-upload-uuid").unwrap().to_str().unwrap();
-    let new_upload_url = if new_loc.starts_with("http") { new_loc.to_string() } else { format!("{base_url}{new_loc}") };
+    let new_loc = new_upload
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let new_uuid = new_upload
+        .headers()
+        .get("docker-upload-uuid")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let new_upload_url = if new_loc.starts_with("http") {
+        new_loc.to_string()
+    } else {
+        format!("{base_url}{new_loc}")
+    };
     let del_resp = client
         .delete(&new_upload_url)
         .basic_auth("demo", Some("demo"))
@@ -1249,7 +1525,12 @@ async fn test_audit_remediation_suite() {
         .expect("del upload");
     assert_eq!(del_resp.status(), reqwest::StatusCode::NO_CONTENT);
     assert_eq!(
-        del_resp.headers().get("docker-upload-uuid").unwrap().to_str().unwrap(),
+        del_resp
+            .headers()
+            .get("docker-upload-uuid")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         new_uuid
     );
 
@@ -1258,14 +1539,22 @@ async fn test_audit_remediation_suite() {
     let unverified_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/{bad_digest_ref}"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(valid_manifest_bytes.clone())
         .send()
         .await
         .expect("put mismatch");
     assert_eq!(unverified_resp.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(
-        unverified_resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        unverified_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/json"
     );
     let unverified_err: serde_json::Value = unverified_resp.json().await.expect("json");
@@ -1283,12 +1572,22 @@ async fn test_audit_remediation_suite() {
         .expect("get /v2");
     assert_eq!(v2_resp.status(), reqwest::StatusCode::MOVED_PERMANENTLY);
     assert_eq!(
-        v2_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+        v2_resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "/v2/"
     );
 
     // 18. Reject malformed repository names in tags route
-    for bad_name in &["INVALID/UPPERCASE", "-invalid-leading-dash", "invalid__double_dot", "invalid..dots"] {
+    for bad_name in &[
+        "INVALID/UPPERCASE",
+        "-invalid-leading-dash",
+        "invalid__double_dot",
+        "invalid..dots",
+    ] {
         let bad_repo_resp = client
             .get(format!("{base_url}/v2/{bad_name}/tags/list"))
             .send()
@@ -1311,7 +1610,9 @@ async fn test_audit_remediation_suite() {
     // 20. Cross-repository blob mount graceful fallback to 202
     let missing_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     let mount_resp = client
-        .post(format!("{base_url}/v2/{repo}/blobs/uploads/?mount={missing_digest}&from=other-repo"))
+        .post(format!(
+            "{base_url}/v2/{repo}/blobs/uploads/?mount={missing_digest}&from=other-repo"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1328,7 +1629,9 @@ async fn test_audit_remediation_suite() {
 
     // 22. Token endpoint issues delete action in scopes
     let token_resp = client
-        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push,delete"))
+        .get(format!(
+            "{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push,delete"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1337,13 +1640,22 @@ async fn test_audit_remediation_suite() {
     let token_body: serde_json::Value = token_resp.json().await.expect("token json");
     let delete_token = token_body["token"].as_str().unwrap();
     let scopes_arr = token_body["scopes"].as_array().unwrap();
-    assert!(scopes_arr[0]["actions"].as_array().unwrap().iter().any(|a| a.as_str() == Some("delete")));
+    assert!(
+        scopes_arr[0]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a.as_str() == Some("delete"))
+    );
 
     // Push tag to delete
     let put_del_resp = client
         .put(format!("{base_url}/v2/{repo}/manifests/delete-me"))
         .basic_auth("demo", Some("demo"))
-        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
         .body(valid_manifest_bytes)
         .send()
         .await
@@ -1361,7 +1673,9 @@ async fn test_audit_remediation_suite() {
 
     // 23. Deny push operation on target repository when token is scoped for a different repository -> 403 Forbidden
     let wrong_token_resp = client
-        .get(format!("{base_url}/token?service=registry-rust&scope=repository:other-repo:push"))
+        .get(format!(
+            "{base_url}/token?service=registry-rust&scope=repository:other-repo:push"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1385,7 +1699,12 @@ async fn test_audit_remediation_suite() {
         .await
         .expect("unauth private tags");
     assert_eq!(challenge_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-    assert!(challenge_resp.headers().get(header::WWW_AUTHENTICATE).is_some());
+    assert!(
+        challenge_resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .is_some()
+    );
 
     // 25. Tags pagination on terminal page omits Link header
     let terminal_page_resp = client
@@ -1398,7 +1717,9 @@ async fn test_audit_remediation_suite() {
 
     // 26. Deny delete operation when token only grants pull,push scope -> 403 Forbidden
     let pull_push_token_resp = client
-        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push"))
+        .get(format!(
+            "{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1418,7 +1739,9 @@ async fn test_audit_remediation_suite() {
     // 27. Repositories starting with 'v' or '2' work without prefix stripping corruption
     let v_repo = "v2-compliance-test";
     let token_v_resp = client
-        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{v_repo}:pull,push"))
+        .get(format!(
+            "{base_url}/token?service=registry-rust&scope=repository:{v_repo}:pull,push"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1458,13 +1781,19 @@ async fn test_audit_remediation_suite() {
         manifest_resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/json"
     );
-    let manifest_err_body: serde_json::Value = manifest_resp.json().await.expect("manifest err json");
-    assert_eq!(manifest_err_body["errors"][0]["code"], "MANIFEST_UNVERIFIED");
+    let manifest_err_body: serde_json::Value =
+        manifest_resp.json().await.expect("manifest err json");
+    assert_eq!(
+        manifest_err_body["errors"][0]["code"],
+        "MANIFEST_UNVERIFIED"
+    );
 
     // 29. Upload initiation with token scoped for a different repository -> 403 Forbidden (DENIED)
     let other_repo = "other-unauthorized-repo";
     let token_other_resp = client
-        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{other_repo}:pull,push"))
+        .get(format!(
+            "{base_url}/token?service=registry-rust&scope=repository:{other_repo}:pull,push"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1487,7 +1816,9 @@ async fn test_audit_remediation_suite() {
     // 30. Tags pagination subsequent page with last cursor omits Link header when no more pages
     let page_repo = "tags-multi-page-repo";
     let token_page_resp = client
-        .get(format!("{base_url}/token?service=registry-rust&scope=repository:{page_repo}:pull,push"))
+        .get(format!(
+            "{base_url}/token?service=registry-rust&scope=repository:{page_repo}:pull,push"
+        ))
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -1513,7 +1844,10 @@ async fn test_audit_remediation_suite() {
         client
             .put(format!("{base_url}/v2/{page_repo}/manifests/{tag_name}"))
             .bearer_auth(page_token)
-            .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .header(
+                header::CONTENT_TYPE,
+                "application/vnd.oci.image.manifest.v1+json",
+            )
             .body(serde_json::to_vec(&manifest).unwrap())
             .send()
             .await
@@ -1532,7 +1866,9 @@ async fn test_audit_remediation_suite() {
     let last_p1 = p1_body["tags"][0].as_str().unwrap();
 
     let tags_page2_resp = client
-        .get(format!("{base_url}/v2/{page_repo}/tags/list?n=100&last={last_p1}"))
+        .get(format!(
+            "{base_url}/v2/{page_repo}/tags/list?n=100&last={last_p1}"
+        ))
         .send()
         .await
         .expect("get tags page 2");
@@ -1553,4 +1889,3 @@ async fn test_audit_remediation_suite() {
     let mount_err: serde_json::Value = mount_fallback_resp.json().await.expect("json");
     assert_eq!(mount_err["errors"][0]["code"], "DENIED");
 }
-

@@ -1,4 +1,6 @@
-use crate::blob_gc::{blob_gc_delete, blob_gc_plan, blob_gc_quarantine, BlobGcLimits, BlobGcPolicy, BlobGcStats};
+use crate::blob_gc::{
+    BlobGcLimits, BlobGcPolicy, BlobGcStats, blob_gc_delete, blob_gc_plan, blob_gc_quarantine,
+};
 use crate::blob_ref_index::BlobRefIndex;
 use crate::storage;
 use fs2::FileExt;
@@ -122,11 +124,7 @@ impl GcService {
             return Ok(None);
         }
 
-        let lock_path: PathBuf = self
-            .config
-            .fs_root
-            .join("quarantine")
-            .join("gc.lock");
+        let lock_path: PathBuf = self.config.fs_root.join("quarantine").join("gc.lock");
 
         let res = tokio::task::spawn_blocking(move || {
             if let Some(parent) = lock_path.parent() {
@@ -166,7 +164,10 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let t0 = Instant::now();
-        let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        let _guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         self.ensure_ref_index_ready().await?;
         self.refresh_tag_rooted_index_if_needed(policy).await?;
@@ -202,7 +203,10 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let t0 = Instant::now();
-        let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        let _guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
@@ -243,7 +247,10 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let t0 = Instant::now();
-        let _guard = self.run_lock.try_lock().map_err(|_| GcServiceError::AlreadyRunning)?;
+        let _guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
@@ -318,7 +325,8 @@ impl GcService {
             });
         }
 
-        let quarantine_delay = Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
+        let quarantine_delay =
+            Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
         let delete = blob_gc_delete(
             &self.config,
             &self.storage,
@@ -352,7 +360,8 @@ mod tests {
     use std::time::SystemTime;
 
     fn tmp_dir(prefix: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));
+        let p =
+            std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("create temp dir");
         p
     }
@@ -477,7 +486,8 @@ mod tests {
         cfg.blob_gc_default_max_blobs = 1000;
 
         let cfg = Arc::new(cfg);
-        let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes)) as Arc<dyn storage::Storage>;
+        let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes))
+            as Arc<dyn storage::Storage>;
         let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).expect("open idx"));
         idx.ensure_healthy_or_rebuild(&storage, true, true)
             .await
@@ -517,10 +527,7 @@ mod tests {
     }
 
     async fn write_blob(fs_root: &PathBuf, digest: &Digest, bytes: &[u8]) {
-        let dir = fs_root
-            .join("blobs")
-            .join("sha256")
-            .join(digest.prefix2());
+        let dir = fs_root.join("blobs").join("sha256").join(digest.prefix2());
         tokio::fs::create_dir_all(&dir).await.expect("mkdir");
         tokio::fs::write(dir.join(digest.hex()), bytes)
             .await
@@ -537,8 +544,12 @@ mod tests {
         let repo_dir = fs_root.join("repos").join(repo);
         let tags_dir = repo_dir.join("tags");
         let manifests_dir = repo_dir.join("manifests");
-        tokio::fs::create_dir_all(&tags_dir).await.expect("mkdir tags");
-        tokio::fs::create_dir_all(&manifests_dir).await.expect("mkdir manifests");
+        tokio::fs::create_dir_all(&tags_dir)
+            .await
+            .expect("mkdir tags");
+        tokio::fs::create_dir_all(&manifests_dir)
+            .await
+            .expect("mkdir manifests");
 
         tokio::fs::write(tags_dir.join(tag), format!("{}\n", root_manifest.as_str()))
             .await
@@ -554,7 +565,8 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn storage::Storage> =
+            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
 
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild empty");
@@ -571,7 +583,11 @@ mod tests {
         };
 
         let q = service
-            .quarantine(BlobGcPolicy::TagRooted, Duration::from_secs(0), budgets.clone())
+            .quarantine(
+                BlobGcPolicy::TagRooted,
+                Duration::from_secs(0),
+                budgets.clone(),
+            )
             .await
             .expect("quarantine");
         assert_eq!(q.quarantined_blobs, 1);
@@ -614,7 +630,8 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex2");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn storage::Storage> =
+            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild");
 
@@ -623,8 +640,12 @@ mod tests {
         let blob = Digest::parse(&format!("sha256:{}", "d".repeat(64))).expect("digest");
         write_blob(&fs_root, &blob, b"blobdata").await;
 
-        idx.pin_blob(&blob, SystemTime::now() + Duration::from_secs(10_000), "test")
-            .expect("pin");
+        idx.pin_blob(
+            &blob,
+            SystemTime::now() + Duration::from_secs(10_000),
+            "test",
+        )
+        .expect("pin");
 
         let budgets = GcBudgets {
             max_blobs: 1000,
@@ -648,7 +669,8 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex3");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn storage::Storage> =
+            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild");
 

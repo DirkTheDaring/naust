@@ -3,10 +3,10 @@ use crate::manifest_refs::parse_manifest_refs;
 use crate::registry::digest::Digest;
 use crate::storage;
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BlobGcPolicy {
@@ -119,7 +119,9 @@ pub async fn blob_gc_plan(
                 Err(_) => continue,
             };
             let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-            let age = now.duration_since(modified).unwrap_or(Duration::from_secs(0));
+            let age = now
+                .duration_since(modified)
+                .unwrap_or(Duration::from_secs(0));
             if age < min_age {
                 continue;
             }
@@ -289,17 +291,13 @@ pub async fn blob_gc_delete(
 
     let now = SystemTime::now();
 
-    let root = cfg
-        .fs_root
-        .join("quarantine")
-        .join("blobs")
-        .join("sha256");
+    let root = cfg.fs_root.join("quarantine").join("blobs").join("sha256");
 
     let mut prefixes = match tokio::fs::read_dir(&root).await {
         Ok(d) => d,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stats),
         Err(e) => return Err(format!("read_dir {}: {e}", root.display())),
-    }; 
+    };
 
     while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
         if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
@@ -481,7 +479,11 @@ enum QuarantineOutcome {
     Skipped,
 }
 
-async fn quarantine_blob(cfg: &crate::config::Config, digest: &Digest, now: SystemTime) -> Result<QuarantineOutcome, String> {
+async fn quarantine_blob(
+    cfg: &crate::config::Config,
+    digest: &Digest,
+    now: SystemTime,
+) -> Result<QuarantineOutcome, String> {
     let src = cfg
         .fs_root
         .join("blobs")
@@ -491,7 +493,9 @@ async fn quarantine_blob(cfg: &crate::config::Config, digest: &Digest, now: Syst
 
     let meta = match tokio::fs::metadata(&src).await {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(QuarantineOutcome::Skipped),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(QuarantineOutcome::Skipped);
+        }
         Err(e) => return Err(format!("metadata {}: {e}", src.display())),
     };
 
@@ -517,7 +521,11 @@ async fn quarantine_blob(cfg: &crate::config::Config, digest: &Digest, now: Syst
             Ok(QuarantineOutcome::Moved { size: meta.len() })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(QuarantineOutcome::Skipped),
-        Err(e) => Err(format!("rename {} -> {}: {e}", src.display(), dest.display())),
+        Err(e) => Err(format!(
+            "rename {} -> {}: {e}",
+            src.display(),
+            dest.display()
+        )),
     }
 }
 
@@ -559,11 +567,18 @@ async fn restore_blob(cfg: &crate::config::Config, digest: &Digest) -> Result<Op
             Ok(Some(meta.len()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("rename {} -> {}: {e}", src.display(), dest.display())),
+        Err(e) => Err(format!(
+            "rename {} -> {}: {e}",
+            src.display(),
+            dest.display()
+        )),
     }
 }
 
-async fn delete_quarantined_blob(cfg: &crate::config::Config, digest: &Digest) -> Result<Option<u64>, String> {
+async fn delete_quarantined_blob(
+    cfg: &crate::config::Config,
+    digest: &Digest,
+) -> Result<Option<u64>, String> {
     let path = cfg
         .fs_root
         .join("quarantine")
@@ -597,7 +612,11 @@ fn quarantine_meta_path(cfg: &crate::config::Config, digest: &Digest) -> PathBuf
         .join(format!("{}.ts", digest.hex()))
 }
 
-async fn write_quarantine_time(cfg: &crate::config::Config, digest: &Digest, at: SystemTime) -> Result<(), String> {
+async fn write_quarantine_time(
+    cfg: &crate::config::Config,
+    digest: &Digest,
+    at: SystemTime,
+) -> Result<(), String> {
     let path = quarantine_meta_path(cfg, digest);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -614,7 +633,10 @@ async fn write_quarantine_time(cfg: &crate::config::Config, digest: &Digest, at:
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-async fn read_quarantine_time(cfg: &crate::config::Config, digest: &Digest) -> Result<Option<SystemTime>, String> {
+async fn read_quarantine_time(
+    cfg: &crate::config::Config,
+    digest: &Digest,
+) -> Result<Option<SystemTime>, String> {
     let path = quarantine_meta_path(cfg, digest);
     let s = match tokio::fs::read_to_string(&path).await {
         Ok(v) => v,
@@ -628,7 +650,10 @@ async fn read_quarantine_time(cfg: &crate::config::Config, digest: &Digest) -> R
     Ok(Some(UNIX_EPOCH + Duration::from_secs(secs)))
 }
 
-async fn remove_quarantine_time(cfg: &crate::config::Config, digest: &Digest) -> Result<(), String> {
+async fn remove_quarantine_time(
+    cfg: &crate::config::Config,
+    digest: &Digest,
+) -> Result<(), String> {
     let path = quarantine_meta_path(cfg, digest);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),

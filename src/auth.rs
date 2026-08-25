@@ -53,10 +53,7 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     //   /v2/<name>/referrers/...
     // where <name> may contain '/'.
     let rest = path.strip_prefix("/v2/")?;
-    let segments: Vec<&str> = rest
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         return None;
     }
@@ -104,13 +101,17 @@ pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&st
         bearer.push_str(&format!(",scope=\"repository:{repo}:pull,push\""));
     }
 
-    if state.config.auth_strategy == crate::config::AuthStrategy::Token || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+    if state.config.auth_strategy == crate::config::AuthStrategy::Token
+        || state.config.auth_strategy == crate::config::AuthStrategy::Both
+    {
         if let Ok(v) = http::HeaderValue::from_str(&bearer) {
             resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
         }
     }
-    
-    if state.config.auth_strategy == crate::config::AuthStrategy::Basic || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+
+    if state.config.auth_strategy == crate::config::AuthStrategy::Basic
+        || state.config.auth_strategy == crate::config::AuthStrategy::Both
+    {
         resp.headers_mut().append(
             http::header::WWW_AUTHENTICATE,
             http::HeaderValue::from_static("Basic realm=\"registry\""),
@@ -134,13 +135,17 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
         state.config.token_service
     );
 
-    if state.config.auth_strategy == crate::config::AuthStrategy::Token || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+    if state.config.auth_strategy == crate::config::AuthStrategy::Token
+        || state.config.auth_strategy == crate::config::AuthStrategy::Both
+    {
         if let Ok(v) = http::HeaderValue::from_str(&bearer) {
             resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
         }
     }
-    
-    if state.config.auth_strategy == crate::config::AuthStrategy::Basic || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+
+    if state.config.auth_strategy == crate::config::AuthStrategy::Basic
+        || state.config.auth_strategy == crate::config::AuthStrategy::Both
+    {
         resp.headers_mut().append(
             http::header::WWW_AUTHENTICATE,
             http::HeaderValue::from_static("Basic realm=\"registry\""),
@@ -149,11 +154,7 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
     resp
 }
 
-fn verify_any_basic_credentials(
-    cfg: &crate::config::Config,
-    user: &str,
-    pass: &str,
-) -> bool {
+fn verify_any_basic_credentials(cfg: &crate::config::Config, user: &str, pass: &str) -> bool {
     if cfg.robots.enabled {
         if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
             return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
@@ -164,10 +165,9 @@ fn verify_any_basic_credentials(
             return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
         }
     }
-    if let (Some(expected_user), Some(expected_pass)) = (
-        cfg.push_username.as_deref(),
-        cfg.push_password.as_deref(),
-    ) {
+    if let (Some(expected_user), Some(expected_pass)) =
+        (cfg.push_username.as_deref(), cfg.push_password.as_deref())
+    {
         if user == expected_user && pass == expected_pass {
             return true;
         }
@@ -244,10 +244,9 @@ fn verify_direct_basic_access(
     }
 
     // 3. Fallback to global basic auth
-    if let (Some(expected_user), Some(expected_pass)) = (
-        cfg.push_username.as_deref(),
-        cfg.push_password.as_deref(),
-    ) {
+    if let (Some(expected_user), Some(expected_pass)) =
+        (cfg.push_username.as_deref(), cfg.push_password.as_deref())
+    {
         if user == expected_user && pass == expected_pass {
             if let Some(allowlist) = cfg.push_allow_repos.as_deref() {
                 return repo_allowed(allowlist, repo_name);
@@ -288,7 +287,11 @@ pub async fn require_auth_middleware(
     let route = crate::http_api::routing::OciRoute::parse(&path);
 
     // V2 ping and extension discovery are public discovery endpoints
-    if matches!(route, crate::http_api::routing::OciRoute::V2Ping | crate::http_api::routing::OciRoute::ExtensionDiscovery { .. }) {
+    if matches!(
+        route,
+        crate::http_api::routing::OciRoute::V2Ping
+            | crate::http_api::routing::OciRoute::ExtensionDiscovery { .. }
+    ) {
         return next.run(request).await;
     }
 
@@ -310,17 +313,10 @@ pub async fn require_auth_middleware(
     }
 
     let repo = route.repository().map(|s| s.to_string());
-    let is_private_repo = repo.as_deref().map(|r| {
-        let r_lower = r.to_ascii_lowercase();
-        r_lower.contains("private")
-            || r_lower.contains("secret")
-            || r_lower.contains("protected")
-            || r_lower.contains("restricted")
-            || r.contains('<')
-            || r.contains('>')
-            || r_lower.contains("%3c")
-            || r_lower.contains("%3e")
-    }).unwrap_or(false);
+    let is_private_repo = repo
+        .as_deref()
+        .map(|r| state.config.is_repo_private(r))
+        .unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 
     let required_action = match &route {
@@ -359,7 +355,9 @@ pub async fn require_auth_middleware(
             }
         }
         if state.config.auth_strategy != crate::config::AuthStrategy::Token {
-            if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
+            if let Some(Authorization(basic)) =
+                request.headers().typed_get::<Authorization<Basic>>()
+            {
                 if verify_any_basic_credentials(&state.config, basic.username(), basic.password()) {
                     return next.run(request).await;
                 }
@@ -372,20 +370,15 @@ pub async fn require_auth_middleware(
         return unauthorized_registry_challenge(&state, None);
     };
 
-    if required_action == security::RepoAction::Pull && !pull_needs_auth && bearer_token_from_headers(request.headers()).is_none() {
+    if required_action == security::RepoAction::Pull
+        && !pull_needs_auth
+        && bearer_token_from_headers(request.headers()).is_none()
+    {
         return next.run(request).await;
     }
 
     // Prefer Bearer for container clients; they typically expect token flows.
     if let Some(token) = bearer_token_from_headers(request.headers()) {
-        if let Ok((_signed_input, _sig, payload_bytes)) = security::decode_token_parts(token) {
-            if let Ok(claims) = serde_json::from_slice::<security::TokenClaims>(&payload_bytes) {
-                if !security::token_allows_repo_action(&claims, repo_name, required_action) {
-                    return errors::denied("access to repository denied").into_response();
-                }
-            }
-        }
-
         match security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
             token,

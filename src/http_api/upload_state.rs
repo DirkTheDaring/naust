@@ -1,0 +1,180 @@
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum StateTokenError {
+    #[error("missing state token")]
+    Missing,
+    #[error("invalid token format")]
+    InvalidFormat,
+    #[error("invalid cryptographic signature")]
+    InvalidSignature,
+    #[error("repository mismatch")]
+    RepoMismatch,
+    #[error("invalid token payload")]
+    InvalidPayload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadStateData {
+    pub repo: String,
+    pub uuid: String,
+    pub offset: u64,
+    pub iat: u64,
+}
+
+impl UploadStateData {
+    pub fn new(repo: impl Into<String>, uuid: impl Into<String>, offset: u64) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            repo: repo.into(),
+            uuid: uuid.into(),
+            offset,
+            iat: now,
+        }
+    }
+
+    pub fn encode_and_sign(&self, signing_key: &[u8]) -> String {
+        let payload_bytes = serde_json::to_vec(self).unwrap_or_default();
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_bytes);
+
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(signing_key).expect("HMAC can take key of any size");
+        mac.update(payload_b64.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+
+        format!("{payload_b64}.{sig_b64}")
+    }
+
+    pub fn verify_and_decode(
+        token_str: &str,
+        signing_key: &[u8],
+        expected_repo: &str,
+    ) -> Result<Self, StateTokenError> {
+        let trimmed = token_str.trim();
+        if trimmed.is_empty() {
+            return Err(StateTokenError::Missing);
+        }
+
+        // Support structured 2-part signed state tokens: <payload_b64>.<sig_b64>
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() != 2 {
+            // Also handle simple legacy format "repo:uuid" if validly matching
+            if let Some((repo, uuid)) = trimmed.split_once(':') {
+                let norm_data_repo = repo
+                    .trim_start_matches('/')
+                    .strip_prefix("library/")
+                    .unwrap_or(repo);
+                let norm_exp_repo = expected_repo
+                    .trim_start_matches('/')
+                    .strip_prefix("library/")
+                    .unwrap_or(expected_repo);
+                if norm_data_repo != norm_exp_repo {
+                    return Err(StateTokenError::RepoMismatch);
+                }
+                return Ok(Self {
+                    repo: repo.to_string(),
+                    uuid: uuid.to_string(),
+                    offset: 0,
+                    iat: 0,
+                });
+            }
+            return Err(StateTokenError::InvalidFormat);
+        }
+
+        let payload_b64 = parts[0];
+        let sig_b64 = parts[1];
+
+        // 1. Verify HMAC Signature
+        let expected_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(sig_b64)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(sig_b64))
+            .map_err(|_| StateTokenError::InvalidSignature)?;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(signing_key)
+            .map_err(|_| StateTokenError::InvalidSignature)?;
+        mac.update(payload_b64.as_bytes());
+        mac.verify_slice(&expected_sig)
+            .map_err(|_| StateTokenError::InvalidSignature)?;
+
+        // 2. Decode payload
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload_b64))
+            .map_err(|_| StateTokenError::InvalidPayload)?;
+
+        let data: UploadStateData =
+            serde_json::from_slice(&payload_bytes).map_err(|_| StateTokenError::InvalidPayload)?;
+
+        // 3. Verify repository binding
+        let norm_data_repo = data
+            .repo
+            .trim_start_matches('/')
+            .strip_prefix("library/")
+            .unwrap_or(&data.repo);
+        let norm_exp_repo = expected_repo
+            .trim_start_matches('/')
+            .strip_prefix("library/")
+            .unwrap_or(expected_repo);
+        if norm_data_repo != norm_exp_repo {
+            return Err(StateTokenError::RepoMismatch);
+        }
+
+        Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_upload_state_roundtrip() {
+        let key = b"secret-key-12345";
+        let state = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            1024,
+        );
+        let token = state.encode_and_sign(key);
+
+        let decoded = UploadStateData::verify_and_decode(&token, key, "library/test-repo").unwrap();
+        assert_eq!(decoded.repo, "library/test-repo");
+        assert_eq!(decoded.uuid, "01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(decoded.offset, 1024);
+    }
+
+    #[test]
+    fn test_upload_state_repo_mismatch() {
+        let key = b"secret-key-12345";
+        let state =
+            UploadStateData::new("library/repo-a", "01234567-89ab-cdef-0123-456789abcdef", 0);
+        let token = state.encode_and_sign(key);
+
+        let res = UploadStateData::verify_and_decode(&token, key, "library/repo-b");
+        assert_eq!(res, Err(StateTokenError::RepoMismatch));
+    }
+
+    #[test]
+    fn test_upload_state_tampered_signature() {
+        let key = b"secret-key-12345";
+        let state = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        );
+        let token = state.encode_and_sign(key);
+
+        // Tamper with payload
+        let tampered = format!("dGFtcGVyZWQ.{}", token.split('.').nth(1).unwrap());
+        let res = UploadStateData::verify_and_decode(&tampered, key, "library/test-repo");
+        assert_eq!(res, Err(StateTokenError::InvalidSignature));
+    }
+}

@@ -65,10 +65,7 @@ pub fn method_not_allowed(allow: &'static str) -> Response {
         header::HeaderName::from_static("docker-distribution-api-version"),
         HeaderValue::from_static("registry/2.0"),
     );
-    headers.insert(
-        header::ALLOW,
-        HeaderValue::from_static(allow),
-    );
+    headers.insert(header::ALLOW, HeaderValue::from_static(allow));
     headers.insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&bytes.len().to_string()).unwrap(),

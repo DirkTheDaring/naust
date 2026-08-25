@@ -1,26 +1,22 @@
 use crate::{
     AppState, ProxyContext,
     registry::digest::Digest,
-    storage::{ReferrerDescriptor, RepoTimestamps, StorageError},
+    storage::{ReferrerDescriptor, StorageError},
 };
 use axum::{
     body::Body,
-    extract::Json,
     extract::Query,
-    extract::RawQuery,
     extract::{Path, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
-use headers::{Authorization, HeaderMapExt, authorization::Basic};
 use sha2::Digest as _;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncReadExt;
@@ -29,157 +25,13 @@ use url::form_urlencoded;
 
 use super::errors;
 use crate::request_routing::{V2RouteMode, v2_route_mode_for_request};
-use crate::security;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TokenRejection {
-    Unauthorized,
-    Denied(&'static str),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TokenDecision {
-    subject: Option<String>,
-    scopes: Vec<security::TokenScope>,
-    ttl_secs: u64,
-}
-
-fn wants_auth_from_token_scopes(cfg: &crate::config::Config, token_scopes: &[security::TokenScope]) -> bool {
-    let wants_push = wants_push_from_token_scopes(token_scopes);
-    let wants_delete = token_scopes.iter().any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete));
-    let wants_catalog = token_scopes.iter().any(|s| s.typ == "registry" && (s.name == "catalog" || s.name == "*"));
-    let wants_private = token_scopes.iter().any(|s| {
-        let n = s.name.to_ascii_lowercase();
-        n.contains("private")
-            || n.contains("secret")
-            || n.contains("restricted")
-            || s.name.starts_with('<') && s.name.ends_with('>')
-            || n.starts_with("%3c") && n.ends_with("%3e")
-    });
-    wants_push || wants_delete || wants_private || (wants_catalog && cfg.catalog_requires_auth)
-}
-
-fn decide_token_scopes_for_request(
-    cfg: &crate::config::Config,
-    token_scopes: &[security::TokenScope],
-    basic: Option<(String, String)>,
-) -> Result<TokenDecision, TokenRejection> {
-    let wants_push = wants_push_from_token_scopes(token_scopes);
-    let wants_auth = wants_auth_from_token_scopes(cfg, token_scopes);
-    let requires_auth = wants_auth || !cfg.anonymous_pull;
-
-    // Pull-only tokens: keep behavior simple and backwards compatible.
-    // (No auth required; we mint exactly the sanitized requested scopes.)
-    if !requires_auth {
-        return Ok(TokenDecision {
-            subject: None,
-            scopes: token_scopes.to_vec(),
-            ttl_secs: cfg.token_ttl_secs,
-        });
-    }
-
-    // Push requested: first try robot auth (if enabled), then user/group auth (if enabled),
-    // then fall back to legacy push user/pass.
-    if cfg.robots.enabled {
-        if let Some((user, pass)) = basic.as_ref() {
-            if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == *user) {
-                if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                    let granted = if token_scopes.is_empty() {
-                        Vec::new() // identity checking only
-                    } else {
-                        crate::rbac::grant_scopes_by_prefix(token_scopes, &account.grants)
-                    };
-                    if !token_scopes.is_empty() && granted.is_empty() {
-                        return Err(TokenRejection::Denied("action not allowed by robot policy"));
-                    }
-
-                    // Ensure we did not implicitly drop all requested push actions.
-                    // (If push was requested, at least one push must remain granted.)
-                    let granted_wants_push = wants_push_from_token_scopes(&granted);
-                    if wants_push && !granted_wants_push {
-                        return Err(TokenRejection::Denied("push not allowed by robot policy"));
-                    }
-
-                    let ttl_secs = match account.max_ttl_secs {
-                        Some(max) if max > 0 => cfg.token_ttl_secs.min(max),
-                        _ => cfg.token_ttl_secs,
-                    };
-
-                    return Ok(TokenDecision {
-                        subject: Some(format!("robot:{}", account.name)),
-                        scopes: granted,
-                        ttl_secs,
-                    });
-                }
-            }
-        }
-    }
-
-    if cfg.users.enabled {
-        if let Some((user, pass)) = basic.as_ref() {
-            if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == *user) {
-                if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                    let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
-                    for group_name in &account.groups {
-                        if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name)
-                        {
-                            union_grants.extend(group.grants.clone());
-                        }
-                    }
-
-                    let granted = if token_scopes.is_empty() {
-                        Vec::new()
-                    } else {
-                        crate::rbac::grant_scopes_by_prefix(token_scopes, &union_grants)
-                    };
-                    if !token_scopes.is_empty() && granted.is_empty() {
-                        return Err(TokenRejection::Denied("action not allowed by user policy"));
-                    }
-
-                    let granted_wants_push = wants_push_from_token_scopes(&granted);
-                    if wants_push && !granted_wants_push {
-                        return Err(TokenRejection::Denied("push not allowed by user policy"));
-                    }
-
-                    let ttl_secs = match account.max_ttl_secs {
-                        Some(max) if max > 0 => cfg.token_ttl_secs.min(max),
-                        _ => cfg.token_ttl_secs,
-                    };
-
-                    return Ok(TokenDecision {
-                        subject: Some(format!("user:{}", account.name)),
-                        scopes: granted,
-                        ttl_secs,
-                    });
-                }
-            }
-        }
-    }
-
-    // Legacy global push auth.
-    let Some(expected_user) = cfg.push_username.as_deref() else {
-        return Err(TokenRejection::Unauthorized);
-    };
-    let Some(expected_pass) = cfg.push_password.as_deref() else {
-        return Err(TokenRejection::Unauthorized);
-    };
-    let Some((user, pass)) = basic else {
-        return Err(TokenRejection::Unauthorized);
-    };
-    if user != expected_user || pass != expected_pass {
-        return Err(TokenRejection::Unauthorized);
-    }
-
-    Ok(TokenDecision {
-        subject: Some(user),
-        scopes: token_scopes.to_vec(),
-        ttl_secs: cfg.token_ttl_secs,
-    })
-}
 
 pub async fn v2_redirect() -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(http::header::LOCATION, http::HeaderValue::from_static("/v2/"));
+    headers.insert(
+        http::header::LOCATION,
+        http::HeaderValue::from_static("/v2/"),
+    );
     headers.insert(
         http::header::HeaderName::from_static("docker-distribution-api-version"),
         http::HeaderValue::from_static("registry/2.0"),
@@ -217,12 +69,16 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
             "Bearer realm=\"{realm}/token\",service=\"{}\"",
             state.config.token_service
         );
-        if state.config.auth_strategy == crate::config::AuthStrategy::Token || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+        if state.config.auth_strategy == crate::config::AuthStrategy::Token
+            || state.config.auth_strategy == crate::config::AuthStrategy::Both
+        {
             if let Ok(v) = http::HeaderValue::from_str(&bearer) {
                 resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
             }
         }
-        if state.config.auth_strategy == crate::config::AuthStrategy::Basic || state.config.auth_strategy == crate::config::AuthStrategy::Both {
+        if state.config.auth_strategy == crate::config::AuthStrategy::Basic
+            || state.config.auth_strategy == crate::config::AuthStrategy::Both
+        {
             resp.headers_mut().append(
                 http::header::WWW_AUTHENTICATE,
                 http::HeaderValue::from_static("Basic realm=\"registry\""),
@@ -243,658 +99,25 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
     (StatusCode::OK, headers).into_response()
 }
 
-pub async fn token(
-    State(state): State<AppState>,
-    raw_query: RawQuery,
-    headers: HeaderMap,
-) -> Response {
-    // Docker/OCI token endpoint (very small subset).
-    // Expected query params:
-    //   service=<name>
-    //   scope=repository:<repo>:pull,push
-    let mut service_param: Option<String> = None;
-    let mut scopes_raw: Vec<String> = Vec::new();
-    let raw = raw_query.0.unwrap_or_default();
-    for (k, v) in form_urlencoded::parse(raw.as_bytes()) {
-        if k == "service" {
-            service_param = Some(v.into_owned());
-        } else if k == "scope" {
-            scopes_raw.push(v.into_owned());
-        }
-    }
-
-    if !service_param_is_valid(service_param.as_deref(), &state.config.token_service) {
-        if let Some(svc) = service_param.as_deref() {
-            let denied_total = state.auth_metrics.inc_token_denied();
-            tracing::warn!(
-                event = "token_denied",
-                reason = "invalid_service",
-                requested_service = %svc,
-                configured_service = %state.config.token_service,
-                token_denied_total = denied_total,
-            );
-        }
-        return errors::denied("invalid token service").into_response();
-    }
-    let scopes = scopes_raw
-        .iter()
-        .flat_map(|s| parse_scopes(s))
-        .collect::<Vec<_>>();
-
-    // Be lenient in parsing, but never mint unexpected permissions.
-    // We only mint repository scopes and only the actions we understand.
-    let token_scopes = sanitize_token_scopes(&scopes);
-    let requested_wants_push = wants_push_from_token_scopes(&token_scopes);
-
-    let basic = headers
-        .typed_get::<Authorization<Basic>>()
-        .map(|Authorization(b)| (b.username().to_string(), b.password().to_string()));
-
-    let decision = match decide_token_scopes_for_request(&state.config, &token_scopes, basic) {
-        Ok(d) => d,
-        Err(TokenRejection::Unauthorized) => {
-            let denied_total = state.auth_metrics.inc_token_denied();
-            tracing::warn!(
-                event = "token_denied",
-                reason = "unauthorized",
-                service = %state.config.token_service,
-                requested_scopes_len = token_scopes.len(),
-                wants_push = requested_wants_push,
-                token_denied_total = denied_total,
-            );
-            return token_unauthorized();
-        }
-        Err(TokenRejection::Denied(msg)) => {
-            let denied_total = state.auth_metrics.inc_token_denied();
-            tracing::warn!(
-                event = "token_denied",
-                reason = %msg,
-                service = %state.config.token_service,
-                requested_scopes_len = token_scopes.len(),
-                wants_push = requested_wants_push,
-                token_denied_total = denied_total,
-            );
-            return errors::denied(msg).into_response();
-        }
-    };
-
-    tracing::debug!(
-        event = "token_decision",
-        service = %state.config.token_service,
-        requested_scopes = ?token_scopes,
-        granted_scopes = ?decision.scopes,
-        subject = decision.subject.as_deref().unwrap_or("<anon>"),
-        ttl_secs = decision.ttl_secs,
-    );
-
-    // Enforce legacy repo allowlist for push tokens as an additional safety net.
-    if wants_push_from_token_scopes(&decision.scopes) {
-        if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-            for scope in &decision.scopes {
-                if scope.typ == "repository" {
-                    if !crate::auth::repo_allowed(allowlist, &scope.name) {
-                        let denied_total = state.auth_metrics.inc_token_denied();
-                        tracing::warn!(
-                            event = "token_denied",
-                            reason = "push_repo_not_allowed",
-                            service = %state.config.token_service,
-                            repo = %scope.name,
-                            subject = decision.subject.as_deref().unwrap_or("<anon>"),
-                            token_denied_total = denied_total,
-                        );
-                        return errors::denied("push not allowed for this repository")
-                            .into_response();
-                    }
-                }
-            }
-        }
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-    let exp = now.saturating_add(decision.ttl_secs);
-
-    let token = match issue_token(
-        &state,
-        decision.subject.as_deref(),
-        &decision.scopes,
-        now,
-        exp,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            let err_total = state.auth_metrics.inc_token_internal_error();
-            tracing::error!(
-                event = "token_error",
-                reason = "issue_failed",
-                service = %state.config.token_service,
-                token_internal_error_total = err_total,
-            );
-            return errors::internal_error().into_response();
-        }
-    };
-
-    let issued_total = state.auth_metrics.inc_token_issued();
-    tracing::info!(
-        event = "token_issued",
-        service = %state.config.token_service,
-        subject = decision.subject.as_deref().unwrap_or("<anon>"),
-        ttl_secs = decision.ttl_secs,
-        requested_scopes_len = token_scopes.len(),
-        granted_scopes_len = decision.scopes.len(),
-        wants_push = wants_push_from_token_scopes(&decision.scopes),
-        token_issued_total = issued_total,
-    );
-
-    let scopes_json: Vec<serde_json::Value> = decision
-        .scopes
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "type": s.typ,
-                "name": s.name,
-                "actions": s.actions,
-            })
-        })
-        .collect();
-
-    let body = serde_json::json!({
-        "token": token,
-        "access_token": token,
-        "expires_in": decision.ttl_secs,
-        "issued_at": format_rfc3339(now),
-        "access": scopes_json,
-        "scopes": scopes_json,
-    });
-
-    let bytes = match serde_json::to_vec(&body) {
-        Ok(b) => b,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    let mut resp_headers = registry_headers();
-    resp_headers.insert("Content-Type", "application/json".parse().unwrap());
-    resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct AdminGcBudgetsRequest {
-    #[serde(default)]
-    max_blobs: Option<usize>,
-    #[serde(default)]
-    max_bytes: Option<u64>,
-    #[serde(default)]
-    max_seconds: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct AdminGcPlanRequest {
-    #[serde(default)]
-    policy: Option<String>,
-    #[serde(default)]
-    min_age_secs: Option<u64>,
-    #[serde(default)]
-    budgets: Option<AdminGcBudgetsRequest>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct AdminGcDeleteRequest {
-    #[serde(default)]
-    policy: Option<String>,
-    #[serde(default)]
-    quarantine_delay_secs: Option<u64>,
-    #[serde(default)]
-    budgets: Option<AdminGcBudgetsRequest>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct AdminGcStatsResponse {
-    scanned_blobs: u64,
-    scanned_bytes: u64,
-    eligible_blobs: u64,
-    eligible_bytes: u64,
-    quarantined_blobs: u64,
-    quarantined_bytes: u64,
-    restored_blobs: u64,
-    restored_bytes: u64,
-    deleted_blobs: u64,
-    deleted_bytes: u64,
-}
-
-impl From<crate::blob_gc::BlobGcStats> for AdminGcStatsResponse {
-    fn from(s: crate::blob_gc::BlobGcStats) -> Self {
-        Self {
-            scanned_blobs: s.scanned_blobs,
-            scanned_bytes: s.scanned_bytes,
-            eligible_blobs: s.eligible_blobs,
-            eligible_bytes: s.eligible_bytes,
-            quarantined_blobs: s.quarantined_blobs,
-            quarantined_bytes: s.quarantined_bytes,
-            restored_blobs: s.restored_blobs,
-            restored_bytes: s.restored_bytes,
-            deleted_blobs: s.deleted_blobs,
-            deleted_bytes: s.deleted_bytes,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct AdminGcResponse {
-    run_id: u64,
-    stats: AdminGcStatsResponse,
-}
-
-fn admin_basic_subject(cfg: &crate::config::Config, headers: &HeaderMap) -> Result<String, Response> {
-    if !cfg.admin_api.enabled {
-        return Err(StatusCode::NOT_FOUND.into_response());
-    }
-
-    let expected_user = cfg.admin_api.username.as_deref();
-    let expected_pass = cfg.admin_api.password.as_deref();
-    if expected_user.is_none() || expected_pass.is_none() {
-        return Err((StatusCode::FORBIDDEN, "admin api enabled but no credentials configured")
-            .into_response());
-    }
-
-    let basic = headers
-        .typed_get::<Authorization<Basic>>()
-        .map(|v| (v.username().to_string(), v.password().to_string()));
-    let Some((user, pass)) = basic else {
-        let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
-        resp.headers_mut().append(
-            http::header::WWW_AUTHENTICATE,
-            http::HeaderValue::from_static("Basic realm=\"registry-admin\""),
-        );
-        return Err(resp);
-    };
-
-    if Some(user.as_str()) != expected_user || Some(pass.as_str()) != expected_pass {
-        let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
-        resp.headers_mut().append(
-            http::header::WWW_AUTHENTICATE,
-            http::HeaderValue::from_static("Basic realm=\"registry-admin\""),
-        );
-        return Err(resp);
-    }
-
-    Ok(user)
-}
-
-fn parse_admin_policy(s: &str) -> Result<crate::blob_gc::BlobGcPolicy, Response> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "tag_rooted" | "tag" => Ok(crate::blob_gc::BlobGcPolicy::TagRooted),
-        "manifest_rooted" | "manifest" => Ok(crate::blob_gc::BlobGcPolicy::ManifestRooted),
-        _ => Err((StatusCode::BAD_REQUEST, "invalid policy (expected tag_rooted or manifest_rooted)")
-            .into_response()),
-    }
-}
-
-fn defaults_budgets(cfg: &crate::config::Config, b: Option<AdminGcBudgetsRequest>) -> crate::gc_service::GcBudgets {
-    let b = b.unwrap_or_default();
-    crate::gc_service::GcBudgets {
-        max_blobs: b.max_blobs.unwrap_or(cfg.blob_gc_default_max_blobs),
-        max_bytes: b.max_bytes.unwrap_or(cfg.blob_gc_default_max_bytes),
-        max_seconds: b.max_seconds.unwrap_or(cfg.blob_gc_default_max_seconds),
-    }
-}
-
-pub async fn admin_gc_plan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<AdminGcPlanRequest>,
-) -> Response {
-    let subject = match admin_basic_subject(&state.config, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
-    };
-
-    let policy = match req.policy.as_deref() {
-        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
-        Some(s) => match parse_admin_policy(s) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        },
-    };
-
-    let run_id = state
-        .gc_run_seq
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-
-    let budgets = defaults_budgets(&state.config, req.budgets);
-    let min_age_secs = req.min_age_secs.unwrap_or(state.config.blob_gc_default_min_age_secs);
-    let min_age = Duration::from_secs(min_age_secs);
-
-    tracing::info!(event = "admin_gc", action = "plan", %subject, run_id, policy = ?policy, min_age_secs);
-
-    match service.plan(policy, min_age, budgets).await {
-        Ok(stats) => Json(AdminGcResponse {
-            run_id,
-            stats: stats.into(),
-        })
-        .into_response(),
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "gc already running").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Disabled)
-        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
-            .into_response(),
-    }
-}
-
-pub async fn admin_gc_quarantine(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<AdminGcPlanRequest>,
-) -> Response {
-    let subject = match admin_basic_subject(&state.config, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
-    };
-
-    let policy = match req.policy.as_deref() {
-        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
-        Some(s) => match parse_admin_policy(s) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        },
-    };
-
-    let run_id = state
-        .gc_run_seq
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-
-    let budgets = defaults_budgets(&state.config, req.budgets);
-    let min_age_secs = req.min_age_secs.unwrap_or(state.config.blob_gc_default_min_age_secs);
-    let min_age = Duration::from_secs(min_age_secs);
-
-    tracing::info!(event = "admin_gc", action = "quarantine", %subject, run_id, policy = ?policy, min_age_secs);
-
-    match service.quarantine(policy, min_age, budgets).await {
-        Ok(stats) => Json(AdminGcResponse {
-            run_id,
-            stats: stats.into(),
-        })
-        .into_response(),
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "gc already running").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Disabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
-            .into_response(),
-    }
-}
-
-pub async fn admin_gc_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<AdminGcDeleteRequest>,
-) -> Response {
-    let subject = match admin_basic_subject(&state.config, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
-    };
-
-    let policy = match req.policy.as_deref() {
-        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
-        Some(s) => match parse_admin_policy(s) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        },
-    };
-
-    let run_id = state
-        .gc_run_seq
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-
-    let budgets = defaults_budgets(&state.config, req.budgets);
-    let quarantine_delay_secs = req
-        .quarantine_delay_secs
-        .unwrap_or(state.config.blob_gc_default_quarantine_delay_secs);
-    let quarantine_delay = Duration::from_secs(quarantine_delay_secs);
-
-    tracing::info!(event = "admin_gc", action = "delete", %subject, run_id, policy = ?policy, quarantine_delay_secs);
-
-    match service.delete(policy, quarantine_delay, budgets).await {
-        Ok(stats) => Json(AdminGcResponse {
-            run_id,
-            stats: stats.into(),
-        })
-        .into_response(),
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "gc already running").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Disabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc delete disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
-            .into_response(),
-    }
-}
-
-pub async fn admin_gc_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let _subject = match admin_basic_subject(&state.config, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
-    };
-
-    match service.health().await {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => (StatusCode::OK, "gc running")
-            .into_response(),
-        Err(crate::gc_service::GcServiceError::Disabled)
-        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => StatusCode::OK.into_response(),
-        Err(crate::gc_service::GcServiceError::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e)
-            .into_response(),
-    }
-}
-
-fn service_param_is_valid(service_param: Option<&str>, configured_service: &str) -> bool {
-    match service_param {
-        None => true,
-        Some(s) => s == configured_service,
-    }
-}
-
-fn token_unauthorized() -> Response {
-    let mut resp: Response = StatusCode::UNAUTHORIZED.into_response();
-    // Challenge so the client knows it can present Basic creds to obtain a token.
-    resp.headers_mut().insert(
-        http::header::WWW_AUTHENTICATE,
-        http::HeaderValue::from_static("Basic realm=\"registry\""),
-    );
-    resp.headers_mut().insert(
-        http::header::HeaderName::from_static("docker-distribution-api-version"),
-        http::HeaderValue::from_static("registry/2.0"),
-    );
-    resp
-}
-
-#[derive(Clone, Debug)]
-struct Scope {
-    typ: String,
-    name: String,
-    actions: Vec<String>,
-}
-
-fn token_scope_requests_repo_action(
-    scope: &security::TokenScope,
-    action: security::RepoAction,
-) -> bool {
-    if scope.typ != "repository" {
-        return false;
-    }
-    let action = action.as_str();
-    scope.actions.iter().any(|a| a == action)
-}
-
-fn sanitize_token_scopes(scopes: &[Scope]) -> Vec<security::TokenScope> {
-    let mut out: Vec<security::TokenScope> = Vec::new();
-    for s in scopes {
-        if s.typ == "registry" && (s.name == "catalog" || s.name == "*") {
-            let mut actions: Vec<String> = Vec::new();
-            for a in &s.actions {
-                if a == "*" || a == "pull" || a == "push" || a == "read" || a == "catalog" {
-                    actions.push(a.clone());
-                }
-            }
-            if !actions.is_empty() {
-                out.push(security::TokenScope {
-                    typ: s.typ.clone(),
-                    name: s.name.clone(),
-                    actions,
-                });
-            }
-            continue;
-        }
-
-        if s.typ != "repository" {
-            continue;
-        }
-
-        if s.name.trim().is_empty() {
-            continue;
-        }
-
-        let mut actions: Vec<String> = Vec::new();
-        for a in &s.actions {
-            if a == security::RepoAction::Pull.as_str()
-                || a == security::RepoAction::Push.as_str()
-                || a == security::RepoAction::Delete.as_str()
-                || a == "*"
-            {
-                actions.push(a.clone());
-            }
-        }
-
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        actions.retain(|a| seen.insert(a.clone()));
-
-        if actions.is_empty() {
-            continue;
-        }
-
-        out.push(security::TokenScope {
-            typ: s.typ.clone(),
-            name: s.name.clone(),
-            actions,
-        });
-    }
-    out
-}
-
-fn wants_push_from_token_scopes(token_scopes: &[security::TokenScope]) -> bool {
-    token_scopes
-        .iter()
-        .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Push))
-}
-
-fn parse_scopes(scope: &str) -> Vec<Scope> {
-    // scope can be repeated in the URL; many clients send exactly one.
-    // We accept a single comma-separated action list.
-    // Example: repository:myrepo:pull,push
-    if scope.trim().is_empty() {
-        return Vec::new();
-    }
-
-    // Some clients include multiple scopes separated by spaces.
-    scope
-        .split_whitespace()
-        .filter_map(|item| {
-            let mut parts = item.splitn(3, ':');
-            let typ = parts.next()?.trim().to_ascii_lowercase();
-            let name = parts.next()?.to_string();
-            let mut actions = parts
-                .next()
-                .unwrap_or("")
-                .split(',')
-                .map(|a| a.trim().to_ascii_lowercase())
-                .filter(|a| !a.is_empty())
-                .collect::<Vec<_>>();
-
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            actions.retain(|a| seen.insert(a.clone()));
-            Some(Scope { typ, name, actions })
-        })
-        .collect()
-}
-
-fn issue_token(
-    state: &AppState,
-    subject: Option<&str>,
-    scopes: &[security::TokenScope],
-    iat: u64,
-    exp: u64,
-) -> Result<String, ()> {
-    security::issue_bearer_token_with_key(
-        state.config.token_primary_signing_key(),
-        &state.config.token_service,
-        subject,
-        scopes,
-        iat,
-        exp,
-    )
-    .map_err(|_| ())
-}
-
-fn format_rfc3339(unix_secs: u64) -> String {
+pub(crate) fn format_rfc3339(unix_secs: u64) -> String {
     OffsetDateTime::from_unix_timestamp(unix_secs as i64)
         .ok()
         .and_then(|t| t.format(&Rfc3339).ok())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn url_encode_component(s: &str) -> String {
+pub(crate) fn url_encode_component(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>()
 }
 
-fn query_bool(map: &HashMap<String, String>, key: &str) -> bool {
+pub(crate) fn query_bool(map: &HashMap<String, String>, key: &str) -> bool {
     map.get(key)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -935,7 +158,7 @@ async fn read_storage_blob_limited_json(
     serde_json::from_slice(&buf).map_err(|_| ())
 }
 
-async fn tag_platforms_for_repo(
+pub(crate) async fn tag_platforms_for_repo(
     storage: &Arc<dyn crate::storage::Storage>,
     repo: &str,
     tag: &str,
@@ -1022,7 +245,14 @@ pub async fn v2_dispatch(
             if method != Method::GET && method != Method::HEAD {
                 return errors::method_not_allowed("GET, HEAD");
             }
-            catalog_list(state, method, &query, route_mode, proxy_ctx.clone()).await
+            crate::http_api::catalog::catalog_list(
+                state,
+                method,
+                &query,
+                route_mode,
+                proxy_ctx.clone(),
+            )
+            .await
         }
         crate::http_api::routing::OciRoute::ExtensionDiscovery { .. } => {
             if method != Method::GET && method != Method::HEAD {
@@ -1051,19 +281,27 @@ pub async fn v2_dispatch(
             if method != Method::GET && method != Method::HEAD {
                 return errors::method_not_allowed("GET, HEAD");
             }
-            tags_list(state, method, &repo, &query, route_mode, proxy_ctx.clone()).await
+            crate::http_api::tags::tags_list(
+                state,
+                method,
+                &repo,
+                &query,
+                route_mode,
+                proxy_ctx.clone(),
+            )
+            .await
         }
         crate::http_api::routing::OciRoute::TagDelete { repo, tag } => {
             if method != Method::DELETE {
                 return errors::method_not_allowed("DELETE");
             }
-            tag_delete(state, method, &repo, &tag).await
+            crate::http_api::tags::tag_delete(state, method, &repo, &tag).await
         }
         crate::http_api::routing::OciRoute::Referrers { repo, digest } => {
             if method != Method::GET && method != Method::HEAD {
                 return errors::method_not_allowed("GET, HEAD");
             }
-            referrers_list(
+            crate::http_api::referrers::referrers_list(
                 state,
                 method,
                 &repo,
@@ -1099,570 +337,6 @@ pub async fn v2_dispatch(
             blob_by_digest(state, method, &repo, &digest, route_mode, proxy_ctx.clone()).await
         }
         _ => errors::not_implemented().into_response(),
-    }
-}
-
-async fn catalog_list(
-    state: AppState,
-    method: Method,
-    query: &HashMap<String, String>,
-    route_mode: V2RouteMode,
-    proxy_ctx: Option<ProxyContext>,
-) -> Response {
-    match method {
-        Method::GET | Method::HEAD => {
-            let storage = match route_mode {
-                V2RouteMode::Default => state.storage.clone(),
-                V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
-                    Some(ctx) => ctx.cache.clone(),
-                    None => return errors::internal_error().into_response(),
-                },
-            };
-
-            match storage.list_repositories().await {
-                Ok(all) => {
-                    let total = all.len();
-                    let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-                    let n = n_opt.unwrap_or(usize::MAX);
-
-                    let start_idx = query
-                        .get("last")
-                        .and_then(|last| all.iter().position(|t| t == last))
-                        .map(|i| i.saturating_add(1))
-                        .unwrap_or(0);
-
-                    let end_idx = start_idx.saturating_add(n).min(total);
-                    let repos: Vec<String> = all
-                        .into_iter()
-                        .skip(start_idx)
-                        .take(end_idx.saturating_sub(start_idx))
-                        .collect();
-                    let has_more = end_idx < total;
-
-                    let payload = serde_json::json!({
-                        "repositories": repos,
-                    });
-                    let bytes = match serde_json::to_vec(&payload) {
-                        Ok(b) => b,
-                        Err(_) => return errors::internal_error().into_response(),
-                    };
-
-                    let mut headers = registry_headers();
-                    headers.insert("Content-Type", "application/json".parse().unwrap());
-                    headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-
-                    if has_more {
-                        if let (Some(n_raw), Some(last_repo)) = (
-                            query.get("n"),
-                            payload
-                                .get("repositories")
-                                .and_then(|v| v.as_array())
-                                .and_then(|a| a.last())
-                                .and_then(|x| x.as_str()),
-                        ) {
-                            let last_repo = url_encode_component(last_repo);
-                            let link =
-                                format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
-                            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                                headers.insert(http::header::LINK, v);
-                            }
-                        }
-                    }
-
-                    if method == Method::HEAD {
-                        return (StatusCode::OK, headers).into_response();
-                    }
-                    (StatusCode::OK, headers, Body::from(bytes)).into_response()
-                }
-                Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-                Err(_) => errors::internal_error().into_response(),
-            }
-        }
-        _ => errors::method_not_allowed("GET, HEAD"),
-    }
-}
-
-fn repo_org(name: &str) -> Option<&str> {
-    name.split_once('/').map(|(org, _)| org)
-}
-
-fn system_time_to_rfc3339_opt(t: Option<SystemTime>) -> Option<String> {
-    let t = t?;
-    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(format_rfc3339(secs))
-}
-
-fn repo_meta_from_timestamps(name: &str, ts: RepoTimestamps) -> serde_json::Value {
-    let last_push = system_time_to_rfc3339_opt(ts.last_tag_update);
-    let last_manifest_change = system_time_to_rfc3339_opt(ts.last_manifest_update);
-    let last_change_time = match (ts.last_tag_update, ts.last_manifest_update) {
-        (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    let last_change = system_time_to_rfc3339_opt(last_change_time);
-
-    serde_json::json!({
-        "name": name,
-        "org": repo_org(name),
-        "last_push": last_push,
-        "last_manifest_change": last_manifest_change,
-        "last_change": last_change,
-    })
-}
-
-pub async fn meta_orgs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
-    let repos = match state.storage.list_repositories().await {
-        Ok(r) => r,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    let mut orgs: Vec<String> = repos
-        .iter()
-        .filter_map(|r| repo_org(r).map(|o| o.to_string()))
-        .collect();
-    orgs.sort();
-    orgs.dedup();
-
-    let total = orgs.len();
-    let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-    let n = n_opt.unwrap_or(usize::MAX);
-    let start_idx = query
-        .get("last")
-        .and_then(|last| orgs.iter().position(|t| t == last))
-        .map(|i| i.saturating_add(1))
-        .unwrap_or(0);
-    let end_idx = start_idx.saturating_add(n).min(total);
-    let page: Vec<String> = orgs
-        .into_iter()
-        .skip(start_idx)
-        .take(end_idx.saturating_sub(start_idx))
-        .collect();
-    let has_more = end_idx < total;
-
-    let payload = serde_json::json!({
-        "orgs": page,
-    });
-    let bytes = match serde_json::to_vec(&payload) {
-        Ok(b) => b,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    let mut resp_headers = registry_headers();
-    resp_headers.insert("Content-Type", "application/json".parse().unwrap());
-    resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more {
-        if let (Some(n_raw), Some(last_org)) = (
-            query.get("n"),
-            payload
-                .get("orgs")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.last())
-                .and_then(|x| x.as_str()),
-        ) {
-            let last_org = url_encode_component(last_org);
-            let link = format!("</_meta/orgs?n={n_raw}&last={last_org}>; rel=\"next\"");
-            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                resp_headers.insert(http::header::LINK, v);
-            }
-        }
-    }
-
-    (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
-}
-
-pub async fn meta_org_repos(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
-    let repos = match state.storage.list_repositories().await {
-        Ok(r) => r,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-    let prefix = format!("{org}/");
-    let mut filtered: Vec<String> = repos
-        .into_iter()
-        .filter(|r| r == &org || r.starts_with(&prefix))
-        .collect();
-    filtered.sort();
-
-    let total = filtered.len();
-    let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-    let n = n_opt.unwrap_or(usize::MAX);
-    let start_idx = query
-        .get("last")
-        .and_then(|last| filtered.iter().position(|t| t == last))
-        .map(|i| i.saturating_add(1))
-        .unwrap_or(0);
-    let end_idx = start_idx.saturating_add(n).min(total);
-    let page: Vec<String> = filtered
-        .into_iter()
-        .skip(start_idx)
-        .take(end_idx.saturating_sub(start_idx))
-        .collect();
-    let has_more = end_idx < total;
-
-    let mut repos_out: Vec<serde_json::Value> = Vec::new();
-    let include_tags = query_bool(&query, "include_tags");
-    for repo in &page {
-        match state.storage.repo_timestamps(repo).await {
-            Ok(ts) => {
-                let mut meta = repo_meta_from_timestamps(repo, ts);
-                if include_tags {
-                    let tags = match state.storage.list_tags(repo).await {
-                        Ok(t) => t,
-                        Err(StorageError::NotFound) => Vec::new(),
-                        Err(_) => return errors::internal_error().into_response(),
-                    };
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
-                        obj.insert("tags".to_string(), serde_json::json!(tags));
-                    }
-                }
-                repos_out.push(meta);
-            }
-            Err(StorageError::NotFound) => {
-                repos_out.push(serde_json::json!({"name": repo, "org": repo_org(repo)}));
-            }
-            Err(_) => return errors::internal_error().into_response(),
-        }
-    }
-
-    let payload = serde_json::json!({
-        "org": org,
-        "repositories": repos_out,
-    });
-    let bytes = match serde_json::to_vec(&payload) {
-        Ok(b) => b,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    let mut resp_headers = registry_headers();
-    resp_headers.insert("Content-Type", "application/json".parse().unwrap());
-    resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more {
-        if let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
-            let last_repo = url_encode_component(last_repo);
-            let link =
-                format!("</_meta/orgs/{org}/repos?n={n_raw}&last={last_repo}>; rel=\"next\"");
-            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                resp_headers.insert(http::header::LINK, v);
-            }
-        }
-    }
-
-    (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
-}
-
-pub async fn meta_repo(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
-    let include_tags = query_bool(&query, "include_tags");
-
-    match state.storage.repo_timestamps(&name).await {
-        Ok(ts) => {
-            let mut payload = repo_meta_from_timestamps(&name, ts);
-            if include_tags {
-                let tags = match state.storage.list_tags(&name).await {
-                    Ok(t) => t,
-                    Err(StorageError::NotFound) => Vec::new(),
-                    Err(_) => return errors::internal_error().into_response(),
-                };
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
-                    obj.insert("tags".to_string(), serde_json::json!(tags));
-                }
-            }
-            let bytes = match serde_json::to_vec(&payload) {
-                Ok(b) => b,
-                Err(_) => return errors::internal_error().into_response(),
-            };
-            let mut resp_headers = registry_headers();
-            resp_headers.insert("Content-Type", "application/json".parse().unwrap());
-            resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-            (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
-        }
-        Err(StorageError::NotFound) => errors::name_unknown().into_response(),
-        Err(_) => errors::internal_error().into_response(),
-    }
-}
-
-pub async fn meta_catalog(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
-    let mut repos = match state.storage.list_repositories().await {
-        Ok(r) => r,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    if let Some(org) = query.get("org") {
-        let prefix = format!("{org}/");
-        repos.retain(|r| r == org || r.starts_with(&prefix));
-    }
-
-    repos.sort();
-
-    let total = repos.len();
-    let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-    let n = n_opt.unwrap_or(usize::MAX);
-    let start_idx = query
-        .get("last")
-        .and_then(|last| repos.iter().position(|t| t == last))
-        .map(|i| i.saturating_add(1))
-        .unwrap_or(0);
-    let end_idx = start_idx.saturating_add(n).min(total);
-    let page: Vec<String> = repos
-        .into_iter()
-        .skip(start_idx)
-        .take(end_idx.saturating_sub(start_idx))
-        .collect();
-    let has_more = end_idx < total;
-
-    let mut repos_out: Vec<serde_json::Value> = Vec::new();
-    let include_platforms = query_bool(&query, "include_platforms");
-    // include_platforms implies include_tags because platform info is per-tag.
-    let include_tags = query_bool(&query, "include_tags") || include_platforms;
-    for repo in &page {
-        match state.storage.repo_timestamps(repo).await {
-            Ok(ts) => {
-                let mut meta = repo_meta_from_timestamps(repo, ts);
-                if include_tags {
-                    let tags = match state.storage.list_tags(repo).await {
-                        Ok(t) => t,
-                        Err(StorageError::NotFound) => Vec::new(),
-                        Err(_) => return errors::internal_error().into_response(),
-                    };
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.insert("tag_count".to_string(), serde_json::json!(tags.len()));
-                        obj.insert("tags".to_string(), serde_json::json!(tags));
-
-                        if include_platforms {
-                            let storage = state.storage.clone();
-                            let repo = repo.to_string();
-                            let tag_details = futures_util::stream::iter(
-                                obj.get("tags")
-                                    .and_then(|t| t.as_array())
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
-                                    .collect::<Vec<_>>(),
-                            )
-                            .map(|tag| {
-                                let storage = storage.clone();
-                                let repo = repo.clone();
-                                async move { tag_platforms_for_repo(&storage, &repo, &tag).await }
-                            })
-                            .buffer_unordered(16)
-                            .collect::<Vec<_>>()
-                            .await;
-
-                            let tag_details = tag_details
-                                .into_iter()
-                                .filter_map(Result::ok)
-                                .collect::<Vec<_>>();
-                            obj.insert("tag_details".to_string(), serde_json::json!(tag_details));
-                        }
-                    }
-                }
-                repos_out.push(meta);
-            }
-            Err(StorageError::NotFound) => {
-                repos_out.push(serde_json::json!({"name": repo, "org": repo_org(repo)}));
-            }
-            Err(_) => return errors::internal_error().into_response(),
-        }
-    }
-
-    let payload = serde_json::json!({
-        "repositories": repos_out,
-    });
-    let bytes = match serde_json::to_vec(&payload) {
-        Ok(b) => b,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    let mut resp_headers = registry_headers();
-    resp_headers.insert("Content-Type", "application/json".parse().unwrap());
-    resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more {
-        if let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
-            let last_repo = url_encode_component(last_repo);
-            let mut link = format!("</_meta/catalog?n={n_raw}&last={last_repo}");
-            if let Some(org) = query.get("org") {
-                let org = url_encode_component(org);
-                link.push_str(&format!("&org={org}"));
-            }
-            link.push_str(">; rel=\"next\"");
-            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                resp_headers.insert(http::header::LINK, v);
-            }
-        }
-    }
-
-    (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
-}
-
-async fn tags_list(
-    state: AppState,
-    method: Method,
-    name: &str,
-    query: &HashMap<String, String>,
-    route_mode: V2RouteMode,
-    proxy_ctx: Option<ProxyContext>,
-) -> Response {
-    if !is_valid_repo_name(name) {
-        return errors::name_invalid().into_response();
-    }
-
-    if route_mode == V2RouteMode::ProxyOnly {
-        match method {
-            Method::GET | Method::HEAD => {}
-            _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
-        }
-    }
-
-    let storage = match route_mode {
-        V2RouteMode::Default => state.storage.clone(),
-        V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
-            Some(ctx) => ctx.cache.clone(),
-            None => return errors::internal_error().into_response(),
-        },
-    };
-
-    match method {
-        Method::GET | Method::HEAD => match storage.list_tags(name).await {
-            Ok(mut all_tags) => {
-                all_tags.sort();
-                // Pagination per OCI/Docker distribution spec:
-                // - `n` limits the number of tags
-                // - `last` starts listing after the provided tag
-                let total = all_tags.len();
-                let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-                let n = n_opt.unwrap_or(usize::MAX);
-
-                let start_idx = match query.get("last") {
-                    Some(last) => all_tags.iter().position(|t| t > last).unwrap_or(all_tags.len()),
-                    None => 0,
-                };
-
-                let end_idx = start_idx.saturating_add(n).min(total);
-                let tags: Vec<String> = all_tags
-                    .into_iter()
-                    .skip(start_idx)
-                    .take(end_idx.saturating_sub(start_idx))
-                    .collect();
-
-                let has_more = n_opt.is_some() && !tags.is_empty() && tags.len() == n && end_idx < total;
-
-                let payload = serde_json::json!({
-                    "name": name,
-                    "tags": tags,
-                });
-                let bytes = match serde_json::to_vec(&payload) {
-                    Ok(b) => b,
-                    Err(_) => return errors::internal_error().into_response(),
-                };
-
-                let mut headers = registry_headers();
-                headers.insert("Content-Type", "application/json".parse().unwrap());
-                headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-
-                if has_more {
-                    if let (Some(n_val), Some(last_tag)) = (n_opt, tags.last()) {
-                        let last_tag = url_encode_component(last_tag);
-                        let link = format!(
-                            "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
-                        );
-                        if let Ok(v) = http::HeaderValue::from_str(&link) {
-                            headers.insert(http::header::LINK, v);
-                        }
-                    }
-                }
-
-                if method == Method::HEAD {
-                    return (StatusCode::OK, headers).into_response();
-                }
-                (StatusCode::OK, headers, Body::from(bytes)).into_response()
-            }
-            Err(StorageError::NotFound) => errors::name_unknown().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
-        _ => errors::method_not_allowed("GET, HEAD"),
-    }
-}
-
-async fn tag_delete(
-    state: AppState,
-    method: Method,
-    name: &str,
-    tag: &str,
-) -> Response {
-    if method != Method::DELETE {
-        return errors::method_not_allowed("DELETE");
-    }
-    if !is_valid_repo_name(name) {
-        return errors::name_invalid().into_response();
-    }
-    if !is_valid_tag(tag) {
-        return errors::tag_invalid().into_response();
-    }
-    if !state.config.allow_tag_overwrite {
-        return errors::denied("tag is immutable and cannot be deleted").into_response();
-    }
-
-    match state.storage.delete_tag(name, tag).await {
-        Ok(()) => {
-            if let Some(idx) = state.ref_index.as_ref() {
-                if let Err(err) = idx.sync_repo_tags(&state.storage, name).await {
-                    tracing::warn!(
-                        error = %err,
-                        repo = name,
-                        "ref-index: failed to resync tags after tag delete"
-                    );
-                }
-            }
-            (StatusCode::ACCEPTED, registry_headers()).into_response()
-        }
-        Err(StorageError::NotFound) => errors::tag_unknown().into_response(),
-        Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-        Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
-        Err(StorageError::Internal(_)) | Err(StorageError::TooLarge) | Err(StorageError::DigestMismatch) => {
-            errors::internal_error().into_response()
-        }
     }
 }
 
@@ -1703,7 +377,9 @@ async fn blob_by_digest(
             // Prefer the persistent ref-index (fast). On index errors, fall back to scanning.
             if let Some(idx) = state.ref_index.as_ref() {
                 match idx.is_blob_referenced(&digest) {
-                    Ok(true) => return errors::blob_in_use("blob is still referenced").into_response(),
+                    Ok(true) => {
+                        return errors::blob_in_use("blob is still referenced").into_response();
+                    }
                     Ok(false) => {}
                     Err(err) => {
                         tracing::warn!(
@@ -1714,11 +390,7 @@ async fn blob_by_digest(
 
                         if state.config.ref_index.auto_rebuild_on_corruption {
                             let _ = idx
-                                .ensure_healthy_or_rebuild(
-                                    &state.storage,
-                                    true,
-                                    false,
-                                )
+                                .ensure_healthy_or_rebuild(&state.storage, true, false)
                                 .await;
                         }
 
@@ -1767,9 +439,11 @@ async fn blob_by_digest(
                     }
                 }
             } else {
-                match crate::blob_delete_safety::find_blob_reference(&state.storage, &digest).await {
+                match crate::blob_delete_safety::find_blob_reference(&state.storage, &digest).await
+                {
                     Ok(Some(r)) => {
-                        let mut msg = format!("blob is still referenced by manifest {}", r.manifest);
+                        let mut msg =
+                            format!("blob is still referenced by manifest {}", r.manifest);
                         if let Some(tag) = r.tag {
                             msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
                         } else {
@@ -2663,7 +1337,7 @@ pub(crate) fn is_valid_repo_name(name: &str) -> bool {
     true
 }
 
-fn is_valid_tag(tag: &str) -> bool {
+pub(crate) fn is_valid_tag(tag: &str) -> bool {
     if tag.is_empty() || tag.len() > 128 {
         return false;
     }
@@ -2683,18 +1357,23 @@ fn is_valid_tag(tag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AdminGcDeleteRequest, AdminGcPlanRequest, admin_gc_plan, decide_token_scopes_for_request,
-        is_valid_repo_name, is_valid_tag, parse_scopes, sanitize_token_scopes,
+    use super::{is_valid_repo_name, is_valid_tag};
+    use crate::AppState;
+    use crate::http_api::admin::{
+        AdminGcDeleteRequest, AdminGcPlanRequest, AdminGcQuarantineRequest, admin_gc_delete,
+        admin_gc_plan, admin_gc_quarantine,
+    };
+    use crate::http_api::auth_token::{
+        TokenRejection, decide_token_scopes_for_request, parse_scopes, sanitize_token_scopes,
         service_param_is_valid, token_scope_requests_repo_action, wants_push_from_token_scopes,
     };
-    use crate::AppState;
+    use crate::http_api::catalog::meta_catalog;
     use axum::extract::{Json, State};
     use axum::http::{HeaderMap, StatusCode};
     use headers::{Authorization, HeaderMapExt};
     use http_body_util::BodyExt;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     fn with_admin_creds(mut cfg: Config) -> Config {
         cfg.admin_api = crate::config::AdminApiConfig {
@@ -2745,8 +1424,9 @@ mod tests {
     #[tokio::test]
     async fn admin_gc_requires_auth() {
         let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
         let state = test_app_state(cfg, storage, None);
 
         let req = AdminGcPlanRequest::default();
@@ -2758,8 +1438,9 @@ mod tests {
     #[tokio::test]
     async fn admin_gc_returns_503_when_service_missing() {
         let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
         let state = test_app_state(cfg, storage, None);
 
         let req = AdminGcPlanRequest::default();
@@ -2770,10 +1451,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_gc_maps_already_running_to_conflict() {
-        let fs_root = std::env::temp_dir().join(format!(
-            "registry-rust-admin-gc-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-admin-gc-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&fs_root);
         let ref_index_path = fs_root.join("ref-index");
         let _ = std::fs::create_dir_all(&ref_index_path);
@@ -2783,11 +1462,16 @@ mod tests {
         cfg.ref_index.path = ref_index_path.clone();
         let cfg = Arc::new(with_admin_creds(cfg));
 
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
         let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
         idx.rebuild(&storage).await.expect("rebuild");
-        let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
+        let service = Arc::new(crate::gc_service::GcService::new(
+            cfg.clone(),
+            storage.clone(),
+            idx,
+        ));
         let service_for_state = service.clone();
         let held = service.test_try_lock().expect("lock");
 
@@ -2804,10 +1488,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_gc_quarantine_blocked_when_kill_switch_off() {
-        let fs_root = std::env::temp_dir().join(format!(
-            "registry-rust-admin-gc-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-admin-gc-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&fs_root);
         let ref_index_path = fs_root.join("ref-index");
         let _ = std::fs::create_dir_all(&ref_index_path);
@@ -2818,15 +1500,25 @@ mod tests {
         cfg.blob_gc_enabled = false;
         let cfg = Arc::new(with_admin_creds(cfg));
 
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
         let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
         idx.rebuild(&storage).await.expect("rebuild");
-        let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
+        let service = Arc::new(crate::gc_service::GcService::new(
+            cfg.clone(),
+            storage.clone(),
+            idx,
+        ));
 
         let state = test_app_state(cfg, storage, Some(service));
 
-        let resp = super::admin_gc_quarantine(State(state), admin_headers_ok(), Json(AdminGcPlanRequest::default())).await;
+        let resp = admin_gc_quarantine(
+            State(state),
+            admin_headers_ok(),
+            Json(AdminGcQuarantineRequest::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         let _ = std::fs::remove_dir_all(&fs_root);
@@ -2834,10 +1526,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_gc_delete_blocked_when_delete_gate_off() {
-        let fs_root = std::env::temp_dir().join(format!(
-            "registry-rust-admin-gc-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-admin-gc-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&fs_root);
         let ref_index_path = fs_root.join("ref-index");
         let _ = std::fs::create_dir_all(&ref_index_path);
@@ -2849,15 +1539,20 @@ mod tests {
         cfg.blob_gc_enable_delete = false;
         let cfg = Arc::new(with_admin_creds(cfg));
 
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
         let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
         idx.rebuild(&storage).await.expect("rebuild");
-        let service = Arc::new(crate::gc_service::GcService::new(cfg.clone(), storage.clone(), idx));
+        let service = Arc::new(crate::gc_service::GcService::new(
+            cfg.clone(),
+            storage.clone(),
+            idx,
+        ));
 
         let state = test_app_state(cfg, storage, Some(service));
 
-        let resp = super::admin_gc_delete(
+        let resp = admin_gc_delete(
             State(state),
             admin_headers_ok(),
             Json(AdminGcDeleteRequest::default()),
@@ -2870,14 +1565,16 @@ mod tests {
 
     #[tokio::test]
     async fn meta_catalog_include_tags_adds_tags_and_tag_count() {
-        let fs_root = std::env::temp_dir().join(format!(
-            "registry-rust-meta-tags-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-meta-tags-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&fs_root);
 
         // Create repos + tags on disk.
-        let repo_dir = fs_root.join("repos").join("org1").join("repoa").join("tags");
+        let repo_dir = fs_root
+            .join("repos")
+            .join("org1")
+            .join("repoa")
+            .join("tags");
         let _ = std::fs::create_dir_all(&repo_dir);
         std::fs::write(repo_dir.join("latest"), "sha256:deadbeef\n").unwrap();
         std::fs::write(repo_dir.join("v1"), "sha256:cafebabe\n").unwrap();
@@ -2887,15 +1584,16 @@ mod tests {
         cfg.catalog_requires_auth = false;
         let cfg = Arc::new(cfg);
 
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
 
         let state = test_app_state(cfg, storage, None);
 
         let mut q = std::collections::HashMap::new();
         q.insert("include_tags".to_string(), "1".to_string());
 
-        let resp = super::meta_catalog(State(state), HeaderMap::new(), axum::extract::Query(q)).await;
+        let resp = meta_catalog(State(state), HeaderMap::new(), axum::extract::Query(q)).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -2904,7 +1602,10 @@ mod tests {
         let repos = v.get("repositories").and_then(|x| x.as_array()).unwrap();
         assert_eq!(repos.len(), 1);
         let repo0 = repos[0].as_object().unwrap();
-        assert_eq!(repo0.get("name").and_then(|x| x.as_str()), Some("org1/repoa"));
+        assert_eq!(
+            repo0.get("name").and_then(|x| x.as_str()),
+            Some("org1/repoa")
+        );
         assert_eq!(repo0.get("tag_count").and_then(|x| x.as_u64()), Some(2));
 
         let tags = repo0.get("tags").and_then(|x| x.as_array()).unwrap();
@@ -2924,12 +1625,10 @@ mod tests {
 
         let repo = "org1/repoa";
 
-        let idx_digest =
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let idx_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let single_digest =
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let cfg_digest =
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let cfg_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
         // Tags.
         let tags_dir = fs_root
@@ -3001,22 +1700,27 @@ mod tests {
             "architecture": "amd64",
             "os": "linux"
         });
-        std::fs::write(cfg_blob_dir.join(cfg_hex), serde_json::to_vec(&cfg_json).unwrap()).unwrap();
+        std::fs::write(
+            cfg_blob_dir.join(cfg_hex),
+            serde_json::to_vec(&cfg_json).unwrap(),
+        )
+        .unwrap();
 
         let mut cfg = minimal_config_for_token_tests();
         cfg.fs_root = fs_root.clone();
         cfg.catalog_requires_auth = false;
         let cfg = Arc::new(cfg);
 
-        let storage: Arc<dyn crate::storage::Storage> =
-            Arc::new(crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
 
         let state = test_app_state(cfg, storage, None);
 
         let mut q = std::collections::HashMap::new();
         q.insert("include_platforms".to_string(), "1".to_string());
 
-        let resp = super::meta_catalog(State(state), HeaderMap::new(), axum::extract::Query(q)).await;
+        let resp = meta_catalog(State(state), HeaderMap::new(), axum::extract::Query(q)).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -3028,13 +1732,11 @@ mod tests {
         assert_eq!(repo0.get("name").and_then(|x| x.as_str()), Some(repo));
         assert_eq!(repo0.get("tag_count").and_then(|x| x.as_u64()), Some(2));
 
-        let tag_details = repo0
-            .get("tag_details")
-            .and_then(|x| x.as_array())
-            .unwrap();
+        let tag_details = repo0.get("tag_details").and_then(|x| x.as_array()).unwrap();
         assert_eq!(tag_details.len(), 2);
 
-        let mut by_tag: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut by_tag: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for d in tag_details {
             let tag = d.get("tag").and_then(|x| x.as_str()).unwrap().to_string();
             let plats = d
@@ -3419,7 +2121,7 @@ mod tests {
 
         assert_eq!(
             err,
-            super::TokenRejection::Denied("action not allowed by robot policy")
+            TokenRejection::Denied("action not allowed by robot policy")
         );
     }
 
@@ -3452,7 +2154,7 @@ mod tests {
         )
         .expect_err("should deny");
 
-        assert_eq!(err, super::TokenRejection::Unauthorized);
+        assert_eq!(err, TokenRejection::Unauthorized);
     }
 
     #[test]
@@ -3566,7 +2268,7 @@ mod tests {
 
         assert_eq!(
             err,
-            super::TokenRejection::Denied("action not allowed by user policy")
+            TokenRejection::Denied("action not allowed by user policy")
         );
     }
 
@@ -3618,7 +2320,7 @@ mod tests {
 
         assert_eq!(
             err,
-            super::TokenRejection::Denied("action not allowed by robot policy")
+            TokenRejection::Denied("action not allowed by robot policy")
         );
     }
 }
@@ -3864,7 +2566,8 @@ async fn manifest_put(
 
     if let Some(schema_version) = manifest_json.get("schemaVersion").and_then(|v| v.as_i64()) {
         if schema_version == 1 {
-            if manifest_json.get("signatures").is_some() || manifest_json.get("signature").is_some() {
+            if manifest_json.get("signatures").is_some() || manifest_json.get("signature").is_some()
+            {
                 return errors::manifest_unverified("manifest failed signature verification");
             }
             return errors::manifest_invalid().into_response();
@@ -3894,7 +2597,8 @@ async fn manifest_put(
     if let Some(refs) = crate::manifest_refs::parse_manifest_refs(&bytes) {
         for blob_str in &refs.blobs {
             if blob_str == "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
-                || blob_str == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                || blob_str
+                    == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             {
                 continue;
             }
@@ -3985,7 +2689,13 @@ async fn manifest_put(
         // Keep the ref-index up to date (best-effort). Errors here should not fail the push.
         if let Some(idx) = state.ref_index.as_ref() {
             if let Err(err) = idx
-                .on_tag_set(&state.storage, name, reference, &computed, old_root_for_index)
+                .on_tag_set(
+                    &state.storage,
+                    name,
+                    reference,
+                    &computed,
+                    old_root_for_index,
+                )
                 .await
             {
                 tracing::warn!(
@@ -4105,147 +2815,7 @@ async fn oci_extension_discover(method: Method) -> Response {
     }
 }
 
-async fn referrers_list(
-    state: AppState,
-    method: Method,
-    name: &str,
-    digest_str: &str,
-    query: &HashMap<String, String>,
-    route_mode: V2RouteMode,
-    proxy_ctx: Option<ProxyContext>,
-) -> Response {
-    if !is_valid_repo_name(name) {
-        return errors::name_invalid().into_response();
-    }
-
-    let subject = match Digest::parse(digest_str) {
-        Ok(d) => d,
-        Err(_) => return errors::digest_invalid().into_response(),
-    };
-
-    match method {
-        Method::GET | Method::HEAD => {
-            let storage = match route_mode {
-                V2RouteMode::Default => state.storage.clone(),
-                V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
-                    Some(ctx) => ctx.cache.clone(),
-                    None => return errors::internal_error().into_response(),
-                },
-            };
-
-            let mut entries = match storage.list_referrers(name, &subject).await {
-                Ok(v) => v,
-                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
-                Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
-                Err(StorageError::DigestMismatch) => {
-                    return errors::internal_error().into_response();
-                }
-                Err(StorageError::NotFound) => Vec::new(),
-                Err(StorageError::InsufficientStorage) => {
-                    return errors::insufficient_storage().into_response();
-                }
-            };
-
-            let artifact_type_filter = query.get("artifactType").map(|s| s.as_str());
-            if let Some(filter) = artifact_type_filter {
-                entries.retain(|d| d.artifact_type.as_deref() == Some(filter));
-            }
-
-            // Sort deterministically by digest for stable pagination.
-            entries.sort_by(|a, b| a.digest.cmp(&b.digest));
-
-            // Apply pagination if `last` is provided.
-            let start_idx = if let Some(last) = query.get("last") {
-                match entries.iter().position(|d| d.digest == *last) {
-                    Some(pos) => pos + 1,
-                    None => 0,
-                }
-            } else {
-                0
-            };
-
-            let remaining = if start_idx < entries.len() {
-                &entries[start_idx..]
-            } else {
-                &[]
-            };
-
-            let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-            let (page_entries, next_last) = match n_opt {
-                Some(n) if n < remaining.len() => (&remaining[..n], Some(&remaining[n - 1].digest)),
-                _ => (remaining, None),
-            };
-
-            // Return OCI index.
-            let manifests = page_entries
-                .iter()
-                .map(|d| {
-                    let mut obj = serde_json::json!({
-                        "mediaType": d.media_type,
-                        "digest": d.digest,
-                        "size": d.size,
-                    });
-                    if let Some(at) = &d.artifact_type {
-                        obj["artifactType"] = serde_json::Value::String(at.clone());
-                    }
-                    if let Some(ann) = &d.annotations {
-                        obj["annotations"] =
-                            serde_json::to_value(ann).unwrap_or(serde_json::Value::Null);
-                    }
-                    obj
-                })
-                .collect::<Vec<_>>();
-
-            let payload = serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.index.v1+json",
-                "manifests": manifests,
-            });
-
-            let bytes = match serde_json::to_vec(&payload) {
-                Ok(b) => b,
-                Err(_) => return errors::internal_error().into_response(),
-            };
-            let mut headers = registry_headers();
-            headers.insert(
-                "Content-Type",
-                "application/vnd.oci.image.index.v1+json".parse().unwrap(),
-            );
-            headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-            if artifact_type_filter.is_some() {
-                headers.insert("OCI-Filters-Applied", "artifactType".parse().unwrap());
-            }
-
-            if let (Some(n), Some(last_digest)) = (n_opt, next_last) {
-                let mut link_params = vec![format!("n={}", n)];
-                if let Some(filter) = artifact_type_filter {
-                    let encoded_filter: String =
-                        url::form_urlencoded::byte_serialize(filter.as_bytes()).collect();
-                    link_params.push(format!("artifactType={}", encoded_filter));
-                }
-                link_params.push(format!("last={}", last_digest));
-                let link_header = format!(
-                    r#"</v2/{}/referrers/{}?{}>; rel="next""#,
-                    name,
-                    subject.as_str(),
-                    link_params.join("&")
-                );
-                if let Ok(val) = link_header.parse() {
-                    headers.insert("Link", val);
-                }
-            }
-
-            if method == Method::HEAD {
-                return (StatusCode::OK, headers).into_response();
-            }
-            (StatusCode::OK, headers, Body::from(bytes)).into_response()
-        }
-        _ => errors::method_not_allowed("GET, HEAD"),
-    }
-}
-
-fn registry_headers() -> HeaderMap {
+pub(crate) fn registry_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         "Docker-Distribution-API-Version",
@@ -4285,9 +2855,13 @@ async fn read_body_limited(
         let chunk = match next {
             Ok(c) => c,
             Err(crate::http_api::stream_guard::StreamGuardError::IdleTimeout(_))
-            | Err(crate::http_api::stream_guard::StreamGuardError::InsufficientThroughput { .. }) => {
-                return Err(errors::request_timeout("request stream timed out or throughput too low")
-                    .into_response());
+            | Err(crate::http_api::stream_guard::StreamGuardError::InsufficientThroughput {
+                ..
+            }) => {
+                return Err(errors::request_timeout(
+                    "request stream timed out or throughput too low",
+                )
+                .into_response());
             }
             Err(_) => return Err(errors::internal_error().into_response()),
         };
@@ -4329,17 +2903,39 @@ async fn upload_create(
             &state.config.token_service,
             state.config.token_ttl_secs,
         ) {
-            if !crate::security::token_allows_repo_action(&claims, name, crate::security::RepoAction::Push) {
-                return errors::denied("push permission denied on target repository").into_response();
+            if !crate::security::token_allows_repo_action(
+                &claims,
+                name,
+                crate::security::RepoAction::Push,
+            ) {
+                return errors::denied("push permission denied on target repository")
+                    .into_response();
             }
         } else {
             return crate::auth::unauthorized_registry_challenge(&state, Some(name));
         }
     }
 
-    // Quota enforcement
-    if name.to_ascii_lowercase().contains("quota") {
-        return (StatusCode::PAYLOAD_TOO_LARGE, errors::denied("quota exceeded")).into_response();
+    let req_content_len = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Storage quota check
+    if !crate::http_api::quota::check_repo_quota(
+        &state.storage,
+        &state.config,
+        name,
+        req_content_len,
+    )
+    .await
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            errors::denied("quota exceeded"),
+        )
+            .into_response();
     }
 
     // Cross-repository blob mount:
@@ -4349,21 +2945,20 @@ async fn upload_create(
     // If source blob is missing, gracefully fall back to standard 202 upload session per spec.
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
         if let Some(from_repo) = query.get("from") {
-            let from_lower = from_repo.to_ascii_lowercase();
-            let from_is_private = from_lower.contains("private")
-                || from_lower.contains("secret")
-                || from_lower.contains("protected")
-                || from_lower.contains("restricted")
-                || from_repo.contains('<')
-                || from_repo.contains('>');
+            let from_is_private = state.config.is_repo_private(from_repo);
 
             let allows_pull = if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
-                if let Ok((_signed_input, _sig, payload_bytes)) = crate::security::decode_token_parts(token) {
-                    if let Ok(claims) = serde_json::from_slice::<crate::security::TokenClaims>(&payload_bytes) {
-                        crate::security::token_allows_repo_action(&claims, from_repo, crate::security::RepoAction::Pull)
-                    } else {
-                        false
-                    }
+                if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
+                    &state.config.token_signing_keys,
+                    token,
+                    &state.config.token_service,
+                    state.config.token_ttl_secs,
+                ) {
+                    crate::security::token_allows_repo_action(
+                        &claims,
+                        from_repo,
+                        crate::security::RepoAction::Pull,
+                    )
                 } else {
                     false
                 }
@@ -4371,7 +2966,7 @@ async fn upload_create(
                 !from_is_private && state.config.anonymous_pull
             };
 
-            if from_is_private && !allows_pull {
+            if !allows_pull {
                 return errors::denied("access to repository denied").into_response();
             }
         }
@@ -4441,12 +3036,27 @@ async fn upload_create(
             match state.storage.create_upload().await {
                 Ok(meta) => {
                     let mut headers = registry_headers();
-                    let state_token = format!("{name}:{}", meta.uuid);
-                    let location = format!("/v2/{name}/blobs/uploads/{}?_state={state_token}", meta.uuid);
+                    let key = state
+                        .config
+                        .token_signing_keys
+                        .first()
+                        .map(|k| k.key.as_bytes())
+                        .unwrap_or(b"registry-rust-state-secret");
+                    let state_token = crate::http_api::upload_state::UploadStateData::new(
+                        name,
+                        &meta.uuid,
+                        meta.offset,
+                    )
+                    .encode_and_sign(key);
+                    let location = format!(
+                        "/v2/{name}/blobs/uploads/{}?_state={state_token}",
+                        meta.uuid
+                    );
                     headers.insert("Location", location.parse().unwrap());
                     headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
                     if let Some(min_len) = state.config.upload_chunk_min_bytes {
-                        headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
+                        headers
+                            .insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
                     }
                     return (StatusCode::ACCEPTED, headers).into_response();
                 }
@@ -4565,7 +3175,8 @@ async fn upload_create(
         return match state.storage.finalize_upload(&meta.uuid, &digest).await {
             Ok(final_meta) => {
                 if let Some(idx) = state.ref_index.as_ref() {
-                    let grace = std::time::Duration::from_secs(state.config.blob_gc_finalize_grace_secs);
+                    let grace =
+                        std::time::Duration::from_secs(state.config.blob_gc_finalize_grace_secs);
                     if let Some(until) = std::time::SystemTime::now().checked_add(grace) {
                         if let Err(err) = idx.pin_blob(&digest, until, "finalize_upload") {
                             tracing::warn!(
@@ -4611,8 +3222,19 @@ async fn upload_create(
     match state.storage.create_upload().await {
         Ok(meta) => {
             let mut headers = registry_headers();
-            let state_token = format!("{name}:{}", meta.uuid);
-            let location = format!("/v2/{name}/blobs/uploads/{}?_state={state_token}", meta.uuid);
+            let key = state
+                .config
+                .token_signing_keys
+                .first()
+                .map(|k| k.key.as_bytes())
+                .unwrap_or(b"registry-rust-state-secret");
+            let state_token =
+                crate::http_api::upload_state::UploadStateData::new(name, &meta.uuid, 0)
+                    .encode_and_sign(key);
+            let location = format!(
+                "/v2/{name}/blobs/uploads/{}?_state={state_token}",
+                meta.uuid
+            );
             headers.insert("Location", location.parse().unwrap());
             headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
             if let Some(min_len) = state.config.upload_chunk_min_bytes {
@@ -4652,25 +3274,39 @@ async fn upload_session(
     query: HashMap<String, String>,
     body: Body,
 ) -> Response {
+    let key = state
+        .config
+        .token_signing_keys
+        .first()
+        .map(|k| k.key.as_bytes())
+        .unwrap_or(b"registry-rust-state-secret");
     if method == Method::PATCH {
         let state_param = query.get("_state").map(|s| s.as_str());
         if state_param.is_none() || state_param.unwrap().is_empty() {
             let _ = axum::body::to_bytes(body, usize::MAX).await;
             return errors::blob_upload_invalid("missing _state parameter").into_response();
         }
-        if let Some(st) = state_param {
-            if st.contains("forged") || st.contains("tampered") || (!st.starts_with(&format!("{name}:")) && st.contains(':')) {
+        let st = state_param.unwrap();
+        match crate::http_api::upload_state::UploadStateData::verify_and_decode(st, key, name) {
+            Ok(state_data) => {
+                if let Ok(meta) = state.storage.upload_status(uuid).await {
+                    if state_data.offset > 0 && state_data.offset != meta.offset {
+                        let _ = axum::body::to_bytes(body, usize::MAX).await;
+                        return errors::range_invalid("storage size does not match state offset")
+                            .into_response();
+                    }
+                }
+            }
+            Err(_) => {
                 let _ = axum::body::to_bytes(body, usize::MAX).await;
                 return errors::blob_upload_invalid("invalid _state parameter").into_response();
-            }
-            if st.contains("desync") {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::range_invalid("storage size does not match state offset").into_response();
             }
         }
     } else if method == Method::PUT {
         if let Some(st) = query.get("_state").map(|s| s.as_str()) {
-            if st.contains("forged") || st.contains("tampered") || (!st.starts_with(&format!("{name}:")) && st.contains(':')) {
+            if crate::http_api::upload_state::UploadStateData::verify_and_decode(st, key, name)
+                .is_err()
+            {
                 let _ = axum::body::to_bytes(body, usize::MAX).await;
                 return errors::blob_upload_invalid("invalid _state parameter").into_response();
             }
@@ -4703,6 +3339,7 @@ async fn upload_session(
                 _ => crate::security::RepoAction::Pull,
             };
             if !crate::security::token_allows_repo_action(&claims, name, required_action) {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
                 return errors::denied("access to repository denied").into_response();
             }
         } else {
@@ -4722,14 +3359,7 @@ async fn upload_session(
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::Internal(_)) | Err(StorageError::DigestMismatch) => {
-                errors::internal_error().into_response()
-            }
+            Err(_) => errors::internal_error().into_response(),
         },
         Method::DELETE => match state.storage.abort_upload(uuid).await {
             Ok(()) => {
@@ -4738,16 +3368,24 @@ async fn upload_session(
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
             Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::Unsupported) => errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE"),
+            Err(StorageError::Unsupported) => {
+                errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE")
+            }
             Err(_) => errors::internal_error().into_response(),
         },
         Method::PATCH => {
             // Enforce that Content-Range starts at the current offset.
             if let Some((start, end)) = parse_content_range(req_headers) {
-                if let Some(cl) = req_headers.get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(cl) = req_headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     if (end.saturating_sub(start) + 1) != cl {
                         let _ = axum::body::to_bytes(body, 1024 * 1024).await;
-                        return errors::size_invalid("provided length did not match content length");
+                        return errors::size_invalid(
+                            "provided length did not match content length",
+                        );
                     }
                 }
                 match state.storage.upload_status(uuid).await {
@@ -4756,10 +3394,8 @@ async fn upload_session(
                         let _ = axum::body::to_bytes(body, 1024 * 1024).await;
                         let mut resp = errors::range_invalid("invalid content range");
                         if meta.offset > 0 {
-                            resp.headers_mut().insert(
-                                "Range",
-                                format!("0-{}", meta.offset - 1).parse().unwrap(),
-                            );
+                            resp.headers_mut()
+                                .insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
                         }
                         return resp;
                     }
@@ -4775,8 +3411,8 @@ async fn upload_session(
             }
 
             let (idle_timeout, min_rate) = state.current_stream_guard_params();
-            let audit_only =
-                state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
+            let audit_only = state.config.slow_connection_policy
+                == crate::config::SlowConnectionPolicy::AuditOnly;
             let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
                 body.into_data_stream(),
                 idle_timeout,
@@ -4810,8 +3446,10 @@ async fn upload_session(
                         if policy.abort_on_error {
                             let _ = state.storage.abort_upload(uuid).await;
                         }
-                        return errors::request_timeout("upload aborted while reading request body")
-                            .into_response();
+                        return errors::request_timeout(
+                            "upload aborted while reading request body",
+                        )
+                        .into_response();
                     }
                 };
                 if chunk.is_empty() {
@@ -4847,8 +3485,22 @@ async fn upload_session(
             }
 
             let mut headers = registry_headers();
-            let state_token = format!("{name}:{}", last_meta.uuid);
-            let patch_location = format!("/v2/{name}/blobs/uploads/{}?_state={state_token}", last_meta.uuid);
+            let key = state
+                .config
+                .token_signing_keys
+                .first()
+                .map(|k| k.key.as_bytes())
+                .unwrap_or(b"registry-rust-state-secret");
+            let state_token = crate::http_api::upload_state::UploadStateData::new(
+                name,
+                &last_meta.uuid,
+                last_meta.offset,
+            )
+            .encode_and_sign(key);
+            let patch_location = format!(
+                "/v2/{name}/blobs/uploads/{}?_state={state_token}",
+                last_meta.uuid
+            );
             headers.insert("Location", patch_location.parse().unwrap());
             headers.insert("Docker-Upload-UUID", last_meta.uuid.parse().unwrap());
             if last_meta.offset > 0 {
@@ -4878,10 +3530,8 @@ async fn upload_session(
                     Ok(meta) => {
                         let mut resp = errors::size_invalid("range not satisfiable");
                         if meta.offset > 0 {
-                            resp.headers_mut().insert(
-                                "Range",
-                                format!("0-{}", meta.offset - 1).parse().unwrap(),
-                            );
+                            resp.headers_mut()
+                                .insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
                         }
                         return resp;
                     }
@@ -4894,8 +3544,8 @@ async fn upload_session(
 
             // Stream any body bytes into the upload (some clients do monolithic finalize-on-PUT).
             let (idle_timeout, min_rate) = state.current_stream_guard_params();
-            let audit_only =
-                state.config.slow_connection_policy == crate::config::SlowConnectionPolicy::AuditOnly;
+            let audit_only = state.config.slow_connection_policy
+                == crate::config::SlowConnectionPolicy::AuditOnly;
             let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
                 body.into_data_stream(),
                 idle_timeout,
@@ -4931,8 +3581,10 @@ async fn upload_session(
                         if policy.abort_on_error {
                             let _ = state.storage.abort_upload(uuid).await;
                         }
-                        return errors::request_timeout("upload aborted while reading request body")
-                            .into_response();
+                        return errors::request_timeout(
+                            "upload aborted while reading request body",
+                        )
+                        .into_response();
                     }
                 };
                 if !first_chunk.is_empty() {
@@ -4979,8 +3631,10 @@ async fn upload_session(
                             if policy.abort_on_error {
                                 let _ = state.storage.abort_upload(uuid).await;
                             }
-                            return errors::request_timeout("upload aborted while reading request body")
-                                .into_response();
+                            return errors::request_timeout(
+                                "upload aborted while reading request body",
+                            )
+                            .into_response();
                         }
                     };
                     if chunk.is_empty() {
@@ -5019,7 +3673,9 @@ async fn upload_session(
             match state.storage.finalize_upload(uuid, &digest).await {
                 Ok(meta) => {
                     if let Some(idx) = state.ref_index.as_ref() {
-                        let grace = std::time::Duration::from_secs(state.config.blob_gc_finalize_grace_secs);
+                        let grace = std::time::Duration::from_secs(
+                            state.config.blob_gc_finalize_grace_secs,
+                        );
                         if let Some(until) = std::time::SystemTime::now().checked_add(grace) {
                             if let Err(err) = idx.pin_blob(&digest, until, "finalize_upload") {
                                 tracing::warn!(

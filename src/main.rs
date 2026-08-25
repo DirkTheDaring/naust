@@ -3,9 +3,9 @@ mod auth;
 mod blob_delete_safety;
 mod blob_gc;
 mod blob_ref_index;
-mod gc_service;
 mod config;
 mod fs_root_lock;
+mod gc_service;
 mod http_api;
 mod ip_concurrency;
 mod manifest_refs;
@@ -35,8 +35,8 @@ use sha2::Digest as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
@@ -442,7 +442,8 @@ async fn main() {
 
     match cli.command {
         CliCommand::CheckConfig => {
-            let _cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths)) {
+            let _cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths))
+            {
                 Ok(c) => c,
                 Err(err) => {
                     let msg = if let Some(s) = err.downcast_ref::<String>() {
@@ -462,7 +463,8 @@ async fn main() {
         }
         CliCommand::AuditPermissions => {
             // Access audit: print effective permissions and exit.
-            let cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths)) {
+            let cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths))
+            {
                 Ok(c) => c,
                 Err(err) => {
                     let msg = if let Some(s) = err.downcast_ref::<String>() {
@@ -525,7 +527,10 @@ async fn main() {
             let idx = match blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("ref-index: failed to open {}: {e}", cfg.ref_index.path.display());
+                    eprintln!(
+                        "ref-index: failed to open {}: {e}",
+                        cfg.ref_index.path.display()
+                    );
                     std::process::exit(1);
                 }
             };
@@ -613,7 +618,10 @@ async fn main() {
             let idx = match blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("blob-gc: failed to open ref-index {}: {e}", cfg.ref_index.path.display());
+                    eprintln!(
+                        "blob-gc: failed to open ref-index {}: {e}",
+                        cfg.ref_index.path.display()
+                    );
                     std::process::exit(1);
                 }
             };
@@ -656,7 +664,10 @@ async fn main() {
 
                     println!(
                         "scanned_blobs={} scanned_bytes={} eligible_blobs={} eligible_bytes={}",
-                        stats.scanned_blobs, stats.scanned_bytes, stats.eligible_blobs, stats.eligible_bytes
+                        stats.scanned_blobs,
+                        stats.scanned_bytes,
+                        stats.eligible_blobs,
+                        stats.eligible_bytes
                     );
                     return;
                 }
@@ -684,7 +695,10 @@ async fn main() {
 
                     println!(
                         "scanned_blobs={} scanned_bytes={} quarantined_blobs={} quarantined_bytes={}",
-                        stats.scanned_blobs, stats.scanned_bytes, stats.quarantined_blobs, stats.quarantined_bytes
+                        stats.scanned_blobs,
+                        stats.scanned_bytes,
+                        stats.quarantined_blobs,
+                        stats.quarantined_bytes
                     );
                     return;
                 }
@@ -712,7 +726,10 @@ async fn main() {
 
                     println!(
                         "restored_blobs={} restored_bytes={} deleted_blobs={} deleted_bytes={}",
-                        stats.restored_blobs, stats.restored_bytes, stats.deleted_blobs, stats.deleted_bytes
+                        stats.restored_blobs,
+                        stats.restored_bytes,
+                        stats.deleted_blobs,
+                        stats.deleted_bytes
                     );
                     return;
                 }
@@ -748,7 +765,10 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "registry-rust starting");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "registry-rust starting"
+    );
 
     let config = match std::panic::catch_unwind(|| {
         if config_paths.is_empty() {
@@ -989,9 +1009,7 @@ async fn main() {
         config.max_concurrent_buffered_requests.max(1),
     ));
     let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
-    let upload_request_sem = Arc::new(Semaphore::new(
-        config.max_concurrent_upload_requests.max(1),
-    ));
+    let upload_request_sem = Arc::new(Semaphore::new(config.max_concurrent_upload_requests.max(1)));
 
     let gc_service = match (&ref_index, &config.storage_backend) {
         (Some(idx), StorageBackend::Filesystem) => Some(Arc::new(gc_service::GcService::new(
@@ -1051,10 +1069,19 @@ async fn main() {
 
     // Operational metadata / inventory endpoints (non-standard).
     let meta = Router::new()
-        .route("/_meta/catalog", get(handlers::meta_catalog))
-        .route("/_meta/orgs", get(handlers::meta_orgs))
-        .route("/_meta/orgs/:org/repos", get(handlers::meta_org_repos))
-        .route("/_meta/repos/*name", get(handlers::meta_repo));
+        .route(
+            "/_meta/catalog",
+            get(crate::http_api::catalog::meta_catalog),
+        )
+        .route("/_meta/orgs", get(crate::http_api::catalog::meta_orgs))
+        .route(
+            "/_meta/orgs/:org/repos",
+            get(crate::http_api::catalog::meta_org_repos),
+        )
+        .route(
+            "/_meta/repos/*name",
+            get(crate::http_api::catalog::meta_repo),
+        );
 
     let tls_cert_path = state.config.tls_cert_path.clone();
     let tls_key_path = state.config.tls_key_path.clone();
@@ -1088,21 +1115,35 @@ async fn main() {
         )
     };
 
-    let token =
-        Router::new()
-            .route("/token", get(handlers::token))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let limiter = token_rate_limiter.clone();
-                async move { limit_token_requests(limiter, req, next).await }
-            }));
+    let token = Router::new()
+        .route(
+            "/token",
+            get(crate::http_api::auth_token::token).post(crate::http_api::auth_token::token),
+        )
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let limiter = token_rate_limiter.clone();
+            async move { limit_token_requests(limiter, req, next).await }
+        }));
 
     // Admin-only endpoints (disabled by default).
     let admin = if state.config.admin_api.enabled {
         Router::new()
-            .route("/_admin/gc/health", get(handlers::admin_gc_health))
-            .route("/_admin/gc/plan", post(handlers::admin_gc_plan))
-            .route("/_admin/gc/quarantine", post(handlers::admin_gc_quarantine))
-            .route("/_admin/gc/delete", post(handlers::admin_gc_delete))
+            .route(
+                "/_admin/gc/health",
+                get(crate::http_api::admin::admin_gc_health),
+            )
+            .route(
+                "/_admin/gc/plan",
+                post(crate::http_api::admin::admin_gc_plan),
+            )
+            .route(
+                "/_admin/gc/quarantine",
+                post(crate::http_api::admin::admin_gc_quarantine),
+            )
+            .route(
+                "/_admin/gc/delete",
+                post(crate::http_api::admin::admin_gc_delete),
+            )
     } else {
         Router::new()
     };
@@ -1838,7 +1879,6 @@ async fn ip_concurrency_middleware(
     }
 }
 
-
 #[cfg(target_os = "linux")]
 fn open_fd_count_linux() -> Option<u64> {
     // Best-effort diagnostic only.
@@ -1918,7 +1958,6 @@ async fn concurrency_limit_v2_non_upload(
     active_counter.fetch_sub(1, Ordering::Relaxed);
 
     response
-
 }
 
 fn is_upload_path(path: &str) -> bool {
@@ -2073,7 +2112,11 @@ fn spawn_blob_gc_scheduler(state: AppState) {
         ticker.tick().await; // consume immediate tick
         loop {
             ticker.tick().await;
-            tracing::info!(event = "blob_gc", action = "scheduled_cleanup", "starting scheduled blob gc cleanup");
+            tracing::info!(
+                event = "blob_gc",
+                action = "scheduled_cleanup",
+                "starting scheduled blob gc cleanup"
+            );
 
             match service.scheduled_cleanup_once().await {
                 Ok(stats) => {
@@ -2084,24 +2127,24 @@ fn spawn_blob_gc_scheduler(state: AppState) {
                         quarantined_bytes = stats.quarantine.quarantined_bytes,
                         restored_blobs = stats.quarantine.restored_blobs,
                         restored_bytes = stats.quarantine.restored_bytes,
-                        deleted_blobs = stats
-                            .delete
-                            .as_ref()
-                            .map(|s| s.deleted_blobs)
-                            .unwrap_or(0),
-                        deleted_bytes = stats
-                            .delete
-                            .as_ref()
-                            .map(|s| s.deleted_bytes)
-                            .unwrap_or(0),
+                        deleted_blobs = stats.delete.as_ref().map(|s| s.deleted_blobs).unwrap_or(0),
+                        deleted_bytes = stats.delete.as_ref().map(|s| s.deleted_bytes).unwrap_or(0),
                         "scheduled blob gc cleanup finished"
                     );
                 }
                 Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-                    tracing::info!(event = "blob_gc", action = "scheduled_cleanup", "scheduled blob gc skipped (already running)");
+                    tracing::info!(
+                        event = "blob_gc",
+                        action = "scheduled_cleanup",
+                        "scheduled blob gc skipped (already running)"
+                    );
                 }
                 Err(crate::gc_service::GcServiceError::Disabled) => {
-                    tracing::warn!(event = "blob_gc", action = "scheduled_cleanup", "blob gc scheduler enabled but blob_gc.enabled=false; stopping scheduler");
+                    tracing::warn!(
+                        event = "blob_gc",
+                        action = "scheduled_cleanup",
+                        "blob gc scheduler enabled but blob_gc.enabled=false; stopping scheduler"
+                    );
                     return;
                 }
                 Err(err) => {

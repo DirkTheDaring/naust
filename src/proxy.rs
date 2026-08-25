@@ -701,9 +701,7 @@ impl Proxy {
                 self.ensure_redirect_allowed(&current_url).await?;
             }
 
-            let mut req = self
-                .client
-                .request(method.clone(), current_url.clone());
+            let mut req = self.client.request(method.clone(), current_url.clone());
 
             if let Some(hs) = current_headers.as_ref() {
                 for (name, value) in hs {
@@ -760,11 +758,15 @@ impl Proxy {
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                 else {
-                    return Err(ProxyError::Upstream("redirect without Location".to_string()));
+                    return Err(ProxyError::Upstream(
+                        "redirect without Location".to_string(),
+                    ));
                 };
 
                 if redirects >= MAX_REDIRECTS {
-                    return Err(ProxyError::Upstream("too many upstream redirects".to_string()));
+                    return Err(ProxyError::Upstream(
+                        "too many upstream redirects".to_string(),
+                    ));
                 }
                 redirects += 1;
 
@@ -776,7 +778,9 @@ impl Proxy {
 
                 match self.cfg.redirect_policy {
                     RedirectPolicy::Disabled => {
-                        return Err(ProxyError::Upstream("upstream redirect blocked".to_string()));
+                        return Err(ProxyError::Upstream(
+                            "upstream redirect blocked".to_string(),
+                        ));
                     }
                     RedirectPolicy::SameHost => {
                         if host_changed {
@@ -1033,14 +1037,7 @@ fn base_domain(host: &str) -> Option<String> {
         return None;
     }
 
-    Some(
-        format!(
-            "{}.{}",
-            labels[labels.len() - 2],
-            labels[labels.len() - 1]
-        )
-        .to_ascii_lowercase(),
-    )
+    Some(format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]).to_ascii_lowercase())
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {

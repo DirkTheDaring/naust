@@ -9,10 +9,7 @@ use std::time::Duration;
 
 fn pick_unused_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    listener
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    listener.local_addr().expect("local_addr").port()
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -45,7 +42,7 @@ fn quarantine_meta_path(fs_root: &Path, hex: &str) -> PathBuf {
         .join("meta")
         .join("sha256")
         .join(&hex[0..2])
-    .join(format!("{hex}.ts"))
+        .join(format!("{hex}.ts"))
 }
 
 fn bin_path() -> String {
@@ -68,10 +65,7 @@ fn bin_path() -> String {
         "registry-rust"
     };
 
-    profile_dir
-        .join(bin_name)
-        .to_string_lossy()
-        .to_string()
+    profile_dir.join(bin_name).to_string_lossy().to_string()
 }
 
 struct ServerGuard {
@@ -240,7 +234,11 @@ async fn get_token(base: &str, scope: &str) -> String {
         .await
         .expect("token request");
 
-    assert!(resp.status().is_success(), "token status: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "token status: {}",
+        resp.status()
+    );
     let v: serde_json::Value = resp.json().await.expect("token json");
     v.get("token")
         .and_then(|t| t.as_str())
@@ -248,7 +246,12 @@ async fn get_token(base: &str, scope: &str) -> String {
         .to_string()
 }
 
-async fn http_get_blob(base: &str, repo: &str, digest: &str, maybe_bearer: Option<&str>) -> reqwest::Response {
+async fn http_get_blob(
+    base: &str,
+    repo: &str,
+    digest: &str,
+    maybe_bearer: Option<&str>,
+) -> reqwest::Response {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -277,7 +280,12 @@ async fn push_blob_via_upload(base: &str, repo: &str, bytes: &[u8]) -> String {
         .send()
         .await
         .expect("start upload");
-    assert_eq!(start.status().as_u16(), 202, "start status: {}", start.status());
+    assert_eq!(
+        start.status().as_u16(),
+        202,
+        "start status: {}",
+        start.status()
+    );
     let loc = start
         .headers()
         .get(header::LOCATION)
@@ -300,7 +308,12 @@ async fn push_blob_via_upload(base: &str, repo: &str, bytes: &[u8]) -> String {
         .send()
         .await
         .expect("patch upload");
-    assert_eq!(patch.status().as_u16(), 202, "patch status: {}", patch.status());
+    assert_eq!(
+        patch.status().as_u16(),
+        202,
+        "patch status: {}",
+        patch.status()
+    );
 
     // Finalize.
     let hex = hex_sha256(bytes);
@@ -376,7 +389,10 @@ async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
         get = http_get_blob(&base, "myrepo", &digest_a, Some(&t)).await;
     }
     assert!(get.status().is_success(), "GET status: {}", get.status());
-    assert_eq!(get.bytes().await.expect("bytes").as_ref(), blob_a.as_slice());
+    assert_eq!(
+        get.bytes().await.expect("bytes").as_ref(),
+        blob_a.as_slice()
+    );
 
     // Phase 3: budgeted quarantine (max_blobs=1) + Phase 1: quarantine-readable reads.
     let q = admin_post_json(
@@ -402,7 +418,10 @@ async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
         get2 = http_get_blob(&base, "myrepo", &digest_a, Some(&t)).await;
     }
     assert!(get2.status().is_success(), "GET2 status: {}", get2.status());
-    assert_eq!(get2.bytes().await.expect("bytes").as_ref(), blob_a.as_slice());
+    assert_eq!(
+        get2.bytes().await.expect("bytes").as_ref(),
+        blob_a.as_slice()
+    );
 
     // Phase 2: finalize pinning -> pinned blob should be skipped by quarantine.
     let pinned_digest = push_blob_via_upload(&base, "myrepo", b"pinned-finalize-blob").await;
@@ -428,7 +447,11 @@ async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
         }),
     )
     .await;
-    assert!(q2.status().is_success(), "quarantine2 status: {}", q2.status());
+    assert!(
+        q2.status().is_success(),
+        "quarantine2 status: {}",
+        q2.status()
+    );
 
     let b_quarantine = quarantine_blob_path(&fs_root, &hex_b);
     assert!(!b_live.exists(), "blob B should be quarantined");
@@ -442,7 +465,11 @@ async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
         let t = get_token(&base, "repository:myrepo:pull").await;
         getp = http_get_blob(&base, "myrepo", &pinned_digest, Some(&t)).await;
     }
-    assert!(getp.status().is_success(), "GET pinned status: {}", getp.status());
+    assert!(
+        getp.status().is_success(),
+        "GET pinned status: {}",
+        getp.status()
+    );
 
     // Ensure we did not accidentally delete quarantine metadata path conventions.
     // (GC writes quarantine timestamps under quarantine/meta/sha256/..)
@@ -545,8 +572,14 @@ async fn phase_5_kill_switch_and_delete_gate_and_delete_flow() {
         .await;
         assert!(d.status().is_success(), "delete status: {}", d.status());
 
-        assert!(!quarantined.exists(), "blob should be deleted from quarantine");
-        assert!(!quarantine_meta_path(&fs_root, &hex).exists(), "meta should be removed");
+        assert!(
+            !quarantined.exists(),
+            "blob should be deleted from quarantine"
+        );
+        assert!(
+            !quarantine_meta_path(&fs_root, &hex).exists(),
+            "meta should be removed"
+        );
 
         // Now reads should fail.
         let resp = http_get_blob(&base, "myrepo", &digest, None).await;

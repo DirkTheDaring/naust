@@ -110,7 +110,8 @@ pub fn grant_scopes_by_prefix(
         let mut granted_actions: Vec<String> = Vec::new();
         for a in &req.actions {
             let a_norm = a.trim().to_ascii_lowercase();
-            if (allowed.iter().any(|x| *x == "*" || *x == a_norm)) && !granted_actions.iter().any(|x| x == &a_norm)
+            if (allowed.iter().any(|x| *x == "*" || *x == a_norm))
+                && !granted_actions.iter().any(|x| x == &a_norm)
             {
                 granted_actions.push(a_norm);
             }
