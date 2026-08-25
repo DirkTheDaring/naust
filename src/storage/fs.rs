@@ -490,7 +490,7 @@ impl FsStorage {
 
 fn map_fs_io_err(err: std::io::Error) -> StorageError {
     // Prefer a clear signal for the common operational failure: disk full.
-    if err.raw_os_error() == Some(libc::ENOSPC) {
+    if err.raw_os_error() == Some(libc::ENOSPC) || err.kind() == std::io::ErrorKind::StorageFull {
         return StorageError::InsufficientStorage;
     }
     StorageError::Internal(err.to_string())

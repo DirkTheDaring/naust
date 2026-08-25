@@ -3,7 +3,6 @@ pub mod auth_token;
 pub mod catalog;
 pub mod errors;
 pub mod handlers;
-pub mod quota;
 pub mod referrers;
 pub mod routing;
 pub mod stream_guard;

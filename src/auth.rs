@@ -3,7 +3,7 @@ use axum::{
     body::Body,
     extract::State,
     http::HeaderMap,
-    http::{Request, StatusCode},
+    http::Request,
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -263,21 +263,7 @@ pub async fn require_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Legacy metrics endpoints (unauthenticated)
     let path = request.uri().path().to_string();
-    if path == "/metrics"
-        || path == "/metrics/security"
-        || path == "/metrics/proxy"
-        || path == "/metrics/ip"
-        || path == "/metrics/connections"
-        || path == "/metrics/stream"
-    {
-        match *request.method() {
-            http::Method::GET | http::Method::HEAD => {}
-            _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
-        }
-    }
-
     let method = request.method().clone();
 
     if path == "/v2" {
@@ -529,5 +515,155 @@ mod tests {
         let huge = format!("Bearer {}", "a".repeat(70000));
         headers.insert(http::header::AUTHORIZATION, huge.parse().unwrap());
         assert!(bearer_token_from_headers(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_route_level_authentication_matrix() {
+        use super::require_auth_middleware;
+        use axum::body::Body;
+        use axum::middleware;
+        use axum::routing::get;
+        use http::Request;
+        use tower::ServiceExt;
+
+        let fs_root = std::env::temp_dir().join(format!("auth-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let cfg_path = fs_root.join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[auth]
+anonymous_pull = false
+
+[[token.signing_keys]]
+kid = "default"
+key = "test-key-material-12345"
+
+[storage]
+backend = "fs"
+[storage.fs]
+root = "{}"
+"#,
+                fs_root.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = crate::config::Config::from_env_with_files(&[cfg_path]).unwrap();
+        let cfg = std::sync::Arc::new(cfg);
+        let storage: std::sync::Arc<dyn crate::storage::Storage> = std::sync::Arc::new(
+            crate::storage::fs::FsStorage::new(fs_root.clone(), cfg.max_upload_bytes),
+        );
+        let ip_limiter = std::sync::Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
+            cfg.max_connections_per_ip,
+            cfg.trusted_bypass_cidrs.clone(),
+        ));
+        let state = crate::AppState {
+            config: cfg,
+            auth_metrics: std::sync::Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: None,
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_upload_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ),
+            gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ip_limiter,
+            is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let app = axum::Router::new()
+            .route("/v2", get(|| async { axum::http::StatusCode::OK }))
+            .route("/v2/", get(|| async { axum::http::StatusCode::OK }))
+            .route(
+                "/v2/*rest",
+                axum::routing::any(|| async { axum::http::StatusCode::OK }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_auth_middleware,
+            ))
+            .with_state(state);
+
+        // 1. /v2 redirect and /v2/ ping are public discovery
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/v2").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::MOVED_PERMANENTLY);
+
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/v2/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // 2. /v2/_oci/ext/discover is public discovery
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/_oci/ext/discover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // 3. /v2/my-repo/_oci/ext/discover is public discovery
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/my-repo/_oci/ext/discover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // 4. Protected endpoint /v2/my-repo/manifests/latest requires auth (401)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/my-repo/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+
+        // 5. Lookalike / suffix endpoint does NOT bypass auth
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/_oci/ext/discover_fake")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
     }
 }

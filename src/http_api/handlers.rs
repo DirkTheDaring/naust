@@ -2803,6 +2803,71 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&fs_root);
     }
+
+    #[tokio::test]
+    async fn test_repo_named_quota_or_limited_behaves_normally() {
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        cfg.max_upload_bytes = 10_000_000; // 10 MB limit
+        let cfg = Arc::new(cfg);
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
+        let state = test_app_state(cfg, storage, None);
+
+        // 1. Repo containing "quota" with 2.5 MB (> old 1 MB test-hook) succeeds (202 Accepted)
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            "2500000".parse().unwrap(),
+        );
+        let query = std::collections::HashMap::new();
+
+        let resp_quota = super::upload_create(
+            state.clone(),
+            &headers,
+            axum::http::Method::POST,
+            "quota-app",
+            &query,
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(resp_quota.status(), StatusCode::ACCEPTED);
+
+        // 2. Repo containing "limited" with 2.5 MB succeeds (202 Accepted)
+        let resp_limited = super::upload_create(
+            state.clone(),
+            &headers,
+            axum::http::Method::POST,
+            "limited-repo",
+            &query,
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(resp_limited.status(), StatusCode::ACCEPTED);
+
+        // 3. Exceeding configured max_upload_bytes (e.g. 15 MB > 10 MB) fails with 413 Payload Too Large
+        let mut headers_oversize = HeaderMap::new();
+        headers_oversize.insert(
+            axum::http::header::CONTENT_LENGTH,
+            "15000000".parse().unwrap(),
+        );
+        let resp_oversize = super::upload_create(
+            state,
+            &headers_oversize,
+            axum::http::Method::POST,
+            "quota-app",
+            &query,
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(resp_oversize.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
 }
 
 #[allow(dead_code)]
@@ -3380,20 +3445,9 @@ async fn upload_create(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    // Storage quota check
-    if !crate::http_api::quota::check_repo_quota(
-        &state.storage,
-        &state.config,
-        name,
-        req_content_len,
-    )
-    .await
-    {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            errors::denied("quota exceeded"),
-        )
-            .into_response();
+    // Configured upload limit check
+    if state.config.max_upload_bytes > 0 && req_content_len > state.config.max_upload_bytes {
+        return errors::payload_too_large();
     }
 
     // Cross-repository blob mount:

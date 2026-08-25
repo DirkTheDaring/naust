@@ -1848,7 +1848,11 @@ async fn concurrency_limit_v2_non_upload(
 }
 
 fn is_upload_path(path: &str) -> bool {
-    path.starts_with("/v2/") && path.contains("/blobs/uploads")
+    matches!(
+        crate::http_api::routing::OciRoute::parse(path),
+        crate::http_api::routing::OciRoute::UploadInitiate { .. }
+            | crate::http_api::routing::OciRoute::UploadSession { .. }
+    )
 }
 
 async fn shutdown_signal() {
