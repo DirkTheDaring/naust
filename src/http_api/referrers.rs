@@ -1,10 +1,7 @@
 use crate::{
-    AppState, ProxyContext,
-    http_api::errors,
-    http_api::handlers::{is_valid_repo_name, registry_headers},
-    registry::digest::Digest,
-    request_routing::V2RouteMode,
-    storage::StorageError,
+    AppState, ProxyContext, http_api::errors, http_api::handlers::registry_headers,
+    registry::digest::Digest, registry::validation::is_valid_repo_name,
+    request_routing::V2RouteMode, storage::StorageError,
 };
 use axum::{
     body::Body,
@@ -52,6 +49,9 @@ pub async fn referrers_list(
                 Err(StorageError::NotFound) => Vec::new(),
                 Err(StorageError::InsufficientStorage) => {
                     return errors::insufficient_storage().into_response();
+                }
+                Err(StorageError::TagAlreadyExists) => {
+                    return errors::internal_error().into_response();
                 }
             };
 

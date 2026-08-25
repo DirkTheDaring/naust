@@ -232,6 +232,41 @@ impl S3Storage {
 
         Ok(max_time)
     }
+
+    async fn get_tag_with_etag(
+        &self,
+        name: &str,
+        tag: &str,
+    ) -> Result<Option<(Digest, String)>, StorageError> {
+        let client = self.client().await?;
+        let bucket = self.bucket()?;
+        let key = self.tag_key(name, tag);
+        let resp = match client.get_object().bucket(bucket).key(&key).send().await {
+            Ok(r) => r,
+            Err(err) => {
+                let err_str = err.to_string();
+                if err_str.contains("NoSuchKey")
+                    || err_str.contains("404")
+                    || err_str.contains("NotFound")
+                {
+                    return Ok(None);
+                }
+                return Err(map_s3_err(err));
+            }
+        };
+
+        let etag = resp.e_tag().unwrap_or("").to_string();
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .into_bytes();
+        let s = std::str::from_utf8(&bytes)
+            .map_err(|_| StorageError::Internal("invalid tag pointer".to_string()))?;
+        let digest = Digest::parse(s.trim()).map_err(|_| StorageError::NotFound)?;
+        Ok(Some((digest, etag)))
+    }
 }
 
 fn map_s3_err(
@@ -492,19 +527,141 @@ impl Storage for S3Storage {
     }
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
+        self.mutate_tag(name, tag, digest, super::TagMutationPolicy::Replace)
+            .await?;
+        Ok(())
+    }
+
+    async fn mutate_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        digest: &Digest,
+        policy: super::TagMutationPolicy,
+    ) -> Result<super::TagMutation, StorageError> {
         let client = self.client().await?;
         let bucket = self.bucket()?;
         let key = self.tag_key(name, tag);
         let body = format!("{}\n", digest.as_str());
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .body(ByteStream::from(body.into_bytes()))
-            .send()
-            .await
-            .map_err(|err| map_put_err(err))?;
-        Ok(())
+
+        match policy {
+            super::TagMutationPolicy::CreateOnly => {
+                let res = client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .if_none_match("*")
+                    .body(ByteStream::from(body.into_bytes()))
+                    .send()
+                    .await;
+
+                match res {
+                    Ok(_) => Ok(super::TagMutation::Created),
+                    Err(err) => {
+                        let err_str = err.to_string();
+                        if err_str.contains("PreconditionFailed")
+                            || err_str.contains("412")
+                            || err_str.contains("AtLeastOnePreconditionFailed")
+                        {
+                            if let Ok(existing_d) = self.resolve_tag(name, tag).await {
+                                if existing_d == *digest {
+                                    return Ok(super::TagMutation::Unchanged);
+                                }
+                            }
+                            Err(StorageError::TagAlreadyExists)
+                        } else {
+                            Err(map_put_err(err))
+                        }
+                    }
+                }
+            }
+            super::TagMutationPolicy::Replace => {
+                let max_retries = 5;
+                for attempt in 0..max_retries {
+                    let current = self.get_tag_with_etag(name, tag).await?;
+                    match current {
+                        None => {
+                            let res = client
+                                .put_object()
+                                .bucket(bucket)
+                                .key(&key)
+                                .if_none_match("*")
+                                .body(ByteStream::from(body.clone().into_bytes()))
+                                .send()
+                                .await;
+                            match res {
+                                Ok(_) => return Ok(super::TagMutation::Created),
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    if err_str.contains("PreconditionFailed")
+                                        || err_str.contains("412")
+                                        || err_str.contains("AtLeastOnePreconditionFailed")
+                                    {
+                                        if attempt + 1 < max_retries {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                10 * (1 << attempt),
+                                            ))
+                                            .await;
+                                            continue;
+                                        }
+                                        return Err(StorageError::Internal(
+                                            "tag mutation contention limit exceeded".to_string(),
+                                        ));
+                                    }
+                                    return Err(map_put_err(err));
+                                }
+                            }
+                        }
+                        Some((existing_d, etag)) => {
+                            if existing_d == *digest {
+                                return Ok(super::TagMutation::Unchanged);
+                            }
+
+                            let mut req = client
+                                .put_object()
+                                .bucket(bucket)
+                                .key(&key)
+                                .body(ByteStream::from(body.clone().into_bytes()));
+
+                            if !etag.is_empty() {
+                                req = req.if_match(etag);
+                            }
+
+                            let res = req.send().await;
+                            match res {
+                                Ok(_) => {
+                                    return Ok(super::TagMutation::Replaced {
+                                        previous: existing_d,
+                                    });
+                                }
+                                Err(err) => {
+                                    let err_str = err.to_string();
+                                    if err_str.contains("PreconditionFailed")
+                                        || err_str.contains("412")
+                                        || err_str.contains("AtLeastOnePreconditionFailed")
+                                    {
+                                        if attempt + 1 < max_retries {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                10 * (1 << attempt),
+                                            ))
+                                            .await;
+                                            continue;
+                                        }
+                                        return Err(StorageError::Internal(
+                                            "tag mutation contention limit exceeded".to_string(),
+                                        ));
+                                    }
+                                    return Err(map_put_err(err));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(StorageError::Internal(
+                    "tag mutation contention limit exceeded".to_string(),
+                ))
+            }
+        }
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
@@ -850,7 +1007,7 @@ impl Storage for S3Storage {
                 .body(ByteStream::from(body))
                 .send()
                 .await
-                .map_err(|err| map_put_err(err))?;
+                .map_err(map_put_err)?;
         }
         Ok(())
     }

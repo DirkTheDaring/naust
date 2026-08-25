@@ -389,7 +389,13 @@ impl FsStorage {
         let mut files = Vec::new();
         loop {
             match dir.next_entry().await {
-                Ok(Some(entry)) => files.push(entry.path()),
+                Ok(Some(entry)) => {
+                    if let Some(file_name) = entry.file_name().to_str() {
+                        if !file_name.starts_with('.') {
+                            files.push(entry.path());
+                        }
+                    }
+                }
                 Ok(None) => break,
                 Err(err) => return Err(StorageError::Internal(err.to_string())),
             }
@@ -653,7 +659,9 @@ impl Storage for FsStorage {
             match dir.next_entry().await {
                 Ok(Some(entry)) => {
                     if let Some(file_name) = entry.file_name().to_str() {
-                        tags.push(file_name.to_string());
+                        if !file_name.starts_with('.') {
+                            tags.push(file_name.to_string());
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -726,12 +734,122 @@ impl Storage for FsStorage {
     }
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
+        self.mutate_tag(name, tag, digest, super::TagMutationPolicy::Replace)
+            .await?;
+        Ok(())
+    }
+
+    async fn mutate_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        digest: &Digest,
+        policy: super::TagMutationPolicy,
+    ) -> Result<super::TagMutation, StorageError> {
         let dir = self.root.join("repos").join(name).join("tags");
         ensure_dir(&dir);
         let path = dir.join(tag);
+        let lock_path = dir.join(format!(".lock.{tag}"));
         let body = format!("{}\n", digest.as_str());
-        atomic_write_file(&path, body.as_bytes()).await?;
-        Ok(())
+        let tag_name = tag.to_string();
+        let digest_clone = digest.clone();
+
+        tokio::task::spawn_blocking(move || {
+            use fs2::FileExt;
+            use std::io::Write;
+
+            let lock_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(map_fs_io_err)?;
+
+            lock_file.lock_exclusive().map_err(map_fs_io_err)?;
+
+            let res: Result<super::TagMutation, StorageError> = (|| {
+                let existing_d = match std::fs::read(&path) {
+                    Ok(existing_bytes) => {
+                        let s = String::from_utf8_lossy(&existing_bytes);
+                        Digest::parse(s.trim()).ok()
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => return Err(map_fs_io_err(err)),
+                };
+
+                if let Some(ref prev) = existing_d {
+                    if *prev == digest_clone {
+                        return Ok(super::TagMutation::Unchanged);
+                    }
+                }
+
+                match policy {
+                    super::TagMutationPolicy::CreateOnly => {
+                        if existing_d.is_some() {
+                            return Err(StorageError::TagAlreadyExists);
+                        }
+
+                        let tmp_name = format!(".tmp.{tag_name}.{}", uuid::Uuid::new_v4());
+                        let tmp_path = dir.join(tmp_name);
+
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&tmp_path)
+                            .map_err(map_fs_io_err)?;
+                        file.write_all(body.as_bytes()).map_err(map_fs_io_err)?;
+                        file.flush().map_err(map_fs_io_err)?;
+                        file.sync_all().map_err(map_fs_io_err)?;
+                        drop(file);
+
+                        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(map_fs_io_err(e));
+                        }
+
+                        if let Ok(dir_file) = std::fs::File::open(&dir) {
+                            let _ = dir_file.sync_all();
+                        }
+
+                        Ok(super::TagMutation::Created)
+                    }
+                    super::TagMutationPolicy::Replace => {
+                        let tmp_name = format!(".tmp.{tag_name}.{}", uuid::Uuid::new_v4());
+                        let tmp_path = dir.join(tmp_name);
+
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&tmp_path)
+                            .map_err(map_fs_io_err)?;
+                        file.write_all(body.as_bytes()).map_err(map_fs_io_err)?;
+                        file.flush().map_err(map_fs_io_err)?;
+                        file.sync_all().map_err(map_fs_io_err)?;
+                        drop(file);
+
+                        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(map_fs_io_err(e));
+                        }
+
+                        if let Ok(dir_file) = std::fs::File::open(&dir) {
+                            let _ = dir_file.sync_all();
+                        }
+
+                        match existing_d {
+                            Some(prev) => Ok(super::TagMutation::Replaced { previous: prev }),
+                            None => Ok(super::TagMutation::Created),
+                        }
+                    }
+                }
+            })();
+
+            let _ = lock_file.unlock();
+            res
+        })
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
@@ -1148,6 +1266,7 @@ impl Storage for FsStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     fn tmp_fs_root() -> PathBuf {
@@ -1353,5 +1472,179 @@ mod tests {
         assert_eq!(storage.resolve_tag(repo, "tag1").await.unwrap(), digest);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_fs_direct_concurrent_create_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FsStorage::new(
+            temp_dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+        ));
+
+        let d1 = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let d2 = Digest::parse(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+
+        let s1 = storage.clone();
+        let d1_clone = d1.clone();
+        let h1 = tokio::spawn(async move {
+            s1.mutate_tag(
+                "repo",
+                "tag",
+                &d1_clone,
+                crate::storage::TagMutationPolicy::CreateOnly,
+            )
+            .await
+        });
+
+        let s2 = storage.clone();
+        let d2_clone = d2.clone();
+        let h2 = tokio::spawn(async move {
+            s2.mutate_tag(
+                "repo",
+                "tag",
+                &d2_clone,
+                crate::storage::TagMutationPolicy::CreateOnly,
+            )
+            .await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        let res1 = r1.unwrap();
+        let res2 = r2.unwrap();
+
+        let success_count = (res1.is_ok() as usize) + (res2.is_ok() as usize);
+        assert_eq!(success_count, 1, "Exactly one CreateOnly must succeed");
+
+        let conflict_count = (matches!(res1, Err(StorageError::TagAlreadyExists)) as usize)
+            + (matches!(res2, Err(StorageError::TagAlreadyExists)) as usize);
+        assert_eq!(conflict_count, 1, "The loser must get TagAlreadyExists");
+
+        // The winning tag on disk must match the winning mutation result
+        let final_d = storage.resolve_tag("repo", "tag").await.unwrap();
+        if let Ok(mut_res) = res1 {
+            assert_eq!(final_d, d1);
+            assert_eq!(mut_res, crate::storage::TagMutation::Created);
+        } else {
+            assert_eq!(final_d, d2);
+            assert_eq!(res2.unwrap(), crate::storage::TagMutation::Created);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_direct_concurrent_replacements_chain() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FsStorage::new(
+            temp_dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+        ));
+
+        let d1 = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let d2 = Digest::parse(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+
+        let s1 = storage.clone();
+        let d1_clone = d1.clone();
+        let h1 = tokio::spawn(async move {
+            s1.mutate_tag(
+                "repo",
+                "tag",
+                &d1_clone,
+                crate::storage::TagMutationPolicy::Replace,
+            )
+            .await
+        });
+
+        let s2 = storage.clone();
+        let d2_clone = d2.clone();
+        let h2 = tokio::spawn(async move {
+            s2.mutate_tag(
+                "repo",
+                "tag",
+                &d2_clone,
+                crate::storage::TagMutationPolicy::Replace,
+            )
+            .await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        let res1 = r1.unwrap().unwrap();
+        let res2 = r2.unwrap().unwrap();
+
+        // One of them was Created (first), and the other was Overwritten with the first's digest!
+        let final_d = storage.resolve_tag("repo", "tag").await.unwrap();
+
+        if final_d == d2 {
+            assert_eq!(res1, crate::storage::TagMutation::Created);
+            assert_eq!(res2, crate::storage::TagMutation::Replaced { previous: d1 });
+        } else {
+            assert_eq!(final_d, d1);
+            assert_eq!(res2, crate::storage::TagMutation::Created);
+            assert_eq!(res1, crate::storage::TagMutation::Replaced { previous: d2 });
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_direct_repeated_replacements() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FsStorage::new(
+            temp_dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+        ));
+
+        let d1 = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let d2 = Digest::parse(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+
+        let m1 = storage
+            .mutate_tag(
+                "repo",
+                "v1",
+                &d1,
+                crate::storage::TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(m1, crate::storage::TagMutation::Created);
+
+        // Same digest -> Unchanged
+        let m1_same = storage
+            .mutate_tag(
+                "repo",
+                "v1",
+                &d1,
+                crate::storage::TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(m1_same, crate::storage::TagMutation::Unchanged);
+
+        // Overwrite -> Replaced { previous: d1 }
+        let m2 = storage
+            .mutate_tag(
+                "repo",
+                "v1",
+                &d2,
+                crate::storage::TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(m2, crate::storage::TagMutation::Replaced { previous: d1 });
     }
 }

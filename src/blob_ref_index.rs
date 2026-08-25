@@ -15,6 +15,7 @@ const META_SCHEMA_VERSION: &[u8] = b"schema_version";
 const META_STATE: &[u8] = b"state";
 const META_STATE_READY: &[u8] = b"ready";
 const META_STATE_BUILDING: &[u8] = b"building";
+const META_STATE_DIRTY: &[u8] = b"dirty";
 
 #[derive(thiserror::Error, Debug)]
 pub enum RefIndexError {
@@ -180,6 +181,11 @@ impl BlobRefIndex {
             .meta
             .get(META_STATE)?
             .ok_or_else(|| RefIndexError::Corrupt("missing state".to_string()))?;
+        if state.as_ref() == META_STATE_DIRTY {
+            return Err(RefIndexError::Corrupt(
+                "index marked dirty (rebuild required)".to_string(),
+            ));
+        }
         if state.as_ref() != META_STATE_READY {
             return Err(RefIndexError::Corrupt(
                 "index not ready (previous rebuild incomplete?)".to_string(),
@@ -197,6 +203,18 @@ impl BlobRefIndex {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn mark_dirty(&self) -> Result<(), RefIndexError> {
+        self.meta.insert(META_STATE, META_STATE_DIRTY)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn mark_ready(&self) -> Result<(), RefIndexError> {
+        self.meta.insert(META_STATE, META_STATE_READY)?;
+        self.db.flush()?;
         Ok(())
     }
 
@@ -257,6 +275,41 @@ impl BlobRefIndex {
         }
 
         Ok(false)
+    }
+
+    pub async fn on_tag_mutation(
+        &self,
+        storage: &Arc<dyn Storage>,
+        repo: &str,
+        tag: &str,
+        new_root: &Digest,
+        mutation: &crate::storage::TagMutation,
+    ) -> Result<(), RefIndexError> {
+        match mutation {
+            crate::storage::TagMutation::Unchanged => {
+                self.ingest_root(storage, repo, new_root).await?;
+                Ok(())
+            }
+            crate::storage::TagMutation::Created => {
+                self.ingest_root(storage, repo, new_root).await?;
+                let key = tag_key(repo, tag);
+                let new_val = new_root.as_str().as_bytes().to_vec();
+                self.tag_to_root.insert(&key, new_val)?;
+                self.inc_root_count(new_root.as_str().as_bytes())?;
+                self.db.flush()?;
+                Ok(())
+            }
+            crate::storage::TagMutation::Replaced { previous } => {
+                self.ingest_root(storage, repo, new_root).await?;
+                let key = tag_key(repo, tag);
+                let new_val = new_root.as_str().as_bytes().to_vec();
+                self.tag_to_root.insert(&key, new_val)?;
+                self.dec_root_count(previous.as_str().as_bytes())?;
+                self.inc_root_count(new_root.as_str().as_bytes())?;
+                self.db.flush()?;
+                Ok(())
+            }
+        }
     }
 
     pub async fn on_tag_set(
@@ -764,6 +817,16 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
+        async fn mutate_tag(
+            &self,
+            _name: &str,
+            _tag: &str,
+            _digest: &Digest,
+            _policy: crate::storage::TagMutationPolicy,
+        ) -> Result<crate::storage::TagMutation, StorageError> {
+            Err(StorageError::Unsupported)
+        }
+
         async fn delete_tag(&self, _name: &str, _tag: &str) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
@@ -844,7 +907,7 @@ mod tests {
     }
 
     fn d(ch: char) -> Digest {
-        let hex: String = std::iter::repeat(ch).take(64).collect();
+        let hex: String = std::iter::repeat_n(ch, 64).collect();
         Digest::parse(&format!("sha256:{hex}")).expect("valid sha256")
     }
 

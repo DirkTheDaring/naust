@@ -597,6 +597,7 @@ root = "{}"
             gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            consistency_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let app = axum::Router::new()
@@ -747,6 +748,7 @@ root = "{}"
             gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            consistency_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let app = axum::Router::new()

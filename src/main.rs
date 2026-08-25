@@ -9,6 +9,7 @@ mod gc_service;
 mod glob;
 mod http_api;
 mod ip_concurrency;
+mod manifest_publication;
 mod manifest_refs;
 mod proxy;
 mod rbac;
@@ -369,6 +370,9 @@ pub struct AppState {
     // Security & Anti-Slowloris:
     pub ip_limiter: Arc<ip_concurrency::IpConcurrencyLimiter>,
     pub is_high_pressure: Arc<std::sync::atomic::AtomicBool>,
+
+    // Shared Consistency Coordinator:
+    pub consistency_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -936,14 +940,25 @@ async fn main() {
     let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
     let upload_request_sem = Arc::new(Semaphore::new(config.max_concurrent_upload_requests.max(1)));
 
+    let consistency_gate = Arc::new(tokio::sync::Mutex::new(()));
+
     let gc_service = match (&ref_index, &config.storage_backend) {
-        (Some(idx), StorageBackend::Filesystem) => Some(Arc::new(gc_service::GcService::new(
-            config.clone(),
-            storage.clone(),
-            idx.clone(),
-        ))),
+        (Some(idx), StorageBackend::Filesystem) => {
+            Some(Arc::new(gc_service::GcService::with_coordinator(
+                config.clone(),
+                storage.clone(),
+                idx.clone(),
+                consistency_gate.clone(),
+            )))
+        }
         _ => None,
     };
+
+    if config.storage_backend == StorageBackend::S3 && ref_index.is_some() {
+        tracing::warn!(
+            "topology: S3 storage backend is active with local Sled BlobRefIndex; this deployment is strictly restricted to a single active registry writer instance per S3 namespace. Multi-node concurrent writers cannot safely share a local index without a distributed coordinator."
+        );
+    }
 
     let ip_limiter = Arc::new(ip_concurrency::IpConcurrencyLimiter::new(
         config.max_connections_per_ip,
@@ -969,6 +984,7 @@ async fn main() {
         last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
         ip_limiter,
         is_high_pressure,
+        consistency_gate,
     };
 
     // For large blobs we stream request bodies; enforce blob size via MAX_UPLOAD_BYTES and

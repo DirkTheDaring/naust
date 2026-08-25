@@ -1033,6 +1033,7 @@ fn map_storage_err(err: StorageError) -> ProxyError {
             ProxyError::Upstream("insufficient storage".to_string())
         }
         StorageError::Unsupported => ProxyError::Internal("storage unsupported".to_string()),
+        StorageError::TagAlreadyExists => ProxyError::Internal("tag already exists".to_string()),
         StorageError::Internal(e) => ProxyError::Internal(e),
     }
 }

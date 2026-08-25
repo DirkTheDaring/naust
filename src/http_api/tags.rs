@@ -1,9 +1,8 @@
 use crate::{
     AppState, ProxyContext,
     http_api::errors,
-    http_api::handlers::{
-        is_valid_repo_name, is_valid_tag, registry_headers, url_encode_component,
-    },
+    http_api::handlers::{registry_headers, url_encode_component},
+    registry::validation::{is_valid_repo_name, is_valid_tag},
     request_routing::V2RouteMode,
     storage::StorageError,
 };
@@ -107,6 +106,7 @@ pub async fn tags_list(
             }
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         _ => errors::method_not_allowed("GET, HEAD"),
@@ -127,17 +127,63 @@ pub async fn tag_delete(state: AppState, method: Method, name: &str, tag: &str) 
         return errors::denied("tag is immutable and cannot be deleted").into_response();
     }
 
+    let _gate = state.consistency_gate.lock().await;
+
+    if let Some(idx) = state.ref_index.as_ref() {
+        if idx.check_health().is_err() {
+            if let Err(err) = idx
+                .ensure_healthy_or_rebuild(&state.storage, true, false)
+                .await
+            {
+                tracing::error!(
+                    repo = name,
+                    error = %err,
+                    "failed to recover dirty ref-index before tag delete"
+                );
+                return errors::internal_error().into_response();
+            }
+        }
+        if let Err(err) = idx.mark_dirty() {
+            tracing::error!(
+                repo = name,
+                error = %err,
+                "failed to mark ref-index dirty before tag delete"
+            );
+            return errors::internal_error().into_response();
+        }
+    }
+
     match state.storage.delete_tag(name, tag).await {
         Ok(()) => {
             if let Some(idx) = state.ref_index.as_ref() {
                 if let Err(err) = idx.sync_repo_tags(&state.storage, name).await {
-                    tracing::warn!(repo = name, error = %err, "failed to sync ref-index after tag delete");
+                    tracing::warn!(
+                        repo = name,
+                        error = %err,
+                        "failed to sync ref-index after tag delete"
+                    );
+                } else if let Err(err) = idx.mark_ready() {
+                    tracing::warn!(
+                        repo = name,
+                        error = %err,
+                        "failed to mark ref-index ready after tag delete"
+                    );
                 }
             }
             (StatusCode::ACCEPTED, registry_headers()).into_response()
         }
-        Err(StorageError::NotFound) => errors::tag_unknown().into_response(),
-        Err(StorageError::Unsupported) => errors::method_not_allowed("DELETE"),
+        Err(StorageError::NotFound) => {
+            if let Some(idx) = state.ref_index.as_ref() {
+                let _ = idx.mark_ready();
+            }
+            errors::tag_unknown().into_response()
+        }
+        Err(StorageError::Unsupported) => {
+            if let Some(idx) = state.ref_index.as_ref() {
+                let _ = idx.mark_ready();
+            }
+            errors::method_not_allowed("DELETE")
+        }
         Err(_) => errors::internal_error().into_response(),
     }
 }

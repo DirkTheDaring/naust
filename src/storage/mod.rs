@@ -31,8 +31,24 @@ pub enum StorageError {
     #[error("insufficient storage")]
     InsufficientStorage,
 
+    #[error("tag already exists")]
+    TagAlreadyExists,
+
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagMutationPolicy {
+    CreateOnly,
+    Replace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagMutation {
+    Created,
+    Unchanged,
+    Replaced { previous: Digest },
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +132,14 @@ pub trait Storage: Send + Sync {
     ) -> Result<ManifestMeta, StorageError>;
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError>;
+
+    async fn mutate_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        digest: &Digest,
+        policy: TagMutationPolicy,
+    ) -> Result<TagMutation, StorageError>;
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError>;
 

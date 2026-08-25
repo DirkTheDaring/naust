@@ -70,11 +70,20 @@ impl GcService {
         storage: Arc<dyn storage::Storage>,
         idx: Arc<BlobRefIndex>,
     ) -> Self {
+        Self::with_coordinator(config, storage, idx, Arc::new(Mutex::new(())))
+    }
+
+    pub fn with_coordinator(
+        config: Arc<crate::config::Config>,
+        storage: Arc<dyn storage::Storage>,
+        idx: Arc<BlobRefIndex>,
+        consistency_gate: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             config,
             storage,
             idx,
-            run_lock: Arc::new(Mutex::new(())),
+            run_lock: consistency_gate,
         }
     }
 
