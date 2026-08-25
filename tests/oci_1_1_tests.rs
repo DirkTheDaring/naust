@@ -949,7 +949,7 @@ async fn test_concurrent_chunk_uploads_integrity() {
                 .await
                 .unwrap();
             assert_eq!(start_resp.status(), reqwest::StatusCode::ACCEPTED);
-            let location = start_resp
+            let mut location = start_resp
                 .headers()
                 .get(header::LOCATION)
                 .unwrap()
@@ -988,6 +988,9 @@ async fn test_concurrent_chunk_uploads_integrity() {
                     .await
                     .unwrap();
                 assert_eq!(patch_resp.status(), reqwest::StatusCode::ACCEPTED);
+                if let Some(loc) = patch_resp.headers().get(header::LOCATION) {
+                    location = loc.to_str().unwrap().to_string();
+                }
             }
 
             let expected_digest = format!("sha256:{}", hex_sha256(&total_bytes));

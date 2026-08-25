@@ -2323,6 +2323,380 @@ mod tests {
             TokenRejection::Denied("action not allowed by robot policy")
         );
     }
+
+    use sha2::Digest as _;
+
+    async fn setup_upload_test_env() -> (AppState, tempfile::TempDir, String) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = temp_dir.path().to_path_buf();
+        cfg.token_signing_keys = vec![crate::security::TokenSigningKey {
+            kid: "default".to_string(),
+            key: "test-signing-key".to_string(),
+        }];
+        let cfg = Arc::new(cfg);
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
+        let state = test_app_state(cfg, storage, None);
+        let upload = state.storage.create_upload().await.unwrap();
+        (state, temp_dir, upload.uuid)
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_with_valid_state_accepted() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk = b"chunk of 1000 bytes";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(chunk))
+            .await
+            .unwrap();
+
+        let key = b"test-signing-key";
+        let state_token =
+            crate::http_api::upload_state::UploadStateData::new(repo, &uuid, chunk.len() as u64)
+                .encode_and_sign(key);
+
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, chunk);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        query.insert("_state".to_string(), state_token);
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_with_stale_offset_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk = b"chunk of 1000 bytes";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(chunk))
+            .await
+            .unwrap();
+
+        let key = b"test-signing-key";
+        // Stale offset 0 when stored offset is 20
+        let state_token = crate::http_api::upload_state::UploadStateData::new(repo, &uuid, 0)
+            .encode_and_sign(key);
+
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, chunk);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        query.insert("_state".to_string(), state_token);
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_with_wrong_uuid_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk = b"chunk of 1000 bytes";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(chunk))
+            .await
+            .unwrap();
+
+        let key = b"test-signing-key";
+        let state_token = crate::http_api::upload_state::UploadStateData::new(
+            repo,
+            "00000000-0000-0000-0000-000000000000",
+            chunk.len() as u64,
+        )
+        .encode_and_sign(key);
+
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, chunk);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        query.insert("_state".to_string(), state_token);
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_with_wrong_repo_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk = b"chunk of 1000 bytes";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(chunk))
+            .await
+            .unwrap();
+
+        let key = b"test-signing-key";
+        let state_token = crate::http_api::upload_state::UploadStateData::new(
+            "library/other-repo",
+            &uuid,
+            chunk.len() as u64,
+        )
+        .encode_and_sign(key);
+
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, chunk);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        query.insert("_state".to_string(), state_token);
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_with_tampered_sig_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk = b"chunk of 1000 bytes";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(chunk))
+            .await
+            .unwrap();
+
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, chunk);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        query.insert("_state".to_string(), "invalid.signature_data".to_string());
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_missing_state_accepted_for_monolithic() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk = b"monolithic upload bytes";
+
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, chunk);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        // No _state query param
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::from(chunk.to_vec()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_handler_put_finalize_with_final_body_pre_append_offset_validated() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        let chunk1 = b"chunk1-bytes-";
+        let chunk2 = b"chunk2-bytes-final";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(chunk1))
+            .await
+            .unwrap();
+
+        let key = b"test-signing-key";
+        // Pre-append offset is chunk1.len()
+        let state_token =
+            crate::http_api::upload_state::UploadStateData::new(repo, &uuid, chunk1.len() as u64)
+                .encode_and_sign(key);
+
+        let mut total_bytes = chunk1.to_vec();
+        total_bytes.extend_from_slice(chunk2);
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &total_bytes);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("digest".to_string(), digest);
+        query.insert("_state".to_string(), state_token);
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PUT,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::from(chunk2.to_vec()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_handler_patch_missing_state_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PATCH,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            std::collections::HashMap::new(),
+            axum::body::Body::from("data"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_handler_patch_stale_offset_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+        state
+            .storage
+            .append_upload(&uuid, bytes::Bytes::from_static(b"existing-1000"))
+            .await
+            .unwrap();
+
+        let key = b"test-signing-key";
+        let state_token = crate::http_api::upload_state::UploadStateData::new(repo, &uuid, 0)
+            .encode_and_sign(key);
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("_state".to_string(), state_token);
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::PATCH,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::from("next-chunk"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn test_handler_get_session_with_invalid_state_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("_state".to_string(), "invalid-tampered-state".to_string());
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::GET,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_handler_delete_session_with_invalid_state_rejected() {
+        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let repo = "library/test";
+
+        let mut query = std::collections::HashMap::new();
+        query.insert("_state".to_string(), "invalid-tampered-state".to_string());
+
+        let resp = super::upload_session(
+            state,
+            axum::http::Method::DELETE,
+            &HeaderMap::new(),
+            repo,
+            &uuid,
+            query,
+            axum::body::Body::empty(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 #[allow(dead_code)]
@@ -3265,6 +3639,45 @@ async fn upload_create(
     }
 }
 
+fn validate_upload_state(
+    query_state: Option<&str>,
+    key: &[u8],
+    route_repo: &str,
+    route_uuid: &str,
+    stored_offset: u64,
+    is_required: bool,
+) -> Result<Option<crate::http_api::upload_state::UploadStateData>, Response> {
+    let state_str = match query_state {
+        Some(st) if !st.trim().is_empty() => st.trim(),
+        _ => {
+            if is_required {
+                return Err(errors::blob_upload_invalid("missing _state parameter").into_response());
+            }
+            return Ok(None);
+        }
+    };
+
+    let state_data = match crate::http_api::upload_state::UploadStateData::verify_and_decode(
+        state_str, key, route_repo,
+    ) {
+        Ok(data) => data,
+        Err(_) => {
+            return Err(errors::blob_upload_invalid("invalid _state parameter").into_response());
+        }
+    };
+
+    if let Err(err) = state_data.validate_session(route_uuid, stored_offset) {
+        return Err(match err {
+            crate::http_api::upload_state::StateTokenError::OffsetMismatch { .. } => {
+                errors::range_invalid("storage size does not match state offset").into_response()
+            }
+            _ => errors::blob_upload_invalid("invalid _state parameter").into_response(),
+        });
+    }
+
+    Ok(Some(state_data))
+}
+
 async fn upload_session(
     state: AppState,
     method: Method,
@@ -3274,45 +3687,6 @@ async fn upload_session(
     query: HashMap<String, String>,
     body: Body,
 ) -> Response {
-    let key = state
-        .config
-        .token_signing_keys
-        .first()
-        .map(|k| k.key.as_bytes())
-        .unwrap_or(b"registry-rust-state-secret");
-    if method == Method::PATCH {
-        let state_param = query.get("_state").map(|s| s.as_str());
-        if state_param.is_none() || state_param.unwrap().is_empty() {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            return errors::blob_upload_invalid("missing _state parameter").into_response();
-        }
-        let st = state_param.unwrap();
-        match crate::http_api::upload_state::UploadStateData::verify_and_decode(st, key, name) {
-            Ok(state_data) => {
-                if let Ok(meta) = state.storage.upload_status(uuid).await {
-                    if state_data.offset > 0 && state_data.offset != meta.offset {
-                        let _ = axum::body::to_bytes(body, usize::MAX).await;
-                        return errors::range_invalid("storage size does not match state offset")
-                            .into_response();
-                    }
-                }
-            }
-            Err(_) => {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::blob_upload_invalid("invalid _state parameter").into_response();
-            }
-        }
-    } else if method == Method::PUT {
-        if let Some(st) = query.get("_state").map(|s| s.as_str()) {
-            if crate::http_api::upload_state::UploadStateData::verify_and_decode(st, key, name)
-                .is_err()
-            {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::blob_upload_invalid("invalid _state parameter").into_response();
-            }
-        }
-    }
-
     if !is_valid_repo_name(name) {
         let _ = axum::body::to_bytes(body, usize::MAX).await;
         return errors::name_invalid().into_response();
@@ -3347,20 +3721,55 @@ async fn upload_session(
         }
     }
 
+    let current_meta = match state.storage.upload_status(uuid).await {
+        Ok(m) => m,
+        Err(StorageError::NotFound) => {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            return errors::blob_upload_unknown().into_response();
+        }
+        Err(StorageError::Unsupported) => {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            return errors::not_implemented().into_response();
+        }
+        Err(StorageError::InsufficientStorage) => {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            return errors::insufficient_storage().into_response();
+        }
+        Err(_) => {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            return errors::internal_error().into_response();
+        }
+    };
+
+    let key = state
+        .config
+        .token_signing_keys
+        .first()
+        .map(|k| k.key.as_bytes())
+        .unwrap_or(b"registry-rust-state-secret");
+
+    let is_patch = method == Method::PATCH;
+    let query_state = query.get("_state").map(|s| s.as_str());
+    if let Err(err_resp) =
+        validate_upload_state(query_state, key, name, uuid, current_meta.offset, is_patch)
+    {
+        let _ = axum::body::to_bytes(body, usize::MAX).await;
+        return err_resp;
+    }
+
     match method {
-        Method::GET | Method::HEAD => match state.storage.upload_status(uuid).await {
-            Ok(meta) => {
-                let mut headers = registry_headers();
-                headers.insert("Location", location.parse().unwrap());
-                headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
-                if meta.offset > 0 {
-                    headers.insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
-                }
-                (StatusCode::NO_CONTENT, headers).into_response()
+        Method::GET | Method::HEAD => {
+            let mut headers = registry_headers();
+            headers.insert("Location", location.parse().unwrap());
+            headers.insert("Docker-Upload-UUID", current_meta.uuid.parse().unwrap());
+            if current_meta.offset > 0 {
+                headers.insert(
+                    "Range",
+                    format!("0-{}", current_meta.offset - 1).parse().unwrap(),
+                );
             }
-            Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(_) => errors::internal_error().into_response(),
-        },
+            (StatusCode::NO_CONTENT, headers).into_response()
+        }
         Method::DELETE => match state.storage.abort_upload(uuid).await {
             Ok(()) => {
                 let mut headers = registry_headers();
@@ -3388,25 +3797,16 @@ async fn upload_session(
                         );
                     }
                 }
-                match state.storage.upload_status(uuid).await {
-                    Ok(meta) if meta.offset == start => {}
-                    Ok(meta) => {
-                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
-                        let mut resp = errors::range_invalid("invalid content range");
-                        if meta.offset > 0 {
-                            resp.headers_mut()
-                                .insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
-                        }
-                        return resp;
+                if current_meta.offset != start {
+                    let _ = axum::body::to_bytes(body, 1024 * 1024).await;
+                    let mut resp = errors::range_invalid("invalid content range");
+                    if current_meta.offset > 0 {
+                        resp.headers_mut().insert(
+                            "Range",
+                            format!("0-{}", current_meta.offset - 1).parse().unwrap(),
+                        );
                     }
-                    Err(StorageError::NotFound) => {
-                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
-                        return errors::blob_upload_unknown().into_response();
-                    }
-                    Err(_) => {
-                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
-                        return errors::internal_error().into_response();
-                    }
+                    return resp;
                 }
             }
 
@@ -3421,17 +3821,7 @@ async fn upload_session(
                 min_rate,
                 audit_only,
             );
-            let mut last_meta = match state.storage.upload_status(uuid).await {
-                Ok(m) => m,
-                Err(StorageError::NotFound) => {
-                    return errors::blob_upload_unknown().into_response();
-                }
-                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => {
-                    return errors::insufficient_storage().into_response();
-                }
-                Err(_) => return errors::internal_error().into_response(),
-            };
+            let mut last_meta = current_meta;
 
             while let Some(next) = stream.next().await {
                 let chunk = match next {

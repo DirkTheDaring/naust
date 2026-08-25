@@ -14,6 +14,10 @@ pub enum StateTokenError {
     InvalidSignature,
     #[error("repository mismatch")]
     RepoMismatch,
+    #[error("uuid mismatch")]
+    UuidMismatch,
+    #[error("offset mismatch (expected {expected}, found {found})")]
+    OffsetMismatch { expected: u64, found: u64 },
     #[error("invalid token payload")]
     InvalidPayload,
 }
@@ -63,29 +67,9 @@ impl UploadStateData {
             return Err(StateTokenError::Missing);
         }
 
-        // Support structured 2-part signed state tokens: <payload_b64>.<sig_b64>
+        // Require structured 2-part signed state tokens: <payload_b64>.<sig_b64>
         let parts: Vec<&str> = trimmed.split('.').collect();
         if parts.len() != 2 {
-            // Also handle simple legacy format "repo:uuid" if validly matching
-            if let Some((repo, uuid)) = trimmed.split_once(':') {
-                let norm_data_repo = repo
-                    .trim_start_matches('/')
-                    .strip_prefix("library/")
-                    .unwrap_or(repo);
-                let norm_exp_repo = expected_repo
-                    .trim_start_matches('/')
-                    .strip_prefix("library/")
-                    .unwrap_or(expected_repo);
-                if norm_data_repo != norm_exp_repo {
-                    return Err(StateTokenError::RepoMismatch);
-                }
-                return Ok(Self {
-                    repo: repo.to_string(),
-                    uuid: uuid.to_string(),
-                    offset: 0,
-                    iat: 0,
-                });
-            }
             return Err(StateTokenError::InvalidFormat);
         }
 
@@ -129,6 +113,23 @@ impl UploadStateData {
 
         Ok(data)
     }
+
+    pub fn validate_session(
+        &self,
+        expected_uuid: &str,
+        stored_offset: u64,
+    ) -> Result<(), StateTokenError> {
+        if self.uuid != expected_uuid {
+            return Err(StateTokenError::UuidMismatch);
+        }
+        if self.offset != stored_offset {
+            return Err(StateTokenError::OffsetMismatch {
+                expected: stored_offset,
+                found: self.offset,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +137,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_upload_state_roundtrip() {
+    fn test_1_valid_signed_state_token_is_accepted() {
         let key = b"secret-key-12345";
         let state = UploadStateData::new(
             "library/test-repo",
@@ -149,10 +150,83 @@ mod tests {
         assert_eq!(decoded.repo, "library/test-repo");
         assert_eq!(decoded.uuid, "01234567-89ab-cdef-0123-456789abcdef");
         assert_eq!(decoded.offset, 1024);
+        assert!(
+            decoded
+                .validate_session("01234567-89ab-cdef-0123-456789abcdef", 1024)
+                .is_ok()
+        );
     }
 
     #[test]
-    fn test_upload_state_repo_mismatch() {
+    fn test_2_unsigned_repo_uuid_state_is_rejected() {
+        let key = b"secret-key-12345";
+        let unsigned = "library/test-repo:01234567-89ab-cdef-0123-456789abcdef";
+        let res = UploadStateData::verify_and_decode(unsigned, key, "library/test-repo");
+        assert_eq!(res, Err(StateTokenError::InvalidFormat));
+    }
+
+    #[test]
+    fn test_3_malformed_token_is_rejected() {
+        let key = b"secret-key-12345";
+        assert_eq!(
+            UploadStateData::verify_and_decode("", key, "library/test-repo"),
+            Err(StateTokenError::Missing)
+        );
+        assert_eq!(
+            UploadStateData::verify_and_decode("not-a-valid-token", key, "library/test-repo"),
+            Err(StateTokenError::InvalidFormat)
+        );
+        assert_eq!(
+            UploadStateData::verify_and_decode("a.b.c", key, "library/test-repo"),
+            Err(StateTokenError::InvalidFormat)
+        );
+        assert_eq!(
+            UploadStateData::verify_and_decode(".", key, "library/test-repo"),
+            Err(StateTokenError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn test_4_tampered_payload_is_rejected() {
+        let key = b"secret-key-12345";
+        let state1 = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        );
+        let token1 = state1.encode_and_sign(key);
+        let sig1 = token1.split('.').nth(1).unwrap();
+
+        let state2 = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            9999,
+        );
+        let token2 = state2.encode_and_sign(key);
+        let payload2 = token2.split('.').next().unwrap();
+
+        // Pair payload from state2 with signature from state1
+        let tampered = format!("{payload2}.{sig1}");
+        let res = UploadStateData::verify_and_decode(&tampered, key, "library/test-repo");
+        assert_eq!(res, Err(StateTokenError::InvalidSignature));
+    }
+
+    #[test]
+    fn test_5_tampered_signature_is_rejected() {
+        let key = b"secret-key-12345";
+        let state = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        );
+        let token = state.encode_and_sign(key);
+        let tampered = format!("{}.invalid_sig_bytes", token.split('.').next().unwrap());
+        let res = UploadStateData::verify_and_decode(&tampered, key, "library/test-repo");
+        assert_eq!(res, Err(StateTokenError::InvalidSignature));
+    }
+
+    #[test]
+    fn test_6_signed_token_for_another_repo_is_rejected() {
         let key = b"secret-key-12345";
         let state =
             UploadStateData::new("library/repo-a", "01234567-89ab-cdef-0123-456789abcdef", 0);
@@ -163,7 +237,24 @@ mod tests {
     }
 
     #[test]
-    fn test_upload_state_tampered_signature() {
+    fn test_7_signed_token_for_uuid_a_rejected_for_uuid_b() {
+        let key = b"secret-key-12345";
+        let state = UploadStateData::new(
+            "library/test-repo",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            0,
+        );
+        let token = state.encode_and_sign(key);
+
+        let decoded = UploadStateData::verify_and_decode(&token, key, "library/test-repo").unwrap();
+        assert_eq!(
+            decoded.validate_session("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 0),
+            Err(StateTokenError::UuidMismatch)
+        );
+    }
+
+    #[test]
+    fn test_8_signed_token_offset_0_rejected_when_stored_offset_nonzero() {
         let key = b"secret-key-12345";
         let state = UploadStateData::new(
             "library/test-repo",
@@ -172,9 +263,50 @@ mod tests {
         );
         let token = state.encode_and_sign(key);
 
-        // Tamper with payload
-        let tampered = format!("dGFtcGVyZWQ.{}", token.split('.').nth(1).unwrap());
-        let res = UploadStateData::verify_and_decode(&tampered, key, "library/test-repo");
-        assert_eq!(res, Err(StateTokenError::InvalidSignature));
+        let decoded = UploadStateData::verify_and_decode(&token, key, "library/test-repo").unwrap();
+        let stored_offset = 1024u64;
+        assert_eq!(
+            decoded.validate_session("01234567-89ab-cdef-0123-456789abcdef", stored_offset),
+            Err(StateTokenError::OffsetMismatch {
+                expected: 1024,
+                found: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_9_stale_signed_offset_rejected() {
+        let key = b"secret-key-12345";
+        let state = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            512,
+        );
+        let token = state.encode_and_sign(key);
+
+        let decoded = UploadStateData::verify_and_decode(&token, key, "library/test-repo").unwrap();
+        let stored_offset = 1024u64;
+        assert_eq!(
+            decoded.validate_session("01234567-89ab-cdef-0123-456789abcdef", stored_offset),
+            Err(StateTokenError::OffsetMismatch {
+                expected: 1024,
+                found: 512,
+            })
+        );
+    }
+
+    #[test]
+    fn test_10_signed_token_with_correct_repo_uuid_offset_accepted() {
+        let key = b"secret-key-12345";
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        let offset = 2048u64;
+        let state = UploadStateData::new("library/test-repo", uuid, offset);
+        let token = state.encode_and_sign(key);
+
+        let decoded = UploadStateData::verify_and_decode(&token, key, "library/test-repo").unwrap();
+        assert_eq!(decoded.repo, "library/test-repo");
+        assert_eq!(decoded.uuid, uuid);
+        assert_eq!(decoded.offset, offset);
+        assert!(decoded.validate_session(uuid, offset).is_ok());
     }
 }

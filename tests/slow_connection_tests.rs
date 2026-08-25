@@ -354,9 +354,21 @@ async fn test_legitimate_upload_and_resumption() {
         "0-999"
     );
 
+    let patch2_loc = patch_resp1
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let upload_url2 = if patch2_loc.starts_with("http") {
+        patch2_loc.to_string()
+    } else {
+        format!("http://127.0.0.1:{port}{patch2_loc}")
+    };
+
     // Verify GET upload status returns current Range
     let get_resp = client
-        .get(&upload_url)
+        .get(&upload_url2)
         .basic_auth("demo", Some("demo"))
         .send()
         .await
@@ -370,7 +382,7 @@ async fn test_legitimate_upload_and_resumption() {
     // Upload chunk 2 (1000 bytes) and finalize with PUT
     let chunk2 = vec![0x42u8; 1000];
     let patch_resp2 = client
-        .patch(&upload_url)
+        .patch(&upload_url2)
         .basic_auth("demo", Some("demo"))
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header("Content-Range", "1000-1999")
@@ -387,10 +399,22 @@ async fn test_legitimate_upload_and_resumption() {
     hasher.update(&all_bytes);
     let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
 
-    let put_url = if upload_url.contains('?') {
-        format!("{upload_url}&digest={digest}")
+    let finalize_loc = patch_resp2
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let finalize_url = if finalize_loc.starts_with("http") {
+        finalize_loc.to_string()
     } else {
-        format!("{upload_url}?digest={digest}")
+        format!("http://127.0.0.1:{port}{finalize_loc}")
+    };
+
+    let put_url = if finalize_url.contains('?') {
+        format!("{finalize_url}&digest={digest}")
+    } else {
+        format!("{finalize_url}?digest={digest}")
     };
     let put_resp = client
         .put(&put_url)

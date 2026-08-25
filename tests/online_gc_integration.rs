@@ -319,10 +319,21 @@ async fn push_blob_via_upload(base: &str, repo: &str, bytes: &[u8]) -> String {
     let hex = hex_sha256(bytes);
     let digest = format!("sha256:{hex}");
 
-    let put_url = if upload_url.contains('?') {
-        format!("{upload_url}&digest={digest}")
+    let patch_loc = patch
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&upload_url);
+    let fin_url = if patch_loc.starts_with("http") {
+        patch_loc.to_string()
     } else {
-        format!("{upload_url}?digest={digest}")
+        format!("{base}{patch_loc}")
+    };
+
+    let put_url = if fin_url.contains('?') {
+        format!("{fin_url}&digest={digest}")
+    } else {
+        format!("{fin_url}?digest={digest}")
     };
     let fin = client
         .put(&put_url)

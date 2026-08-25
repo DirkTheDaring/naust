@@ -180,37 +180,11 @@ impl RepoAction {
 
 #[cfg(test)]
 pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims, TokenError> {
-    let (signed_input, sig, payload_bytes) = decode_token_parts(token)?;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
-        .map_err(|_| TokenError::InvalidSigningKey)?;
-    mac.update(signed_input.as_bytes());
-    if mac.verify_slice(&sig).is_err() {
-        // Fallback check if signed over payload only
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() == 3 {
-            let mut mac2 = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
-                .map_err(|_| TokenError::InvalidSigningKey)?;
-            mac2.update(parts[1].as_bytes());
-            mac2.verify_slice(&sig)
-                .map_err(|_| TokenError::InvalidSignature)?;
-        } else {
-            return Err(TokenError::InvalidSignature);
-        }
-    }
-
-    let claims: TokenClaims =
-        serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| TokenError::InvalidPayload)?
-        .as_secs();
-    if now > claims.exp {
-        return Err(TokenError::Expired);
-    }
-
-    Ok(claims)
+    let key = TokenSigningKey {
+        kid: "default".to_string(),
+        key: signing_key.to_string(),
+    };
+    verify_bearer_token_with_keys(&[key], token)
 }
 
 pub fn verify_bearer_token_with_keys(
@@ -222,27 +196,10 @@ pub fn verify_bearer_token_with_keys(
     }
 
     let (signed_input, sig, payload_bytes) = decode_token_parts(token)?;
-    let claims: TokenClaims =
-        serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
-
-    // Use `kid` as a hint only; never trust it without signature verification.
-    let mut candidates: Vec<&TokenSigningKey> = Vec::with_capacity(signing_keys.len());
-    if let Some(kid) = claims.kid.as_deref() {
-        for k in signing_keys {
-            if k.kid == kid {
-                candidates.push(k);
-            }
-        }
-    }
-    for k in signing_keys {
-        if !candidates.iter().any(|x| x.kid == k.kid) {
-            candidates.push(k);
-        }
-    }
 
     let parts: Vec<&str> = token.split('.').collect();
     let mut verified = false;
-    for k in candidates {
+    for k in signing_keys {
         let mut mac = Hmac::<Sha256>::new_from_slice(k.key.as_bytes())
             .map_err(|_| TokenError::InvalidSigningKey)?;
         mac.update(signed_input.as_bytes());
@@ -265,6 +222,9 @@ pub fn verify_bearer_token_with_keys(
         return Err(TokenError::InvalidSignature);
     }
 
+    let claims: TokenClaims =
+        serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::InvalidPayload)?;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| TokenError::InvalidPayload)?
@@ -283,36 +243,27 @@ pub fn verify_bearer_token_bound(
     expected_aud: &str,
     max_ttl_secs: u64,
 ) -> Result<TokenClaims, TokenError> {
-    let claims = verify_bearer_token(signing_key, token)?;
-
-    if let Some(aud) = claims.aud.as_deref() {
-        if !expected_aud.is_empty() && aud != expected_aud {
-            return Err(TokenError::InvalidPayload);
-        }
-    }
-
-    if let Some(iat) = claims.iat {
-        if claims.exp < iat {
-            return Err(TokenError::InvalidPayload);
-        }
-        if max_ttl_secs > 0 {
-            let ttl = claims.exp.saturating_sub(iat);
-            if ttl > max_ttl_secs {
-                return Err(TokenError::InvalidPayload);
-            }
-        }
-    }
-
-    Ok(claims)
+    let key = TokenSigningKey {
+        kid: "default".to_string(),
+        key: signing_key.to_string(),
+    };
+    verify_bearer_token_bound_with_keys(&[key], token, expected_aud, max_ttl_secs)
 }
 
 pub fn verify_bearer_token_bound_with_keys(
     signing_keys: &[TokenSigningKey],
     token: &str,
-    _expected_aud: &str,
+    expected_aud: &str,
     max_ttl_secs: u64,
 ) -> Result<TokenClaims, TokenError> {
     let claims = verify_bearer_token_with_keys(signing_keys, token)?;
+
+    if !expected_aud.is_empty() {
+        match claims.aud.as_deref() {
+            Some(aud) if !aud.is_empty() && aud == expected_aud => {}
+            _ => return Err(TokenError::InvalidPayload),
+        }
+    }
 
     if let Some(iat) = claims.iat {
         if claims.exp < iat {
@@ -678,45 +629,120 @@ mod tests {
     }
 
     #[test]
-    fn bearer_wrong_audience_rejected() {
-        let signing_key = "test-signing-key";
+    fn test_prod_verifier_1_correct_audience_accepted() {
+        let key = TokenSigningKey {
+            kid: "k1".to_string(),
+            key: "secret".to_string(),
+        };
         let now = now_secs();
-        let scopes: Vec<TokenScope> = Vec::new();
+        let token =
+            issue_bearer_token_with_key(&key, "registry.example.com", None, &[], now, now + 3600)
+                .unwrap();
+        let claims =
+            verify_bearer_token_bound_with_keys(&[key], &token, "registry.example.com", 3600)
+                .unwrap();
+        assert_eq!(claims.aud.as_deref(), Some("registry.example.com"));
+    }
 
-        let token = issue_bearer_token(signing_key, "aud-a", None, &scopes, now, now + 3600)
-            .expect("issue");
+    #[test]
+    fn test_prod_verifier_2_incorrect_audience_rejected() {
+        let key = TokenSigningKey {
+            kid: "k1".to_string(),
+            key: "secret".to_string(),
+        };
+        let now = now_secs();
+        let token =
+            issue_bearer_token_with_key(&key, "auth.example.com", None, &[], now, now + 3600)
+                .unwrap();
+        let err = verify_bearer_token_bound_with_keys(&[key], &token, "registry.example.com", 3600)
+            .unwrap_err();
+        assert!(matches!(err, TokenError::InvalidPayload));
+    }
 
+    #[test]
+    fn test_prod_verifier_3_missing_audience_rejected_when_expected_aud_configured() {
+        let key = TokenSigningKey {
+            kid: "k1".to_string(),
+            key: "secret".to_string(),
+        };
+        let now = now_secs();
+        // Token minted without audience ("")
+        let token = issue_bearer_token_with_key(&key, "", None, &[], now, now + 3600).unwrap();
+        let err = verify_bearer_token_bound_with_keys(&[key], &token, "registry.example.com", 3600)
+            .unwrap_err();
+        assert!(matches!(err, TokenError::InvalidPayload));
+    }
+
+    #[test]
+    fn test_prod_verifier_4_expired_tokens_rejected() {
+        let key = TokenSigningKey {
+            kid: "k1".to_string(),
+            key: "secret".to_string(),
+        };
+        let now = now_secs();
+        let token = issue_bearer_token_with_key(
+            &key,
+            "registry",
+            None,
+            &[],
+            now.saturating_sub(10),
+            now.saturating_sub(1),
+        )
+        .unwrap();
         let err =
-            verify_bearer_token_bound(signing_key, &token, "aud-b", 3600).expect_err("wrong aud");
-        assert!(matches!(err, TokenError::InvalidPayload));
+            verify_bearer_token_bound_with_keys(&[key], &token, "registry", 3600).unwrap_err();
+        assert!(matches!(err, TokenError::Expired));
     }
 
     #[test]
-    fn bearer_ttl_over_max_rejected() {
-        let signing_key = "test-signing-key";
+    fn test_prod_verifier_5_unknown_key_rejected() {
+        let key_a = TokenSigningKey {
+            kid: "ka".to_string(),
+            key: "secret_a".to_string(),
+        };
+        let key_b = TokenSigningKey {
+            kid: "kb".to_string(),
+            key: "secret_b".to_string(),
+        };
         let now = now_secs();
-        let scopes: Vec<TokenScope> = Vec::new();
-
-        let token = issue_bearer_token(signing_key, "registry", None, &scopes, now, now + 7200)
-            .expect("issue");
-
-        let err = verify_bearer_token_bound(signing_key, &token, "registry", 3600)
-            .expect_err("ttl too large");
-        assert!(matches!(err, TokenError::InvalidPayload));
+        let token =
+            issue_bearer_token_with_key(&key_a, "registry", None, &[], now, now + 3600).unwrap();
+        let err =
+            verify_bearer_token_bound_with_keys(&[key_b], &token, "registry", 3600).unwrap_err();
+        assert!(matches!(err, TokenError::InvalidSignature));
     }
 
     #[test]
-    fn bearer_exp_before_iat_rejected_as_invalid_payload() {
-        let signing_key = "test-signing-key";
+    fn test_prod_verifier_6_key_rotation_supported() {
+        let key_old = TokenSigningKey {
+            kid: "k_old".to_string(),
+            key: "old_secret".to_string(),
+        };
+        let key_new = TokenSigningKey {
+            kid: "k_new".to_string(),
+            key: "new_secret".to_string(),
+        };
         let now = now_secs();
-        let scopes: Vec<TokenScope> = Vec::new();
+        let token =
+            issue_bearer_token_with_key(&key_old, "registry", None, &[], now, now + 3600).unwrap();
+        let claims =
+            verify_bearer_token_bound_with_keys(&[key_new, key_old], &token, "registry", 3600)
+                .unwrap();
+        assert_eq!(claims.kid.as_deref(), Some("k_old"));
+    }
 
-        // Signed token where exp < iat is structurally invalid, but still might not be expired.
-        let token = issue_bearer_token(signing_key, "registry", None, &scopes, now + 10, now + 1)
-            .expect("issue");
-
-        let err = verify_bearer_token_bound(signing_key, &token, "registry", 3600)
-            .expect_err("exp < iat");
-        assert!(matches!(err, TokenError::InvalidPayload));
+    #[test]
+    fn test_prod_verifier_7_issuer_and_verifier_agree_on_audience() {
+        let key = TokenSigningKey {
+            kid: "k1".to_string(),
+            key: "secret".to_string(),
+        };
+        let aud = "production-registry-service";
+        let now = now_secs();
+        let token =
+            issue_bearer_token_with_key(&key, aud, Some("user1"), &[], now, now + 3600).unwrap();
+        let claims = verify_bearer_token_bound_with_keys(&[key], &token, aud, 3600).unwrap();
+        assert_eq!(claims.aud.as_deref(), Some(aud));
+        assert_eq!(claims.sub.as_deref(), Some("user1"));
     }
 }
