@@ -361,8 +361,11 @@ pub fn issue_bearer_token_with_key(
 }
 
 fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
-    let s = scope_name.trim_start_matches('/');
-    let t = target_name.trim_start_matches('/');
+    let s = scope_name.trim().trim_start_matches('/');
+    let t = target_name.trim().trim_start_matches('/');
+    if s.is_empty() || t.is_empty() {
+        return false;
+    }
     if s == t || s == "*" {
         return true;
     }
@@ -371,6 +374,9 @@ fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
     }
     let s_no_lib = s.strip_prefix("library/").unwrap_or(s);
     let t_no_lib = t.strip_prefix("library/").unwrap_or(t);
+    if s_no_lib.is_empty() || t_no_lib.is_empty() {
+        return false;
+    }
     s_no_lib == t_no_lib
 }
 
@@ -744,5 +750,124 @@ mod tests {
         let claims = verify_bearer_token_bound_with_keys(&[key], &token, aud, 3600).unwrap();
         assert_eq!(claims.aud.as_deref(), Some(aud));
         assert_eq!(claims.sub.as_deref(), Some("user1"));
+    }
+
+    #[test]
+    fn test_token_scope_repository_authorization_matrix() {
+        let claims = TokenClaims {
+            sub: Some("user1".to_string()),
+            aud: Some("service".to_string()),
+            exp: now_secs() + 3600,
+            iat: Some(now_secs()),
+            jti: None,
+            iss: None,
+            kid: None,
+            scopes: vec![
+                TokenScope {
+                    typ: "repository".to_string(),
+                    name: "org/app".to_string(),
+                    actions: vec!["pull".to_string()],
+                },
+                TokenScope {
+                    typ: "repository".to_string(),
+                    name: "teams/backend/*".to_string(),
+                    actions: vec!["pull".to_string(), "push".to_string()],
+                },
+                TokenScope {
+                    typ: "repository".to_string(),
+                    name: "library/ubuntu".to_string(),
+                    actions: vec!["pull".to_string()],
+                },
+            ],
+        };
+
+        // 1. Exact repository scope
+        assert!(token_allows_repo_action(
+            &claims,
+            "org/app",
+            RepoAction::Pull
+        ));
+        // Action restriction: pull allowed, push denied
+        assert!(!token_allows_repo_action(
+            &claims,
+            "org/app",
+            RepoAction::Push
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "org/app",
+            RepoAction::Delete
+        ));
+        // Exact prefix must not match extended name or sub-path
+        assert!(!token_allows_repo_action(
+            &claims,
+            "org/application",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "org/app/sub",
+            RepoAction::Pull
+        ));
+
+        // 2. Prefix scope (teams/backend/*)
+        assert!(token_allows_repo_action(
+            &claims,
+            "teams/backend/service",
+            RepoAction::Pull
+        ));
+        assert!(token_allows_repo_action(
+            &claims,
+            "teams/backend/service",
+            RepoAction::Push
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "teams/backend/service",
+            RepoAction::Delete
+        ));
+        // Cross boundary rejection
+        assert!(!token_allows_repo_action(
+            &claims,
+            "teams/backend-other/service",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "teams/other/service",
+            RepoAction::Pull
+        ));
+
+        // 3. Docker library/ alias symmetry and boundary
+        assert!(token_allows_repo_action(
+            &claims,
+            "library/ubuntu",
+            RepoAction::Pull
+        ));
+        assert!(token_allows_repo_action(
+            &claims,
+            "ubuntu",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "library2/ubuntu",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "library/ubuntu-extra",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "ubuntu-extra",
+            RepoAction::Pull
+        ));
+
+        // 4. Empty and malformed repository names fail closed
+        assert!(!token_allows_repo_action(&claims, "", RepoAction::Pull));
+        assert!(!token_allows_repo_action(&claims, "   ", RepoAction::Pull));
+        assert!(!token_allows_repo_action(&claims, "/", RepoAction::Pull));
     }
 }

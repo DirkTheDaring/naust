@@ -681,4 +681,189 @@ root = "{}"
 
         let _ = std::fs::remove_dir_all(&fs_root);
     }
+
+    #[tokio::test]
+    async fn test_route_normalization_and_auth_bypass_resistance() {
+        use super::require_auth_middleware;
+        use crate::security::{TokenScope, issue_bearer_token_with_key};
+        use axum::body::Body;
+        use axum::middleware;
+        use http::Request;
+        use tower::ServiceExt;
+
+        let fs_root = std::env::temp_dir().join(format!("auth-norm-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let cfg_path = fs_root.join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[auth]
+anonymous_pull = false
+
+[[token.signing_keys]]
+kid = "default"
+key = "test-key-material-12345"
+
+[storage]
+backend = "fs"
+[storage.fs]
+root = "{}"
+"#,
+                fs_root.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = crate::config::Config::from_env_with_files(&[cfg_path]).unwrap();
+        let cfg = std::sync::Arc::new(cfg);
+        let storage: std::sync::Arc<dyn crate::storage::Storage> = std::sync::Arc::new(
+            crate::storage::fs::FsStorage::new(fs_root.clone(), cfg.max_upload_bytes),
+        );
+        let ip_limiter = std::sync::Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
+            cfg.max_connections_per_ip,
+            cfg.trusted_bypass_cidrs.clone(),
+        ));
+        let state = crate::AppState {
+            config: cfg.clone(),
+            auth_metrics: std::sync::Arc::new(crate::AuthMetrics::default()),
+            storage,
+            ref_index: None,
+            gc_service: None,
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: vec![],
+            buffered_body_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            request_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            upload_request_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            active_non_upload_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_upload_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ),
+            gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ip_limiter,
+            is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let app = axum::Router::new()
+            .route(
+                "/v2/*rest",
+                axum::routing::any(|| async { axum::http::StatusCode::OK }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_auth_middleware,
+            ))
+            .with_state(state);
+
+        let now = now_secs();
+        let signing_key = &cfg.token_signing_keys[0];
+
+        // Token scoped exclusively to "org/app"
+        let token_org_app = issue_bearer_token_with_key(
+            signing_key,
+            &cfg.token_service,
+            Some("user1"),
+            &[TokenScope {
+                typ: "repository".to_string(),
+                name: "org/app".to_string(),
+                actions: vec!["pull".to_string()],
+            }],
+            now,
+            now + 300,
+        )
+        .unwrap();
+
+        // 1. Legitimate request with matching token succeeds (200 OK)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/org/app/manifests/latest")
+                    .header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {token_org_app}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::OK);
+
+        // 2. Cross-boundary tenant attack (org2/app) with org/app token is DENIED (403)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/org2/app/manifests/latest")
+                    .header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {token_org_app}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        // 3. Extended name attack (org/application) with org/app token is DENIED (403)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/org/application/manifests/latest")
+                    .header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {token_org_app}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        // 4. Sub-path attack (org/app/sub) with org/app token is DENIED (403)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/org/app/sub/manifests/latest")
+                    .header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {token_org_app}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        // 5. Method restriction: write (PUT) with pull-only token is DENIED (403)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::PUT)
+                    .uri("/v2/org/app/manifests/latest")
+                    .header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {token_org_app}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
 }
