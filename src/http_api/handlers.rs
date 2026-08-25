@@ -870,7 +870,7 @@ async fn manifest_by_reference(
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                 headers.insert("Content-Type", meta.media_type.parse().unwrap());
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                if let Some(subject) = extract_subject_digest(&bytes) {
+                if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
                     headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
                 }
                 (StatusCode::OK, headers).into_response()
@@ -880,17 +880,15 @@ async fn manifest_by_reference(
                     if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
                         ctx.proxy.note_manifest_access(name, &digest);
                         if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                            for blob in &refs.blobs {
-                                if let Ok(d) = crate::registry::digest::Digest::parse(blob) {
-                                    ctx.proxy.note_blob_access(&d);
-                                }
+                            for blob in refs.blob_references() {
+                                ctx.proxy.note_blob_access(blob);
                             }
                         }
                         let mut headers = registry_headers();
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                         headers.insert("Content-Type", meta.media_type.parse().unwrap());
                         headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                        if let Some(subject) = extract_subject_digest(&bytes) {
+                        if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
                             headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
                         }
                         return (StatusCode::OK, headers).into_response();
@@ -938,7 +936,7 @@ async fn manifest_by_reference(
                                         "Content-Length",
                                         meta.size.to_string().parse().unwrap(),
                                     );
-                                    if let Some(subject) = extract_subject_digest(&bytes) {
+                                    if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
                                         headers.insert(
                                             "OCI-Subject",
                                             subject.as_str().parse().unwrap(),
@@ -971,7 +969,7 @@ async fn manifest_by_reference(
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                 headers.insert("Content-Type", meta.media_type.parse().unwrap());
                 headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                if let Some(subject) = extract_subject_digest(&bytes) {
+                if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
                     headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
                 }
                 (StatusCode::OK, headers, Body::from(bytes)).into_response()
@@ -981,10 +979,8 @@ async fn manifest_by_reference(
                     if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
                         ctx.proxy.note_manifest_access(name, &digest);
                         if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                            for blob in &refs.blobs {
-                                if let Ok(d) = crate::registry::digest::Digest::parse(blob) {
-                                    ctx.proxy.note_blob_access(&d);
-                                }
+                            for blob in refs.blob_references() {
+                                ctx.proxy.note_blob_access(blob);
                             }
                         }
                         let mut headers = registry_headers();
@@ -1174,10 +1170,8 @@ async fn manifest_by_reference_proxy_only(
             if let Ok(meta) = ctx.cache.head_manifest(name, &digest).await {
                 ctx.proxy.note_manifest_access(name, &digest);
                 if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                    for blob in &refs.blobs {
-                        if let Ok(d) = crate::registry::digest::Digest::parse(blob) {
-                            ctx.proxy.note_blob_access(&d);
-                        }
+                    for blob in refs.blob_references() {
+                        ctx.proxy.note_blob_access(blob);
                     }
                 }
                 let mut headers = registry_headers();
@@ -1237,10 +1231,8 @@ async fn manifest_by_reference_proxy_only(
             if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
                 ctx.proxy.note_manifest_access(name, &digest);
                 if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                    for blob in &refs.blobs {
-                        if let Ok(d) = crate::registry::digest::Digest::parse(blob) {
-                            ctx.proxy.note_blob_access(&d);
-                        }
+                    for blob in refs.blob_references() {
+                        ctx.proxy.note_blob_access(blob);
                     }
                 }
                 let mut headers = registry_headers();
@@ -2697,6 +2689,120 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn test_manifest_put_rejects_malformed_layer_digest() {
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        let cfg = Arc::new(cfg);
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
+        let state = test_app_state(cfg, storage, None);
+        let repo = "library/malformed";
+
+        let malformed_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "size": 2
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:not-valid-hex-digest",
+                    "size": 100
+                }
+            ]
+        });
+        let bytes = serde_json::to_vec(&malformed_manifest).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            bytes.len().to_string().parse().unwrap(),
+        );
+
+        let resp = super::manifest_put(
+            state,
+            &headers,
+            repo,
+            "latest",
+            axum::body::Body::from(bytes),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let err_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(err_json["errors"][0]["code"], "MANIFEST_INVALID");
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_put_rejects_malformed_config_structure() {
+        let fs_root =
+            std::env::temp_dir().join(format!("registry-rust-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&fs_root);
+        let mut cfg = minimal_config_for_token_tests();
+        cfg.fs_root = fs_root.clone();
+        let cfg = Arc::new(cfg);
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
+        );
+        let state = test_app_state(cfg, storage, None);
+        let repo = "library/malformed-cfg";
+
+        let malformed_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": "not_an_object",
+            "layers": []
+        });
+        let bytes = serde_json::to_vec(&malformed_manifest).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            bytes.len().to_string().parse().unwrap(),
+        );
+
+        let resp = super::manifest_put(
+            state,
+            &headers,
+            repo,
+            "latest",
+            axum::body::Body::from(bytes),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let err_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(err_json["errors"][0]["code"], "MANIFEST_INVALID");
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
 }
 
 #[allow(dead_code)]
@@ -2968,24 +3074,32 @@ async fn manifest_put(
     }
 
     // Verify all referenced layer/config blobs exist in storage.
-    if let Some(refs) = crate::manifest_refs::parse_manifest_refs(&bytes) {
-        for blob_str in &refs.blobs {
-            if blob_str == "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
-                || blob_str
-                    == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            {
-                continue;
-            }
-            if let Ok(blob_d) = Digest::parse(blob_str) {
-                if state.storage.head_blob(&blob_d).await.is_err() {
-                    return errors::manifest_blob_unknown(blob_str).into_response();
-                }
-            }
+    let refs = match crate::manifest_refs::parse_manifest_refs(&bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            return errors::manifest_invalid().into_response();
+        }
+    };
+    for blob_d in refs.blob_references() {
+        if blob_d.as_str()
+            == "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            || blob_d.as_str()
+                == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        {
+            continue;
+        }
+        if state.storage.head_blob(blob_d).await.is_err() {
+            return errors::manifest_blob_unknown(&blob_d.as_str()).into_response();
         }
     }
 
     // Best-effort: pre-parse referrer info. We only persist it if the manifest is accepted.
-    let referrer_info = parse_referrer_info(&bytes);
+    let referrer_info = match parse_referrer_info(&bytes) {
+        Ok(info) => info,
+        Err(_) => {
+            return errors::manifest_invalid().into_response();
+        }
+    };
     let subject_for_headers = referrer_info.as_ref().map(|(s, _, _)| s.clone());
 
     // Compute manifest digest over the raw bytes.
@@ -3113,47 +3227,17 @@ async fn manifest_put(
 
 fn parse_referrer_info(
     manifest_bytes: &[u8],
-) -> Option<(Digest, Option<String>, Option<HashMap<String, String>>)> {
-    let v: serde_json::Value = serde_json::from_slice(manifest_bytes).ok()?;
-    let subject_digest = v
-        .get("subject")
-        .and_then(|s| s.get("digest"))
-        .and_then(|d| d.as_str())?;
-    let subject = Digest::parse(subject_digest).ok()?;
-
-    let artifact_type = v
-        .get("artifactType")
-        .and_then(|a| a.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            v.get("config")
-                .and_then(|c| c.get("mediaType"))
-                .and_then(|m| m.as_str())
-                .filter(|m| *m != "application/vnd.oci.empty.v1+json")
-                .map(|s| s.to_string())
-        });
-
-    let annotations = v
-        .get("annotations")
-        .and_then(|a| a.as_object())
-        .and_then(|obj| {
-            let map = obj
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect::<HashMap<_, _>>();
-            if map.is_empty() { None } else { Some(map) }
-        });
-
-    Some((subject, artifact_type, annotations))
+) -> Result<
+    Option<(Digest, Option<String>, Option<HashMap<String, String>>)>,
+    crate::manifest_refs::ManifestParseError,
+> {
+    crate::manifest_refs::parse_referrer_info(manifest_bytes)
 }
 
-fn extract_subject_digest(manifest_bytes: &[u8]) -> Option<Digest> {
-    let v: serde_json::Value = serde_json::from_slice(manifest_bytes).ok()?;
-    let subject_digest = v
-        .get("subject")
-        .and_then(|s| s.get("digest"))
-        .and_then(|d| d.as_str())?;
-    Digest::parse(subject_digest).ok()
+fn extract_subject_digest(
+    manifest_bytes: &[u8],
+) -> Result<Option<Digest>, crate::manifest_refs::ManifestParseError> {
+    crate::manifest_refs::extract_subject_digest(manifest_bytes)
 }
 
 async fn oci_extension_discover(method: Method) -> Response {

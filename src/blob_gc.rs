@@ -710,15 +710,14 @@ async fn build_manifest_protected_set(fs_root: &Path) -> Result<HashSet<String>,
 
                         let bytes = match tokio::fs::read(&mp).await {
                             Ok(b) => b,
-                            Err(_) => continue,
+                            Err(e) => {
+                                return Err(format!("read manifest {}: {e}", mp.display()));
+                            }
                         };
-                        if let Some(refs) = parse_manifest_refs(&bytes) {
-                            for b in refs.blobs {
-                                protected.insert(b);
-                            }
-                            for d in refs.manifests {
-                                protected.insert(d);
-                            }
+                        let refs = parse_manifest_refs(&bytes)
+                            .map_err(|e| format!("unparsable manifest {}: {e}", mp.display()))?;
+                        for r in refs.all_references() {
+                            protected.insert(r.as_str());
                         }
                     }
                 } else {
@@ -730,4 +729,68 @@ async fn build_manifest_protected_set(fs_root: &Path) -> Result<HashSet<String>,
     }
 
     Ok(protected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_build_manifest_protected_set_aborts_on_unparsable_manifest() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let fs_root = temp.path();
+
+        // Create a repository with a valid manifest and a malformed manifest
+        let manifests_dir = fs_root
+            .join("repos")
+            .join("library")
+            .join("test")
+            .join("manifests");
+        tokio::fs::create_dir_all(&manifests_dir).await.unwrap();
+
+        // 1. Valid manifest
+        let valid_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+        let valid_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222" },
+            "layers": [{ "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333" }]
+        });
+        tokio::fs::write(
+            manifests_dir.join(valid_hex),
+            serde_json::to_vec(&valid_manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Only valid manifest: should succeed and protect blobs
+        let protected = build_manifest_protected_set(fs_root).await.unwrap();
+        assert!(
+            protected.contains(
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            )
+        );
+        assert!(
+            protected.contains(
+                "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+            )
+        );
+
+        // 2. Add an unparsable / malformed manifest (e.g. invalid digest in layers)
+        let malformed_hex = "4444444444444444444444444444444444444444444444444444444444444444";
+        let malformed_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555" },
+            "layers": [{ "digest": "sha256:invalid-hex" }]
+        });
+        tokio::fs::write(
+            manifests_dir.join(malformed_hex),
+            serde_json::to_vec(&malformed_manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Now scan must fail immediately rather than returning an incomplete protection set
+        let err = build_manifest_protected_set(fs_root).await.unwrap_err();
+        assert!(err.contains("unparsable manifest"));
+    }
 }

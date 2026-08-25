@@ -1101,18 +1101,19 @@ impl Storage for FsStorage {
         let manifest_path = self.manifest_path(name, digest);
 
         // Pre-read manifest bytes to extract subject if present for referrers cleanup.
-        let maybe_subject = if let Ok(bytes) = tokio::fs::read(&manifest_path).await {
-            serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| {
-                    v.get("subject")
-                        .and_then(|s| s.get("digest"))
-                        .and_then(|d| d.as_str())
-                        .and_then(|d| Digest::parse(d).ok())
-                })
-        } else {
-            None
+        let bytes = match tokio::fs::read(&manifest_path).await {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
+            Err(err) => return Err(StorageError::Internal(err.to_string())),
         };
+
+        let maybe_subject = crate::manifest_refs::extract_subject_digest(&bytes).map_err(|e| {
+            StorageError::Internal(format!(
+                "cannot delete manifest with malformed structure: {e}"
+            ))
+        })?;
 
         match tokio::fs::remove_file(&manifest_path).await {
             Ok(()) => {}
@@ -1306,6 +1307,50 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.expect("read blob");
         assert_eq!(buf, live_content);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn delete_manifest_fails_safe_on_malformed_manifest() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let repo = "library/delete-malformed";
+        let digest = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // Write a malformed manifest on disk
+        let malformed_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "subject": { "digest": "sha256:invalid-subject-hex" }
+        });
+        storage
+            .put_manifest(
+                repo,
+                &digest,
+                serde_json::to_vec(&malformed_manifest).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        storage.set_tag(repo, "tag1", &digest).await.unwrap();
+
+        // Attempt deletion
+        let err = storage
+            .delete_manifest(repo, &digest)
+            .await
+            .expect_err("should abort on malformed manifest");
+        match err {
+            StorageError::Internal(msg) => {
+                assert!(msg.contains("malformed"));
+            }
+            other => panic!("expected StorageError::Internal, got {other:?}"),
+        }
+
+        // Verify manifest and tag are still present (not mutated)
+        assert!(storage.get_manifest(repo, &digest).await.is_ok());
+        assert_eq!(storage.resolve_tag(repo, "tag1").await.unwrap(), digest);
 
         let _ = std::fs::remove_dir_all(&root);
     }

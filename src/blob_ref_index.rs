@@ -24,6 +24,9 @@ pub enum RefIndexError {
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
+    #[error("manifest parse error: {0}")]
+    ManifestParse(#[from] crate::manifest_refs::ManifestParseError),
+
     #[error("ref-index corrupt: {0}")]
     Corrupt(String),
 }
@@ -464,25 +467,23 @@ impl BlobRefIndex {
                     Err(e) => return Err(e.into()),
                 };
 
-                let parsed = parse_manifest_refs(&bytes);
-                refs_cache.insert(digest_hex, parsed.clone());
-                let Some(r) = parsed else {
-                    continue;
-                };
-                r
+                let parsed = parse_manifest_refs(&bytes)?;
+                refs_cache.insert(digest_hex, Some(parsed.clone()));
+                parsed
             };
 
             // child blob -> parent manifest
-            for child_blob in &refs.blobs {
-                self.add_parent(child_blob.as_bytes(), digest.as_str().as_bytes())?;
+            for child_blob in refs.blob_references() {
+                self.add_parent(child_blob.as_str().as_bytes(), digest.as_str().as_bytes())?;
             }
 
             // child manifest -> parent manifest
-            for child_manifest in &refs.manifests {
-                self.add_parent(child_manifest.as_bytes(), digest.as_str().as_bytes())?;
-                if let Ok(d) = Digest::parse(child_manifest) {
-                    queue.push_back(d);
-                }
+            for child_manifest in refs.manifest_references() {
+                self.add_parent(
+                    child_manifest.as_str().as_bytes(),
+                    digest.as_str().as_bytes(),
+                )?;
+                queue.push_back(child_manifest.clone());
             }
         }
 

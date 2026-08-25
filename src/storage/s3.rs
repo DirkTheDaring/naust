@@ -862,17 +862,12 @@ impl Storage for S3Storage {
         let key = self.manifest_key(name, digest);
 
         // Pre-read manifest to extract subject if present for referrers cleanup.
-        let maybe_subject = match self.get_object_bytes(&key).await {
-            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| {
-                    v.get("subject")
-                        .and_then(|s| s.get("digest"))
-                        .and_then(|d| d.as_str())
-                        .and_then(|d| Digest::parse(d).ok())
-                }),
-            Err(_) => None,
-        };
+        let bytes = self.get_object_bytes(&key).await?;
+        let maybe_subject = crate::manifest_refs::extract_subject_digest(&bytes).map_err(|e| {
+            StorageError::Internal(format!(
+                "cannot delete manifest with malformed structure: {e}"
+            ))
+        })?;
 
         // If the object doesn't exist, S3 can still return 204; treat it as success
         // unless we can clearly map it to NotFound.

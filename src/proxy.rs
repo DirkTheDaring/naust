@@ -51,11 +51,7 @@ pub struct TagMeta {
     pub etag: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct ManifestRefs {
-    pub blobs: Vec<String>,
-    pub manifests: Vec<String>,
-}
+pub use crate::manifest_refs::ManifestRefs;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
@@ -530,6 +526,13 @@ impl Proxy {
                 }
             }
 
+            // Validate manifest descriptor structure before storing in local cache
+            if let Err(e) = crate::manifest_refs::parse_manifest_refs(&bytes) {
+                return Err(ProxyError::Upstream(format!(
+                    "upstream manifest has invalid reference structure: {e}"
+                )));
+            }
+
             storage
                 .put_manifest(&decision.local_repo, &computed, bytes.clone())
                 .await
@@ -606,41 +609,9 @@ impl Proxy {
     }
 
     pub fn index_manifest(&self, repo: &str, digest: &Digest, bytes: &[u8]) {
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        let Ok(refs) = crate::manifest_refs::parse_manifest_refs(bytes) else {
             return;
         };
-        let mut refs = ManifestRefs::default();
-
-        // Index/list: manifests[].digest
-        if let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) {
-            for m in manifests {
-                if let Some(d) = m.get("digest").and_then(|d| d.as_str()) {
-                    if Digest::parse(d).is_ok() {
-                        refs.manifests.push(d.to_string());
-                    }
-                }
-            }
-        }
-
-        // Manifest: config.digest + layers[].digest
-        if let Some(cfg_digest) = v
-            .get("config")
-            .and_then(|c| c.get("digest"))
-            .and_then(|d| d.as_str())
-        {
-            if Digest::parse(cfg_digest).is_ok() {
-                refs.blobs.push(cfg_digest.to_string());
-            }
-        }
-        if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
-            for layer in layers {
-                if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
-                    if Digest::parse(d).is_ok() {
-                        refs.blobs.push(d.to_string());
-                    }
-                }
-            }
-        }
 
         let key = format!("manifestrefs::{repo}::{}", digest.hex());
         if let Ok(encoded) = serde_json::to_vec(&refs) {
@@ -1137,4 +1108,124 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
         service: service?,
         scope,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_proxy() -> (Proxy, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("proxy.db");
+        let cfg = ProxyConfig {
+            enabled: true,
+            mode: ProxyMode::Allowlist,
+            upstream_base_url: Some("http://localhost:5000".to_string()),
+            upstream_username: None,
+            upstream_password: None,
+            allowed_upstream_hosts: vec!["localhost".to_string()],
+            allowed_repo_prefixes: vec![],
+            block_private_networks: false,
+            redirect_policy: RedirectPolicy::AnyPublic,
+            max_concurrent_upstream: 10,
+            index_path: db_path,
+            cache_fs_root: None,
+            cache_s3_prefix: None,
+            gc_interval_secs: 0,
+            scrub_enabled: false,
+            scrub_interval_secs: 0,
+            scrub_max_files_per_run: 0,
+            max_cache_bytes: None,
+            repo_rules: vec![],
+            upstreams: vec![],
+            routing_proxy_hosts: vec![],
+            routing_trust_x_forwarded_host: false,
+        };
+        let proxy = Proxy::new(&cfg).unwrap().unwrap();
+        (proxy, temp_dir)
+    }
+
+    #[test]
+    fn test_index_manifest_handles_oci_artifact_blobs_and_subject() {
+        let (proxy, _temp) = create_test_proxy();
+        let repo = "library/artifact";
+        let digest = Digest::parse(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let blob_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let subject_digest =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let artifact_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
+            "blobs": [{ "digest": blob_digest }],
+            "subject": { "digest": subject_digest }
+        });
+        let bytes = serde_json::to_vec(&artifact_json).unwrap();
+
+        proxy.index_manifest(repo, &digest, &bytes);
+        let refs = proxy
+            .get_manifest_refs(repo, &digest)
+            .expect("indexed refs");
+
+        let blob_refs: Vec<String> = refs.blob_references().map(|d| d.as_str()).collect();
+        assert_eq!(blob_refs, vec![blob_digest]);
+
+        let manifest_refs: Vec<String> = refs.manifest_references().map(|d| d.as_str()).collect();
+        assert_eq!(manifest_refs, vec![subject_digest]);
+    }
+
+    #[test]
+    fn test_index_manifest_handles_image_manifest_and_index() {
+        let (proxy, _temp) = create_test_proxy();
+        let repo = "library/image";
+        let img_digest = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let cfg_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let layer_digest =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+        let img_json = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": cfg_digest },
+            "layers": [{ "digest": layer_digest }]
+        });
+        proxy.index_manifest(repo, &img_digest, &serde_json::to_vec(&img_json).unwrap());
+
+        let refs = proxy
+            .get_manifest_refs(repo, &img_digest)
+            .expect("indexed image refs");
+        let blob_refs: Vec<String> = refs.blob_references().map(|d| d.as_str()).collect();
+        assert_eq!(blob_refs, vec![cfg_digest, layer_digest]);
+    }
+
+    #[test]
+    fn test_index_manifest_rejects_malformed_and_does_not_index_partial_graph() {
+        let (proxy, _temp) = create_test_proxy();
+        let repo = "library/malformed";
+        let digest = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // Mixed valid and invalid layer digest
+        let malformed_json = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222" },
+            "layers": [
+                { "digest": "sha256:invalid-hex" }
+            ]
+        });
+        proxy.index_manifest(repo, &digest, &serde_json::to_vec(&malformed_json).unwrap());
+
+        assert!(
+            proxy.get_manifest_refs(repo, &digest).is_none(),
+            "malformed manifest must not be indexed in proxy db"
+        );
+    }
 }

@@ -6,7 +6,7 @@ pub struct Digest {
     hex: String,
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum DigestParseError {
     #[error("unsupported digest algorithm")]
     UnsupportedAlgorithm,
@@ -57,6 +57,31 @@ impl Digest {
     pub fn prefix2(&self) -> &str {
         // safe because hex length is at least 64
         &self.hex[..2]
+    }
+}
+
+impl std::fmt::Display for Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.algo, self.hex)
+    }
+}
+
+impl serde::Serialize for Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Digest::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 

@@ -26,8 +26,6 @@ async fn scan_repo_for_blob(
     target: &Digest,
     refs_cache: &mut HashMap<Digest, Option<ManifestRefs>>,
 ) -> Result<Option<BlobReference>, StorageError> {
-    let target_str = target.as_str();
-
     let mut queue: VecDeque<Digest> = VecDeque::new();
     queue.push_back(root_manifest);
 
@@ -53,15 +51,20 @@ async fn scan_repo_for_blob(
                 Err(e) => return Err(e),
             };
 
-            let parsed = parse_manifest_refs(&bytes);
-            refs_cache.insert(digest.clone(), parsed.clone());
-            let Some(r) = parsed else {
-                continue;
+            let parsed = match parse_manifest_refs(&bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(StorageError::Internal(format!(
+                        "unparsable manifest {}: {e}",
+                        digest.as_str()
+                    )));
+                }
             };
-            r
+            refs_cache.insert(digest.clone(), Some(parsed.clone()));
+            parsed
         };
 
-        if refs.blobs.iter().any(|d| d.as_str() == target_str) {
+        if refs.blob_references().any(|d| d == target) {
             return Ok(Some(BlobReference {
                 repo: repo.to_string(),
                 tag: root_tag,
@@ -69,10 +72,8 @@ async fn scan_repo_for_blob(
             }));
         }
 
-        for child in refs.manifests {
-            if let Ok(d) = Digest::parse(&child) {
-                queue.push_back(d);
-            }
+        for child in refs.manifest_references() {
+            queue.push_back(child.clone());
         }
     }
 

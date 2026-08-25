@@ -1891,4 +1891,88 @@ async fn test_audit_remediation_suite() {
     assert_eq!(mount_fallback_resp.status(), reqwest::StatusCode::FORBIDDEN);
     let mount_err: serde_json::Value = mount_fallback_resp.json().await.expect("json");
     assert_eq!(mount_err["errors"][0]["code"], "DENIED");
+
+    // 32. Manifest PUT with malformed descriptor (invalid digest in layers) -> 400 Bad Request MANIFEST_INVALID, nothing persisted
+    let malformed_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "size": 2
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": "sha256:invalid_not_hex_chars_here_xyz",
+                "size": 10
+            }
+        ]
+    });
+    let malformed_bytes = serde_json::to_vec(&malformed_manifest).unwrap();
+    let malformed_put_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/malformed-tag"))
+        .bearer_auth(pull_push_token)
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .body(malformed_bytes)
+        .send()
+        .await
+        .expect("put malformed manifest");
+    assert_eq!(
+        malformed_put_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let malformed_err: serde_json::Value = malformed_put_resp.json().await.expect("json");
+    assert_eq!(malformed_err["errors"][0]["code"], "MANIFEST_INVALID");
+
+    // Verify tag was NOT created
+    let get_malformed_tag_resp = client
+        .get(format!("{base_url}/v2/{repo}/manifests/malformed-tag"))
+        .bearer_auth(pull_push_token)
+        .send()
+        .await
+        .expect("get malformed tag");
+    assert_eq!(
+        get_malformed_tag_resp.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // 33. Manifest PUT with duplicate layer descriptors: verifies correct multiplicity handling
+    let duplicate_layers_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "size": 2
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "size": 0
+            },
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "size": 0
+            }
+        ]
+    });
+    let dup_bytes = serde_json::to_vec(&duplicate_layers_manifest).unwrap();
+    let dup_put_resp = client
+        .put(format!("{base_url}/v2/{repo}/manifests/dup-layers-tag"))
+        .bearer_auth(pull_push_token)
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .body(dup_bytes)
+        .send()
+        .await
+        .expect("put dup layers manifest");
+    assert_eq!(dup_put_resp.status(), reqwest::StatusCode::CREATED);
 }

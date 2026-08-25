@@ -1513,7 +1513,7 @@ async fn proxy_gc_once(
     repo_rules: &[config::ProxyRepoRule],
     proxy: &proxy::Proxy,
 ) -> Result<(), String> {
-    let protected = compute_protected_blobs(storage, repo_rules, proxy).await;
+    let protected = compute_protected_blobs(storage, repo_rules, proxy).await?;
 
     let blobs_root = fs_root.join("blobs").join("sha256");
     let mut entries: Vec<(
@@ -1616,8 +1616,11 @@ async fn compute_protected_blobs(
     storage: &Arc<dyn storage::Storage>,
     repo_rules: &[config::ProxyRepoRule],
     proxy: &proxy::Proxy,
-) -> HashSet<String> {
-    let repos = storage.list_repositories().await.unwrap_or_default();
+) -> Result<HashSet<String>, String> {
+    let repos = storage
+        .list_repositories()
+        .await
+        .map_err(|e| e.to_string())?;
     let mut protected_blobs: HashSet<String> = HashSet::new();
     let mut seen_manifests: HashSet<(String, String)> = HashSet::new();
 
@@ -1658,13 +1661,13 @@ async fn compute_protected_blobs(
                         proxy,
                         0,
                     )
-                    .await;
+                    .await?;
                 }
             }
         }
     }
 
-    protected_blobs
+    Ok(protected_blobs)
 }
 
 async fn collect_protected_blobs_for_manifest(
@@ -1675,7 +1678,7 @@ async fn collect_protected_blobs_for_manifest(
     seen_manifests: &mut HashSet<(String, String)>,
     proxy: &proxy::Proxy,
     depth: usize,
-) {
+) -> Result<(), String> {
     let mut stack: Vec<(registry::digest::Digest, usize)> = vec![(digest.clone(), depth)];
     while let Some((digest, depth)) = stack.pop() {
         if depth >= 5 {
@@ -1686,67 +1689,27 @@ async fn collect_protected_blobs_for_manifest(
             continue;
         }
 
-        if let Some(refs) = proxy.get_manifest_refs(repo, &digest) {
-            if !refs.manifests.is_empty() {
-                for child in &refs.manifests {
-                    if let Ok(child) = registry::digest::Digest::parse(child) {
-                        stack.push((child, depth + 1));
-                    }
-                }
-                // Index/list: only traverse to children.
-                continue;
-            }
-
-            for blob in refs.blobs {
-                if let Ok(d) = registry::digest::Digest::parse(&blob) {
-                    protected_blobs.insert(d.hex().to_string());
-                }
-            }
-            continue;
-        }
-
-        let Ok((_meta, bytes)) = storage.get_manifest(repo, &digest).await else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
+        let refs = if let Some(r) = proxy.get_manifest_refs(repo, &digest) {
+            r
+        } else {
+            let (_meta, bytes) = storage
+                .get_manifest(repo, &digest)
+                .await
+                .map_err(|e| format!("get_manifest {repo}@{digest}: {e}"))?;
+            let r = crate::manifest_refs::parse_manifest_refs(&bytes)
+                .map_err(|e| format!("unparsable manifest {repo}@{digest}: {e}"))?;
+            proxy.index_manifest(repo, &digest, &bytes);
+            r
         };
 
-        // Best-effort: populate DB index so next GC pass is faster.
-        proxy.index_manifest(repo, &digest, &bytes);
-
-        // Index/list: manifests[].digest
-        if let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) {
-            for m in manifests {
-                if let Some(d) = m.get("digest").and_then(|d| d.as_str()) {
-                    if let Ok(child) = registry::digest::Digest::parse(d) {
-                        stack.push((child, depth + 1));
-                    }
-                }
-            }
-            continue;
+        for child in refs.manifest_references() {
+            stack.push((child.clone(), depth + 1));
         }
-
-        // Manifest: config.digest + layers[].digest
-        if let Some(cfg_digest) = v
-            .get("config")
-            .and_then(|c| c.get("digest"))
-            .and_then(|d| d.as_str())
-        {
-            if let Ok(d) = registry::digest::Digest::parse(cfg_digest) {
-                protected_blobs.insert(d.hex().to_string());
-            }
-        }
-        if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
-            for layer in layers {
-                if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
-                    if let Ok(d) = registry::digest::Digest::parse(d) {
-                        protected_blobs.insert(d.hex().to_string());
-                    }
-                }
-            }
+        for blob in refs.blob_references() {
+            protected_blobs.insert(blob.hex().to_string());
         }
     }
+    Ok(())
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -2153,4 +2116,173 @@ fn spawn_blob_gc_scheduler(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_env() -> (Arc<dyn storage::Storage>, proxy::Proxy, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let fs_root = temp_dir.path().join("registry");
+        let storage: Arc<dyn storage::Storage> =
+            Arc::new(storage::fs::FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let proxy_db_path = temp_dir.path().join("proxy.db");
+        let proxy_cfg = config::ProxyConfig {
+            enabled: true,
+            mode: config::ProxyMode::Allowlist,
+            upstream_base_url: Some("http://localhost:5000".to_string()),
+            upstream_username: None,
+            upstream_password: None,
+            allowed_upstream_hosts: vec!["localhost".to_string()],
+            allowed_repo_prefixes: vec![],
+            block_private_networks: false,
+            redirect_policy: config::RedirectPolicy::AnyPublic,
+            max_concurrent_upstream: 10,
+            index_path: proxy_db_path,
+            cache_fs_root: None,
+            cache_s3_prefix: None,
+            gc_interval_secs: 0,
+            scrub_enabled: false,
+            scrub_interval_secs: 0,
+            scrub_max_files_per_run: 0,
+            max_cache_bytes: None,
+            repo_rules: vec![],
+            upstreams: vec![],
+            routing_proxy_hosts: vec![],
+            routing_trust_x_forwarded_host: false,
+        };
+        let proxy = proxy::Proxy::new(&proxy_cfg).unwrap().unwrap();
+        (storage, proxy, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_collect_protected_blobs_protects_oci_artifact_blobs_and_subject() {
+        let (storage, proxy, _temp) = create_test_env();
+        let repo = "library/artifact";
+
+        let blob_digest = registry::digest::Digest::parse(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let subject_blob_digest = registry::digest::Digest::parse(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+
+        // 1. Subject manifest (has a layer blob)
+        let subject_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            },
+            "layers": [
+                { "digest": subject_blob_digest.as_str() }
+            ]
+        });
+        let subject_bytes = serde_json::to_vec(&subject_manifest).unwrap();
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &subject_bytes);
+        let subject_digest = registry::digest::Digest::parse(&format!(
+            "sha256:{}",
+            hex::encode(sha2::Digest::finalize(hasher))
+        ))
+        .unwrap();
+        storage
+            .put_manifest(repo, &subject_digest, bytes::Bytes::from(subject_bytes))
+            .await
+            .unwrap();
+
+        // 2. Artifact manifest referencing subject
+        let artifact_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
+            "blobs": [
+                { "digest": blob_digest.as_str() }
+            ],
+            "subject": {
+                "digest": subject_digest.as_str()
+            }
+        });
+        let artifact_bytes = serde_json::to_vec(&artifact_manifest).unwrap();
+        let mut hasher2 = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher2, &artifact_bytes);
+        let artifact_digest = registry::digest::Digest::parse(&format!(
+            "sha256:{}",
+            hex::encode(sha2::Digest::finalize(hasher2))
+        ))
+        .unwrap();
+        storage
+            .put_manifest(repo, &artifact_digest, bytes::Bytes::from(artifact_bytes))
+            .await
+            .unwrap();
+
+        let mut protected_blobs = HashSet::new();
+        let mut seen_manifests = HashSet::new();
+
+        collect_protected_blobs_for_manifest(
+            &storage,
+            repo,
+            &artifact_digest,
+            &mut protected_blobs,
+            &mut seen_manifests,
+            &proxy,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            protected_blobs.contains(blob_digest.hex()),
+            "artifact blob must be protected"
+        );
+        assert!(
+            protected_blobs.contains(subject_blob_digest.hex()),
+            "subject layer blob must be protected via subject traversal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_protected_blobs_aborts_on_unparsable_manifest() {
+        let (storage, proxy, _temp) = create_test_env();
+        let repo = "library/malformed-repo";
+
+        // Store a malformed manifest
+        let malformed_digest = registry::digest::Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let malformed_manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": "sha256:invalid-hex" },
+            "layers": []
+        });
+        storage
+            .put_manifest(
+                repo,
+                &malformed_digest,
+                serde_json::to_vec(&malformed_manifest).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        storage
+            .set_tag(repo, "v1", &malformed_digest)
+            .await
+            .unwrap();
+
+        let rules = vec![config::ProxyRepoRule {
+            match_pattern: "library/*".to_string(),
+            upstream_repo: None,
+            tag_policy: config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: config::EvictionPolicy::KeepTags(vec!["v1".to_string()]),
+        }];
+
+        let result = compute_protected_blobs(&storage, &rules, &proxy).await;
+        assert!(
+            result.is_err(),
+            "compute_protected_blobs must fail when a pinned manifest is unparsable"
+        );
+    }
 }

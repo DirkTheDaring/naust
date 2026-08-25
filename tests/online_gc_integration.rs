@@ -597,3 +597,71 @@ async fn phase_5_kill_switch_and_delete_gate_and_delete_flow() {
         assert!(resp.status().as_u16() == 404 || resp.status().as_u16() == 401);
     }
 }
+
+#[tokio::test]
+async fn test_gc_quarantine_aborts_when_manifest_unparsable_and_protects_blobs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = pick_unused_port();
+    let cfg_path = write_config(&dir, port, true, true);
+    let fs_root = dir.path().join("data");
+
+    let log_path = dir.path().join("server.log");
+    let _srv = spawn_server(&cfg_path, log_path.clone());
+    let base = format!("http://127.0.0.1:{port}");
+    wait_ready(&base, &log_path).await;
+
+    // 1. Create an unreferenced blob
+    let blob = b"potentially-orphan-blob".to_vec();
+    let hex = hex_sha256(&blob);
+    let live = live_blob_path(&fs_root, &hex);
+    std::fs::create_dir_all(live.parent().unwrap()).expect("mkdir live");
+    std::fs::write(&live, &blob).expect("write blob");
+
+    // 2. Create a malformed manifest on disk
+    let malformed_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let malformed_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "config": { "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        "layers": [{ "digest": "sha256:not-valid-hex-digest-at-all" }]
+    });
+    let manifests_dir = fs_root.join("repos").join("myrepo").join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("mkdir manifests");
+    let malformed_path = manifests_dir.join(malformed_hex);
+    std::fs::write(
+        &malformed_path,
+        serde_json::to_vec(&malformed_manifest).unwrap(),
+    )
+    .expect("write malformed manifest");
+
+    // 3. Attempt to run GC quarantine: must fail and NOT quarantine the blob
+    let q = admin_post_json(
+        &base,
+        "/_admin/gc/quarantine",
+        json!({"policy": "manifest_rooted", "min_age_secs": 0, "budgets": {"max_blobs": 1000}}),
+    )
+    .await;
+    assert_eq!(q.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+    let quarantined = quarantine_blob_path(&fs_root, &hex);
+    assert!(live.exists(), "live blob must still exist");
+    assert!(
+        !quarantined.exists(),
+        "blob must NOT be quarantined when graph is incomplete"
+    );
+
+    // 4. Remove the malformed manifest and rerun quarantine
+    std::fs::remove_file(&malformed_path).expect("remove malformed manifest");
+
+    let q2 = admin_post_json(
+        &base,
+        "/_admin/gc/quarantine",
+        json!({"policy": "manifest_rooted", "min_age_secs": 0, "budgets": {"max_blobs": 1000}}),
+    )
+    .await;
+    assert!(
+        q2.status().is_success(),
+        "quarantine must succeed after removing malformed manifest"
+    );
+    assert!(!live.exists(), "blob should now be quarantined");
+    assert!(quarantined.exists(), "blob should now exist in quarantine");
+}
