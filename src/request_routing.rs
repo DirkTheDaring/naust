@@ -52,53 +52,10 @@ pub fn effective_host_for_request(
     if host.is_empty() { None } else { Some(host) }
 }
 
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    // Minimal glob: '*' matches any substring.
-    if pattern == "*" {
-        return true;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == value;
-    }
-
-    let mut rest = value;
-
-    // First part must match at start.
-    if !parts[0].is_empty() {
-        if let Some(r) = rest.strip_prefix(parts[0]) {
-            rest = r;
-        } else {
-            return false;
-        }
-    }
-
-    // Middle parts must occur in order.
-    for part in parts.iter().skip(1).take(parts.len().saturating_sub(2)) {
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(idx) = rest.find(part) {
-            rest = &rest[idx + part.len()..];
-        } else {
-            return false;
-        }
-    }
-
-    // Last part must match at end.
-    if let Some(last) = parts.last() {
-        if last.is_empty() {
-            return true;
-        }
-        return rest.ends_with(last);
-    }
-    true
-}
-
 fn host_matches_any(patterns: &[String], host: &str) -> bool {
     patterns
         .iter()
-        .any(|p| wildcard_match(&p.to_ascii_lowercase(), host))
+        .any(|p| crate::glob::wildcard_match(&p.to_ascii_lowercase(), host))
 }
 
 pub fn proxy_upstream_index_for_request(proxy: &ProxyConfig, headers: &HeaderMap) -> Option<usize> {
@@ -179,7 +136,7 @@ pub fn resolve_trusted_client_ip(
 mod tests {
     use super::{
         V2RouteMode, effective_host_for_request, proxy_upstream_index_for_request,
-        resolve_trusted_client_ip, v2_route_mode_for_request, wildcard_match,
+        resolve_trusted_client_ip, v2_route_mode_for_request,
     };
     use crate::config::{ProxyConfig, ProxyMode, RedirectPolicy};
     use axum::http::HeaderMap;
@@ -213,7 +170,8 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_match_minimal_glob() {
+    fn host_wildcard_matching() {
+        use crate::glob::wildcard_match;
         assert!(wildcard_match("cache.example.com", "cache.example.com"));
         assert!(!wildcard_match("cache.example.com", "other.example.com"));
         assert!(wildcard_match("*.example.com", "cache.example.com"));

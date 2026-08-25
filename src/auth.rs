@@ -70,8 +70,23 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     Some(segments[..marker_idx].join("/"))
 }
 
-pub(crate) fn repo_allowed(allowlist: &[String], repo: &str) -> bool {
+/// Legacy repository push allowlist matcher.
+///
+/// Compatibility Contract:
+/// - `*` authorizes any repository.
+/// - `prefix/*` authorizes `prefix` itself as well as any `prefix/...` descendants.
+/// - Exact string `pat == repo` authorizes only the specified repository name.
+/// - Empty allowlist or non-matching repository returns `false`.
+pub(crate) fn legacy_repo_allowed(allowlist: &[String], repo: &str) -> bool {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return false;
+    }
     allowlist.iter().any(|pat| {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            return false;
+        }
         if pat == "*" {
             return true;
         }
@@ -249,7 +264,7 @@ fn verify_direct_basic_access(
     {
         if user == expected_user && pass == expected_pass {
             if let Some(allowlist) = cfg.push_allow_repos.as_deref() {
-                return repo_allowed(allowlist, repo_name);
+                return legacy_repo_allowed(allowlist, repo_name);
             }
             return true;
         }
@@ -378,7 +393,7 @@ pub async fn require_auth_middleware(
 
                 if required_action == security::RepoAction::Push {
                     if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                        if !repo_allowed(allowlist, repo_name) {
+                        if !legacy_repo_allowed(allowlist, repo_name) {
                             return errors::denied("push not allowed for this repository")
                                 .into_response();
                         }
@@ -415,7 +430,7 @@ pub async fn require_auth_middleware(
 mod tests {
     use super::{
         bearer_claims_are_authenticated, bearer_token_from_headers, extract_repo_from_v2_path,
-        repo_allowed,
+        legacy_repo_allowed,
     };
     use crate::security;
     use axum::http::HeaderMap;
@@ -483,27 +498,27 @@ mod tests {
     }
 
     #[test]
-    fn repo_allowed_matches_exact_and_prefix() {
+    fn legacy_repo_allowed_matches_exact_and_prefix() {
         let allowlist = vec!["org/repo".to_string(), "org/*".to_string()];
-        assert!(repo_allowed(&allowlist, "org/repo"));
-        assert!(repo_allowed(&allowlist, "org/other"));
-        assert!(!repo_allowed(&allowlist, "other/repo"));
+        assert!(legacy_repo_allowed(&allowlist, "org/repo"));
+        assert!(legacy_repo_allowed(&allowlist, "org/other"));
+        assert!(!legacy_repo_allowed(&allowlist, "other/repo"));
     }
 
     #[test]
-    fn repo_allowed_star_allows_everything() {
+    fn legacy_repo_allowed_star_allows_everything() {
         let allowlist = vec!["*".to_string()];
-        assert!(repo_allowed(&allowlist, "anything/here"));
-        assert!(repo_allowed(&allowlist, "single"));
+        assert!(legacy_repo_allowed(&allowlist, "anything/here"));
+        assert!(legacy_repo_allowed(&allowlist, "single"));
     }
 
     #[test]
-    fn repo_allowed_prefix_matches_exact_prefix_repo_too() {
+    fn legacy_repo_allowed_prefix_matches_exact_prefix_repo_too() {
         let allowlist = vec!["org/*".to_string()];
         // This registry treats 'org/*' as allowing 'org' and 'org/...'.
-        assert!(repo_allowed(&allowlist, "org"));
-        assert!(repo_allowed(&allowlist, "org/repo"));
-        assert!(!repo_allowed(&allowlist, "org2/repo"));
+        assert!(legacy_repo_allowed(&allowlist, "org"));
+        assert!(legacy_repo_allowed(&allowlist, "org/repo"));
+        assert!(!legacy_repo_allowed(&allowlist, "org2/repo"));
     }
 
     #[test]

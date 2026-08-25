@@ -197,7 +197,7 @@ impl Proxy {
         self.cfg
             .repo_rules
             .iter()
-            .find(|r| wildcard_match(&r.match_pattern, repo))
+            .find(|r| crate::glob::wildcard_match(&r.match_pattern, repo))
     }
 
     fn upstream_base_url(&self) -> Result<Url, ProxyError> {
@@ -956,40 +956,6 @@ impl SingleFlight {
             }
         }
     }
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    // Very small glob: '*' matches any substring.
-    if !pattern.contains('*') {
-        return pattern == value;
-    }
-    let mut parts = pattern.split('*');
-    let first = parts.next().unwrap_or("");
-    if !value.starts_with(first) {
-        return false;
-    }
-    let mut remainder = &value[first.len()..];
-    let mut last_part = first;
-    for part in parts {
-        if part.is_empty() {
-            last_part = part;
-            continue;
-        }
-        if let Some(idx) = remainder.find(part) {
-            remainder = &remainder[idx + part.len()..];
-            last_part = part;
-        } else {
-            return false;
-        }
-    }
-    if !pattern.ends_with('*') {
-        // If pattern doesn't end with '*', ensure we consumed to the end by checking that the last
-        // non-empty part is a suffix.
-        if !value.ends_with(last_part) {
-            return false;
-        }
-    }
-    true
 }
 
 fn base_domain(host: &str) -> Option<String> {

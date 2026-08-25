@@ -53,6 +53,29 @@ pub fn validate_grants(grants: &[Grant]) -> Result<Vec<Grant>, PolicyError> {
     Ok(out)
 }
 
+/// Evaluates whether a validated repository grant prefix authorizes access to a repository.
+///
+/// Security Invariants:
+/// - `grant_prefix == "*"` authorizes any valid non-empty repository name.
+/// - If `grant_prefix` ends with `/` (e.g. `"org/"`), it matches `"org/app"` and `"org/sub/app"`,
+///   but NEVER matches `"org2/app"` (prefix boundary leakage) or bare `"org"`.
+/// - Empty repositories or empty grants fail closed (return `false`).
+/// - Exact repository grants match `grant_prefix == repo`.
+pub fn matches_repo_grant(grant_prefix: &str, repo: &str) -> bool {
+    let repo = repo.trim();
+    let grant = grant_prefix.trim();
+    if repo.is_empty() || grant.is_empty() {
+        return false;
+    }
+    if grant == "*" {
+        return true;
+    }
+    if grant.ends_with('/') {
+        return repo.starts_with(grant);
+    }
+    grant == repo
+}
+
 /// Compute granted token scopes as the intersection of:
 /// - requested scopes (already sanitized)
 /// - allowed actions derived from prefix grants
@@ -94,7 +117,7 @@ pub fn grant_scopes_by_prefix(
 
         let mut allowed: Vec<&str> = Vec::new();
         for g in &grants {
-            if g.repo_prefix == "*" || repo.starts_with(&g.repo_prefix) {
+            if matches_repo_grant(&g.repo_prefix, repo) {
                 for a in &g.actions {
                     if !allowed.iter().any(|x| x == a) {
                         allowed.push(a);
@@ -258,5 +281,213 @@ mod tests {
 
         let granted = grant_scopes_by_prefix(&requested, &grants);
         assert_eq!(granted, requested);
+    }
+
+    #[test]
+    fn test_matcher_truth_table_differential_analysis() {
+        use crate::auth::legacy_repo_allowed;
+        use crate::glob::wildcard_match;
+
+        struct TruthRow {
+            pattern: &'static str,
+            value: &'static str,
+            expected_glob: bool,
+            expected_rbac: bool,
+            expected_legacy: bool,
+        }
+
+        let rows = [
+            // Exact match
+            TruthRow {
+                pattern: "org/app",
+                value: "org/app",
+                expected_glob: true,
+                expected_rbac: true, // exact repo match
+                expected_legacy: true,
+            },
+            TruthRow {
+                pattern: "org/app",
+                value: "org/other",
+                expected_glob: false,
+                expected_rbac: false,
+                expected_legacy: false,
+            },
+            // Global '*'
+            TruthRow {
+                pattern: "*",
+                value: "org/app",
+                expected_glob: true,
+                expected_rbac: true,
+                expected_legacy: true,
+            },
+            TruthRow {
+                pattern: "*",
+                value: "",
+                expected_glob: true,
+                expected_rbac: false,   // empty repo fails closed
+                expected_legacy: false, // empty repo fails closed for authorization
+            },
+            // Prefix boundary 'org/'
+            TruthRow {
+                pattern: "org/",
+                value: "org/app",
+                expected_glob: false,   // glob is exact
+                expected_rbac: true,    // RBAC prefix match
+                expected_legacy: false, // legacy uses 'org/*'
+            },
+            TruthRow {
+                pattern: "org/",
+                value: "org/sub/app",
+                expected_glob: false,
+                expected_rbac: true,
+                expected_legacy: false,
+            },
+            TruthRow {
+                pattern: "org/",
+                value: "org",
+                expected_glob: false,
+                expected_rbac: false, // bare base repo not matched by prefix
+                expected_legacy: false,
+            },
+            TruthRow {
+                pattern: "org/",
+                value: "org2/app",
+                expected_glob: false,
+                expected_rbac: false, // prefix boundary enforced
+                expected_legacy: false,
+            },
+            // Legacy wildcard 'org/*'
+            TruthRow {
+                pattern: "org/*",
+                value: "org/app",
+                expected_glob: true,
+                expected_rbac: false, // RBAC grants use 'org/', not 'org/*'
+                expected_legacy: true,
+            },
+            TruthRow {
+                pattern: "org/*",
+                value: "org/sub/app",
+                expected_glob: true,
+                expected_rbac: false,
+                expected_legacy: true,
+            },
+            TruthRow {
+                pattern: "org/*",
+                value: "org",
+                expected_glob: false,
+                expected_rbac: false,
+                expected_legacy: true, // legacy compatibility feature: org/* covers org
+            },
+            TruthRow {
+                pattern: "org/*",
+                value: "org2/app",
+                expected_glob: false,
+                expected_rbac: false,
+                expected_legacy: false,
+            },
+            // Suffix and arbitrary glob
+            TruthRow {
+                pattern: "*app",
+                value: "my-app",
+                expected_glob: true,
+                expected_rbac: false,
+                expected_legacy: false,
+            },
+            TruthRow {
+                pattern: "a*b*c",
+                value: "a1b2c",
+                expected_glob: true,
+                expected_rbac: false,
+                expected_legacy: false,
+            },
+            // Empty pattern
+            TruthRow {
+                pattern: "",
+                value: "",
+                expected_glob: true,
+                expected_rbac: false,
+                expected_legacy: false,
+            },
+            TruthRow {
+                pattern: "",
+                value: "org/app",
+                expected_glob: false,
+                expected_rbac: false,
+                expected_legacy: false,
+            },
+        ];
+
+        for row in rows {
+            let actual_glob = wildcard_match(row.pattern, row.value);
+            let actual_rbac = matches_repo_grant(row.pattern, row.value);
+            let actual_legacy = legacy_repo_allowed(&[row.pattern.to_string()], row.value);
+
+            assert_eq!(
+                actual_glob, row.expected_glob,
+                "Glob mismatch for pattern='{}' value='{}'",
+                row.pattern, row.value
+            );
+            assert_eq!(
+                actual_rbac, row.expected_rbac,
+                "RBAC mismatch for pattern='{}' value='{}'",
+                row.pattern, row.value
+            );
+            assert_eq!(
+                actual_legacy, row.expected_legacy,
+                "Legacy mismatch for pattern='{}' value='{}'",
+                row.pattern, row.value
+            );
+        }
+    }
+
+    #[test]
+    fn test_authorization_regression_boundaries() {
+        let grants = vec![
+            Grant {
+                repo_prefix: "teams/core/".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            },
+            Grant {
+                repo_prefix: "teams/read-only/".to_string(),
+                actions: vec!["pull".to_string()],
+            },
+        ];
+
+        // 1. Valid nested matches
+        let req_valid = vec![
+            security::TokenScope {
+                typ: "repository".to_string(),
+                name: "teams/core/service-a".to_string(),
+                actions: vec!["push".to_string()],
+            },
+            security::TokenScope {
+                typ: "repository".to_string(),
+                name: "teams/read-only/docs".to_string(),
+                actions: vec!["pull".to_string(), "push".to_string()],
+            },
+        ];
+        let granted = grant_scopes_by_prefix(&req_valid, &grants);
+        assert_eq!(granted.len(), 2);
+        assert_eq!(granted[0].name, "teams/core/service-a");
+        assert_eq!(granted[0].actions, vec!["push".to_string()]);
+        // push denied on read-only prefix
+        assert_eq!(granted[1].name, "teams/read-only/docs");
+        assert_eq!(granted[1].actions, vec!["pull".to_string()]);
+
+        // 2. Prefix collision attempts fail closed
+        let req_collisions = vec![
+            security::TokenScope {
+                typ: "repository".to_string(),
+                name: "teams/core-extra/service".to_string(),
+                actions: vec!["pull".to_string()],
+            },
+            security::TokenScope {
+                typ: "repository".to_string(),
+                name: "teams/core".to_string(),
+                actions: vec!["pull".to_string()],
+            },
+        ];
+        let granted_collisions = grant_scopes_by_prefix(&req_collisions, &grants);
+        assert!(granted_collisions.is_empty());
     }
 }

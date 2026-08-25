@@ -6,6 +6,7 @@ mod blob_ref_index;
 mod config;
 mod fs_root_lock;
 mod gc_service;
+mod glob;
 mod http_api;
 mod ip_concurrency;
 mod manifest_refs;
@@ -1550,7 +1551,7 @@ async fn compute_protected_blobs(
 
     for repo in repos {
         for rule in repo_rules {
-            if !wildcard_match(&rule.match_pattern, &repo) {
+            if !crate::glob::wildcard_match(&rule.match_pattern, &repo) {
                 continue;
             }
 
@@ -1634,37 +1635,6 @@ async fn collect_protected_blobs_for_manifest(
         }
     }
     Ok(())
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    if !pattern.contains('*') {
-        return pattern == value;
-    }
-    let mut parts = pattern.split('*');
-    let first = parts.next().unwrap_or("");
-    if !value.starts_with(first) {
-        return false;
-    }
-    let mut remainder = &value[first.len()..];
-    let mut last_part = first;
-    for part in parts {
-        if part.is_empty() {
-            last_part = part;
-            continue;
-        }
-        if let Some(idx) = remainder.find(part) {
-            remainder = &remainder[idx + part.len()..];
-            last_part = part;
-        } else {
-            return false;
-        }
-    }
-    if !pattern.ends_with('*') {
-        if !value.ends_with(last_part) {
-            return false;
-        }
-    }
-    true
 }
 
 fn pick_latest_semver_tag(

@@ -2131,7 +2131,7 @@ impl Config {
 
     pub fn resolved_upload_policy_for_repo(&self, repo: &str) -> ResolvedUploadPolicy {
         for rule in &self.upload_policy.repo_rules {
-            if wildcard_match(&rule.match_pattern, repo) {
+            if crate::glob::wildcard_match(&rule.match_pattern, repo) {
                 return ResolvedUploadPolicy {
                     abort_on_error: rule
                         .abort_on_error
@@ -2561,46 +2561,6 @@ fn resolve_proxy_upstreams(
     }
 
     Ok(upstreams)
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    // Minimal glob: '*' matches any substring.
-    if pattern == "*" {
-        return true;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == value;
-    }
-
-    let mut rest = value;
-    let mut first = true;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if first && !pattern.starts_with('*') {
-            if !rest.starts_with(part) {
-                return false;
-            }
-            rest = &rest[part.len()..];
-            first = false;
-            continue;
-        }
-
-        if let Some(pos) = rest.find(part) {
-            rest = &rest[pos + part.len()..];
-        } else {
-            return false;
-        }
-
-        if i == parts.len() - 1 && !pattern.ends_with('*') {
-            return rest.is_empty();
-        }
-
-        first = false;
-    }
-    true
 }
 
 fn parse_toml_config(contents: &str) -> Result<(FileConfig, Vec<String>), toml::de::Error> {

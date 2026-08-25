@@ -344,7 +344,7 @@ pub async fn token(
         if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
             for scope in &decision.scopes {
                 if scope.typ == "repository" {
-                    if !crate::auth::repo_allowed(allowlist, &scope.name) {
+                    if !crate::auth::legacy_repo_allowed(allowlist, &scope.name) {
                         return errors::denied("push not allowed for this repository")
                             .into_response();
                     }
