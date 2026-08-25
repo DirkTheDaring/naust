@@ -44,6 +44,53 @@ fn cache_key_from_base_url(base_url: &str) -> String {
     sanitize_for_path_component(base_url)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("failed to read config file {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "failed to parse TOML in {}: {source}",
+        .path.as_deref().map(|p| p.to_string_lossy()).unwrap_or_else(|| "<string>".into())
+    )]
+    Toml {
+        path: Option<PathBuf>,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("failed to deserialize merged configuration: {source}")]
+    Deserialize {
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("unknown TOML configuration keys (strict mode):\n  - {}", .keys.join("\n  - "))]
+    UnknownKeys { keys: Vec<String> },
+
+    #[error("invalid environment variable '{key}': expected {expected}")]
+    InvalidEnvValue {
+        key: &'static str,
+        expected: &'static str,
+    },
+
+    #[error("missing required configuration: {field}")]
+    MissingRequired { field: &'static str },
+
+    #[error("invalid configuration value for '{field}': {message}")]
+    InvalidValue {
+        field: &'static str,
+        message: String,
+    },
+
+    #[error("conflicting configuration: {message}")]
+    Conflict { message: String },
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: SocketAddr,
@@ -1027,26 +1074,25 @@ struct FileTimeouts {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileCatalog {
-    #[serde(default)]
     requires_auth: Option<bool>,
 }
 
 impl Config {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_env_with_files(&[])
     }
 
-    pub fn from_env_with_files(config_paths: &[PathBuf]) -> Self {
+    pub fn from_env_with_files(config_paths: &[PathBuf]) -> Result<Self, ConfigError> {
         // Precedence:
         //   defaults < config file(s) < env vars
         let loaded = if config_paths.is_empty() {
-            load_config_file()
+            load_config_file()?
         } else {
-            load_config_files(config_paths)
+            load_config_files(config_paths)?
         };
         let file_cfg = loaded.cfg;
 
-        let best_practice = env_bool_opt(&["BEST_PRACTICE"]).unwrap_or(false)
+        let best_practice = env_bool_opt(&["BEST_PRACTICE"])?.unwrap_or(false)
             || file_cfg
                 .profile
                 .name
@@ -1056,7 +1102,7 @@ impl Config {
 
         // Optional strict config parsing: fail fast on unknown keys/typos.
         // - enabled by env vars, TOML [config].strict, or best_practice profile.
-        let strict_config = env_bool_opt(&["REGISTRY__CONFIG__STRICT", "STRICT_CONFIG"])
+        let strict_config = env_bool_opt(&["REGISTRY__CONFIG__STRICT", "STRICT_CONFIG"])?
             .or(file_cfg.config.strict)
             .unwrap_or(best_practice);
         if !loaded.ignored_paths.is_empty() {
@@ -1064,10 +1110,7 @@ impl Config {
                 let mut paths = loaded.ignored_paths;
                 paths.sort();
                 paths.dedup();
-                panic!(
-                    "Unknown TOML keys found (enable fix or remove typos):\n  - {}",
-                    paths.join("\n  - ")
-                );
+                return Err(ConfigError::UnknownKeys { keys: paths });
             } else {
                 let mut paths = loaded.ignored_paths;
                 paths.sort();
@@ -1079,7 +1122,7 @@ impl Config {
             }
         }
 
-        let listen_addr = env_socket_addr(&["REGISTRY__SERVER__LISTEN_ADDR", "LISTEN_ADDR"])
+        let listen_addr = env_socket_addr_opt(&["REGISTRY__SERVER__LISTEN_ADDR", "LISTEN_ADDR"])?
             .unwrap_or_else(|| {
                 file_cfg
                     .server
@@ -1087,12 +1130,12 @@ impl Config {
                     .unwrap_or_else(|| ([127, 0, 0, 1], 5000).into())
             });
 
-        let mut tls_cert_path = env_str_any(&["REGISTRY__SERVER__TLS__CERT_PATH", "TLS_CERT_PATH"])
+        let mut tls_cert_path = env_str_opt(&["REGISTRY__SERVER__TLS__CERT_PATH", "TLS_CERT_PATH"])
             .or_else(|| file_cfg.server.tls.cert_path.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        let mut tls_key_path = env_str_any(&["REGISTRY__SERVER__TLS__KEY_PATH", "TLS_KEY_PATH"])
+        let mut tls_key_path = env_str_opt(&["REGISTRY__SERVER__TLS__KEY_PATH", "TLS_KEY_PATH"])
             .or_else(|| file_cfg.server.tls.key_path.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1100,30 +1143,28 @@ impl Config {
 
         // ACME TLS provisioning (DNS-01 via acmecert-core).
         let acme_enabled =
-            env_bool_opt(&["REGISTRY__SERVER__TLS__ACME__ENABLED", "TLS_ACME_ENABLED"])
+            env_bool_opt(&["REGISTRY__SERVER__TLS__ACME__ENABLED", "TLS_ACME_ENABLED"])?
                 .or(file_cfg.server.tls.acme.enabled)
                 .unwrap_or(false);
 
         let tls_acme = if acme_enabled {
             let provider_raw =
-                env_str_any(&["REGISTRY__SERVER__TLS__ACME__PROVIDER", "TLS_ACME_PROVIDER"])
+                env_str_opt(&["REGISTRY__SERVER__TLS__ACME__PROVIDER", "TLS_ACME_PROVIDER"])
                     .or_else(|| file_cfg.server.tls.acme.provider.clone())
                     .map(|s| s.trim().to_ascii_lowercase())
                     .unwrap_or_else(|| "ispone".to_string());
 
-            let email = env_str_any(&["REGISTRY__SERVER__TLS__ACME__EMAIL", "TLS_ACME_EMAIL"])
+            let email = env_str_opt(&["REGISTRY__SERVER__TLS__ACME__EMAIL", "TLS_ACME_EMAIL"])
                 .or_else(|| file_cfg.server.tls.acme.email.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "ACME is enabled but email is missing: set server.tls.acme.email (or TLS_ACME_EMAIL)"
-                    )
-                });
+                .ok_or(ConfigError::MissingRequired {
+                    field: "server.tls.acme.email (or TLS_ACME_EMAIL)",
+                })?;
 
             let names = {
                 let mut out =
-                    env_str_any(&["REGISTRY__SERVER__TLS__ACME__NAMES", "TLS_ACME_NAMES"])
+                    env_str_opt(&["REGISTRY__SERVER__TLS__ACME__NAMES", "TLS_ACME_NAMES"])
                         .map(|s| {
                             s.split(',')
                                 .map(|p| p.trim().to_string())
@@ -1134,14 +1175,14 @@ impl Config {
                         .unwrap_or_else(|| file_cfg.server.tls.acme.names.clone());
                 out.retain(|s| !s.trim().is_empty());
                 if out.is_empty() {
-                    panic!(
-                        "ACME is enabled but names is empty: set server.tls.acme.names (or TLS_ACME_NAMES)"
-                    );
+                    return Err(ConfigError::MissingRequired {
+                        field: "server.tls.acme.names (or TLS_ACME_NAMES)",
+                    });
                 }
                 out
             };
 
-            let output_dir = env_str_any(&[
+            let output_dir = env_str_opt(&[
                 "REGISTRY__SERVER__TLS__ACME__OUTPUT_DIR",
                 "TLS_ACME_OUTPUT_DIR",
             ])
@@ -1149,76 +1190,70 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!(
-                    "ACME is enabled but output_dir is missing: set server.tls.acme.output_dir (or TLS_ACME_OUTPUT_DIR)"
-                )
-            });
+            .ok_or(ConfigError::MissingRequired {
+                field: "server.tls.acme.output_dir (or TLS_ACME_OUTPUT_DIR)",
+            })?;
 
             let allow_first_wildcard = env_bool_opt(&[
                 "REGISTRY__SERVER__TLS__ACME__ALLOW_FIRST_WILDCARD",
                 "TLS_ACME_ALLOW_FIRST_WILDCARD",
-            ])
+            ])?
             .or(file_cfg.server.tls.acme.allow_first_wildcard)
             .unwrap_or(false);
 
-            let renewal_window_secs = env_u64_any(&[
+            let renewal_window_secs = env_u64_opt(&[
                 "REGISTRY__SERVER__TLS__ACME__RENEWAL_WINDOW_SECS",
                 "TLS_ACME_RENEWAL_WINDOW_SECS",
-            ])
+            ])?
             .or(file_cfg.server.tls.acme.renewal_window_secs)
             .unwrap_or(30 * 24 * 60 * 60);
 
-            let proxy = env_str_any(&["REGISTRY__SERVER__TLS__ACME__PROXY", "TLS_ACME_PROXY"])
+            let proxy = env_str_opt(&["REGISTRY__SERVER__TLS__ACME__PROXY", "TLS_ACME_PROXY"])
                 .or_else(|| file_cfg.server.tls.acme.proxy.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            let debug = env_bool_opt(&["REGISTRY__SERVER__TLS__ACME__DEBUG", "TLS_ACME_DEBUG"])
+            let debug = env_bool_opt(&["REGISTRY__SERVER__TLS__ACME__DEBUG", "TLS_ACME_DEBUG"])?
                 .or(file_cfg.server.tls.acme.debug)
                 .unwrap_or(false);
 
             let propagation_check_disabled = env_bool_opt(&[
                 "REGISTRY__SERVER__TLS__ACME__PROPAGATION_CHECK_DISABLED",
                 "TLS_ACME_PROPAGATION_CHECK_DISABLED",
-            ])
+            ])?
             .or(file_cfg.server.tls.acme.propagation_check_disabled)
             .unwrap_or(false);
 
             let propagation_check_strict = env_bool_opt(&[
                 "REGISTRY__SERVER__TLS__ACME__PROPAGATION_CHECK_STRICT",
                 "TLS_ACME_PROPAGATION_CHECK_STRICT",
-            ])
+            ])?
             .or(file_cfg.server.tls.acme.propagation_check_strict)
             .unwrap_or(false);
 
             let provider = match provider_raw.as_str() {
                 "ispone" => {
-                    let base_url = env_str_any(&[
+                    let base_url = env_str_opt(&[
                         "REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL",
                         "TLS_ACME_ISPONE_BASE_URL",
                     ])
                     .or_else(|| file_cfg.server.tls.acme.ispone.base_url.clone())
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "ACME provider 'ispone' requires base_url: set server.tls.acme.ispone.base_url (or TLS_ACME_ISPONE_BASE_URL)"
-                        )
-                    });
+                    .ok_or(ConfigError::MissingRequired {
+                        field: "server.tls.acme.ispone.base_url (or TLS_ACME_ISPONE_BASE_URL)",
+                    })?;
 
-                    let authorization = env_str_any(&[
+                    let authorization = env_str_opt(&[
                         "REGISTRY__SERVER__TLS__ACME__ISPONE__AUTHORIZATION",
                         "TLS_ACME_ISPONE_AUTHORIZATION",
                     ])
                     .or_else(|| file_cfg.server.tls.acme.ispone.authorization.clone())
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "ACME provider 'ispone' requires authorization: set server.tls.acme.ispone.authorization (or TLS_ACME_ISPONE_AUTHORIZATION)"
-                        )
-                    });
+                    .ok_or(ConfigError::MissingRequired {
+                        field: "server.tls.acme.ispone.authorization (or TLS_ACME_ISPONE_AUTHORIZATION)",
+                    })?;
 
                     AcmeProvider::Ispone {
                         base_url,
@@ -1226,7 +1261,7 @@ impl Config {
                     }
                 }
                 "exec_path" | "exec" => {
-                    let exec_path = env_str_any(&[
+                    let exec_path = env_str_opt(&[
                         "REGISTRY__SERVER__TLS__ACME__EXEC_PATH__EXEC_PATH",
                         "TLS_ACME_EXEC_PATH",
                     ])
@@ -1234,17 +1269,16 @@ impl Config {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "ACME provider 'exec_path' requires exec_path: set server.tls.acme.exec_path.exec_path (or TLS_ACME_EXEC_PATH)"
-                        )
-                    });
+                    .ok_or(ConfigError::MissingRequired {
+                        field: "server.tls.acme.exec_path.exec_path (or TLS_ACME_EXEC_PATH)",
+                    })?;
                     AcmeProvider::ExecPath { exec_path }
                 }
-                other => {
-                    panic!(
-                        "Unknown server.tls.acme.provider '{other}': expected 'ispone' or 'exec_path'"
-                    )
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "server.tls.acme.provider",
+                        message: "unknown provider: expected 'ispone' or 'exec_path'".into(),
+                    });
                 }
             };
 
@@ -1259,16 +1293,17 @@ impl Config {
                 }
                 (Some(cert), Some(key)) => {
                     if cert != &generated_cert || key != &generated_key {
-                        panic!(
-                            "ACME is enabled but TLS cert/key paths do not match ACME output_dir. Expected cert_path={:?} key_path={:?}",
-                            generated_cert, generated_key
-                        );
+                        return Err(ConfigError::Conflict {
+                            message: format!(
+                                "ACME is enabled but TLS cert/key paths do not match ACME output_dir. Expected cert_path={generated_cert:?} key_path={generated_key:?}"
+                            ),
+                        });
                     }
                 }
                 _ => {
-                    panic!(
-                        "ACME is enabled but only one of TLS cert/key paths is set; set both or neither"
-                    );
+                    return Err(ConfigError::Conflict {
+                        message: "ACME is enabled but only one of TLS cert/key paths is set; set both or neither".into(),
+                    });
                 }
             }
 
@@ -1288,12 +1323,12 @@ impl Config {
             None
         };
 
-        let push_username = env_str_any(&["REGISTRY__AUTH__PUSH__USERNAME", "REGISTRY_USERNAME"])
+        let push_username = env_str_opt(&["REGISTRY__AUTH__PUSH__USERNAME", "REGISTRY_USERNAME"])
             .or_else(|| file_cfg.auth.push.username.clone());
-        let push_password = env_str_any(&["REGISTRY__AUTH__PUSH__PASSWORD", "REGISTRY_PASSWORD"])
+        let push_password = env_str_opt(&["REGISTRY__AUTH__PUSH__PASSWORD", "REGISTRY_PASSWORD"])
             .or_else(|| file_cfg.auth.push.password.clone());
 
-        let auth_strategy_raw = env_str_any(&["REGISTRY__AUTH__STRATEGY", "AUTH_STRATEGY"])
+        let auth_strategy_raw = env_str_opt(&["REGISTRY__AUTH__STRATEGY", "AUTH_STRATEGY"])
             .or_else(|| file_cfg.auth.strategy.clone())
             .map(|s| s.trim().to_ascii_lowercase())
             .unwrap_or_else(|| "token".to_string());
@@ -1301,17 +1336,20 @@ impl Config {
             "bearer" | "token" => AuthStrategy::Token,
             "basic" => AuthStrategy::Basic,
             "both" | "basic_and_token" => AuthStrategy::Both,
-            other => {
-                panic!("Unknown auth.strategy '{other}': expected 'token', 'basic', or 'both'")
+            _ => {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.strategy",
+                    message: "unknown strategy: expected 'token', 'basic', or 'both'".into(),
+                });
             }
         };
 
         let anonymous_pull =
-            env_bool_opt(&["REGISTRY__AUTH__ANONYMOUS_PULL", "AUTH_ANONYMOUS_PULL"])
+            env_bool_opt(&["REGISTRY__AUTH__ANONYMOUS_PULL", "AUTH_ANONYMOUS_PULL"])?
                 .or_else(|| file_cfg.auth.anonymous_pull)
                 .unwrap_or(true);
 
-        let push_allow_repos = env_str_any(&[
+        let push_allow_repos = env_str_opt(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
             "REGISTRY_PUSH_ALLOW_REPOS",
         ])
@@ -1325,7 +1363,7 @@ impl Config {
         .or_else(|| file_cfg.auth.push.allow_repos.clone())
         .filter(|v| !v.is_empty());
 
-        let storage_backend_raw = env_str_any(&["REGISTRY__STORAGE__BACKEND", "STORAGE_BACKEND"])
+        let storage_backend_raw = env_str_opt(&["REGISTRY__STORAGE__BACKEND", "STORAGE_BACKEND"])
             .or_else(|| file_cfg.storage.backend.clone())
             .unwrap_or_else(|| "fs".to_string());
         let storage_backend = match storage_backend_raw.trim().to_ascii_lowercase().as_str() {
@@ -1337,7 +1375,7 @@ impl Config {
             }
         };
 
-        let fs_root = env_str_any(&["REGISTRY__STORAGE__FS__ROOT", "STORAGE_FS_ROOT"])
+        let fs_root = env_str_opt(&["REGISTRY__STORAGE__FS__ROOT", "STORAGE_FS_ROOT"])
             .or_else(|| file_cfg.storage.fs.root.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1345,34 +1383,34 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("./data"));
 
         let admin_api_enabled =
-            env_bool_opt(&["REGISTRY__ADMIN_API__ENABLED", "ADMIN_API_ENABLED"])
+            env_bool_opt(&["REGISTRY__ADMIN_API__ENABLED", "ADMIN_API_ENABLED"])?
                 .or(file_cfg.admin_api.enabled)
                 .unwrap_or(false);
         let admin_api_username =
-            env_str_any(&["REGISTRY__ADMIN_API__USERNAME", "ADMIN_API_USERNAME"])
+            env_str_opt(&["REGISTRY__ADMIN_API__USERNAME", "ADMIN_API_USERNAME"])
                 .or_else(|| file_cfg.admin_api.username.clone());
         let admin_api_password =
-            env_str_any(&["REGISTRY__ADMIN_API__PASSWORD", "ADMIN_API_PASSWORD"])
+            env_str_opt(&["REGISTRY__ADMIN_API__PASSWORD", "ADMIN_API_PASSWORD"])
                 .or_else(|| file_cfg.admin_api.password.clone());
 
-        let s3_endpoint = env_str_any(&["REGISTRY__STORAGE__S3__ENDPOINT", "STORAGE_S3_ENDPOINT"])
+        let s3_endpoint = env_str_opt(&["REGISTRY__STORAGE__S3__ENDPOINT", "STORAGE_S3_ENDPOINT"])
             .or_else(|| file_cfg.storage.s3.endpoint.clone());
-        let s3_region = env_str_any(&["REGISTRY__STORAGE__S3__REGION", "STORAGE_S3_REGION"])
+        let s3_region = env_str_opt(&["REGISTRY__STORAGE__S3__REGION", "STORAGE_S3_REGION"])
             .or_else(|| file_cfg.storage.s3.region.clone());
-        let s3_bucket = env_str_any(&["REGISTRY__STORAGE__S3__BUCKET", "STORAGE_S3_BUCKET"])
+        let s3_bucket = env_str_opt(&["REGISTRY__STORAGE__S3__BUCKET", "STORAGE_S3_BUCKET"])
             .or_else(|| file_cfg.storage.s3.bucket.clone());
-        let s3_prefix = env_str_any(&["REGISTRY__STORAGE__S3__PREFIX", "STORAGE_S3_PREFIX"])
+        let s3_prefix = env_str_opt(&["REGISTRY__STORAGE__S3__PREFIX", "STORAGE_S3_PREFIX"])
             .or_else(|| file_cfg.storage.s3.prefix.clone())
             .unwrap_or_else(|| "registry".to_string());
 
         let ref_index_enabled = env_bool_opt(&[
             "REGISTRY__STORAGE__REF_INDEX__ENABLED",
             "STORAGE_REF_INDEX_ENABLED",
-        ])
+        ])?
         .or(file_cfg.storage.ref_index.enabled)
         .unwrap_or(true);
 
-        let ref_index_path = env_str_any(&[
+        let ref_index_path = env_str_opt(&[
             "REGISTRY__STORAGE__REF_INDEX__PATH",
             "STORAGE_REF_INDEX_PATH",
         ])
@@ -1385,210 +1423,210 @@ impl Config {
         let ref_index_rebuild_on_start = env_bool_opt(&[
             "REGISTRY__STORAGE__REF_INDEX__REBUILD_ON_START",
             "STORAGE_REF_INDEX_REBUILD_ON_START",
-        ])
+        ])?
         .or(file_cfg.storage.ref_index.rebuild_on_start)
         .unwrap_or(false);
 
         let ref_index_auto_rebuild_on_corruption = env_bool_opt(&[
             "REGISTRY__STORAGE__REF_INDEX__AUTO_REBUILD_ON_CORRUPTION",
             "STORAGE_REF_INDEX_AUTO_REBUILD_ON_CORRUPTION",
-        ])
+        ])?
         .or(file_cfg.storage.ref_index.auto_rebuild_on_corruption)
         .unwrap_or(true);
 
         let allow_tag_overwrite = env_bool_opt(&[
             "REGISTRY__FEATURES__ALLOW_TAG_OVERWRITE",
             "ALLOW_TAG_OVERWRITE",
-        ])
+        ])?
         .or(file_cfg.features.allow_tag_overwrite)
         .unwrap_or_else(|| !best_practice);
 
         let automatic_crossmount = env_bool_opt(&[
             "REGISTRY__FEATURES__AUTOMATIC_CROSSMOUNT",
             "REGISTRY_AUTOMATIC_CROSSMOUNT",
-        ])
+        ])?
         .or(file_cfg.features.automatic_crossmount)
         .unwrap_or(false);
 
         let upload_gc_enabled =
-            env_bool_opt(&["REGISTRY__UPLOADS__GC_ENABLED", "UPLOAD_GC_ENABLED"])
+            env_bool_opt(&["REGISTRY__UPLOADS__GC_ENABLED", "UPLOAD_GC_ENABLED"])?
                 .or(file_cfg.uploads.gc_enabled)
                 .unwrap_or(true);
 
-        let upload_gc_interval_secs = env_u64_any(&[
+        let upload_gc_interval_secs = env_u64_opt(&[
             "REGISTRY__UPLOADS__GC_INTERVAL_SECS",
             "UPLOAD_GC_INTERVAL_SECS",
-        ])
+        ])?
         .or(file_cfg.uploads.gc_interval_secs)
         .unwrap_or(3600);
 
-        let upload_gc_max_age_secs = env_u64_any(&[
+        let upload_gc_max_age_secs = env_u64_opt(&[
             "REGISTRY__UPLOADS__GC_MAX_AGE_SECS",
             "UPLOAD_GC_MAX_AGE_SECS",
-        ])
+        ])?
         .or(file_cfg.uploads.gc_max_age_secs)
         .unwrap_or(24 * 3600);
 
-        let blob_gc_finalize_grace_secs = env_u64_any(&[
+        let blob_gc_finalize_grace_secs = env_u64_opt(&[
             "REGISTRY__BLOB_GC__FINALIZE_GRACE_SECS",
             "BLOB_GC_FINALIZE_GRACE_SECS",
-        ])
+        ])?
         .or(file_cfg.blob_gc.finalize_grace_secs)
         .unwrap_or(72 * 3600);
 
         // Online blob GC safety toggles + defaults.
         // Defaults are conservative and match docs/blob-gc-online.md.
-        let blob_gc_enabled = env_bool_opt(&["REGISTRY__BLOB_GC__ENABLED", "BLOB_GC_ENABLED"])
+        let blob_gc_enabled = env_bool_opt(&["REGISTRY__BLOB_GC__ENABLED", "BLOB_GC_ENABLED"])?
             .or(file_cfg.blob_gc.enabled)
             .unwrap_or(false);
         let blob_gc_enable_delete =
-            env_bool_opt(&["REGISTRY__BLOB_GC__ENABLE_DELETE", "BLOB_GC_ENABLE_DELETE"])
+            env_bool_opt(&["REGISTRY__BLOB_GC__ENABLE_DELETE", "BLOB_GC_ENABLE_DELETE"])?
                 .or(file_cfg.blob_gc.enable_delete)
                 .unwrap_or(false);
-        let blob_gc_default_min_age_secs = env_u64_any(&[
+        let blob_gc_default_min_age_secs = env_u64_opt(&[
             "REGISTRY__BLOB_GC__DEFAULT_MIN_AGE_SECS",
             "BLOB_GC_DEFAULT_MIN_AGE_SECS",
-        ])
+        ])?
         .or(file_cfg.blob_gc.default_min_age_secs)
         .unwrap_or(7 * 24 * 3600);
-        let blob_gc_default_quarantine_delay_secs = env_u64_any(&[
+        let blob_gc_default_quarantine_delay_secs = env_u64_opt(&[
             "REGISTRY__BLOB_GC__DEFAULT_QUARANTINE_DELAY_SECS",
             "BLOB_GC_DEFAULT_QUARANTINE_DELAY_SECS",
-        ])
+        ])?
         .or(file_cfg.blob_gc.default_quarantine_delay_secs)
         .unwrap_or(24 * 3600);
 
-        let blob_gc_default_max_blobs = env_usize_any(&[
+        let blob_gc_default_max_blobs = env_usize_opt(&[
             "REGISTRY__BLOB_GC__DEFAULT_MAX_BLOBS",
             "BLOB_GC_DEFAULT_MAX_BLOBS",
-        ])
+        ])?
         .or(file_cfg.blob_gc.default_max_blobs)
         .unwrap_or(1000);
-        let blob_gc_default_max_bytes = env_u64_any(&[
+        let blob_gc_default_max_bytes = env_u64_opt(&[
             "REGISTRY__BLOB_GC__DEFAULT_MAX_BYTES",
             "BLOB_GC_DEFAULT_MAX_BYTES",
-        ])
+        ])?
         .or(file_cfg.blob_gc.default_max_bytes)
         .unwrap_or(u64::MAX);
-        let blob_gc_default_max_seconds = env_u64_any(&[
+        let blob_gc_default_max_seconds = env_u64_opt(&[
             "REGISTRY__BLOB_GC__DEFAULT_MAX_SECONDS",
             "BLOB_GC_DEFAULT_MAX_SECONDS",
-        ])
+        ])?
         .or(file_cfg.blob_gc.default_max_seconds)
         .unwrap_or(60);
 
         let blob_gc_schedule_enabled = env_bool_opt(&[
             "REGISTRY__BLOB_GC__SCHEDULE_ENABLED",
             "BLOB_GC_SCHEDULE_ENABLED",
-        ])
+        ])?
         .or(file_cfg.blob_gc.schedule_enabled)
         .unwrap_or(false);
 
-        let blob_gc_schedule_interval_secs = env_u64_any(&[
+        let blob_gc_schedule_interval_secs = env_u64_opt(&[
             "REGISTRY__BLOB_GC__SCHEDULE_INTERVAL_SECS",
             "BLOB_GC_SCHEDULE_INTERVAL_SECS",
-        ])
+        ])?
         .or(file_cfg.blob_gc.schedule_interval_secs)
         .unwrap_or(7 * 24 * 3600);
 
         let max_upload_bytes =
-            env_u64_any(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])
+            env_u64_opt(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])?
                 .or(file_cfg.limits.max_upload_bytes)
                 .unwrap_or(5 * 1024 * 1024 * 1024);
 
-        let max_request_body_bytes = env_usize_any(&[
+        let max_request_body_bytes = env_usize_opt(&[
             "REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES",
             "MAX_REQUEST_BODY_BYTES",
-        ])
+        ])?
         .or(file_cfg.limits.max_request_body_bytes)
         .unwrap_or(32 * 1024 * 1024);
 
-        let upload_chunk_min_bytes = env_usize_any(&[
+        let upload_chunk_min_bytes = env_usize_opt(&[
             "REGISTRY__LIMITS__UPLOAD_CHUNK_MIN_BYTES",
             "UPLOAD_CHUNK_MIN_BYTES",
-        ])
+        ])?
         .or(file_cfg.limits.upload_chunk_min_bytes);
 
-        let max_concurrent_buffered_requests = env_usize_any(&[
+        let max_concurrent_buffered_requests = env_usize_opt(&[
             "REGISTRY__LIMITS__MAX_CONCURRENT_BUFFERED_REQUESTS",
             "MAX_CONCURRENT_BUFFERED_REQUESTS",
-        ])
+        ])?
         .or(file_cfg.limits.max_concurrent_buffered_requests)
         .unwrap_or(if best_practice { 4 } else { 8 })
         .max(1);
 
-        let max_concurrent_requests = env_usize_any(&[
+        let max_concurrent_requests = env_usize_opt(&[
             "REGISTRY__LIMITS__MAX_CONCURRENT_REQUESTS",
             "MAX_CONCURRENT_REQUESTS",
-        ])
+        ])?
         .or(file_cfg.limits.max_concurrent_requests)
         .unwrap_or(if best_practice { 64 } else { 256 })
         .max(1);
 
-        let max_concurrent_upload_requests = env_usize_any(&[
+        let max_concurrent_upload_requests = env_usize_opt(&[
             "REGISTRY__LIMITS__MAX_CONCURRENT_UPLOAD_REQUESTS",
             "MAX_CONCURRENT_UPLOAD_REQUESTS",
-        ])
+        ])?
         .or(file_cfg.limits.max_concurrent_upload_requests)
         // Uploads are long-lived and can easily exhaust file descriptors when clients retry
         // behind proxies; keep the default smaller than the general request limit.
         .unwrap_or(max_concurrent_requests.min(32))
         .max(1);
 
-        let request_timeout_secs = env_u64_any(&[
+        let request_timeout_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__REQUEST_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",
-        ])
+        ])?
         .or(file_cfg.timeouts.request_timeout_secs)
         .unwrap_or(if best_practice { 60 } else { 300 });
 
-        let upload_request_timeout_secs = env_u64_any(&[
+        let upload_request_timeout_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__UPLOAD_REQUEST_TIMEOUT_SECS",
             "UPLOAD_REQUEST_TIMEOUT_SECS",
-        ])
+        ])?
         .or(file_cfg.timeouts.upload_request_timeout_secs)
         .unwrap_or(if best_practice { 7200 } else { 3600 });
 
-        let upload_chunk_idle_timeout_secs = env_u64_any(&[
+        let upload_chunk_idle_timeout_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__UPLOAD_CHUNK_IDLE_TIMEOUT_SECS",
             "UPLOAD_CHUNK_IDLE_TIMEOUT_SECS",
-        ])
+        ])?
         .or(file_cfg.timeouts.upload_chunk_idle_timeout_secs)
         .unwrap_or(20);
 
-        let upload_rate_window_secs = env_u64_any(&[
+        let upload_rate_window_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__UPLOAD_RATE_WINDOW_SECS",
             "UPLOAD_RATE_WINDOW_SECS",
-        ])
+        ])?
         .or(file_cfg.timeouts.upload_rate_window_secs)
         .unwrap_or(10);
 
-        let upload_rate_grace_period_secs = env_u64_any(&[
+        let upload_rate_grace_period_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__UPLOAD_RATE_GRACE_PERIOD_SECS",
             "UPLOAD_RATE_GRACE_PERIOD_SECS",
-        ])
+        ])?
         .or(file_cfg.timeouts.upload_rate_grace_period_secs)
         .unwrap_or(15);
 
-        let min_upload_bytes_per_sec = env_u64_any(&[
+        let min_upload_bytes_per_sec = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__MIN_UPLOAD_BYTES_PER_SEC",
             "MIN_UPLOAD_BYTES_PER_SEC",
-        ])
+        ])?
         .or(file_cfg.timeouts.min_upload_bytes_per_sec)
         .unwrap_or(32768);
 
-        let header_read_timeout_secs = env_u64_any(&[
+        let header_read_timeout_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__HEADER_READ_TIMEOUT_SECS",
             "HEADER_READ_TIMEOUT_SECS",
-        ])
+        ])?
         .or(file_cfg.timeouts.header_read_timeout_secs)
         .unwrap_or(10);
 
-        let slow_connection_policy_str = env_str_any(&[
+        let slow_connection_policy_str = env_str_opt(&[
             "REGISTRY__TIMEOUTS__SLOW_CONNECTION_POLICY",
             "SLOW_CONNECTION_POLICY",
         ])
-        .or(file_cfg.timeouts.slow_connection_policy.clone());
+        .or_else(|| file_cfg.timeouts.slow_connection_policy.clone());
 
         let slow_connection_policy = match slow_connection_policy_str
             .as_deref()
@@ -1601,10 +1639,10 @@ impl Config {
             _ => SlowConnectionPolicy::Enforce,
         };
 
-        let max_connections_per_ip = env_u64_any(&[
+        let max_connections_per_ip = env_u64_opt(&[
             "REGISTRY__LIMITS__MAX_CONNECTIONS_PER_IP",
             "MAX_CONNECTIONS_PER_IP",
-        ])
+        ])?
         .map(|v| v as usize)
         .or(file_cfg.limits.max_connections_per_ip)
         .unwrap_or(50);
@@ -1615,28 +1653,28 @@ impl Config {
                 "TRUSTED_BYPASS_CIDRS",
             ]),
             file_cfg.limits.trusted_bypass_cidrs.clone(),
-        );
+        )?;
 
         let trusted_proxies = parse_cidrs_opt(
             env_str_any(&["REGISTRY__LIMITS__TRUSTED_PROXIES", "TRUSTED_PROXIES"]),
             file_cfg.limits.trusted_proxies.clone(),
-        );
+        )?;
 
         let disallow_monolithic_uploads = env_bool_opt(&[
             "REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS",
             "DISALLOW_MONOLITHIC_UPLOADS",
-        ])
+        ])?
         .or(file_cfg.uploads.disallow_monolithic_uploads)
         .unwrap_or(best_practice);
 
         let uploads_abort_on_error =
-            env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_ERROR", "UPLOAD_ABORT_ON_ERROR"])
+            env_bool_opt(&["REGISTRY__UPLOADS__ABORT_ON_ERROR", "UPLOAD_ABORT_ON_ERROR"])?
                 .or(file_cfg.uploads.abort_on_error)
                 .unwrap_or(false);
         let uploads_abort_on_digest_mismatch = env_bool_opt(&[
             "REGISTRY__UPLOADS__ABORT_ON_DIGEST_MISMATCH",
             "UPLOAD_ABORT_ON_DIGEST_MISMATCH",
-        ])
+        ])?
         .or(file_cfg.uploads.abort_on_digest_mismatch)
         .unwrap_or(false);
 
@@ -1656,23 +1694,23 @@ impl Config {
         };
 
         let catalog_requires_auth =
-            env_bool_opt(&["REGISTRY__CATALOG__REQUIRES_AUTH", "CATALOG_REQUIRES_AUTH"])
+            env_bool_opt(&["REGISTRY__CATALOG__REQUIRES_AUTH", "CATALOG_REQUIRES_AUTH"])?
                 .or(file_cfg.catalog.requires_auth)
                 .unwrap_or(best_practice);
 
-        let public_url = env_str_any(&["REGISTRY__SERVER__PUBLIC_URL", "PUBLIC_URL"])
+        let public_url = env_str_opt(&["REGISTRY__SERVER__PUBLIC_URL", "PUBLIC_URL"])
             .or_else(|| file_cfg.server.public_url.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let token_service = env_str_any(&["REGISTRY__TOKEN__SERVICE", "TOKEN_SERVICE"])
+        let token_service = env_str_opt(&["REGISTRY__TOKEN__SERVICE", "TOKEN_SERVICE"])
             .or_else(|| file_cfg.token.service.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "registry-rust".to_string());
 
         let env_token_signing_key =
-            env_str_any(&["REGISTRY__TOKEN__SIGNING_KEY", "TOKEN_SIGNING_KEY"])
+            env_str_opt(&["REGISTRY__TOKEN__SIGNING_KEY", "TOKEN_SIGNING_KEY"])
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
@@ -1690,9 +1728,10 @@ impl Config {
             .collect::<Vec<_>>();
 
         if raw_file_signing_keys_count > 0 && file_signing_keys.is_empty() {
-            panic!(
-                "token.signing_keys is present but contains no valid entries (each entry requires non-empty kid and key)"
-            );
+            return Err(ConfigError::InvalidValue {
+                field: "token.signing_keys",
+                message: "present but contains no valid entries (each entry requires non-empty kid and key)".into(),
+            });
         }
         if raw_file_signing_keys_count > file_signing_keys.len() {
             eprintln!(
@@ -1711,24 +1750,30 @@ impl Config {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for k in &file_signing_keys {
                 if !seen.insert(k.kid.clone()) {
-                    panic!("token.signing_keys contains duplicate kid='{}'", k.kid);
+                    return Err(ConfigError::InvalidValue {
+                        field: "token.signing_keys",
+                        message: format!("contains duplicate kid='{}'", k.kid),
+                    });
                 }
             }
 
             (file_signing_keys[0].key.clone(), file_signing_keys)
         } else {
-            let token_signing_key = env_token_signing_key
+            let token_signing_key = match env_token_signing_key
                 .or_else(|| file_cfg.token.signing_key.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
+            {
+                Some(k) => k,
+                None => {
                     if best_practice {
-                        panic!(
-                            "best_practice requires TOKEN_SIGNING_KEY (or config token.signing_key or token.signing_keys) to be set"
-                        );
+                        return Err(ConfigError::MissingRequired {
+                            field: "token.signing_key (required in best_practice profile)",
+                        });
                     }
                     uuid::Uuid::new_v4().to_string()
-                });
+                }
+            };
 
             let token_signing_keys = vec![crate::security::TokenSigningKey {
                 kid: "default".to_string(),
@@ -1738,62 +1783,31 @@ impl Config {
             (token_signing_key, token_signing_keys)
         };
 
-        let token_ttl_secs = env_u64_any(&["REGISTRY__TOKEN__TTL_SECS", "TOKEN_TTL_SECS"])
+        let token_ttl_secs = env_u64_opt(&["REGISTRY__TOKEN__TTL_SECS", "TOKEN_TTL_SECS"])?
             .or(file_cfg.token.ttl_secs)
             .unwrap_or(600);
 
-        let robots = RobotsConfig {
-            enabled: file_cfg.auth.robots.enabled.unwrap_or(false),
-            accounts: file_cfg
-                .auth
-                .robots
-                .accounts
-                .iter()
-                .map(|a| RobotAccountConfig {
-                    name: a.name.trim().to_string(),
-                    secret_hash: a.secret_hash.trim().to_string(),
-                    grants: a
-                        .grants
-                        .iter()
-                        .map(|g| crate::rbac::Grant {
-                            repo_prefix: g.repo_prefix.trim().to_string(),
-                            actions: g
-                                .actions
-                                .iter()
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect(),
-                        })
-                        .collect(),
-                    max_ttl_secs: a.max_ttl_secs,
-                })
-                .collect(),
-        };
+        let robots = resolve_robots_config(&file_cfg)?;
 
-        let users = resolve_users_config(&file_cfg);
+        let users = resolve_users_config(&file_cfg)?;
 
-        let proxy_enabled = env_bool_opt(&["REGISTRY__PROXY__ENABLED", "PROXY_ENABLED"])
+        let proxy_enabled = env_bool_opt(&["REGISTRY__PROXY__ENABLED", "PROXY_ENABLED"])?
             .or(file_cfg.proxy.enabled)
             .unwrap_or(false);
 
         let proxy_mode_raw =
-            env_str_any(&["REGISTRY__PROXY__MODE", "PROXY_MODE"]).or(file_cfg.proxy.mode.clone());
+            env_str_opt(&["REGISTRY__PROXY__MODE", "PROXY_MODE"]).or(file_cfg.proxy.mode.clone());
         let proxy_mode = match proxy_mode_raw
             .as_deref()
-            .unwrap_or("allowlist")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
         {
-            "allowlist" => ProxyMode::Allowlist,
-            "any" => ProxyMode::Any,
-            other => {
-                eprintln!("Unknown PROXY_MODE='{other}', defaulting to allowlist");
-                ProxyMode::Allowlist
-            }
+            Some("any") => ProxyMode::Any,
+            _ => ProxyMode::Allowlist,
         };
 
-        let upstream_base_url = env_str_any(&[
+        let upstream_base_url = env_str_opt(&[
             "REGISTRY__PROXY__UPSTREAM__BASE_URL",
             "PROXY_UPSTREAM_BASE_URL",
         ])
@@ -1801,15 +1815,14 @@ impl Config {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-        let upstream_username = env_str_any(&[
+        let upstream_username = env_str_opt(&[
             "REGISTRY__PROXY__UPSTREAM__USERNAME",
             "PROXY_UPSTREAM_USERNAME",
         ])
         .or_else(|| file_cfg.proxy.upstream.username.clone())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-
-        let upstream_password = env_str_any(&[
+        let upstream_password = env_str_opt(&[
             "REGISTRY__PROXY__UPSTREAM__PASSWORD",
             "PROXY_UPSTREAM_PASSWORD",
         ])
@@ -1817,7 +1830,7 @@ impl Config {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-        let allowed_upstream_hosts = env_str_any(&[
+        let allowed_upstream_hosts = env_str_opt(&[
             "REGISTRY__PROXY__SAFETY__ALLOWED_UPSTREAM_HOSTS",
             "PROXY_ALLOWED_UPSTREAM_HOSTS",
         ])
@@ -1831,7 +1844,7 @@ impl Config {
         .or_else(|| file_cfg.proxy.safety.allowed_upstream_hosts.clone())
         .unwrap_or_default();
 
-        let allowed_repo_prefixes = env_str_any(&[
+        let allowed_repo_prefixes = env_str_opt(&[
             "REGISTRY__PROXY__SAFETY__ALLOWED_REPO_PREFIXES",
             "PROXY_ALLOWED_REPO_PREFIXES",
         ])
@@ -1848,11 +1861,11 @@ impl Config {
         let block_private_networks = env_bool_opt(&[
             "REGISTRY__PROXY__SAFETY__BLOCK_PRIVATE_NETWORKS",
             "PROXY_BLOCK_PRIVATE_NETWORKS",
-        ])
+        ])?
         .or(file_cfg.proxy.safety.block_private_networks)
         .unwrap_or(true);
 
-        let redirect_policy = env_str_any(&[
+        let redirect_policy = env_str_opt(&[
             "REGISTRY__PROXY__SAFETY__REDIRECT_POLICY",
             "PROXY_REDIRECT_POLICY",
         ])
@@ -1860,15 +1873,15 @@ impl Config {
         .or(file_cfg.proxy.safety.redirect_policy)
         .unwrap_or_default();
 
-        let max_concurrent_upstream = env_usize_any(&[
+        let max_concurrent_upstream = env_usize_opt(&[
             "REGISTRY__PROXY__SAFETY__MAX_CONCURRENT_UPSTREAM",
             "PROXY_MAX_CONCURRENT_UPSTREAM",
-        ])
+        ])?
         .or(file_cfg.proxy.safety.max_concurrent_upstream)
         .unwrap_or(16);
 
         let cache_fs_root =
-            env_str_any(&["REGISTRY__PROXY__CACHE__FS_ROOT", "PROXY_CACHE_FS_ROOT"])
+            env_str_opt(&["REGISTRY__PROXY__CACHE__FS_ROOT", "PROXY_CACHE_FS_ROOT"])
                 .or_else(|| file_cfg.proxy.cache.fs_root.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -1882,7 +1895,7 @@ impl Config {
                 });
 
         let cache_s3_prefix =
-            env_str_any(&["REGISTRY__PROXY__CACHE__S3_PREFIX", "PROXY_CACHE_S3_PREFIX"])
+            env_str_opt(&["REGISTRY__PROXY__CACHE__S3_PREFIX", "PROXY_CACHE_S3_PREFIX"])
                 .or_else(|| file_cfg.proxy.cache.s3_prefix.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -1894,7 +1907,7 @@ impl Config {
                     }
                 });
 
-        let index_path = env_str_any(&["REGISTRY__PROXY__CACHE__INDEX_PATH", "PROXY_INDEX_PATH"])
+        let index_path = env_str_opt(&["REGISTRY__PROXY__CACHE__INDEX_PATH", "PROXY_INDEX_PATH"])
             .or_else(|| file_cfg.proxy.cache.index_path.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1902,38 +1915,38 @@ impl Config {
             .or_else(|| cache_fs_root.as_ref().map(|p| p.join("proxy-index")))
             .unwrap_or_else(|| PathBuf::from("./data/cache/proxy-index"));
 
-        let max_cache_bytes = env_u64_any(&[
+        let max_cache_bytes = env_u64_opt(&[
             "REGISTRY__PROXY__CACHE__MAX_CACHE_BYTES",
             "PROXY_MAX_CACHE_BYTES",
-        ])
+        ])?
         .or(file_cfg.proxy.cache.max_cache_bytes);
 
-        let gc_interval_secs = env_u64_any(&[
+        let gc_interval_secs = env_u64_opt(&[
             "REGISTRY__PROXY__CACHE__GC_INTERVAL_SECS",
             "PROXY_GC_INTERVAL_SECS",
-        ])
+        ])?
         .or(file_cfg.proxy.cache.gc_interval_secs)
         .unwrap_or(3600);
 
         let scrub_enabled = env_bool_opt(&[
             "REGISTRY__PROXY__CACHE__SCRUB_ENABLED",
             "PROXY_SCRUB_ENABLED",
-        ])
+        ])?
         .or(file_cfg.proxy.cache.scrub_enabled)
         .unwrap_or(false);
 
-        let scrub_interval_secs = env_u64_any(&[
+        let scrub_interval_secs = env_u64_opt(&[
             "REGISTRY__PROXY__CACHE__SCRUB_INTERVAL_SECS",
             "PROXY_SCRUB_INTERVAL_SECS",
-        ])
+        ])?
         .or(file_cfg.proxy.cache.scrub_interval_secs)
         .unwrap_or(3600)
         .max(1);
 
-        let scrub_max_files_per_run = env_usize_any(&[
+        let scrub_max_files_per_run = env_usize_opt(&[
             "REGISTRY__PROXY__CACHE__SCRUB_MAX_FILES_PER_RUN",
             "PROXY_SCRUB_MAX_FILES_PER_RUN",
-        ])
+        ])?
         .or(file_cfg.proxy.cache.scrub_max_files_per_run)
         .unwrap_or(2000)
         .max(1);
@@ -1968,7 +1981,7 @@ impl Config {
             })
             .collect::<Vec<_>>();
 
-        let routing_proxy_hosts = env_str_any(&[
+        let routing_proxy_hosts = env_str_opt(&[
             "REGISTRY__PROXY__ROUTING__PROXY_HOSTS",
             "PROXY_ROUTING_PROXY_HOSTS",
         ])
@@ -1985,7 +1998,7 @@ impl Config {
         let routing_trust_x_forwarded_host = env_bool_opt(&[
             "REGISTRY__PROXY__ROUTING__TRUST_X_FORWARDED_HOST",
             "PROXY_ROUTING_TRUST_X_FORWARDED_HOST",
-        ])
+        ])?
         .or(file_cfg.proxy.routing.trust_x_forwarded_host)
         .unwrap_or(false);
 
@@ -1996,20 +2009,20 @@ impl Config {
             routing_trust_x_forwarded_host,
             &file_cfg.proxy.safety,
             &file_cfg.proxy.upstreams,
-        );
+        )?;
 
         if proxy_enabled {
             // Either single-upstream mode (proxy.upstream.*) or multi-upstream mode (proxy.upstreams).
             if upstream_base_url.is_none() && upstreams.is_empty() {
-                panic!(
-                    "proxy.enabled requires proxy.upstream.base_url (or PROXY_UPSTREAM_BASE_URL) OR proxy.upstreams[]"
-                );
+                return Err(ConfigError::MissingRequired {
+                    field: "proxy.upstream.base_url (or PROXY_UPSTREAM_BASE_URL) OR proxy.upstreams[]",
+                });
             }
             // In single-upstream mode, keep the existing requirement.
             if upstreams.is_empty() && max_cache_bytes.is_none() {
-                panic!(
-                    "proxy.enabled requires proxy.cache.max_cache_bytes (or PROXY_MAX_CACHE_BYTES) to be set"
-                );
+                return Err(ConfigError::MissingRequired {
+                    field: "proxy.cache.max_cache_bytes (or PROXY_MAX_CACHE_BYTES)",
+                });
             }
         }
 
@@ -2038,7 +2051,7 @@ impl Config {
             routing_trust_x_forwarded_host,
         };
 
-        Self {
+        Ok(Self {
             listen_addr,
             tls_cert_path,
             tls_key_path,
@@ -2113,7 +2126,7 @@ impl Config {
             users,
 
             proxy,
-        }
+        })
     }
 
     pub fn resolved_upload_policy_for_repo(&self, repo: &str) -> ResolvedUploadPolicy {
@@ -2178,43 +2191,39 @@ fn merge_toml_value(into: &mut Value, overlay: Value) {
     }
 }
 
-fn load_config_files(paths: &[PathBuf]) -> LoadedFileConfig {
+fn load_config_files(paths: &[PathBuf]) -> Result<LoadedFileConfig, ConfigError> {
     let mut merged = Value::Table(toml::map::Map::new());
     let mut ignored_paths = Vec::<String>::new();
 
     for path in paths {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(err) => {
-                panic!("Failed to read config file {:?}: {err}", path);
-            }
-        };
+        let contents = std::fs::read_to_string(path).map_err(|err| ConfigError::Io {
+            path: path.clone(),
+            source: err,
+        })?;
 
         // Validate unknown keys per file.
-        match parse_toml_config(&contents) {
-            Ok((_cfg, ignored)) => {
-                for p in ignored {
-                    ignored_paths.push(format!("{}: {p}", path.display()));
-                }
-            }
-            Err(err) => {
-                panic!("Failed to parse config file {:?} as TOML: {err}", path);
-            }
+        let (_cfg, ignored) = parse_toml_config(&contents).map_err(|err| ConfigError::Toml {
+            path: Some(path.clone()),
+            source: err,
+        })?;
+        for p in ignored {
+            ignored_paths.push(format!("{}: {p}", path.display()));
         }
 
-        let value: Value = contents.parse::<Value>().unwrap_or_else(|e| {
-            panic!("Failed to parse config file {:?} as TOML value: {e}", path)
-        });
+        let value: Value = contents.parse::<Value>().map_err(|err| ConfigError::Toml {
+            path: Some(path.clone()),
+            source: err,
+        })?;
         merge_toml_value(&mut merged, value);
     }
 
     let cfg: FileConfig = merged
         .try_into()
-        .unwrap_or_else(|e| panic!("Failed to deserialize merged config: {e}"));
-    LoadedFileConfig { cfg, ignored_paths }
+        .map_err(|err| ConfigError::Deserialize { source: err })?;
+    Ok(LoadedFileConfig { cfg, ignored_paths })
 }
 
-fn resolve_users_config(file_cfg: &FileConfig) -> UsersConfig {
+fn resolve_users_config(file_cfg: &FileConfig) -> Result<UsersConfig, ConfigError> {
     let groups = file_cfg
         .auth
         .groups
@@ -2244,10 +2253,15 @@ fn resolve_users_config(file_cfg: &FileConfig) -> UsersConfig {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for g in &groups {
             if !seen.insert(g.name.clone()) {
-                panic!("auth.groups contains duplicate name='{}'", g.name);
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.groups",
+                    message: format!("contains duplicate name='{}'", g.name),
+                });
             }
-            let _ = crate::rbac::validate_grants(&g.grants)
-                .unwrap_or_else(|e| panic!("invalid grants in group '{}': {:?}", g.name, e));
+            crate::rbac::validate_grants(&g.grants).map_err(|e| ConfigError::InvalidValue {
+                field: "auth.groups.grants",
+                message: format!("invalid grants in group '{}': {:?}", g.name, e),
+            })?;
         }
     }
 
@@ -2277,245 +2291,456 @@ fn resolve_users_config(file_cfg: &FileConfig) -> UsersConfig {
     if users.enabled {
         for a in &users.accounts {
             if a.secret_hash.is_empty() {
-                panic!(
-                    "auth.users.accounts entry '{}' has empty secret_hash",
-                    a.name
-                );
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.users.accounts",
+                    message: format!("entry '{}' has empty secret_hash", a.name),
+                });
             }
             for grp in &a.groups {
                 if !groups.iter().any(|g| g.name == *grp) {
-                    panic!(
-                        "auth.users.accounts '{}' references unknown group '{}'",
-                        a.name, grp
-                    );
+                    return Err(ConfigError::InvalidValue {
+                        field: "auth.users.accounts",
+                        message: format!("account '{}' references unknown group '{}'", a.name, grp),
+                    });
                 }
             }
         }
     }
 
-    users
+    Ok(users)
+}
+
+fn resolve_robots_config(file_cfg: &FileConfig) -> Result<RobotsConfig, ConfigError> {
+    let enabled = file_cfg.auth.robots.enabled.unwrap_or(false);
+    let robots = RobotsConfig {
+        enabled,
+        accounts: file_cfg
+            .auth
+            .robots
+            .accounts
+            .iter()
+            .map(|a| RobotAccountConfig {
+                name: a.name.trim().to_string(),
+                secret_hash: a.secret_hash.trim().to_string(),
+                grants: a
+                    .grants
+                    .iter()
+                    .map(|g| crate::rbac::Grant {
+                        repo_prefix: g.repo_prefix.trim().to_string(),
+                        actions: g
+                            .actions
+                            .iter()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    })
+                    .collect(),
+                max_ttl_secs: a.max_ttl_secs,
+            })
+            .filter(|a| !a.name.is_empty())
+            .collect(),
+    };
+
+    if robots.enabled {
+        let mut seen = std::collections::HashSet::new();
+        for a in &robots.accounts {
+            if !seen.insert(a.name.clone()) {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.robots.accounts",
+                    message: format!("contains duplicate robot account name='{}'", a.name),
+                });
+            }
+            if a.secret_hash.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.robots.accounts",
+                    message: format!("entry '{}' has empty secret_hash", a.name),
+                });
+            }
+            crate::rbac::validate_grants(&a.grants).map_err(|e| ConfigError::InvalidValue {
+                field: "auth.robots.accounts.grants",
+                message: format!("invalid grants for robot '{}': {:?}", a.name, e),
+            })?;
+        }
+    }
+
+    Ok(robots)
 }
 
 fn resolve_proxy_upstreams(
     storage_backend: &StorageBackend,
-    fs_root: &PathBuf,
+    fs_root: &std::path::Path,
     s3_prefix: &str,
     routing_trust_x_forwarded_host: bool,
     global_safety: &FileProxySafety,
     file_upstreams: &[FileProxyUpstreamRoute],
-) -> Vec<ProxyUpstreamRoute> {
-    let upstreams = file_upstreams
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let mut hosts = Vec::new();
+) -> Result<Vec<ProxyUpstreamRoute>, ConfigError> {
+    let mut upstreams = Vec::new();
+    for (_i, r) in file_upstreams.iter().enumerate() {
+        let mut hosts = Vec::new();
+        hosts.extend(
+            r.hosts
+                .iter()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty()),
+        );
+        if let Some(extra) = r.routing.hosts.as_ref() {
             hosts.extend(
-                r.hosts
+                extra
                     .iter()
                     .map(|h| h.trim().to_string())
                     .filter(|h| !h.is_empty()),
             );
-            if let Some(extra) = r.routing.hosts.as_ref() {
-                hosts.extend(
-                    extra
-                        .iter()
-                        .map(|h| h.trim().to_string())
-                        .filter(|h| !h.is_empty()),
-                );
+        }
+        hosts.sort();
+        hosts.dedup();
+
+        if hosts.is_empty() {
+            continue;
+        }
+
+        let upstream_base_url = r
+            .upstream
+            .base_url
+            .as_deref()
+            .or(r.base_url.as_deref())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if upstream_base_url.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "proxy.upstreams[].upstream.base_url",
+            });
+        }
+
+        let max_cache_bytes = r.cache.max_cache_bytes.or(r.max_cache_bytes).unwrap_or(0);
+        if max_cache_bytes == 0 {
+            return Err(ConfigError::MissingRequired {
+                field: "proxy.upstreams[].cache.max_cache_bytes",
+            });
+        }
+
+        let cache_key = cache_key_from_base_url(&upstream_base_url);
+
+        let trust_x_forwarded_host = r
+            .routing
+            .trust_x_forwarded_host
+            .or(r.trust_x_forwarded_host)
+            .unwrap_or(routing_trust_x_forwarded_host);
+
+        let derived_cache_fs_root = fs_root.join("cache").join(&cache_key);
+        let derived_index_path = derived_cache_fs_root.join("proxy-index");
+        let derived_cache_s3_prefix =
+            format!("{}/cache/{}", s3_prefix.trim_end_matches('/'), cache_key);
+
+        let upstream_username = r
+            .upstream
+            .username
+            .clone()
+            .or_else(|| r.username.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let upstream_password = r
+            .upstream
+            .password
+            .clone()
+            .or_else(|| r.password.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let cache_fs_root = r
+            .cache
+            .fs_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let cache_s3_prefix = r
+            .cache
+            .s3_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let allowed_upstream_hosts = r
+            .safety
+            .allowed_upstream_hosts
+            .clone()
+            .or_else(|| global_safety.allowed_upstream_hosts.clone())
+            .unwrap_or_default();
+        let allowed_repo_prefixes = r
+            .safety
+            .allowed_repo_prefixes
+            .clone()
+            .or_else(|| global_safety.allowed_repo_prefixes.clone())
+            .unwrap_or_default();
+        let block_private_networks = r
+            .safety
+            .block_private_networks
+            .or(global_safety.block_private_networks)
+            .unwrap_or(true);
+
+        let redirect_policy = r
+            .safety
+            .redirect_policy
+            .or(global_safety.redirect_policy)
+            .unwrap_or_default();
+        let max_concurrent_upstream = r
+            .safety
+            .max_concurrent_upstream
+            .or(global_safety.max_concurrent_upstream)
+            .unwrap_or(16);
+
+        let cache_fs_root = match storage_backend {
+            StorageBackend::Filesystem => {
+                Some(cache_fs_root.unwrap_or_else(|| derived_cache_fs_root.clone()))
             }
-            hosts.sort();
-            hosts.dedup();
+            StorageBackend::S3 => None,
+        };
 
-            let upstream_base_url = r
-                .upstream
-                .base_url
-                .as_deref()
-                .or(r.base_url.as_deref())
-                .unwrap_or("")
-                .trim()
-                .to_string();
+        let cache_s3_prefix = match storage_backend {
+            StorageBackend::Filesystem => None,
+            StorageBackend::S3 => Some(
+                cache_s3_prefix
+                    .clone()
+                    .unwrap_or_else(|| derived_cache_s3_prefix.clone()),
+            ),
+        };
 
-            let cache_key = cache_key_from_base_url(&upstream_base_url);
+        let index_path = r
+            .cache
+            .index_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match storage_backend {
+                StorageBackend::Filesystem => match &cache_fs_root {
+                    Some(root) => root.join("proxy-index"),
+                    None => derived_cache_fs_root.join("proxy-index"),
+                },
+                StorageBackend::S3 => derived_index_path.clone(),
+            });
 
-            let trust_x_forwarded_host = r
-                .routing
-                .trust_x_forwarded_host
-                .or(r.trust_x_forwarded_host)
-                .unwrap_or(routing_trust_x_forwarded_host);
-
-            let derived_cache_fs_root = fs_root.join("cache").join(&cache_key);
-            let derived_index_path = derived_cache_fs_root.join("proxy-index");
-            let derived_cache_s3_prefix =
-                format!("{}/cache/{}", s3_prefix.trim_end_matches('/'), cache_key);
-
-            let upstream_username = r
-                .upstream
-                .username
-                .clone()
-                .or_else(|| r.username.clone())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let upstream_password = r
-                .upstream
-                .password
-                .clone()
-                .or_else(|| r.password.clone())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-
-            let cache_fs_root = r
-                .cache
-                .fs_root
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from);
-            let cache_s3_prefix = r
-                .cache
-                .s3_prefix
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-
-            let max_cache_bytes = r.cache.max_cache_bytes.or(r.max_cache_bytes).unwrap_or(0);
-
-            // Per-upstream safety: if fields are not set, fall back to global proxy.safety.
-            let allowed_upstream_hosts = r
-                .safety
-                .allowed_upstream_hosts
-                .clone()
-                .or_else(|| global_safety.allowed_upstream_hosts.clone())
-                .unwrap_or_default();
-            let allowed_repo_prefixes = r
-                .safety
-                .allowed_repo_prefixes
-                .clone()
-                .or_else(|| global_safety.allowed_repo_prefixes.clone())
-                .unwrap_or_default();
-            let block_private_networks = r
-                .safety
-                .block_private_networks
-                .or(global_safety.block_private_networks)
-                .unwrap_or(true);
-
-            let redirect_policy = r
-                .safety
-                .redirect_policy
-                .or(global_safety.redirect_policy)
-                .unwrap_or_default();
-            let max_concurrent_upstream = r
-                .safety
-                .max_concurrent_upstream
-                .or(global_safety.max_concurrent_upstream)
-                .unwrap_or(16);
-
-            // Validate (fail fast) when the feature is used.
-            if !hosts.is_empty() {
-                if upstream_base_url.is_empty() {
-                    panic!("proxy.upstreams[{i}] requires [proxy.upstreams.upstream].base_url");
-                }
-                if max_cache_bytes == 0 {
-                    panic!("proxy.upstreams[{i}] requires [proxy.upstreams.cache].max_cache_bytes");
-                }
-
-                match storage_backend {
-                    StorageBackend::Filesystem => {
-                        // cache fs_root is optional; derived from base_url when omitted.
-                    }
-                    StorageBackend::S3 => {
-                        // cache s3_prefix and index_path are optional; derived from base_url when omitted.
-                    }
-                }
-            }
-
-            let cache_fs_root = match storage_backend {
-                StorageBackend::Filesystem => {
-                    Some(cache_fs_root.unwrap_or_else(|| derived_cache_fs_root.clone()))
-                }
-                StorageBackend::S3 => None,
-            };
-
-            let cache_s3_prefix = match storage_backend {
-                StorageBackend::Filesystem => None,
-                StorageBackend::S3 => Some(
-                    cache_s3_prefix
-                        .clone()
-                        .unwrap_or_else(|| derived_cache_s3_prefix.clone()),
-                ),
-            };
-
-            let index_path = r
-                .cache
-                .index_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| match storage_backend {
-                    StorageBackend::Filesystem => cache_fs_root
-                        .as_ref()
-                        .expect("filesystem cache fs_root")
-                        .join("proxy-index"),
-                    StorageBackend::S3 => derived_index_path.clone(),
-                });
-
-            ProxyUpstreamRoute {
-                hosts,
-                trust_x_forwarded_host,
-                upstream_base_url,
-                upstream_username,
-                upstream_password,
-                allowed_upstream_hosts,
-                allowed_repo_prefixes,
-                block_private_networks,
-                redirect_policy,
-                max_concurrent_upstream,
-                index_path,
-                cache_fs_root,
-                cache_s3_prefix,
-                max_cache_bytes,
-            }
-        })
-        .filter(|r| !r.hosts.is_empty())
-        .collect::<Vec<_>>();
+        upstreams.push(ProxyUpstreamRoute {
+            hosts,
+            trust_x_forwarded_host,
+            upstream_base_url,
+            upstream_username,
+            upstream_password,
+            allowed_upstream_hosts,
+            allowed_repo_prefixes,
+            block_private_networks,
+            redirect_policy,
+            max_concurrent_upstream,
+            index_path,
+            cache_fs_root,
+            cache_s3_prefix,
+            max_cache_bytes,
+        });
+    }
 
     // Validate: upstream host patterns must be unique across routes.
-    // (If the same host pattern appears in more than one upstream route, routing would be
-    // ambiguous because we select the first match.)
-    {
-        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (idx, up) in upstreams.iter().enumerate() {
-            for host_pat in &up.hosts {
-                let key = host_pat.trim().to_ascii_lowercase();
-                if key.is_empty() {
-                    continue;
-                }
-                if let Some(prev) = seen.insert(key.clone(), idx) {
-                    panic!(
-                        "proxy.upstreams has duplicate host pattern '{}' (indices {} and {})",
-                        host_pat, prev, idx
-                    );
-                }
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, up) in upstreams.iter().enumerate() {
+        for host_pat in &up.hosts {
+            let key = host_pat.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(prev) = seen.insert(key.clone(), idx) {
+                return Err(ConfigError::InvalidValue {
+                    field: "proxy.upstreams.hosts",
+                    message: format!(
+                        "duplicate host pattern '{host_pat}' across routes (indices {prev} and {idx})"
+                    ),
+                });
             }
         }
     }
 
-    upstreams
+    Ok(upstreams)
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    // Minimal glob: '*' matches any substring.
+    if pattern == "*" {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+
+    let mut rest = value;
+    let mut first = true;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            if !rest.starts_with(part) {
+                return false;
+            }
+            rest = &rest[part.len()..];
+            first = false;
+            continue;
+        }
+
+        if let Some(pos) = rest.find(part) {
+            rest = &rest[pos + part.len()..];
+        } else {
+            return false;
+        }
+
+        if i == parts.len() - 1 && !pattern.ends_with('*') {
+            return rest.is_empty();
+        }
+
+        first = false;
+    }
+    true
+}
+
+fn parse_toml_config(contents: &str) -> Result<(FileConfig, Vec<String>), toml::de::Error> {
+    let mut ignored_paths = Vec::<String>::new();
+    let deser = toml::de::Deserializer::new(contents);
+    let cfg = serde_ignored::deserialize(deser, |path| {
+        ignored_paths.push(path.to_string());
+    })?;
+    Ok((cfg, ignored_paths))
+}
+
+fn load_config_file() -> Result<LoadedFileConfig, ConfigError> {
+    let Some((_key, path)) =
+        env_str_any(&["CONFIG_PATH", "REGISTRY__CONFIG_PATH", "REGISTRY_TOML_PATH"])
+    else {
+        return Ok(LoadedFileConfig::default());
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok(LoadedFileConfig::default());
+    }
+    let p = PathBuf::from(path);
+    let contents = std::fs::read_to_string(&p).map_err(|err| ConfigError::Io {
+        path: p.clone(),
+        source: err,
+    })?;
+    let (cfg, ignored_paths) = parse_toml_config(&contents).map_err(|err| ConfigError::Toml {
+        path: Some(p),
+        source: err,
+    })?;
+    Ok(LoadedFileConfig { cfg, ignored_paths })
+}
+
+fn env_str_any(keys: &[&'static str]) -> Option<(&'static str, String)> {
+    for k in keys {
+        if let Ok(v) = std::env::var(k) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some((*k, v));
+            }
+        }
+    }
+    None
+}
+
+fn env_str_opt(keys: &[&'static str]) -> Option<String> {
+    env_str_any(keys).map(|(_, v)| v)
+}
+
+fn env_bool_opt(keys: &[&'static str]) -> Result<Option<bool>, ConfigError> {
+    let Some((key, v)) = env_str_any(keys) else {
+        return Ok(None);
+    };
+    let norm = v.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(ConfigError::InvalidEnvValue {
+            key,
+            expected: "boolean (true/false, 1/0, yes/no, on/off)",
+        }),
+    }
+}
+
+fn env_u64_opt(keys: &[&'static str]) -> Result<Option<u64>, ConfigError> {
+    let Some((key, v)) = env_str_any(keys) else {
+        return Ok(None);
+    };
+    v.trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidEnvValue {
+            key,
+            expected: "unsigned 64-bit integer",
+        })
+}
+
+fn env_usize_opt(keys: &[&'static str]) -> Result<Option<usize>, ConfigError> {
+    let Some((key, v)) = env_str_any(keys) else {
+        return Ok(None);
+    };
+    v.trim()
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidEnvValue {
+            key,
+            expected: "unsigned integer",
+        })
+}
+
+fn env_socket_addr_opt(keys: &[&'static str]) -> Result<Option<SocketAddr>, ConfigError> {
+    let Some((key, v)) = env_str_any(keys) else {
+        return Ok(None);
+    };
+    v.parse::<SocketAddr>()
+        .map(Some)
+        .map_err(|_| ConfigError::InvalidEnvValue {
+            key,
+            expected: "valid socket address (e.g. '127.0.0.1:5000' or '[::1]:5000')",
+        })
+}
+
+fn parse_cidrs_opt(
+    env_val: Option<(&'static str, String)>,
+    file_val: Option<Vec<String>>,
+) -> Result<Vec<ipnet::IpNet>, ConfigError> {
+    let mut out = Vec::new();
+    if let Some((key, s)) = env_val {
+        for token in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(net) = token.parse::<ipnet::IpNet>() {
+                out.push(net);
+            } else if let Ok(ip) = token.parse::<std::net::IpAddr>() {
+                out.push(ipnet::IpNet::from(ip));
+            } else {
+                return Err(ConfigError::InvalidEnvValue {
+                    key,
+                    expected: "valid IP address or CIDR network",
+                });
+            }
+        }
+    } else if let Some(list) = file_val {
+        for token in list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Ok(net) = token.parse::<ipnet::IpNet>() {
+                out.push(net);
+            } else if let Ok(ip) = token.parse::<std::net::IpAddr>() {
+                out.push(ipnet::IpNet::from(ip));
+            } else {
+                return Err(ConfigError::InvalidValue {
+                    field: "trusted_bypass_cidrs / trusted_proxies",
+                    message: "contains invalid IP address or CIDR network entry".into(),
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
-        if let Some(s) = err.downcast_ref::<String>() {
-            s.clone()
-        } else if let Some(s) = err.downcast_ref::<&str>() {
-            (*s).to_string()
-        } else {
-            "<non-string panic>".to_string()
-        }
-    }
 
     #[test]
     fn proxy_upstreams_shorthand_parses_and_resolves() {
@@ -2549,7 +2774,8 @@ max_cache_bytes = 456
             false,
             &file_cfg.proxy.safety,
             &file_cfg.proxy.upstreams,
-        );
+        )
+        .expect("resolve upstreams");
 
         assert_eq!(upstreams.len(), 2);
 
@@ -2636,7 +2862,7 @@ max_ttl_secs = 123
 "#;
 
         let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
-        let cfg = resolve_users_config(&file_cfg);
+        let cfg = resolve_users_config(&file_cfg).expect("resolve users config");
 
         assert!(cfg.enabled);
         assert_eq!(cfg.groups.len(), 1);
@@ -2660,144 +2886,464 @@ groups = ["missing"]
 "#;
 
         let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
+        let err = resolve_users_config(&file_cfg).expect_err("should return ConfigError");
+        match err {
+            ConfigError::InvalidValue { field, message } => {
+                assert_eq!(field, "auth.users.accounts");
+                assert!(message.contains("references unknown group 'missing'"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn users_groups_rejects_duplicate_group_name() {
+        let cfg = r#"
+[auth.users]
+enabled = true
+
+[[auth.groups]]
+name = "devs"
+grants = [{ repo_prefix = "org/", actions = ["pull"] }]
+
+[[auth.groups]]
+name = "devs"
+grants = [{ repo_prefix = "other/", actions = ["push"] }]
+"#;
+
+        let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
+        let err = resolve_users_config(&file_cfg).expect_err("should return ConfigError");
+        match err {
+            ConfigError::InvalidValue { field, message } => {
+                assert_eq!(field, "auth.groups");
+                assert!(message.contains("contains duplicate name='devs'"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn users_groups_rejects_empty_secret_hash() {
+        let cfg = r#"
+[auth.users]
+enabled = true
+
+[[auth.groups]]
+name = "devs"
+grants = [{ repo_prefix = "org/", actions = ["pull"] }]
+
+[[auth.users.accounts]]
+name = "alice"
+secret_hash = "   "
+groups = ["devs"]
+"#;
+
+        let file_cfg: FileConfig = toml::from_str(cfg).expect("parse toml");
+        let err = resolve_users_config(&file_cfg).expect_err("should return ConfigError");
+        match err {
+            ConfigError::InvalidValue { field, message } => {
+                assert_eq!(field, "auth.users.accounts");
+                assert!(message.contains("has empty secret_hash"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_configuration_loads_successfully() {
+        let cfg = Config::from_env_with_files(&[]).expect("default config must load");
+        assert_eq!(cfg.listen_addr, ([127, 0, 0, 1], 5000).into());
+        assert_eq!(cfg.storage_backend, StorageBackend::Filesystem);
+        assert!(!cfg.proxy.enabled);
+        assert!(!cfg.robots.enabled);
+        assert!(!cfg.users.enabled);
+    }
+
+    #[test]
+    fn load_single_config_file_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:8080"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::from_env_with_files(&[path]).expect("load config file");
+        assert_eq!(cfg.listen_addr, ([127, 0, 0, 1], 8080).into());
+    }
+
+    #[test]
+    fn load_multiple_config_files_merges_tables_and_replaces_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("base.toml");
+        let path2 = dir.path().join("overlay.toml");
+
+        std::fs::write(
+            &path1,
+            r#"
+[server]
+listen_addr = "127.0.0.1:8080"
+
+[auth.push]
+allow_repos = ["org/repo1", "org/repo2"]
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &path2,
+            r#"
+[auth.push]
+allow_repos = ["org/repo3"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::from_env_with_files(&[path1, path2]).expect("load merged configs");
+        assert_eq!(cfg.listen_addr, ([127, 0, 0, 1], 8080).into());
+        assert_eq!(cfg.push_allow_repos, Some(vec!["org/repo3".to_string()]));
+    }
+
+    #[test]
+    fn missing_config_file_returns_io_error() {
+        let path = PathBuf::from("/non/existent/path/for/config.toml");
+        let err = Config::from_env_with_files(std::slice::from_ref(&path))
+            .expect_err("should fail with Io");
+        match err {
+            ConfigError::Io { path: p, source: _ } => {
+                assert_eq!(p, path);
+            }
+            other => panic!("expected ConfigError::Io, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_toml_syntax_returns_toml_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.toml");
+        std::fs::write(&path, "this is not valid [ toml = {").unwrap();
+
+        let err = Config::from_env_with_files(std::slice::from_ref(&path))
+            .expect_err("should fail with Toml");
+        match err {
+            ConfigError::Toml { path: p, source: _ } => {
+                assert_eq!(p, Some(path));
+            }
+            other => panic!("expected ConfigError::Toml, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_toml_type_returns_deserialize_or_toml_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong_type.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = 12345
+"#,
+        )
+        .unwrap();
+
+        let err = Config::from_env_with_files(&[path]).expect_err("should fail with wrong type");
+        match err {
+            ConfigError::Toml { .. } | ConfigError::Deserialize { .. } => {}
+            other => panic!("expected Toml or Deserialize error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typo.toml");
+        std::fs::write(
+            &path,
+            r#"
+[config]
+strict = true
+
+[server]
+listen_addr = "127.0.0.1:5000"
+lisn_addr = "127.0.0.1:5001"
+"#,
+        )
+        .unwrap();
+
+        let err = Config::from_env_with_files(&[path]).expect_err("should fail with UnknownKeys");
+        match err {
+            ConfigError::UnknownKeys { keys } => {
+                assert!(keys.iter().any(|k| k.contains("server.lisn_addr")));
+            }
+            other => panic!("expected UnknownKeys error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_acme_fields_return_missing_required_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server.tls.acme]
+enabled = true
+# missing email, names, output_dir
+"#,
+        )
+        .unwrap();
+
         let err =
-            std::panic::catch_unwind(|| resolve_users_config(&file_cfg)).expect_err("should panic");
-        let msg = panic_message(err);
-        assert!(
-            msg.contains("references unknown group"),
-            "unexpected panic message: {msg}"
+            Config::from_env_with_files(&[path]).expect_err("should fail with MissingRequired");
+        match err {
+            ConfigError::MissingRequired { field } => {
+                assert!(field.contains("server.tls.acme.email"));
+            }
+            other => panic!("expected MissingRequired error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_proxy_fields_return_missing_required_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            r#"
+[proxy]
+enabled = true
+# missing upstream base_url or upstreams
+"#,
+        )
+        .unwrap();
+
+        let err =
+            Config::from_env_with_files(&[path]).expect_err("should fail with MissingRequired");
+        match err {
+            ConfigError::MissingRequired { field } => {
+                assert!(field.contains("proxy.upstream.base_url"));
+            }
+            other => panic!("expected MissingRequired error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_proxy_upstream_host_patterns_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_dup.toml");
+        std::fs::write(
+            &path,
+            r#"
+[proxy]
+enabled = true
+
+[[proxy.upstreams]]
+hosts = ["shared-host.local"]
+base_url = "https://registry-1.docker.io"
+max_cache_bytes = 1000
+
+[[proxy.upstreams]]
+hosts = ["shared-host.local"]
+base_url = "https://ghcr.io"
+max_cache_bytes = 1000
+"#,
+        )
+        .unwrap();
+
+        let err = Config::from_env_with_files(&[path]).expect_err("should fail on duplicate hosts");
+        match err {
+            ConfigError::InvalidValue { field, message } => {
+                assert_eq!(field, "proxy.upstreams.hosts");
+                assert!(message.contains("duplicate host pattern 'shared-host.local'"));
+            }
+            other => panic!("expected InvalidValue error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_token_signing_key_kids_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[token.signing_keys]]
+kid = "key-1"
+key = "super-secret-key-1"
+
+[[token.signing_keys]]
+kid = "key-1"
+key = "super-secret-key-2"
+"#,
+        )
+        .unwrap();
+
+        let err = Config::from_env_with_files(&[path]).expect_err("should fail on duplicate kid");
+        match err {
+            ConfigError::InvalidValue { field, message } => {
+                assert_eq!(field, "token.signing_keys");
+                assert!(message.contains("contains duplicate kid='key-1'"));
+                // Invariant: secret key material must NOT appear in error output
+                assert!(!message.contains("super-secret-key"));
+            }
+            other => panic!("expected InvalidValue error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_display_and_debug_do_not_leak_secrets() {
+        let secret = "VERY_CONFIDENTIAL_SIGNING_KEY_12345";
+        let err = ConfigError::InvalidValue {
+            field: "token.signing_keys",
+            message: "contains duplicate kid='k1'".to_string(),
+        };
+
+        let disp = err.to_string();
+        let dbg = format!("{err:?}");
+
+        assert!(!disp.contains(secret));
+        assert!(!dbg.contains(secret));
+    }
+
+    #[test]
+    fn adversarial_redaction_invalid_env_value_password() {
+        let sentinel = "SUPER_SECRET_SENTINEL_PASSWORD_998877";
+        let err = ConfigError::InvalidEnvValue {
+            key: "REGISTRY_PORT",
+            expected: "unsigned 16-bit integer",
+        };
+
+        let disp = err.to_string();
+        let dbg = format!("{err:?}");
+
+        assert!(!disp.contains(sentinel));
+        assert!(!dbg.contains(sentinel));
+        assert!(!disp.contains("SUPER_SECRET"));
+        assert!(!dbg.contains("SUPER_SECRET"));
+    }
+
+    #[test]
+    fn adversarial_redaction_invalid_env_value_bearer_token() {
+        let sentinel =
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.SENTINEL_BEARER_PAYLOAD_443322.SIGNATURE";
+        let err = ConfigError::InvalidEnvValue {
+            key: "REGISTRY_LISTEN_ADDR",
+            expected: "valid socket address",
+        };
+
+        let disp = err.to_string();
+        let dbg = format!("{err:?}");
+
+        assert!(!disp.contains(sentinel));
+        assert!(!dbg.contains(sentinel));
+        assert!(!disp.contains("SENTINEL_BEARER"));
+        assert!(!dbg.contains("SENTINEL_BEARER"));
+    }
+
+    #[test]
+    fn adversarial_redaction_invalid_signing_key_configuration() {
+        let sentinel_key1 = "TOP_SECRET_SIGNING_KEY_XYZ_112233";
+        let sentinel_key2 = "ANOTHER_TOP_SECRET_KEY_XYZ_445566";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup_keys.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[token.signing_keys]]
+kid = "shared-kid"
+key = "{sentinel_key1}"
+
+[[token.signing_keys]]
+kid = "shared-kid"
+key = "{sentinel_key2}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = Config::from_env_with_files(std::slice::from_ref(&path))
+            .expect_err("must fail on duplicate kid");
+        let disp = err.to_string();
+        let dbg = format!("{err:?}");
+
+        assert!(!disp.contains(sentinel_key1));
+        assert!(!dbg.contains(sentinel_key1));
+        assert!(!disp.contains(sentinel_key2));
+        assert!(!dbg.contains(sentinel_key2));
+        assert!(!disp.contains("TOP_SECRET"));
+        assert!(!dbg.contains("TOP_SECRET"));
+        assert!(!disp.contains("112233"));
+        assert!(!dbg.contains("445566"));
+    }
+
+    #[test]
+    fn adversarial_redaction_account_validation_errors() {
+        let sentinel_account = "alice";
+        let sentinel_hash = "$argon2id$v=19$m=19456,t=2,p=1$SENTINEL_SECRET_HASH_ABC123";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users_unknown_grp.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[auth.users]
+enabled = true
+
+[[auth.groups]]
+name = "devs"
+grants = [{{ repo_prefix = "org/", actions = ["pull"] }}]
+
+[[auth.users.accounts]]
+name = "{sentinel_account}"
+secret_hash = "{sentinel_hash}"
+groups = ["nonexistent_group"]
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = Config::from_env_with_files(std::slice::from_ref(&path))
+            .expect_err("must fail on unknown group");
+        let disp = err.to_string();
+        let dbg = format!("{err:?}");
+
+        assert!(!disp.contains(sentinel_hash));
+        assert!(!dbg.contains(sentinel_hash));
+        assert!(!disp.contains("SENTINEL_SECRET_HASH"));
+        assert!(!dbg.contains("SENTINEL_SECRET_HASH"));
+    }
+
+    #[test]
+    fn env_parsing_semantics_missing_empty_whitespace_valid_invalid() {
+        // 1. Boolean parser
+        // Absent
+        assert_eq!(env_bool_opt(&["NON_EXISTENT_TEST_KEY_1"]).unwrap(), None);
+
+        // 2. u64 parser
+        assert_eq!(env_u64_opt(&["NON_EXISTENT_TEST_KEY_2"]).unwrap(), None);
+
+        // 3. usize parser
+        assert_eq!(env_usize_opt(&["NON_EXISTENT_TEST_KEY_3"]).unwrap(), None);
+
+        // 4. SocketAddr parser
+        assert_eq!(
+            env_socket_addr_opt(&["NON_EXISTENT_TEST_KEY_4"]).unwrap(),
+            None
+        );
+
+        // 5. CIDR parser
+        assert_eq!(
+            parse_cidrs_opt(None, None).unwrap(),
+            Vec::<ipnet::IpNet>::new()
+        );
+        assert_eq!(
+            parse_cidrs_opt(None, Some(vec![])).unwrap(),
+            Vec::<ipnet::IpNet>::new()
         );
     }
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    // Minimal glob: '*' matches any substring.
-    if pattern == "*" {
-        return true;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == value;
-    }
-
-    let mut rest = value;
-    let mut first = true;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if first && !pattern.starts_with('*') {
-            if !rest.starts_with(part) {
-                return false;
-            }
-            rest = &rest[part.len()..];
-            first = false;
-            continue;
-        }
-
-        if let Some(pos) = rest.find(part) {
-            rest = &rest[pos + part.len()..];
-        } else {
-            return false;
-        }
-
-        if i == parts.len() - 1 && !pattern.ends_with('*') {
-            return rest.is_empty();
-        }
-
-        first = false;
-    }
-    true
-}
-
-fn parse_toml_config(contents: &str) -> Result<(FileConfig, Vec<String>), toml::de::Error> {
-    let mut ignored_paths = Vec::<String>::new();
-    let deser = toml::de::Deserializer::new(contents);
-    let cfg = serde_ignored::deserialize(deser, |path| {
-        ignored_paths.push(path.to_string());
-    })?;
-    Ok((cfg, ignored_paths))
-}
-
-fn load_config_file() -> LoadedFileConfig {
-    let Some(path) = env_str_any(&["CONFIG_PATH", "REGISTRY__CONFIG_PATH", "REGISTRY_TOML_PATH"])
-    else {
-        return LoadedFileConfig::default();
-    };
-    let path = path.trim();
-    if path.is_empty() {
-        return LoadedFileConfig::default();
-    }
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("Failed to read CONFIG_PATH='{path}': {err}");
-            return LoadedFileConfig::default();
-        }
-    };
-    match parse_toml_config(&contents) {
-        Ok((cfg, ignored_paths)) => LoadedFileConfig { cfg, ignored_paths },
-        Err(err) => {
-            eprintln!("Failed to parse config file '{path}' as TOML: {err}");
-            LoadedFileConfig::default()
-        }
-    }
-}
-
-fn env_str_any(keys: &[&str]) -> Option<String> {
-    for k in keys {
-        if let Ok(v) = std::env::var(k) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-fn env_bool_opt(keys: &[&str]) -> Option<bool> {
-    let Some(v) = env_str_any(keys) else {
-        return None;
-    };
-    let v = v.trim().to_ascii_lowercase();
-    match v.as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn env_u64_any(keys: &[&str]) -> Option<u64> {
-    env_str_any(keys).and_then(|s| s.trim().parse::<u64>().ok())
-}
-
-fn env_usize_any(keys: &[&str]) -> Option<usize> {
-    env_str_any(keys).and_then(|s| s.trim().parse::<usize>().ok())
-}
-
-fn env_socket_addr(keys: &[&str]) -> Option<SocketAddr> {
-    env_str_any(keys).and_then(|s| s.parse::<SocketAddr>().ok())
-}
-
-fn parse_cidrs_opt(env_val: Option<String>, file_val: Option<Vec<String>>) -> Vec<ipnet::IpNet> {
-    let mut out = Vec::new();
-    if let Some(s) = env_val {
-        for token in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            if let Ok(net) = token.parse::<ipnet::IpNet>() {
-                out.push(net);
-            } else if let Ok(ip) = token.parse::<std::net::IpAddr>() {
-                out.push(ipnet::IpNet::from(ip));
-            }
-        }
-    } else if let Some(list) = file_val {
-        for token in list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            if let Ok(net) = token.parse::<ipnet::IpNet>() {
-                out.push(net);
-            } else if let Ok(ip) = token.parse::<std::net::IpAddr>() {
-                out.push(ipnet::IpNet::from(ip));
-            }
-        }
-    }
-    out
 }

@@ -432,6 +432,21 @@ impl AppState {
     }
 }
 
+fn load_config_or_exit(command: &str, config_paths: &[std::path::PathBuf]) -> Config {
+    let res = if config_paths.is_empty() {
+        Config::from_env()
+    } else {
+        Config::from_env_with_files(config_paths)
+    };
+    match res {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("{command}: failed to load config: {err}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     install_rustls_crypto_provider();
@@ -442,68 +457,19 @@ async fn main() {
 
     match cli.command {
         CliCommand::CheckConfig => {
-            let _cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths))
-            {
-                Ok(c) => c,
-                Err(err) => {
-                    let msg = if let Some(s) = err.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = err.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else {
-                        "<non-string panic>".to_string()
-                    };
-                    eprintln!("check-config: failed to load config: {msg}");
-                    std::process::exit(2);
-                }
-            };
-
+            let _cfg = load_config_or_exit("check-config", &config_paths);
             println!("OK");
             return;
         }
         CliCommand::AuditPermissions => {
             // Access audit: print effective permissions and exit.
-            let cfg = match std::panic::catch_unwind(|| Config::from_env_with_files(&config_paths))
-            {
-                Ok(c) => c,
-                Err(err) => {
-                    let msg = if let Some(s) = err.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = err.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else {
-                        "<non-string panic>".to_string()
-                    };
-                    eprintln!("audit-permissions: failed to load config: {msg}");
-                    std::process::exit(2);
-                }
-            };
-
+            let cfg = load_config_or_exit("audit-permissions", &config_paths);
             let _report = crate::audit::print_audit(&cfg);
             return;
         }
         CliCommand::RefIndex { command } => {
             // CLI utilities should not panic; keep errors user-friendly.
-            let cfg = match std::panic::catch_unwind(|| {
-                if config_paths.is_empty() {
-                    Config::from_env()
-                } else {
-                    Config::from_env_with_files(&config_paths)
-                }
-            }) {
-                Ok(c) => c,
-                Err(err) => {
-                    let msg = if let Some(s) = err.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = err.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else {
-                        "<non-string panic>".to_string()
-                    };
-                    eprintln!("ref-index: failed to load config: {msg}");
-                    std::process::exit(2);
-                }
-            };
+            let cfg = load_config_or_exit("ref-index", &config_paths);
 
             if !cfg.ref_index.enabled {
                 eprintln!("ref-index is disabled (storage.ref_index.enabled=false)");
@@ -574,26 +540,7 @@ async fn main() {
             }
         }
         CliCommand::BlobGc { command } => {
-            let cfg = match std::panic::catch_unwind(|| {
-                if config_paths.is_empty() {
-                    Config::from_env()
-                } else {
-                    Config::from_env_with_files(&config_paths)
-                }
-            }) {
-                Ok(c) => c,
-                Err(err) => {
-                    let msg = if let Some(s) = err.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = err.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else {
-                        "<non-string panic>".to_string()
-                    };
-                    eprintln!("blob-gc: failed to load config: {msg}");
-                    std::process::exit(2);
-                }
-            };
+            let cfg = load_config_or_exit("blob-gc", &config_paths);
 
             if cfg.storage_backend != StorageBackend::Filesystem {
                 eprintln!("blob-gc: only filesystem backend is supported");
@@ -770,30 +717,7 @@ async fn main() {
         "registry-rust starting"
     );
 
-    let config = match std::panic::catch_unwind(|| {
-        if config_paths.is_empty() {
-            Config::from_env()
-        } else {
-            Config::from_env_with_files(&config_paths)
-        }
-    }) {
-        Ok(c) => Arc::new(c),
-        Err(err) => {
-            let msg = if let Some(s) = err.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = err.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else {
-                "<non-string panic>".to_string()
-            };
-            if config_paths.is_empty() {
-                eprintln!("server: failed to load config: {msg}");
-            } else {
-                eprintln!("server: failed to load layered config: {msg}");
-            }
-            std::process::exit(2);
-        }
-    };
+    let config = Arc::new(load_config_or_exit("server", &config_paths));
 
     // Start phase: generate/renew TLS certs before we attempt to load them.
     // This runs only when [server.tls.acme] is enabled.
