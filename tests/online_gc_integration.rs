@@ -144,6 +144,7 @@ mode = "basic_or_token"
 username = "demo"
 password = "demo"
 allow_repos = ["*"]
+actions = ["pull", "push", "delete"]
 
 [token]
 service = "registry-rust"

@@ -74,6 +74,7 @@ strategy = "both"
 username = "demo"
 password = "demo"
 allow_repos = ["*"]
+actions = ["pull", "push", "delete"]
 
 [storage]
 backend = "fs"
@@ -1693,7 +1694,10 @@ async fn test_audit_remediation_suite() {
         .send()
         .await
         .expect("denied upload create");
-    assert_eq!(denied_upload_resp.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied_upload_resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     // 24. Unauthenticated request to private repo returns 401 challenge
     let challenge_resp = client
@@ -1737,7 +1741,10 @@ async fn test_audit_remediation_suite() {
         .send()
         .await
         .expect("denied delete");
-    assert_eq!(denied_delete_resp.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied_delete_resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     // 27. Repositories starting with 'v' or '2' work without prefix stripping corruption
     let v_repo = "v2-compliance-test";
@@ -1812,9 +1819,12 @@ async fn test_audit_remediation_suite() {
         .send()
         .await
         .expect("upload with wrong token");
-    assert_eq!(denied_upload_resp.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied_upload_resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let denied_body: serde_json::Value = denied_upload_resp.json().await.expect("denied json");
-    assert_eq!(denied_body["errors"][0]["code"], "DENIED");
+    assert_eq!(denied_body["errors"][0]["code"], "UNAUTHORIZED");
 
     // 30. Tags pagination subsequent page with last cursor omits Link header when no more pages
     let page_repo = "tags-multi-page-repo";
@@ -1931,17 +1941,23 @@ async fn test_audit_remediation_suite() {
     let p2_body: serde_json::Value = tags_page2_resp.json().await.expect("p2 json");
     assert_eq!(p2_body["tags"].as_array().unwrap().len(), 2);
 
-    // 31. Cross-repository blob mount without pull permissions on source repo -> 403 Forbidden DENIED per auth spec
+    // 31. Cross-repository blob mount without pull permissions on source repo -> falls back to 202 Accepted per OCI Distribution spec
     let mount_fallback_resp = client
-        .post(format!("{base_url}/v2/{repo}/blobs/uploads/?mount={sha512_digest}&from=unauthorized-secret-repo"))
+        .post(format!(
+            "{base_url}/v2/{repo}/blobs/uploads/?mount={sha512_digest}&from=unauthorized-secret-repo"
+        ))
         .bearer_auth(pull_push_token)
         .header(header::CONTENT_LENGTH, "0")
         .send()
         .await
         .expect("mount fallback");
-    assert_eq!(mount_fallback_resp.status(), reqwest::StatusCode::FORBIDDEN);
-    let mount_err: serde_json::Value = mount_fallback_resp.json().await.expect("json");
-    assert_eq!(mount_err["errors"][0]["code"], "DENIED");
+    assert_eq!(mount_fallback_resp.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        mount_fallback_resp
+            .headers()
+            .get(header::LOCATION)
+            .is_some()
+    );
 
     // 32. Manifest PUT with malformed descriptor (invalid digest in layers) -> 400 Bad Request MANIFEST_INVALID, nothing persisted
     let malformed_manifest = serde_json::json!({

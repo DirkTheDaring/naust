@@ -8,6 +8,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
+use headers::HeaderMapExt;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1878,6 +1879,8 @@ mod tests {
             push_username: None,
             push_password: None,
             push_allow_repos: Some(vec![crate::registry::RepositoryAccessPattern::All]),
+            push_actions: vec!["pull".to_string(), "push".to_string()],
+            push_implies_delete: false,
             storage_backend: crate::config::StorageBackend::Filesystem,
             fs_root: PathBuf::from("./data"),
             s3_endpoint: None,
@@ -3243,12 +3246,58 @@ async fn upload_create(
                 name,
                 crate::security::RepoAction::Push,
             ) {
-                return errors::denied("push permission denied on target repository")
-                    .into_response();
+                return crate::auth::unauthorized_registry_challenge(
+                    &state,
+                    Some(name),
+                    Some(crate::security::RepoAction::Push),
+                );
             }
         } else {
-            return crate::auth::unauthorized_registry_challenge(&state, Some(name));
+            return crate::auth::unauthorized_registry_challenge(
+                &state,
+                Some(name),
+                Some(crate::security::RepoAction::Push),
+            );
         }
+    } else if state.config.auth_strategy != crate::config::AuthStrategy::Token {
+        if let Some(headers::Authorization(basic)) =
+            headers.typed_get::<headers::Authorization<headers::authorization::Basic>>()
+        {
+            let Ok(canonical_target) = crate::registry::CanonicalRepoName::parse(name) else {
+                return errors::name_invalid().into_response();
+            };
+            if !crate::auth::verify_direct_basic_access(
+                &state.config,
+                basic.username(),
+                basic.password(),
+                &canonical_target,
+                "push",
+            ) {
+                return crate::auth::unauthorized_registry_challenge(
+                    &state,
+                    Some(name),
+                    Some(crate::security::RepoAction::Push),
+                );
+            }
+        } else if state.config.push_username.is_some()
+            || state.config.robots.enabled
+            || state.config.users.enabled
+        {
+            return crate::auth::unauthorized_registry_challenge(
+                &state,
+                Some(name),
+                Some(crate::security::RepoAction::Push),
+            );
+        }
+    } else if state.config.push_username.is_some()
+        || state.config.robots.enabled
+        || state.config.users.enabled
+    {
+        return crate::auth::unauthorized_registry_challenge(
+            &state,
+            Some(name),
+            Some(crate::security::RepoAction::Push),
+        );
     }
 
     let req_content_len = headers
@@ -3270,7 +3319,7 @@ async fn upload_create(
             Err(_) => return errors::digest_invalid().into_response(),
         };
 
-        let from_repo = query.get("from").map(|s| s.as_str());
+        let mut from_repo = query.get("from").map(|s| s.as_str());
         if let Some(src_repo) = from_repo {
             if !is_valid_repo_name(src_repo) {
                 return errors::name_invalid().into_response();
@@ -3292,12 +3341,26 @@ async fn upload_create(
                 } else {
                     false
                 }
+            } else if let Some(headers::Authorization(basic)) =
+                headers.typed_get::<headers::Authorization<headers::authorization::Basic>>()
+            {
+                if let Ok(canonical_src) = crate::registry::CanonicalRepoName::parse(src_repo) {
+                    crate::auth::verify_direct_basic_access(
+                        &state.config,
+                        basic.username(),
+                        basic.password(),
+                        &canonical_src,
+                        "pull",
+                    )
+                } else {
+                    false
+                }
             } else {
                 !from_is_private && state.config.anonymous_pull
             };
 
             if !allows_pull {
-                return errors::denied("access to repository denied").into_response();
+                from_repo = None;
             }
         }
 
@@ -3565,6 +3628,11 @@ async fn upload_session(
         return errors::blob_upload_unknown().into_response();
     }
 
+    let required_action = match method {
+        Method::DELETE | Method::PATCH | Method::PUT => crate::security::RepoAction::Push,
+        _ => crate::security::RepoAction::Pull,
+    };
+
     if let Some(token) = crate::auth::bearer_token_from_headers(req_headers) {
         if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
@@ -3572,17 +3640,70 @@ async fn upload_session(
             &state.config.token_service,
             state.config.token_ttl_secs,
         ) {
-            let required_action = match method {
-                Method::DELETE | Method::PATCH | Method::PUT => crate::security::RepoAction::Push,
-                _ => crate::security::RepoAction::Pull,
-            };
             if !crate::security::token_allows_repo_action(&claims, name, required_action) {
                 let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::denied("access to repository denied").into_response();
+                return crate::auth::unauthorized_registry_challenge(
+                    &state,
+                    Some(name),
+                    Some(required_action),
+                );
             }
         } else {
-            return crate::auth::unauthorized_registry_challenge(&state, Some(name));
+            return crate::auth::unauthorized_registry_challenge(
+                &state,
+                Some(name),
+                Some(required_action),
+            );
         }
+    } else if state.config.auth_strategy != crate::config::AuthStrategy::Token {
+        if let Some(headers::Authorization(basic)) =
+            req_headers.typed_get::<headers::Authorization<headers::authorization::Basic>>()
+        {
+            let Ok(canonical_target) = crate::registry::CanonicalRepoName::parse(name) else {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+                return errors::name_invalid().into_response();
+            };
+            if !crate::auth::verify_direct_basic_access(
+                &state.config,
+                basic.username(),
+                basic.password(),
+                &canonical_target,
+                required_action.as_str(),
+            ) {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+                return crate::auth::unauthorized_registry_challenge(
+                    &state,
+                    Some(name),
+                    Some(required_action),
+                );
+            }
+        } else if (required_action != crate::security::RepoAction::Pull
+            || !state.config.anonymous_pull
+            || state.config.is_repo_private(name))
+            && (state.config.push_username.is_some()
+                || state.config.robots.enabled
+                || state.config.users.enabled)
+        {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            return crate::auth::unauthorized_registry_challenge(
+                &state,
+                Some(name),
+                Some(required_action),
+            );
+        }
+    } else if (required_action != crate::security::RepoAction::Pull
+        || !state.config.anonymous_pull
+        || state.config.is_repo_private(name))
+        && (state.config.push_username.is_some()
+            || state.config.robots.enabled
+            || state.config.users.enabled)
+    {
+        let _ = axum::body::to_bytes(body, usize::MAX).await;
+        return crate::auth::unauthorized_registry_challenge(
+            &state,
+            Some(name),
+            Some(required_action),
+        );
     }
 
     match method {
@@ -3595,7 +3716,8 @@ async fn upload_session(
             {
                 Ok(st) => {
                     let mut headers = registry_headers();
-                    let location = format!("/v2/{name}/blobs/uploads/{uuid}");
+                    let location =
+                        format!("/v2/{name}/blobs/uploads/{uuid}?_state={}", st.state_token);
                     headers.insert("Location", location.parse().unwrap());
                     headers.insert("Docker-Upload-UUID", uuid.parse().unwrap());
                     if st.offset > 0 {

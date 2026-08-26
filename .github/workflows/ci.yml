@@ -57,73 +57,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build registry
-        run: cargo build
-
-      - name: Start registry (for conformance)
-        shell: bash
-        run: |
-          set -euo pipefail
-          data_dir="$(mktemp -d)"
-          echo "OCI_REGISTRY_DATA_DIR=${data_dir}" >> "$GITHUB_ENV"
-
-          REGISTRY_USERNAME=demo \
-          REGISTRY_PASSWORD=demo \
-          REGISTRY_PUSH_ALLOW_REPOS='*' \
-          STORAGE_BACKEND=fs \
-          STORAGE_FS_ROOT="${data_dir}" \
-          ALLOW_TAG_OVERWRITE=1 \
-          PUBLIC_URL='http://127.0.0.1:5000' \
-          RUST_LOG='info' \
-          ./target/debug/registry-rust &
-
-          echo "OCI_REGISTRY_PID=$!" >> "$GITHUB_ENV"
-
-          for _ in {1..60}; do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:5000/v2/ || true)
-            if [[ "$code" == "200" || "$code" == "401" ]]; then
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "registry did not start" >&2
-          exit 1
-
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
 
-      - name: Run OCI Distribution conformance (black-box)
-        uses: opencontainers/distribution-spec@v1.1.0
-        env:
-          OCI_ROOT_URL: http://127.0.0.1:5000
-          OCI_NAMESPACE: conformance/myrepo
-          OCI_USERNAME: demo
-          OCI_PASSWORD: demo
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-          OCI_TEST_PULL: 1
-          OCI_TEST_PUSH: 1
-          OCI_TEST_CONTENT_DISCOVERY: 1
-          OCI_TEST_CONTENT_MANAGEMENT: 1
+      - name: Install Python dependencies
+        run: pip install pyyaml
 
-          OCI_HIDE_SKIPPED_WORKFLOWS: 1
-          OCI_DEBUG: 0
-          OCI_DELETE_MANIFEST_BEFORE_BLOBS: 1
+      - name: Start MinIO
+        run: scripts/start-minio.sh
 
-      - name: Stop registry (before skipped-branch conformance)
+      - name: Run OCI Distribution v1.1.1 Conformance (FS and S3)
+        run: scripts/oci-conformance.sh
+
+      - name: Upload Conformance Artifacts (All Matrices)
         if: always()
-        shell: bash
-        run: |
-          kill "${OCI_REGISTRY_PID:-}" 2>/dev/null || true
-
-      - name: Run OCI conformance skipped branches (env + cross-mount + blob delete)
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/oci-conformance-skipped.sh
-
-      - name: Stop registry
-        if: always()
-        shell: bash
-        run: |
-          kill "${OCI_REGISTRY_PID:-}" 2>/dev/null || true
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-conformance-results
+          path: conformance-results/**

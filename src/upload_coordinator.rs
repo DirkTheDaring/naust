@@ -74,6 +74,7 @@ pub struct UploadStatusResult {
     pub session: UploadSessionId,
     pub state: UploadSessionState,
     pub offset: u64,
+    pub state_token: String,
 }
 
 #[derive(Clone, Debug)]
@@ -332,10 +333,13 @@ impl BlobUploadCoordinator {
         let session = UploadSessionId::new(canonical_repo, uuid);
         let status = self.storage.session_status(&session).await?;
 
+        let state_token = self.generate_state_token(repo, uuid, status.committed_offset);
+
         Ok(UploadStatusResult {
             session: status.session,
             state: status.state,
             offset: status.committed_offset,
+            state_token,
         })
     }
 

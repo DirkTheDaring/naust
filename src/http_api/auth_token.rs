@@ -250,9 +250,76 @@ pub fn decide_token_scopes_for_request(
         return Err(TokenRejection::Unauthorized);
     }
 
+    let allowed_actions: Vec<String> = if cfg.push_implies_delete {
+        vec!["pull".to_string(), "push".to_string(), "delete".to_string()]
+    } else {
+        cfg.push_actions.clone()
+    };
+
+    let mut granted_scopes: Vec<security::TokenScope> = Vec::new();
+    for req in token_scopes {
+        if req.typ == "registry" && (req.name == "catalog" || req.name == "*") {
+            if allowed_actions
+                .iter()
+                .any(|a| a == "*" || a == "pull" || a == "push")
+            {
+                granted_scopes.push(req.clone());
+            }
+            continue;
+        }
+        if req.typ != "repository" {
+            continue;
+        }
+        let Ok(canonical_repo) = crate::registry::CanonicalRepoName::parse(req.name.trim()) else {
+            continue;
+        };
+        let repo_allowed = match cfg.push_allow_repos.as_deref() {
+            Some(allowlist) => crate::auth::push_repository_allowed(allowlist, &canonical_repo),
+            None => true,
+        };
+
+        let mut granted_actions: Vec<String> = Vec::new();
+        for a in &req.actions {
+            let a_norm = a.trim().to_ascii_lowercase();
+            if a_norm == "pull" {
+                if repo_allowed || cfg.anonymous_pull {
+                    granted_actions.push(a_norm);
+                }
+            } else if repo_allowed && (allowed_actions.iter().any(|x| x == "*" || x == &a_norm)) {
+                granted_actions.push(a_norm);
+            }
+        }
+
+        if !granted_actions.is_empty() {
+            granted_scopes.push(security::TokenScope {
+                typ: req.typ.clone(),
+                name: canonical_repo.to_string(),
+                actions: granted_actions,
+            });
+        }
+    }
+
+    if !token_scopes.is_empty() && granted_scopes.is_empty() {
+        return Err(TokenRejection::Denied("action not allowed by policy"));
+    }
+
+    if wants_push && !wants_push_from_token_scopes(&granted_scopes) {
+        return Err(TokenRejection::Denied("push not allowed by policy"));
+    }
+
+    let wants_delete = token_scopes
+        .iter()
+        .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete));
+    let granted_wants_delete = granted_scopes
+        .iter()
+        .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete));
+    if wants_delete && !granted_wants_delete {
+        return Err(TokenRejection::Denied("delete not allowed by policy"));
+    }
+
     Ok(TokenDecision {
         subject: Some(user),
-        scopes: token_scopes.to_vec(),
+        scopes: granted_scopes,
         ttl_secs: cfg.token_ttl_secs,
     })
 }
@@ -340,7 +407,12 @@ pub async fn token(
         }
     };
 
-    if wants_push_from_token_scopes(&decision.scopes) {
+    if wants_push_from_token_scopes(&decision.scopes)
+        || decision
+            .scopes
+            .iter()
+            .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete))
+    {
         if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
             for scope in &decision.scopes {
                 if scope.typ == "repository" {

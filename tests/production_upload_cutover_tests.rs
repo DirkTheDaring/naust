@@ -78,6 +78,7 @@ strategy = "both"
 username = "demo"
 password = "demo"
 allow_repos = ["*"]
+actions = ["pull", "push", "delete"]
 
 [storage]
 backend = "fs"
@@ -722,6 +723,7 @@ strategy = "both"
 username = "demo"
 password = "demo"
 allow_repos = ["*"]
+actions = ["pull", "push", "delete"]
 
 [storage]
 backend = "fs"

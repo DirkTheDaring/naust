@@ -105,6 +105,8 @@ pub struct Config {
     pub push_username: Option<String>,
     pub push_password: Option<String>,
     pub push_allow_repos: Option<Vec<crate::registry::RepositoryAccessPattern>>,
+    pub push_actions: Vec<String>,
+    pub push_implies_delete: bool,
 
     pub auth_strategy: AuthStrategy,
     pub anonymous_pull: bool,
@@ -947,6 +949,10 @@ struct FilePushAuth {
     password: Option<String>,
     #[serde(default)]
     allow_repos: Option<Vec<String>>,
+    #[serde(default)]
+    actions: Option<Vec<String>>,
+    #[serde(default)]
+    implies_delete: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1369,10 +1375,14 @@ impl Config {
         let push_password = env_str_opt(&["REGISTRY__AUTH__PUSH__PASSWORD", "REGISTRY_PASSWORD"])
             .or_else(|| file_cfg.auth.push.password.clone());
 
-        let auth_strategy_raw = env_str_opt(&["REGISTRY__AUTH__STRATEGY", "AUTH_STRATEGY"])
-            .or_else(|| file_cfg.auth.strategy.clone())
-            .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "token".to_string());
+        let auth_strategy_raw = env_str_opt(&[
+            "REGISTRY__AUTH__STRATEGY",
+            "REGISTRY_AUTH_STRATEGY",
+            "AUTH_STRATEGY",
+        ])
+        .or_else(|| file_cfg.auth.strategy.clone())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "token".to_string());
         let auth_strategy = match auth_strategy_raw.as_str() {
             "bearer" | "token" => AuthStrategy::Token,
             "basic" => AuthStrategy::Basic,
@@ -1385,10 +1395,14 @@ impl Config {
             }
         };
 
-        let anonymous_pull =
-            env_bool_opt(&["REGISTRY__AUTH__ANONYMOUS_PULL", "AUTH_ANONYMOUS_PULL"])?
-                .or_else(|| file_cfg.auth.anonymous_pull)
-                .unwrap_or(true);
+        let anonymous_pull = env_bool_opt(&[
+            "REGISTRY__AUTH__ANONYMOUS_PULL",
+            "REGISTRY_AUTH_ANONYMOUS_PULL",
+            "REGISTRY_ANONYMOUS_PULL",
+            "AUTH_ANONYMOUS_PULL",
+        ])?
+        .or_else(|| file_cfg.auth.anonymous_pull)
+        .unwrap_or(true);
 
         let push_allow_repos_raw = env_str_opt(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
@@ -1403,6 +1417,28 @@ impl Config {
         .filter(|v| !v.is_empty())
         .or_else(|| file_cfg.auth.push.allow_repos.clone())
         .filter(|v| !v.is_empty());
+
+        let push_actions = env_str_opt(&[
+            "REGISTRY__AUTH__PUSH__ACTIONS",
+            "REGISTRY_AUTH_ACTIONS",
+            "REGISTRY_PUSH_ACTIONS",
+        ])
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .or_else(|| file_cfg.auth.push.actions.clone())
+        .unwrap_or_else(|| vec!["pull".to_string(), "push".to_string()]);
+
+        let push_implies_delete = env_bool_opt(&[
+            "REGISTRY__AUTH__PUSH_IMPLIES_DELETE",
+            "REGISTRY_PUSH_IMPLIES_DELETE",
+        ])?
+        .or(file_cfg.auth.push.implies_delete)
+        .unwrap_or(false);
 
         let push_allow_repos = match push_allow_repos_raw {
             Some(raw_list) => {
@@ -2261,6 +2297,8 @@ impl Config {
             push_username,
             push_password,
             push_allow_repos,
+            push_actions,
+            push_implies_delete,
             auth_strategy,
             anonymous_pull,
             storage_backend,

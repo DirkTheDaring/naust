@@ -84,7 +84,11 @@ pub(crate) fn push_repository_allowed(
     allowlist.iter().any(|pat| pat.matches(repo))
 }
 
-pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Response {
+pub(crate) fn unauthorized_registry_challenge(
+    state: &AppState,
+    repo: Option<&str>,
+    action: Option<crate::security::RepoAction>,
+) -> Response {
     let mut resp = errors::unauthorized("authentication required");
 
     let realm = state
@@ -100,7 +104,8 @@ pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&st
     );
 
     if let Some(repo) = repo {
-        bearer.push_str(&format!(",scope=\"repository:{repo}:pull,push\""));
+        let action_str = action.map(|a| a.as_str()).unwrap_or("pull");
+        bearer.push_str(&format!(",scope=\"repository:{repo}:{action_str}\""));
     }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Token
@@ -204,7 +209,7 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     false
 }
 
-fn verify_direct_basic_access(
+pub(crate) fn verify_direct_basic_access(
     cfg: &crate::config::Config,
     user: &str,
     pass: &str,
@@ -250,6 +255,17 @@ fn verify_direct_basic_access(
         (cfg.push_username.as_deref(), cfg.push_password.as_deref())
     {
         if user == expected_user && pass == expected_pass {
+            let action_norm = action.to_ascii_lowercase();
+            let action_allowed = if cfg.push_implies_delete {
+                action_norm == "pull" || action_norm == "push" || action_norm == "delete"
+            } else {
+                cfg.push_actions
+                    .iter()
+                    .any(|a| a == "*" || a.eq_ignore_ascii_case(&action_norm))
+            };
+            if !action_allowed {
+                return false;
+            }
             if let Some(allowlist) = cfg.push_allow_repos.as_deref() {
                 return push_repository_allowed(allowlist, repo);
             }
@@ -362,7 +378,7 @@ pub async fn require_auth_middleware(
     }
 
     let Some(canonical_repo) = route.repository() else {
-        return unauthorized_registry_challenge(&state, None);
+        return unauthorized_registry_challenge(&state, None, None);
     };
     let repo_name = canonical_repo.as_str();
 
@@ -383,21 +399,33 @@ pub async fn require_auth_middleware(
         ) {
             Ok(claims) => {
                 if !security::token_allows_repo_action(&claims, repo_name, required_action) {
-                    return errors::denied("access to repository denied").into_response();
+                    return unauthorized_registry_challenge(
+                        &state,
+                        Some(repo_name),
+                        Some(required_action),
+                    );
                 }
 
-                if required_action == security::RepoAction::Push {
+                if required_action == security::RepoAction::Push
+                    || required_action == security::RepoAction::Delete
+                {
                     if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
                         if !push_repository_allowed(allowlist, canonical_repo) {
-                            return errors::denied("push not allowed for this repository")
-                                .into_response();
+                            return errors::denied(
+                                "push or delete not allowed for this repository",
+                            )
+                            .into_response();
                         }
                     }
                 }
                 return next.run(request).await;
             }
             Err(_) => {
-                return unauthorized_registry_challenge(&state, Some(repo_name));
+                return unauthorized_registry_challenge(
+                    &state,
+                    Some(repo_name),
+                    Some(required_action),
+                );
             }
         }
     }
@@ -418,7 +446,7 @@ pub async fn require_auth_middleware(
         }
     }
 
-    unauthorized_registry_challenge(&state, Some(repo_name))
+    unauthorized_registry_challenge(&state, Some(repo_name), Some(required_action))
 }
 
 #[cfg(test)]
@@ -854,7 +882,7 @@ root = "{}"
             .unwrap();
         assert_eq!(res.status(), http::StatusCode::OK);
 
-        // 2. Cross-boundary tenant attack (org2/app) with org/app token is DENIED (403)
+        // 2. Cross-boundary tenant attack (org2/app) with org/app token is challenged (401)
         let res = app
             .clone()
             .oneshot(
@@ -869,9 +897,9 @@ root = "{}"
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
 
-        // 3. Extended name attack (org/application) with org/app token is DENIED (403)
+        // 3. Extended name attack (org/application) with org/app token is challenged (401)
         let res = app
             .clone()
             .oneshot(
@@ -886,9 +914,9 @@ root = "{}"
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
 
-        // 4. Sub-path attack (org/app/sub) with org/app token is DENIED (403)
+        // 4. Sub-path attack (org/app/sub) with org/app token is challenged (401)
         let res = app
             .clone()
             .oneshot(
@@ -903,9 +931,9 @@ root = "{}"
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
 
-        // 5. Method restriction: write (PUT) with pull-only token is DENIED (403)
+        // 5. Method restriction: write (PUT) with pull-only token is challenged (401)
         let res = app
             .clone()
             .oneshot(
@@ -921,7 +949,7 @@ root = "{}"
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
 
         let _ = std::fs::remove_dir_all(&fs_root);
     }

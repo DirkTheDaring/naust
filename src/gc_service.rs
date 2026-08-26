@@ -573,6 +573,8 @@ mod tests {
             push_username: None,
             push_password: None,
             push_allow_repos: None,
+            push_actions: vec!["pull".to_string(), "push".to_string()],
+            push_implies_delete: false,
             auth_strategy: crate::config::AuthStrategy::Token,
             anonymous_pull: true,
             storage_backend: StorageBackend::Filesystem,
