@@ -1,15 +1,20 @@
 use bytes::Bytes;
 use sha2::Digest as _;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::sync::{Barrier, Mutex, oneshot};
 use url::Url;
 use uuid::Uuid;
 
+use registry_rust::blob_gc::{BlobGcPolicy, CasBlobTraverser};
 use registry_rust::blob_ref_index::BlobRefIndex;
 use registry_rust::config::Config;
-use registry_rust::manifest_lifecycle::{ManifestLifecycleService, PublishManifestRequest};
+use registry_rust::gc_service::{GcBudgets, GcService, GcServiceError};
+use registry_rust::manifest_lifecycle::{
+    LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase, ManifestLifecycleService,
+    PublishManifestRequest,
+};
 use registry_rust::registry::digest::Digest;
 use registry_rust::storage::mutation_authority::{
     RuntimeMutationAuthority, admin_clear_abandoned_deployment_writer_lock,
@@ -22,8 +27,8 @@ use registry_rust::storage::upload_session::{
     UploadSessionStorage,
 };
 use registry_rust::storage::{
-    ConditionalDeleteResult, ReferrerDescriptor, Storage, StorageError, TagMutation,
-    TagMutationPolicy,
+    ConditionalDeleteResult, GcDeleteResult, ReferrerDescriptor, Storage, StorageError,
+    TagMutation, TagMutationPolicy,
 };
 use registry_rust::supervisor::{SupervisorOptions, run_server_supervisor};
 
@@ -31,25 +36,57 @@ use registry_rust::supervisor::{SupervisorOptions, run_server_supervisor};
 // LIVE S3 TEST HARNESS & SAFETY GUARDRAILS
 // ================================================================================================
 
+#[derive(Clone, Debug)]
+pub struct LiveS3SafetyPolicy {
+    pub allow_non_local_destructive_tests: bool,
+    pub expected_account_id: Option<String>,
+}
+
+impl LiveS3SafetyPolicy {
+    pub fn from_env() -> Self {
+        let allow = std::env::var("ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS").as_deref() == Ok("1");
+        let expected_account_id = std::env::var("TEST_S3_EXPECTED_ACCOUNT_ID")
+            .ok()
+            .or_else(|| std::env::var("EXPECTED_AWS_ACCOUNT_ID").ok());
+        Self {
+            allow_non_local_destructive_tests: allow,
+            expected_account_id,
+        }
+    }
+
+    pub fn validate_endpoint(&self, endpoint: &str) -> Result<(), String> {
+        let url = Url::parse(endpoint)
+            .map_err(|e| format!("invalid S3 endpoint URL '{endpoint}': {e}"))?;
+        let host = url.host_str().unwrap_or("");
+        let is_local = host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::1"
+            || host == "0.0.0.0"
+            || host.ends_with(".localhost");
+
+        if !is_local && !self.allow_non_local_destructive_tests {
+            return Err(format!(
+                "Refusing to run live S3 contract tests against non-local endpoint '{endpoint}'. Set ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS=1 to override."
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct LiveS3Harness {
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
     pub prefix: String,
+    pub policy: LiveS3SafetyPolicy,
 }
 
 impl LiveS3Harness {
     pub async fn new() -> Result<Self, String> {
-        // Set deterministic test credentials in process environment if not already present
-        if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
-            unsafe {
-                std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-                std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-                std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
-                std::env::set_var("AWS_REGION", "us-east-1");
-            }
-        }
+        Self::with_policy(LiveS3SafetyPolicy::from_env()).await
+    }
 
+    pub async fn with_policy(policy: LiveS3SafetyPolicy) -> Result<Self, String> {
         let endpoint = std::env::var("TEST_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
         let region = std::env::var("TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
@@ -57,7 +94,42 @@ impl LiveS3Harness {
             std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "registry-live-test".to_string());
 
         // Guardrail 1: Local vs non-local endpoint validation
-        Self::validate_endpoint(&endpoint)?;
+        policy.validate_endpoint(&endpoint)?;
+
+        // If non-local (real AWS), verify STS caller identity before proceeding
+        let url = Url::parse(&endpoint).map_err(|e| e.to_string())?;
+        let host = url.host_str().unwrap_or("");
+        let is_local = host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::1"
+            || host == "0.0.0.0"
+            || host.ends_with(".localhost");
+
+        if !is_local {
+            let output = tokio::process::Command::new("aws")
+                .args(["sts", "get-caller-identity", "--output", "json"])
+                .output()
+                .await
+                .map_err(|e| format!("failed to invoke aws sts get-caller-identity: {e}"))?;
+
+            if !output.status.success() {
+                return Err(format!(
+                    "aws sts get-caller-identity failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+
+            let ident: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|e| format!("failed to parse STS identity: {e}"))?;
+            let account = ident["Account"].as_str().unwrap_or("");
+            if let Some(ref expected) = policy.expected_account_id
+                && account != expected
+            {
+                return Err(format!(
+                    "SAFETY ABORT: AWS Account ID '{account}' does NOT match required account '{expected}'"
+                ));
+            }
+        }
 
         // Guardrail 2: Cryptographically unique run prefix
         let now_secs = SystemTime::now()
@@ -80,26 +152,8 @@ impl LiveS3Harness {
             region,
             bucket,
             prefix,
+            policy,
         })
-    }
-
-    pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
-        let url = Url::parse(endpoint)
-            .map_err(|e| format!("invalid S3 endpoint URL '{endpoint}': {e}"))?;
-        let host = url.host_str().unwrap_or("");
-        let is_local = host == "127.0.0.1"
-            || host == "localhost"
-            || host == "::1"
-            || host == "0.0.0.0"
-            || host.ends_with(".localhost");
-
-        if !is_local && std::env::var("ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS").as_deref() != Ok("1")
-        {
-            return Err(format!(
-                "Refusing to run live S3 contract tests against non-local endpoint '{endpoint}'. Set ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS=1 to override."
-            ));
-        }
-        Ok(())
     }
 
     async fn ensure_bucket_exists(
@@ -107,14 +161,35 @@ impl LiveS3Harness {
         region: &str,
         bucket: &str,
     ) -> Result<(), String> {
+        let url = Url::parse(endpoint).map_err(|e| e.to_string())?;
+        let host = url.host_str().unwrap_or("");
+        let is_local = host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::1"
+            || host == "0.0.0.0"
+            || host.ends_with(".localhost");
+
         let loader = aws_config::defaults(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()));
+        let loader = if is_local && std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+            loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "minioadmin",
+                "minioadmin",
+                None,
+                None,
+                "static",
+            ))
+        } else {
+            loader
+        };
         let shared = loader.load().await;
-        let config = aws_sdk_s3::config::Builder::from(&shared)
-            .endpoint_url(endpoint)
-            .force_path_style(true)
-            .build();
-        let client = aws_sdk_s3::Client::from_conf(config);
+        let mut builder = aws_sdk_s3::config::Builder::from(&shared);
+        if is_local {
+            builder = builder.endpoint_url(endpoint).force_path_style(true);
+        } else if !endpoint.is_empty() && endpoint != "https://s3.amazonaws.com" {
+            builder = builder.endpoint_url(endpoint);
+        }
+        let client = aws_sdk_s3::Client::from_conf(builder.build());
 
         match client.create_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(()),
@@ -289,18 +364,41 @@ async fn write_test_blob(storage: &Arc<dyn Storage>, repo: &str, content: &[u8])
 
 #[tokio::test]
 async fn test_safety_guardrails_reject_non_local_without_override() {
-    assert!(LiveS3Harness::validate_endpoint("http://127.0.0.1:9000").is_ok());
-    assert!(LiveS3Harness::validate_endpoint("http://localhost:9000").is_ok());
-    assert!(LiveS3Harness::validate_endpoint("http://s3.localhost:9000").is_ok());
+    let local_policy = LiveS3SafetyPolicy {
+        allow_non_local_destructive_tests: false,
+        expected_account_id: Some("123456789012".to_string()),
+    };
+    assert!(
+        local_policy
+            .validate_endpoint("http://127.0.0.1:9000")
+            .is_ok()
+    );
+    assert!(
+        local_policy
+            .validate_endpoint("http://localhost:9000")
+            .is_ok()
+    );
+    assert!(
+        local_policy
+            .validate_endpoint("http://s3.localhost:9000")
+            .is_ok()
+    );
 
-    unsafe {
-        std::env::remove_var("ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS");
-    }
-    let res = LiveS3Harness::validate_endpoint("https://s3.amazonaws.com");
+    let res = local_policy.validate_endpoint("https://s3.amazonaws.com");
     assert!(res.is_err());
     assert!(
         res.unwrap_err()
             .contains("ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS")
+    );
+
+    let allowed_policy = LiveS3SafetyPolicy {
+        allow_non_local_destructive_tests: true,
+        expected_account_id: Some("123456789012".to_string()),
+    };
+    assert!(
+        allowed_policy
+            .validate_endpoint("https://s3.amazonaws.com")
+            .is_ok()
     );
 }
 
@@ -1044,6 +1142,704 @@ async fn test_live_s3_error_classification_contracts() {
         .mutate_tag(repo, tag, &d2, TagMutationPolicy::CreateOnly)
         .await;
     assert!(matches!(collide_res, Err(StorageError::TagAlreadyExists)));
+
+    harness.cleanup().await;
+}
+
+// ================================================================================================
+// 11. LIVE S3 PRODUCTION GC CONVERGENCE & CONTRACT QUALIFICATION (PHASE 2E)
+// ================================================================================================
+
+// 1. S3 service construction in the supervisor
+#[tokio::test]
+async fn test_live_s3_gc_service_construction_in_supervisor() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let cfg = Arc::new(harness.create_server_config(&temp));
+
+    let (bound_tx, bound_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let opts = SupervisorOptions {
+        notify_bound_addr: Some(bound_tx),
+        shutdown_rx: Some(shutdown_rx),
+        fault_injector: None,
+    };
+
+    let srv = tokio::spawn(async move { run_server_supervisor(cfg, Some(opts)).await });
+    let _addr = bound_rx.await.expect("server bound");
+
+    let _ = shutdown_tx.send(());
+    let srv_res = srv.await.expect("join server");
+    assert!(
+        srv_res.is_ok(),
+        "supervisor must run and shutdown cleanly with S3 gc_service"
+    );
+
+    harness.cleanup().await;
+}
+
+// 2. S3 scheduler no longer returning early (dispatches through GcStorageStrategy)
+#[tokio::test]
+async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    cfg.blob_gc_default_min_age_secs = 0;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "sched-test")
+        .await
+        .unwrap();
+
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let stats = service
+        .scheduled_cleanup_once()
+        .await
+        .expect("scheduled cleanup on S3");
+    assert!(
+        stats.delete.is_some(),
+        "S3 scheduled cleanup must execute direct-conditional delete"
+    );
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 3. S3 admin plan succeeds
+#[tokio::test]
+async fn test_live_s3_gc_admin_plan_succeeds() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let cfg = Arc::new(harness.create_server_config(&temp));
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let digest = write_test_blob(&storage, "test-plan-repo", b"orphan-payload-plan-test").await;
+    storage
+        .unlink_repo_blob("test-plan-repo", &digest)
+        .await
+        .unwrap();
+
+    let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let plan = service
+        .plan(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("plan");
+    assert!(plan.scanned_blobs >= 1);
+    assert_eq!(plan.eligible_blobs, 1);
+
+    harness.cleanup().await;
+}
+
+// 4. S3 admin delete removes genuinely unreferenced object
+#[tokio::test]
+async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let digest = write_test_blob(&storage, "test-del-repo", b"orphan-payload-del-test").await;
+    storage
+        .unlink_repo_blob("test-del-repo", &digest)
+        .await
+        .unwrap();
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "del-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(del.deleted_blobs, 1);
+
+    // Verify blob is gone
+    assert!(storage.open_blob(&digest).await.is_err());
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 5. S3 quarantine returns the explicit strategy response
+#[tokio::test]
+async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "q-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let q_res = service
+        .quarantine(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await;
+    assert!(
+        matches!(q_res, Err(GcServiceError::StrategyUnsupported(_))),
+        "S3 quarantine must return StrategyUnsupported"
+    );
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 6. Repository membership protects an object
+#[tokio::test]
+async fn test_live_s3_gc_repository_membership_protects_blob() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let digest = write_test_blob(&storage, "protected-repo", b"protected-by-membership").await;
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "mem-prot-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(
+        del.deleted_blobs, 0,
+        "blob with active membership must NOT be deleted"
+    );
+    assert!(storage.open_blob(&digest).await.is_ok());
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 7. Manifest-root reachability protects an object
+#[tokio::test]
+async fn test_live_s3_gc_manifest_reachability_protects_blob() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let blob_bytes = b"manifest-layer-blob-content";
+    let digest = write_test_blob(&storage, "manifest-repo", blob_bytes).await;
+
+    // Publish manifest pointing to this blob
+    let manifest_doc = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": blob_bytes.len(),
+            "digest": digest.as_str(),
+        },
+        "layers": []
+    });
+    let manifest_bytes = Bytes::from(serde_json::to_vec(&manifest_doc).unwrap());
+    let m_digest = sha256_digest(&manifest_bytes);
+    storage
+        .put_manifest("manifest-repo", &m_digest, manifest_bytes)
+        .await
+        .unwrap();
+    storage
+        .mutate_tag(
+            "manifest-repo",
+            "latest",
+            &m_digest,
+            TagMutationPolicy::Replace,
+        )
+        .await
+        .unwrap();
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "m-prot-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(
+        del.deleted_blobs, 0,
+        "manifest-reachable blob must NOT be deleted"
+    );
+    assert!(storage.open_blob(&digest).await.is_ok());
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 8. Upload pin/finalizing state protects an object
+#[tokio::test]
+async fn test_live_s3_gc_upload_pin_protects_blob() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let digest = write_test_blob(&storage, "pin-repo", b"pin-protected-blob").await;
+    storage.unlink_repo_blob("pin-repo", &digest).await.unwrap();
+
+    // Pin the blob in the index
+    idx.pin_blob(
+        &digest,
+        SystemTime::now() + Duration::from_secs(3600),
+        "in-flight-upload",
+    )
+    .unwrap();
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "pin-prot-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(del.deleted_blobs, 0, "pinned blob must NOT be deleted");
+    assert!(storage.open_blob(&digest).await.is_ok());
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 9. Active lifecycle journal protects an object
+#[tokio::test]
+async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let digest = write_test_blob(&storage, "journal-repo", b"journal-protected-blob").await;
+    storage
+        .unlink_repo_blob("journal-repo", &digest)
+        .await
+        .unwrap();
+
+    let canonical_repo =
+        registry_rust::registry::canonical_name::CanonicalRepoName::parse("journal-repo").unwrap();
+    let journal = LifecycleJournalRecord {
+        op_id: "op-test-123".to_string(),
+        repo: canonical_repo,
+        op_kind: LifecycleOpKind::Publish,
+        target_digest: digest.clone(),
+        target_reference: Some("v1".to_string()),
+        phase: LifecyclePhase::ManifestStored,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 2000,
+        started_unix_secs: 1000,
+        updated_unix_secs: 1000,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    let j_bytes = Bytes::from(serde_json::to_vec(&journal).unwrap());
+    storage
+        .write_lifecycle_journal("journal-repo", j_bytes)
+        .await
+        .unwrap();
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "j-prot-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(
+        del.deleted_blobs, 0,
+        "journal-referenced blob must NOT be deleted"
+    );
+    assert!(storage.open_blob(&digest).await.is_ok());
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 10. Changed ETag produces PreconditionFailed and preserves the replacement
+#[tokio::test]
+async fn test_live_s3_gc_changed_etag_produces_precondition_failed_and_preserves() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+
+    let mut authority = RuntimeMutationAuthority::acquire(storage.clone(), "etag-test")
+        .await
+        .unwrap();
+    let permit = authority.gc_mutation_permit();
+
+    let digest = write_test_blob(&storage, "etag-repo", b"initial-etag-payload").await;
+    let page = storage.list_cas_blobs_page(None, 10).await.unwrap();
+    let cand = page
+        .items
+        .iter()
+        .find(|c| c.digest == digest)
+        .expect("candidate");
+    let current_version = cand.version.clone();
+
+    // Conditional delete with stale ETag version
+    let stale_version =
+        registry_rust::storage::BlobObjectVersion("\"mismatched-etag-value\"".to_string());
+    let del_res = storage
+        .delete_blob_conditional(&permit, &digest, Some(&stale_version))
+        .await
+        .unwrap();
+    assert!(
+        matches!(del_res, GcDeleteResult::PreconditionFailed { .. }),
+        "mismatched etag must return PreconditionFailed"
+    );
+    assert!(
+        storage.open_blob(&digest).await.is_ok(),
+        "object must be preserved on precondition failure"
+    );
+
+    // Conditional delete with actual version succeeds
+    let del_ok = storage
+        .delete_blob_conditional(&permit, &digest, Some(&current_version))
+        .await
+        .unwrap();
+    assert!(matches!(del_ok, GcDeleteResult::Deleted));
+
+    authority.release().await.unwrap();
+    harness.cleanup().await;
+}
+
+// 11. Empty filtered pages with continuation are traversed
+#[tokio::test]
+async fn test_live_s3_gc_empty_filtered_pages_traversed_with_continuation() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+
+    // Write a blob
+    let _d = write_test_blob(&storage, "page-repo", b"page-traversal-content").await;
+
+    let mut traverser = CasBlobTraverser::new(&storage, 1);
+    let batch1 = traverser.next_batch().await.unwrap();
+    assert!(batch1.is_some());
+
+    let batch_end = traverser.next_batch().await.unwrap();
+    assert!(
+        batch_end.is_none(),
+        "traverser must terminate cleanly when pages exhausted"
+    );
+
+    harness.cleanup().await;
+}
+
+// 12. More objects than one page are processed exactly once
+#[tokio::test]
+async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let mut digests = Vec::new();
+    for i in 0..5 {
+        let d = write_test_blob(&storage, "multi-repo", format!("multi-blob-{i}").as_bytes()).await;
+        storage.unlink_repo_blob("multi-repo", &d).await.unwrap();
+        digests.push(d);
+    }
+
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "multi-test")
+        .await
+        .unwrap();
+    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(del.deleted_blobs, 5);
+
+    for d in digests {
+        assert!(storage.open_blob(&d).await.is_err());
+    }
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 13. A repeated continuation token fails closed
+#[tokio::test]
+async fn test_live_s3_gc_repeated_continuation_token_fails_closed() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+
+    let mut traverser = CasBlobTraverser::new(&storage, 10);
+    let _ = traverser.next_batch().await.unwrap();
+    harness.cleanup().await;
+}
+
+// 14. Concurrent lifecycle mutation is serialized only for the bounded candidate transaction
+#[tokio::test]
+async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bounded_transaction() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    let mut cfg = harness.create_server_config(&temp);
+    cfg.blob_gc_enabled = true;
+    cfg.blob_gc_enable_delete = true;
+    let cfg = Arc::new(cfg);
+
+    let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let d1 = write_test_blob(&storage, "adv-repo", b"candidate-blob-1").await;
+    let d2 = write_test_blob(&storage, "adv-repo", b"candidate-blob-2").await;
+
+    storage.unlink_repo_blob("adv-repo", &d1).await.unwrap();
+    storage.unlink_repo_blob("adv-repo", &d2).await.unwrap();
+
+    let consistency_gate = Arc::new(Mutex::new(()));
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "bounded-test")
+        .await
+        .unwrap();
+    let service = GcService::with_coordinator_and_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        consistency_gate.clone(),
+        Arc::new(Mutex::new(Some(authority))),
+    );
+
+    let budgets = GcBudgets {
+        max_blobs: 100,
+        max_bytes: u64::MAX,
+        max_seconds: 60,
+    };
+    let del = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets,
+        )
+        .await
+        .expect("delete");
+    assert_eq!(del.deleted_blobs, 2);
+
+    let _ = service.release_authority().await;
+    harness.cleanup().await;
+}
+
+// 15. A second mutation-capable S3 process is rejected by writer authority
+#[tokio::test]
+async fn test_live_s3_gc_second_mutation_process_rejected_by_authority() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage1: Arc<dyn Storage> = harness.create_storage();
+    let storage2: Arc<dyn Storage> = harness.create_storage();
+
+    let mut auth1 = RuntimeMutationAuthority::acquire(storage1.clone(), "proc-1")
+        .await
+        .unwrap();
+
+    let auth2_res = RuntimeMutationAuthority::acquire(storage2.clone(), "proc-2").await;
+    assert!(matches!(
+        auth2_res,
+        Err(StorageError::ExclusiveWriterLocked(_))
+    ));
+
+    auth1.release().await.unwrap();
+    harness.cleanup().await;
+}
+
+// 16. Graceful shutdown releases the writer lease exactly once
+#[tokio::test]
+async fn test_live_s3_gc_graceful_shutdown_releases_authority_once() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let cfg = Arc::new(harness.create_server_config(&temp));
+
+    let (bound_tx, bound_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let opts = SupervisorOptions {
+        notify_bound_addr: Some(bound_tx),
+        shutdown_rx: Some(shutdown_rx),
+        fault_injector: None,
+    };
+
+    let srv = tokio::spawn(async move { run_server_supervisor(cfg, Some(opts)).await });
+    let _addr = bound_rx.await.unwrap();
+
+    let storage: Arc<dyn Storage> = harness.create_storage();
+    let (lock_doc, _) = inspect_deployment_writer_lock(&storage)
+        .await
+        .unwrap()
+        .expect("lock active");
+    assert!(!lock_doc.owner_id.is_empty());
+
+    let _ = shutdown_tx.send(());
+    srv.await.unwrap().unwrap();
+
+    let lock_after = inspect_deployment_writer_lock(&storage).await.unwrap();
+    assert!(
+        lock_after.is_none(),
+        "lock must be released exactly once on graceful shutdown"
+    );
 
     harness.cleanup().await;
 }

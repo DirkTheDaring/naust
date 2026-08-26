@@ -913,6 +913,9 @@ mod tests {
     impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for MockStorage {}
 
     #[async_trait]
+    impl crate::storage::GcStorage for MockStorage {}
+
+    #[async_trait]
     impl Storage for MockStorage {
         fn kind(&self) -> &'static str {
             "mock"
@@ -1173,10 +1176,6 @@ mod tests {
         }
 
         async fn abort_upload(&self, _uuid: &str) -> Result<(), StorageError> {
-            Err(StorageError::Unsupported)
-        }
-
-        async fn delete_blob(&self, _digest: &Digest) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
         }
 

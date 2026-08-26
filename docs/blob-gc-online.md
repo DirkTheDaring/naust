@@ -178,60 +178,80 @@ Rationale:
 Important: a standalone CLI must not open sled/ref-index while the server is live.
 If a CLI workflow is desired for operators, it should act as a thin client that calls the in-process admin trigger.
 
-Security best practices:
-- Keep admin GC endpoints off the public registry surface by default (bind to loopback, behind admin auth, or require an explicit config flag).
-- Require a strong permission such as “admin/maintenance”; do not reuse broad “push” scopes unless they are already tightly controlled.
-- Log all GC actions with a unique run id and include the authenticated subject.
+## Backend Strategies: Filesystem vs. S3
 
-## Operational defaults and rollout
+The garbage collector supports two production storage backends with distinct physical storage mechanics:
 
-Recommended rollout sequence:
+### 1. Filesystem Backend (`FsStorage`)
+- **Quarantine-and-Delay Strategy:** Candidates are first quarantined via atomic `rename()` from `blobs/sha256/<p2>/<hex>` to `quarantine/blobs/sha256/<p2>/<hex>`. An epoch timestamp metadata file is written to `quarantine/meta/sha256/<p2>/<hex>.ts`.
+- **Read Fallback:** While quarantined, the blob remains readable on pull requests (`LIVE` checked first, then `QUARANTINED`).
+- **Delayed Final Delete:** Candidates are only permanently deleted after `quarantine_delay_secs` has elapsed AND a fresh reachability revalidation succeeds under the shared `consistency_gate`.
+- **Restoration:** If a quarantined blob is re-referenced before deletion, it is atomically restored back to `LIVE`.
 
-1) Implement quarantine-read fallback in blob read path.
-2) Add pin-on-finalize (lease) to cover slow/in-flight pushes.
-3) Enable online **quarantine-only** runs; observe.
-4) Enable online **delete** after quarantine delay + recheck.
+### 2. S3 Backend (`S3Storage`)
+- **Direct Conditional-Delete Strategy:** S3 does not support atomic cross-directory renames or quarantine fallbacks. S3 GC operates via direct conditional deletion using S3 entity tags (`If-Match: "<etag>"`).
+- **Quarantine Gating:** Invoking quarantine on S3 returns HTTP `422 Unprocessable Entity` with typed error `StrategyUnsupported`. Quarantine is rejected fail-closed on S3.
+- **Bucket Versioning Requirement:** Physical S3 GC requires a verified **Unversioned** bucket (`S3BucketVersioningState::Unversioned`).
+- **Fail-Closed on Versioned / Unknown Buckets:**
+  - `Enabled` or `Suspended` versioning: S3 GC refuses deletion and fails closed with `StrategyUnsupported`. S3 delete markers do *not* constitute physical GC, and physical GC is disabled to prevent silent storage leaks.
+  - `UnknownOrDenied` (e.g. 403 Forbidden on `GetBucketVersioning`): Fails closed with `StrategyUnsupported`.
+  - Zero conditional delete requests are transmitted to S3 when in any non-unversioned state.
+  - On registry startup, a preflight check logs an actionable warning if S3 versioning is enabled or unreadable.
 
-Recommended conservative defaults:
-- `min_age`: 7 days
-- `quarantine_delay`: 24h
-- `finalize_grace` pin: 72h
+---
 
-Operational safety toggles (strongly recommended):
-- A global kill switch: `gc.enabled=false` stops quarantine/delete immediately.
-- Phase gating: allow `plan` and `quarantine` separately from `delete`.
-- “Dry-run first” should remain the standard workflow.
+## Writer Authority, Coordination, and Publication Invariants
 
-## Open questions for review
+### 1. Storage Mutation Authority (`RuntimeMutationAuthority`)
+- All GC operations and lifecycle mutations require holding a cluster-wide mutation authority lease (storage lock).
+- Offline CLI and online supervisor processes mutually exclude each other via storage lock acquisition.
+- If authority renewal fails, workers terminate and GC fails closed.
 
-- Pin persistence location: sled tree vs filesystem metadata files.
-- Authentication model for admin GC trigger (reuse existing push auth, or separate admin token).
-- Multi-instance deployments sharing `fs_root`: leader-only GC vs coordination.
+### 2. Consistency Gate (`consistency_gate`)
+- An in-process mutex (`Arc<Mutex<()>>`) serializes GC reachability revalidation against active mutations (manifest publications, tag updates, membership migrations, and blob finalization).
+- Candidate reachability is evaluated once during discovery, and revalidated under the gate immediately prior to deletion.
 
-## Well-known failure patterns (and mitigations)
+### 3. Unified Proxy & Upload Blob-Publication Invariant
+Both upload finalization and proxy cache writes follow the exact 6-step state machine in `BlobUploadCoordinator`:
+1. Stream and digest-verify payload.
+2. Acquire durable `PinLeaseGuard` in `BlobRefIndex` with active heartbeat renewal.
+3. Publish payload into CAS store (`blobs/sha256/<p2>/<hex>`).
+4. Under `consistency_gate`: link repository membership in storage, record in `BlobRefIndex`, flush index, and mark ready.
+5. Release `consistency_gate`.
+6. Stop heartbeat and release pin *only after* membership link is durable.
 
-These are common ways online deletion systems break; this design addresses them explicitly.
+### 4. Crash Recovery
+- If the process crashes between CAS publication and membership linking, the pin expires after its TTL, allowing GC to reclaim the orphan.
+- If the process crashes after membership linking, the blob is protected by durable repository membership even after pin expiration.
 
-1) TOCTOU: “unreferenced at scan time, referenced at delete time”
-- Mitigation: quarantine + delay + **re-check** before delete.
+---
 
-2) In-flight pushes: finalized blobs are not yet referenced by any tag
-- Mitigation: pin-on-finalize (`finalize_grace`) and conservative `min_age`.
+## Operator Testing & Qualification
 
-3) Pull races: GC moves content while a reader is opening it
-- Mitigation: **quarantine is readable** (LIVE first, then QUARANTINED).
+### Running MinIO Integration Tests
+To qualify against local MinIO (e.g. `docker.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` on `http://127.0.0.1:9000`):
+```bash
+cargo test --locked --all-features --test s3_live_integration -- --nocapture
+```
 
-4) Unbounded work: GC starves the server or triggers thundering herds
-- Mitigation: budgets per run (max blobs/bytes/time), low-priority execution, and explicit operator scheduling.
+### Running Real AWS GC Contract Runner
+To run destructive contract tests against a live AWS S3 account, invoke the opt-in runner with explicit account confirmation:
+```bash
+EXPECTED_AWS_ACCOUNT_ID=441104250201 \
+AWS_REGION=us-east-1 \
+./scripts/run_aws_gc_contract.sh
+```
 
-5) Clock issues: NTP steps, clock skew after reboot, bad mtimes
-- Mitigation: treat clock anomalies conservatively; prefer pins and explicit timestamps over mtime-only decisions.
+### Destructive Test Safety Model
+1. **Endpoint Safety Guardrails:** Non-local endpoints require explicit `ALLOW_NON_LOCAL_S3_DESTRUCTIVE_TESTS=1`.
+2. **Account Guardrails:** STS caller account must match `EXPECTED_AWS_ACCOUNT_ID` before any bucket operation.
+3. **Prefix Isolation:** Live test harnesses generate unique UUID prefixes (`live-test-<uuid>/`) and purge only matching test objects.
+4. **Bucket Cleanup:** The AWS runner generates an ephemeral bucket (`registry-rust-gc-contract-<uuid>`), applies public access block, runs tests, empties objects/markers, deletes the bucket, and verifies 404 deletion status.
 
-6) Partial metadata / crash during phase transitions
-- Mitigation: design is correct even if metadata is missing; worst case is “quarantine but keep readable”, and retry later.
+---
 
-7) Multi-instance coordination failures
-- Mitigation: single in-process writer per instance; for shared `fs_root`, require leader-only GC or a shared coordination mechanism.
-
-8) Index health / corruption leading to false deletion
-- Mitigation: refuse online delete unless ref-index reports healthy; rebuild in-process if configured.
+## Security Advisories (`cargo audit`)
+The project baseline permits three non-exploitable advisory warnings:
+1. `fxhash` 0.2.1: `RUSTSEC-2025-0057` (unmaintained upstream).
+2. `instant` 0.1.13: `RUSTSEC-2024-0384` (unmaintained upstream).
+3. `lru` 0.16.4: `RUSTSEC-2026-0253` (potential lack of panic safety in `LruCache::pop()`, unused in panic-unwind paths).

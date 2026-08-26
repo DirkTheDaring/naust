@@ -227,13 +227,6 @@ Track:
 - bytes eligible / quarantined / restored / deleted
 - ref-index health and rebuild events
 
-## Non-filesystem backends
+## Non-filesystem backends (S3)
 
-S3 requires a different approach because listing *all* blobs and moving to quarantine is expensive.
-A safe S3 GC would likely need:
-
-- a maintained inventory of stored blobs (index)
-- server-side tagging/versioning or delete markers
-- or periodic inventory reports
-
-This doc intentionally scopes the first safe implementation to filesystem.
+For S3-backed deployments, GC operates via direct conditional deletion (`If-Match: "<etag>"`) on verified unversioned buckets. See `docs/blob-gc-online.md` for the complete S3 GC architecture, bucket versioning requirements, and operator qualification run instructions.

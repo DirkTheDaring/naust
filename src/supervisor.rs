@@ -602,18 +602,31 @@ pub async fn run_server_supervisor(
     ));
     let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
     let upload_request_sem = Arc::new(Semaphore::new(config.max_concurrent_upload_requests.max(1)));
-
     let consistency_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let mutation_authority = Arc::new(tokio::sync::Mutex::new(Some(mutation_authority)));
 
-    let gc_service = match (&ref_index, &config.storage_backend) {
-        (Some(idx), StorageBackend::Filesystem) => Some(Arc::new(GcService::with_coordinator(
+    let gc_service = match &ref_index {
+        Some(idx) => Some(Arc::new(GcService::with_coordinator_and_authority(
             config.clone(),
             storage.clone(),
             idx.clone(),
             consistency_gate.clone(),
+            mutation_authority.clone(),
         ))),
-        _ => None,
+        None => None,
     };
+
+    if config.storage_backend == crate::config::StorageBackend::S3
+        && config.blob_gc_enabled
+        && config.blob_gc_enable_delete
+    {
+        if let Err(e) = storage.check_bucket_versioning_for_gc().await {
+            tracing::warn!(
+                "S3 bucket versioning preflight check: {}; physical GC deletion will fail closed",
+                e
+            );
+        }
+    }
 
     let ip_limiter = Arc::new(IpConcurrencyLimiter::new(
         config.max_connections_per_ip,
@@ -633,9 +646,10 @@ pub async fn run_server_supervisor(
         upload_chunk_min_bytes: config.upload_chunk_min_bytes.map(|v| v as u64),
         gc_pin_duration_secs: config.gc_pin_duration_secs,
     };
-    let upload_coordinator = Arc::new(BlobUploadCoordinator::new(
+    let upload_coordinator = Arc::new(BlobUploadCoordinator::with_gate(
         storage.clone(),
         ref_index.clone(),
+        consistency_gate.clone(),
         upload_coord_config,
     ));
 
@@ -678,14 +692,18 @@ pub async fn run_server_supervisor(
 
     injector.record_event("app_state_constructed").await;
     if let Err(e) = injector.on_phase(StartupPhase::AppStateConstructed).await {
-        let _ = mutation_authority.release().await;
+        if let Some(mut a) = mutation_authority.lock().await.take() {
+            let _ = a.release().await;
+        }
         return Err(e);
     }
 
     let app = build_router(state.clone());
     injector.record_event("routes_configured").await;
     if let Err(e) = injector.on_phase(StartupPhase::RoutesConfigured).await {
-        let _ = mutation_authority.release().await;
+        if let Some(mut a) = mutation_authority.lock().await.take() {
+            let _ = a.release().await;
+        }
         return Err(e);
     }
 
@@ -707,7 +725,9 @@ pub async fn run_server_supervisor(
     injector.record_event("workers_spawned").await;
     if let Err(e) = injector.on_phase(StartupPhase::WorkersSpawned).await {
         let _ = supervisor.shutdown().await;
-        let _ = mutation_authority.release().await;
+        if let Some(mut a) = mutation_authority.lock().await.take() {
+            let _ = a.release().await;
+        }
         return Err(e);
     }
 
@@ -722,7 +742,9 @@ pub async fn run_server_supervisor(
             Ok(t) => t,
             Err(err) => {
                 let _ = supervisor.shutdown().await;
-                let _ = mutation_authority.release().await;
+                if let Some(mut a) = mutation_authority.lock().await.take() {
+                    let _ = a.release().await;
+                }
                 return Err(format!("load TLS cert/key: {err}"));
             }
         };
@@ -730,7 +752,9 @@ pub async fn run_server_supervisor(
         injector.record_event("listener_bound").await;
         if let Err(e) = injector.on_phase(StartupPhase::ListenerBound).await {
             let _ = supervisor.shutdown().await;
-            let _ = mutation_authority.release().await;
+            if let Some(mut a) = mutation_authority.lock().await.take() {
+                let _ = a.release().await;
+            }
             return Err(e);
         }
 
@@ -770,7 +794,9 @@ pub async fn run_server_supervisor(
             .await
         {
             let _ = supervisor.shutdown().await;
-            let _ = mutation_authority.release().await;
+            if let Some(mut a) = mutation_authority.lock().await.take() {
+                let _ = a.release().await;
+            }
             return Err(format!("serve https: {err}"));
         }
     } else {
@@ -778,7 +804,9 @@ pub async fn run_server_supervisor(
             Ok(l) => l,
             Err(err) => {
                 let _ = supervisor.shutdown().await;
-                let _ = mutation_authority.release().await;
+                if let Some(mut a) = mutation_authority.lock().await.take() {
+                    let _ = a.release().await;
+                }
                 return Err(format!("bind listen addr: {err}"));
             }
         };
@@ -791,7 +819,9 @@ pub async fn run_server_supervisor(
         injector.record_event("listener_bound").await;
         if let Err(e) = injector.on_phase(StartupPhase::ListenerBound).await {
             let _ = supervisor.shutdown().await;
-            let _ = mutation_authority.release().await;
+            if let Some(mut a) = mutation_authority.lock().await.take() {
+                let _ = a.release().await;
+            }
             return Err(e);
         }
 
@@ -819,7 +849,9 @@ pub async fn run_server_supervisor(
 
         if let Err(err) = server_res {
             let _ = supervisor.shutdown().await;
-            let _ = mutation_authority.release().await;
+            if let Some(mut a) = mutation_authority.lock().await.take() {
+                let _ = a.release().await;
+            }
             return Err(format!("serve http: {err}"));
         }
     }
@@ -833,7 +865,9 @@ pub async fn run_server_supervisor(
             "graceful shutdown completed with warnings"
         );
     }
-    let _ = mutation_authority.release().await;
+    if let Some(mut a) = mutation_authority.lock().await.take() {
+        let _ = a.release().await;
+    }
     injector.record_event("authority_released").await;
 
     Ok(())
@@ -1631,9 +1665,6 @@ pub async fn spawn_fd_diagnostics_logger(supervisor: &TaskSupervisor, state: App
 }
 
 pub async fn spawn_blob_gc_scheduler(supervisor: &TaskSupervisor, state: AppState) {
-    if state.config.storage_backend != StorageBackend::Filesystem {
-        return;
-    }
     if !state.config.blob_gc_schedule_enabled {
         return;
     }

@@ -23,6 +23,9 @@ pub enum GcServiceError {
     #[error("gc delete disabled")]
     DeleteDisabled,
 
+    #[error("unsupported for storage strategy: {0}")]
+    StrategyUnsupported(String),
+
     #[error("ref-index unhealthy: {0}")]
     RefIndexUnhealthy(String),
 
@@ -47,12 +50,16 @@ impl GcBudgets {
     }
 }
 
+use crate::storage::mutation_authority::RuntimeMutationAuthority;
+
 #[derive(Clone)]
 pub struct GcService {
     config: Arc<crate::config::Config>,
     storage: Arc<dyn storage::Storage>,
     idx: Arc<BlobRefIndex>,
     run_lock: Arc<Mutex<()>>,
+    consistency_gate: Arc<Mutex<()>>,
+    mutation_authority: Arc<Mutex<Option<RuntimeMutationAuthority>>>,
 }
 
 struct FsGcLock {
@@ -81,7 +88,28 @@ impl GcService {
         storage: Arc<dyn storage::Storage>,
         idx: Arc<BlobRefIndex>,
     ) -> Self {
-        Self::with_coordinator(config, storage, idx, Arc::new(Mutex::new(())))
+        Self::with_coordinator_and_authority(
+            config,
+            storage,
+            idx,
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    pub fn with_authority(
+        config: Arc<crate::config::Config>,
+        storage: Arc<dyn storage::Storage>,
+        idx: Arc<BlobRefIndex>,
+        authority: RuntimeMutationAuthority,
+    ) -> Self {
+        Self::with_coordinator_and_authority(
+            config,
+            storage,
+            idx,
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(Some(authority))),
+        )
     }
 
     pub fn with_coordinator(
@@ -90,12 +118,37 @@ impl GcService {
         idx: Arc<BlobRefIndex>,
         consistency_gate: Arc<Mutex<()>>,
     ) -> Self {
+        Self::with_coordinator_and_authority(
+            config,
+            storage,
+            idx,
+            consistency_gate,
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    pub fn with_coordinator_and_authority(
+        config: Arc<crate::config::Config>,
+        storage: Arc<dyn storage::Storage>,
+        idx: Arc<BlobRefIndex>,
+        consistency_gate: Arc<Mutex<()>>,
+        mutation_authority: Arc<Mutex<Option<RuntimeMutationAuthority>>>,
+    ) -> Self {
         Self {
             config,
             storage,
             idx,
-            run_lock: consistency_gate,
+            run_lock: Arc::new(Mutex::new(())),
+            consistency_gate,
+            mutation_authority,
         }
+    }
+
+    pub async fn release_authority(&self) -> Result<(), storage::StorageError> {
+        if let Some(mut auth) = self.mutation_authority.lock().await.take() {
+            auth.release().await?;
+        }
+        Ok(())
     }
 
     async fn ensure_ref_index_ready(&self) -> Result<(), GcServiceError> {
@@ -223,20 +276,55 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let t0 = Instant::now();
-        let _guard = self
+
+        if self.storage.gc_strategy() == storage::GcStorageStrategy::S3DirectConditional {
+            return Err(GcServiceError::StrategyUnsupported(
+                "quarantine is not supported for S3 storage backend; use delete or scheduled cleanup with S3DirectConditional".to_string(),
+            ));
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // LOCK ORDER (strictly preserved across all GC mutation paths):
+        // 1. self.run_lock: In-process mutual exclusion between concurrent GC executions.
+        // 2. _fs_gc_lock: Cross-process file lock on `quarantine/.lock` (for filesystem backend).
+        // 3. (auth_guard & consistency_gate): Acquired per bounded candidate transaction inside
+        //    blob_gc_quarantine / blob_gc_delete.
+        // -----------------------------------------------------------------------------------------
+        let _run_guard = self
             .run_lock
             .try_lock()
             .map_err(|_| GcServiceError::AlreadyRunning)?;
+
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
+
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
         }
+
+        // Validate authority is present and active before starting run
+        {
+            let auth_guard = self.mutation_authority.lock().await;
+            let Some(ref auth) = *auth_guard else {
+                return Err(GcServiceError::Failed(
+                    "mutation authority unavailable or inactive".to_string(),
+                ));
+            };
+            if !auth.is_active() {
+                return Err(GcServiceError::Failed(
+                    "mutation authority released".to_string(),
+                ));
+            }
+        }
+
         self.ensure_ref_index_ready().await?;
         self.refresh_tag_rooted_index_if_needed(policy).await?;
+
         blob_gc_quarantine(
             &self.config,
             &self.storage,
             &self.idx,
+            &self.consistency_gate,
+            &self.mutation_authority,
             policy,
             min_age,
             budgets.to_limits(),
@@ -267,23 +355,59 @@ impl GcService {
         budgets: GcBudgets,
     ) -> Result<BlobGcStats, GcServiceError> {
         let t0 = Instant::now();
-        let _guard = self
+
+        // -----------------------------------------------------------------------------------------
+        // LOCK ORDER (strictly preserved across all GC mutation paths):
+        // 1. self.run_lock: In-process mutual exclusion between concurrent GC executions.
+        // 2. _fs_gc_lock: Cross-process file lock on `quarantine/.lock` (for filesystem backend).
+        // 3. (auth_guard & consistency_gate): Acquired per bounded candidate transaction inside
+        //    blob_gc_delete.
+        // -----------------------------------------------------------------------------------------
+        let _run_guard = self
             .run_lock
             .try_lock()
             .map_err(|_| GcServiceError::AlreadyRunning)?;
+
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
+
         if !self.config.blob_gc_enabled {
             return Err(GcServiceError::Disabled);
         }
         if !self.config.blob_gc_enable_delete {
             return Err(GcServiceError::DeleteDisabled);
         }
+
+        // Validate authority is present and active before starting run
+        {
+            let auth_guard = self.mutation_authority.lock().await;
+            let Some(ref auth) = *auth_guard else {
+                return Err(GcServiceError::Failed(
+                    "mutation authority unavailable or inactive".to_string(),
+                ));
+            };
+            if !auth.is_active() {
+                return Err(GcServiceError::Failed(
+                    "mutation authority released".to_string(),
+                ));
+            }
+        }
+
         self.ensure_ref_index_ready().await?;
         self.refresh_tag_rooted_index_if_needed(policy).await?;
+
+        if self.storage.gc_strategy() == storage::GcStorageStrategy::S3DirectConditional {
+            self.storage
+                .check_bucket_versioning_for_gc()
+                .await
+                .map_err(|e| GcServiceError::StrategyUnsupported(e.to_string()))?;
+        }
+
         blob_gc_delete(
             &self.config,
             &self.storage,
             &self.idx,
+            &self.consistency_gate,
+            &self.mutation_authority,
             policy,
             quarantine_delay,
             budgets.to_limits(),
@@ -377,7 +501,7 @@ impl GcService {
                         || rec.unreferenced_since_unix_secs.is_some()
                     {
                         match ledger
-                            .reactivate_with_guard(&guard, rec.repo.as_str(), &rec.digest)
+                            .reactivate_with_guard(guard, rec.repo.as_str(), &rec.digest)
                             .await
                         {
                             Ok(true) => stats.activated += 1,
@@ -398,7 +522,7 @@ impl GcService {
                         || rec.unreferenced_since_unix_secs.is_none()
                     {
                         match ledger
-                            .set_candidate_with_guard(&guard, rec.repo.as_str(), &rec.digest, now)
+                            .set_candidate_with_guard(guard, rec.repo.as_str(), &rec.digest, now)
                             .await
                         {
                             Ok(true) => stats.candidated += 1,
@@ -430,7 +554,7 @@ impl GcService {
 
                             if !still_referenced {
                                 match ledger
-                                    .unlink_with_guard(&guard, rec.repo.as_str(), &rec.digest)
+                                    .unlink_with_guard(guard, rec.repo.as_str(), &rec.digest)
                                     .await
                                 {
                                     Ok(true) => {
@@ -475,7 +599,7 @@ impl GcService {
     }
 
     pub async fn scheduled_cleanup_once(&self) -> Result<ScheduledCleanupStats, GcServiceError> {
-        let _guard = self
+        let _run_guard = self
             .run_lock
             .try_lock()
             .map_err(|_| GcServiceError::AlreadyRunning)?;
@@ -486,13 +610,27 @@ impl GcService {
             return Err(GcServiceError::Disabled);
         }
 
+        {
+            let auth_guard = self.mutation_authority.lock().await;
+            let Some(ref auth) = *auth_guard else {
+                return Err(GcServiceError::Failed(
+                    "mutation authority unavailable or inactive".to_string(),
+                ));
+            };
+            if !auth.is_active() {
+                return Err(GcServiceError::Failed(
+                    "mutation authority released".to_string(),
+                ));
+            }
+        }
+
         self.ensure_ref_index_ready().await?;
 
         let min_age = Duration::from_secs(self.config.blob_gc_default_min_age_secs);
 
         // 1. Sweep repository memberships: Active -> Candidate(unreferenced_since) -> Unlink
         let _membership_stats = self
-            .sweep_repository_memberships_with_guard(&_guard, min_age, 256)
+            .sweep_repository_memberships_with_guard(&_run_guard, min_age, 256)
             .await?;
 
         let policy = BlobGcPolicy::ManifestRooted;
@@ -502,41 +640,78 @@ impl GcService {
             max_seconds: self.config.blob_gc_default_max_seconds,
         };
 
-        let quarantine = blob_gc_quarantine(
-            &self.config,
-            &self.storage,
-            &self.idx,
-            policy,
-            min_age,
-            budgets.to_limits(),
-        )
-        .await
-        .map_err(GcServiceError::Failed)?;
+        match self.storage.gc_strategy() {
+            storage::GcStorageStrategy::S3DirectConditional => {
+                if !self.config.blob_gc_enable_delete {
+                    return Ok(ScheduledCleanupStats {
+                        quarantine: Default::default(),
+                        delete: None,
+                    });
+                }
+                self.storage
+                    .check_bucket_versioning_for_gc()
+                    .await
+                    .map_err(|e| GcServiceError::StrategyUnsupported(e.to_string()))?;
+                let delete = blob_gc_delete(
+                    &self.config,
+                    &self.storage,
+                    &self.idx,
+                    &self.consistency_gate,
+                    &self.mutation_authority,
+                    policy,
+                    min_age,
+                    budgets.to_limits(),
+                )
+                .await
+                .map_err(GcServiceError::Failed)?;
 
-        if !self.config.blob_gc_enable_delete {
-            return Ok(ScheduledCleanupStats {
-                quarantine,
-                delete: None,
-            });
+                Ok(ScheduledCleanupStats {
+                    quarantine: Default::default(),
+                    delete: Some(delete),
+                })
+            }
+            storage::GcStorageStrategy::FilesystemQuarantine => {
+                let quarantine = blob_gc_quarantine(
+                    &self.config,
+                    &self.storage,
+                    &self.idx,
+                    &self.consistency_gate,
+                    &self.mutation_authority,
+                    policy,
+                    min_age,
+                    budgets.to_limits(),
+                )
+                .await
+                .map_err(GcServiceError::Failed)?;
+
+                if !self.config.blob_gc_enable_delete {
+                    return Ok(ScheduledCleanupStats {
+                        quarantine,
+                        delete: None,
+                    });
+                }
+
+                let quarantine_delay =
+                    Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
+                let delete = blob_gc_delete(
+                    &self.config,
+                    &self.storage,
+                    &self.idx,
+                    &self.consistency_gate,
+                    &self.mutation_authority,
+                    policy,
+                    quarantine_delay,
+                    budgets.to_limits(),
+                )
+                .await
+                .map_err(GcServiceError::Failed)?;
+
+                Ok(ScheduledCleanupStats {
+                    quarantine,
+                    delete: Some(delete),
+                })
+            }
         }
-
-        let quarantine_delay =
-            Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
-        let delete = blob_gc_delete(
-            &self.config,
-            &self.storage,
-            &self.idx,
-            policy,
-            quarantine_delay,
-            budgets.to_limits(),
-        )
-        .await
-        .map_err(GcServiceError::Failed)?;
-
-        Ok(ScheduledCleanupStats {
-            quarantine,
-            delete: Some(delete),
-        })
     }
 
     #[cfg(test)]
@@ -697,6 +872,13 @@ mod tests {
             .await
             .expect("ensure idx");
 
+        let authority = crate::storage::mutation_authority::RuntimeMutationAuthority::acquire(
+            storage.clone(),
+            "test-sched-gc",
+        )
+        .await
+        .expect("authority");
+
         // Create an unreferenced blob in live store.
         let data = b"scheduled-cleanup";
         let hex = hex::encode(sha2::Sha256::digest(data));
@@ -709,7 +891,8 @@ mod tests {
         std::fs::create_dir_all(live.parent().unwrap()).expect("mkdir");
         std::fs::write(&live, data).expect("write");
 
-        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+        let service =
+            GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
 
         let stats = service
             .scheduled_cleanup_once()
@@ -775,7 +958,15 @@ mod tests {
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild empty");
 
-        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+        let authority = crate::storage::mutation_authority::RuntimeMutationAuthority::acquire(
+            storage.clone(),
+            "test-quarantine-restore",
+        )
+        .await
+        .expect("authority");
+
+        let service =
+            GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
 
         let blob = Digest::parse(&format!("sha256:{}", "a".repeat(64))).expect("digest");
         write_blob(&fs_root, &blob, b"blobdata").await;
@@ -839,7 +1030,15 @@ mod tests {
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild");
 
-        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+        let authority = crate::storage::mutation_authority::RuntimeMutationAuthority::acquire(
+            storage.clone(),
+            "test-pinned",
+        )
+        .await
+        .expect("authority");
+
+        let service =
+            GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
 
         let blob = Digest::parse(&format!("sha256:{}", "d".repeat(64))).expect("digest");
         write_blob(&fs_root, &blob, b"blobdata").await;

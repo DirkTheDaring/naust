@@ -490,23 +490,12 @@ async fn blob_by_digest(
                 if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
                     if ctx
                         .proxy
-                        .fetch_blob_into_storage(&decision, &digest, &ctx.cache)
+                        .fetch_blob_into_storage(&decision, &digest, &state.upload_coordinator)
                         .await
                         .is_ok()
                     {
                         if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
                             ctx.proxy.note_blob_access(&digest);
-                            if let Err(e) = state
-                                .membership_ledger
-                                .link(&crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                                    canonical_repo.clone(),
-                                    digest.clone(),
-                                ))
-                                .await
-                            {
-                                tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
-                                return errors::internal_error().into_response();
-                            }
                             let stream = ReaderStream::new(reader);
                             let body = Body::from_stream(stream);
                             let mut headers = registry_headers();
@@ -531,7 +520,7 @@ async fn blob_by_digest(
 }
 
 async fn blob_by_digest_proxy_only(
-    _state: AppState,
+    state: AppState,
     method: Method,
     name: &str,
     digest: Digest,
@@ -558,7 +547,7 @@ async fn blob_by_digest_proxy_only(
             if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
                 match ctx
                     .proxy
-                    .fetch_blob_into_storage(&decision, &digest, &ctx.cache)
+                    .fetch_blob_into_storage(&decision, &digest, &state.upload_coordinator)
                     .await
                 {
                     Ok(()) => {

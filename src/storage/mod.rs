@@ -98,6 +98,104 @@ pub enum ConditionalDeleteResult {
     PreconditionFailed { current_version: Option<String> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobObjectVersion(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcCursor(pub String);
+
+#[derive(Clone, Debug)]
+pub struct GcBlobCandidate {
+    pub digest: Digest,
+    pub size: u64,
+    pub last_modified: SystemTime,
+    pub version: BlobObjectVersion,
+}
+
+#[derive(Clone, Debug)]
+pub struct GcBlobPage {
+    pub items: Vec<GcBlobCandidate>,
+    pub next_cursor: Option<GcCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GcDeleteResult {
+    Deleted,
+    NotFound,
+    PreconditionFailed {
+        current_version: Option<BlobObjectVersion>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GcQuarantineResult {
+    Quarantined { size: u64 },
+    Skipped,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GcStorageStrategy {
+    FilesystemQuarantine,
+    S3DirectConditional,
+}
+
+#[async_trait]
+pub trait GcStorage: Send + Sync {
+    /// Checks whether bucket versioning capabilities allow physical GC.
+    /// Fails closed if versioning is Enabled, Suspended, Unknown, or Permission Denied.
+    async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn list_cas_blobs_page(
+        &self,
+        _cursor: Option<&GcCursor>,
+        _limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        Ok(GcBlobPage {
+            items: Vec::new(),
+            next_cursor: None,
+        })
+    }
+
+    async fn quarantine_blob(
+        &self,
+        _permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        _digest: &Digest,
+        _version: &BlobObjectVersion,
+    ) -> Result<GcQuarantineResult, StorageError> {
+        Ok(GcQuarantineResult::Skipped)
+    }
+
+    async fn restore_quarantined_blob(
+        &self,
+        _permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        _digest: &Digest,
+    ) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+
+    async fn quarantined_blob_version(
+        &self,
+        _digest: &Digest,
+    ) -> Result<Option<BlobObjectVersion>, StorageError> {
+        Ok(None)
+    }
+
+    async fn delete_blob_conditional(
+        &self,
+        _permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        _digest: &Digest,
+        _version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        Ok(GcDeleteResult::NotFound)
+    }
+
+    fn gc_strategy(&self) -> GcStorageStrategy {
+        GcStorageStrategy::FilesystemQuarantine
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReferrerDescriptor {
     pub media_type: String,
@@ -112,7 +210,9 @@ pub struct ReferrerDescriptor {
 }
 
 #[async_trait]
-pub trait Storage: Send + Sync + UploadSessionStorage + RepositoryBlobMembershipStorage {
+pub trait Storage:
+    Send + Sync + UploadSessionStorage + RepositoryBlobMembershipStorage + GcStorage
+{
     fn kind(&self) -> &'static str;
 
     // Best-effort listing of repositories known to the backend.
@@ -285,9 +385,6 @@ pub trait Storage: Send + Sync + UploadSessionStorage + RepositoryBlobMembership
 
     // Best-effort cleanup for failed/abandoned uploads.
     async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError>;
-
-    // Content Management: blob deletion.
-    async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError>;
 
     // Content Discovery: referrers API.
     async fn list_referrers(

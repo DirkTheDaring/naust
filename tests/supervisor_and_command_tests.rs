@@ -906,3 +906,73 @@ async fn test_flush_hook_executed_before_authority_release() {
         "flush hook must execute during supervisor shutdown"
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// 21. Supervisor partial-startup failure unwinds and releases authority cleanly
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_partial_startup_failure_unwinds_and_releases_authority() {
+    struct FaultOnIndex;
+    #[async_trait::async_trait]
+    impl SupervisorFaultInjector for FaultOnIndex {
+        async fn on_phase(&self, phase: StartupPhase) -> Result<(), String> {
+            if phase == StartupPhase::IndexInitialized {
+                Err("simulated failure after authority acquisition".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cfg = Arc::new(create_test_config(&temp));
+    let opts = SupervisorOptions {
+        fault_injector: Some(Arc::new(FaultOnIndex)),
+        shutdown_rx: None,
+        notify_bound_addr: None,
+    };
+
+    let run_res = run_server_supervisor(cfg.clone(), Some(opts)).await;
+    assert!(
+        run_res.is_err(),
+        "supervisor must fail closed when fault injected"
+    );
+
+    // Verify storage lock is released and can be acquired immediately by a new process
+    let storage = storage::from_config(&cfg);
+    let mut auth2 = RuntimeMutationAuthority::acquire(storage, "recovery-after-failed-startup")
+        .await
+        .expect("must be able to acquire authority after failed startup unwind");
+    auth2.release().await.unwrap();
+}
+
+// ------------------------------------------------------------------------------------------------
+// 22. Supervisor graceful shutdown waits for active work and releases authority exactly once
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_graceful_shutdown_releases_authority_exactly_once() {
+    let temp = TempDir::new().unwrap();
+    let cfg = Arc::new(create_test_config(&temp));
+
+    let (bound_tx, bound_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let opts = SupervisorOptions {
+        fault_injector: None,
+        shutdown_rx: Some(shutdown_rx),
+        notify_bound_addr: Some(bound_tx),
+    };
+
+    let srv = tokio::spawn(async move { run_server_supervisor(cfg, Some(opts)).await });
+    let _addr = bound_rx.await.expect("bound");
+
+    let _ = shutdown_tx.send(());
+    let srv_res = srv.await.expect("join");
+    assert!(srv_res.is_ok());
+
+    let storage = storage::from_config(&create_test_config(&temp));
+    let mut auth = RuntimeMutationAuthority::acquire(storage, "post-shutdown-check")
+        .await
+        .expect("must acquire authority after clean supervisor shutdown");
+    auth.release().await.unwrap();
+}

@@ -115,6 +115,9 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::storage::GcStorage for FaultInjectableStorage {}
+
+    #[async_trait::async_trait]
     impl Storage for FaultInjectableStorage {
         fn kind(&self) -> &'static str {
             "fault-injectable"
@@ -346,10 +349,6 @@ mod tests {
 
         async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
             self.inner.abort_upload(uuid).await
-        }
-
-        async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
-            self.inner.delete_blob(digest).await
         }
 
         async fn list_referrers(

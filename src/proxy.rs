@@ -17,7 +17,6 @@ use crate::{
     config::{EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, RedirectPolicy, TagPolicy},
     registry::canonical_name::{CanonicalRepoName, RepoNameError},
     registry::digest::Digest,
-    storage::StorageError,
 };
 
 /// Host pattern for proxy upstream routing.
@@ -575,14 +574,22 @@ impl Proxy {
         &self,
         decision: &RepoDecision,
         digest: &Digest,
-        storage: &Arc<dyn crate::storage::Storage>,
+        coordinator: &crate::upload_coordinator::BlobUploadCoordinator,
     ) -> Result<(), ProxyError> {
         // Singleflight per digest to avoid thundering herd.
         let key = format!("blob:{}", digest.as_str());
         let (sf_key, sf_arc, sf_guard) = self.singleflight.lock_key(&key).await;
 
         let result = async {
-            if storage.head_blob(digest).await.is_ok() {
+            if coordinator.storage().head_blob(digest).await.is_ok()
+                && coordinator
+                    .storage()
+                    .get_repo_blob_membership(decision.local_repo.as_str(), digest)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
                 return Ok(());
             }
 
@@ -614,29 +621,22 @@ impl Proxy {
                 )));
             }
 
-            let upload = storage.create_upload().await.map_err(map_storage_err)?;
+            let stream = resp.bytes_stream().map(|item| {
+                item.map_err(|e| {
+                    crate::storage::upload_session::UploadStreamError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })
+            });
 
-            let mut stream = resp.bytes_stream();
-            while let Some(next) = stream.next().await {
-                let chunk = next.map_err(|e| ProxyError::Upstream(e.to_string()))?;
-                if chunk.is_empty() {
-                    continue;
-                }
-                if let Err(e) = storage.append_upload(&upload.uuid, chunk).await {
-                    let _ = storage.abort_upload(&upload.uuid).await;
-                    return Err(map_storage_err(e));
-                }
-            }
+            let pinned_stream: crate::storage::upload_session::UploadByteStream = Box::pin(stream);
 
-            if let Err(e) = storage.finalize_upload(&upload.uuid, digest).await {
-                let _ = storage.abort_upload(&upload.uuid).await;
-                return Err(map_storage_err(e));
-            }
-            let record = crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                decision.local_repo.clone(),
-                digest.clone(),
-            );
-            let _ = storage.link_repo_blob(&record).await;
+            coordinator
+                .publish_proxy_blob(&decision.local_repo, digest, pinned_stream)
+                .await
+                .map_err(|e| ProxyError::Internal(e.to_string()))?;
+
             self.note_blob_access(digest);
             Ok(())
         };
@@ -1278,27 +1278,6 @@ async fn read_response_limited(resp: reqwest::Response, limit: usize) -> Result<
         buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
-}
-
-fn map_storage_err(err: StorageError) -> ProxyError {
-    match err {
-        StorageError::NotFound => ProxyError::NotFound,
-        StorageError::DigestMismatch => ProxyError::DigestMismatch,
-        StorageError::TooLarge => ProxyError::TooLarge,
-        StorageError::InsufficientStorage => {
-            ProxyError::Upstream("insufficient storage".to_string())
-        }
-        StorageError::Unsupported => ProxyError::Internal("storage unsupported".to_string()),
-        StorageError::TagAlreadyExists => ProxyError::Internal("tag already exists".to_string()),
-        StorageError::ExclusiveWriterLocked(e) => {
-            ProxyError::Internal(format!("exclusive writer locked: {e}"))
-        }
-        StorageError::InvalidRepoName(e) => {
-            ProxyError::Internal(format!("invalid repository name: {e}"))
-        }
-        StorageError::MigrationRequired(e) => ProxyError::Internal(e),
-        StorageError::Internal(e) => ProxyError::Internal(e),
-    }
 }
 
 #[derive(Debug)]

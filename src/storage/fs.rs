@@ -1,6 +1,8 @@
 use super::upload_session::*;
 use super::{
-    BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, ensure_dir,
+    BlobMeta, BlobObjectVersion, GcBlobCandidate, GcBlobPage, GcCursor, GcDeleteResult,
+    GcQuarantineResult, GcStorage, GcStorageStrategy, ManifestMeta, ReferrerDescriptor,
+    RepoTimestamps, Storage, StorageError, ensure_dir,
 };
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
@@ -503,7 +505,12 @@ impl FsStorage {
                 };
 
                 // Do not descend into internal leaf dirs.
-                if name == "tags" || name == "manifests" || name == "referrers" || name == "blobs" {
+                if name == "tags"
+                    || name == "manifests"
+                    || name == "referrers"
+                    || name == "blobs"
+                    || name == "meta"
+                {
                     continue;
                 }
 
@@ -514,10 +521,11 @@ impl FsStorage {
                     format!("{rel}/{name}")
                 };
 
-                // Consider this a repo if it has tags/, manifests/, or blobs/ directories.
+                // Consider this a repo if it has tags/, manifests/, blobs/, or meta/ directories.
                 let tags_dir = child_path.join("tags");
                 let manifests_dir = child_path.join("manifests");
                 let blobs_dir = child_path.join("blobs");
+                let meta_dir = child_path.join("meta");
                 let has_tags = tokio::fs::metadata(&tags_dir)
                     .await
                     .map(|m| m.is_dir())
@@ -530,7 +538,11 @@ impl FsStorage {
                     .await
                     .map(|m| m.is_dir())
                     .unwrap_or(false);
-                if has_tags || has_manifests || has_blobs {
+                let has_meta = tokio::fs::metadata(&meta_dir)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if has_tags || has_manifests || has_blobs || has_meta {
                     repos.push(child_rel.clone());
                 }
 
@@ -1530,15 +1542,6 @@ impl Storage for FsStorage {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(StorageError::Internal(err.to_string())),
-        }
-    }
-
-    async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
-        let path = self.blob_path(digest);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
             Err(err) => Err(StorageError::Internal(err.to_string())),
         }
     }
@@ -3192,6 +3195,434 @@ impl RepositoryBlobMembershipStorage for FsStorage {
     }
 }
 
+impl FsStorage {
+    pub async fn write_quarantine_timestamp(
+        &self,
+        digest: &Digest,
+        timestamp: SystemTime,
+    ) -> Result<(), StorageError> {
+        let ts_dir = self
+            .root
+            .join("quarantine")
+            .join("meta")
+            .join(digest.algorithm())
+            .join(digest.prefix2());
+        tokio::fs::create_dir_all(&ts_dir)
+            .await
+            .map_err(|e| StorageError::Internal(format!("mkdir {}: {e}", ts_dir.display())))?;
+        let ts_path = ts_dir.join(format!("{}.ts", digest.hex()));
+        let secs = timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        write_atomic_file(&ts_path, format!("{secs}\n").as_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn read_quarantine_timestamp(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<SystemTime>, StorageError> {
+        let ts_path = self
+            .root
+            .join("quarantine")
+            .join("meta")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(format!("{}.ts", digest.hex()));
+        if let Ok(content) = tokio::fs::read_to_string(&ts_path).await {
+            if let Ok(secs) = content.trim().parse::<u64>() {
+                return Ok(Some(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub async fn remove_quarantine_timestamp(&self, digest: &Digest) -> Result<(), StorageError> {
+        let ts_path = self
+            .root
+            .join("quarantine")
+            .join("meta")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(format!("{}.ts", digest.hex()));
+        let _ = tokio::fs::remove_file(&ts_path).await;
+        Ok(())
+    }
+}
+
+pub(crate) async fn compute_fs_blob_version(
+    path: &Path,
+) -> Result<BlobObjectVersion, StorageError> {
+    let meta = tokio::fs::metadata(path).await.map_err(map_fs_io_err)?;
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .map(|t| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        })
+        .unwrap_or(0);
+
+    let mut file = tokio::fs::File::open(path).await.map_err(map_fs_io_err)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.map_err(map_fs_io_err)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hex::encode(hasher.finalize());
+    Ok(BlobObjectVersion(format!("fs:{len}:{mtime}:{hash}")))
+}
+
+#[async_trait]
+impl GcStorage for FsStorage {
+    async fn list_cas_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        let max_limit = 1000;
+        let limit = limit.min(max_limit).max(1);
+        let root = self.root.join("blobs").join("sha256");
+
+        if tokio::fs::metadata(&root).await.is_err() {
+            return Ok(GcBlobPage {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        let cursor_str = cursor.map(|c| c.0.as_str());
+
+        let mut prefix_dirs = Vec::new();
+        let mut rd = tokio::fs::read_dir(&root)
+            .await
+            .map_err(|e| StorageError::Internal(format!("read_dir {}: {e}", root.display())))?;
+        while let Some(ent) = rd.next_entry().await.map_err(|e| {
+            StorageError::Internal(format!("read_dir entry in {}: {e}", root.display()))
+        })? {
+            let ft = ent.file_type().await.map_err(|e| {
+                StorageError::Internal(format!("file_type for {}: {e}", ent.path().display()))
+            })?;
+            let fname = ent.file_name();
+            let name = fname.to_str().ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "malformed non-utf8 entry in CAS root: {}",
+                    ent.path().display()
+                ))
+            })?;
+
+            if !ft.is_dir() {
+                return Err(StorageError::Internal(format!(
+                    "malformed non-directory entry in CAS prefix directory root: {}",
+                    ent.path().display()
+                )));
+            }
+
+            if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(StorageError::Internal(format!(
+                    "malformed 2-char prefix directory name in CAS root: {name}"
+                )));
+            }
+            prefix_dirs.push(name.to_ascii_lowercase());
+        }
+        prefix_dirs.sort();
+
+        let mut candidates = Vec::new();
+        let mut next_cursor = None;
+
+        'outer: for p2 in prefix_dirs {
+            let dir_path = root.join(&p2);
+            let mut entries = Vec::new();
+            let mut rd = tokio::fs::read_dir(&dir_path).await.map_err(|e| {
+                StorageError::Internal(format!("read_dir {}: {e}", dir_path.display()))
+            })?;
+            while let Some(ent) = rd.next_entry().await.map_err(|e| {
+                StorageError::Internal(format!("read_dir entry in {}: {e}", dir_path.display()))
+            })? {
+                let ft = ent.file_type().await.map_err(|e| {
+                    StorageError::Internal(format!("file_type for {}: {e}", ent.path().display()))
+                })?;
+                let fname = ent.file_name();
+                let name = fname.to_str().ok_or_else(|| {
+                    StorageError::Internal(format!(
+                        "malformed non-utf8 blob filename in {}: {}",
+                        dir_path.display(),
+                        ent.path().display()
+                    ))
+                })?;
+
+                if !ft.is_file() {
+                    return Err(StorageError::Internal(format!(
+                        "malformed non-file entry in CAS shard directory {}: {}",
+                        dir_path.display(),
+                        name
+                    )));
+                }
+
+                if name.len() != 64
+                    || !name.to_ascii_lowercase().starts_with(&p2)
+                    || !name.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err(StorageError::Internal(format!(
+                        "malformed blob file name in CAS shard {}: {}",
+                        dir_path.display(),
+                        name
+                    )));
+                }
+                entries.push(name.to_ascii_lowercase());
+            }
+            entries.sort();
+
+            for hex in entries {
+                let digest_str = format!("sha256:{hex}");
+                if let Some(c) = cursor_str {
+                    if digest_str.as_str() <= c {
+                        continue;
+                    }
+                }
+
+                let path = dir_path.join(&hex);
+                let meta = tokio::fs::metadata(&path).await.map_err(|e| {
+                    StorageError::Internal(format!("metadata {}: {e}", path.display()))
+                })?;
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let size = meta.len();
+                let mtime_secs = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let version = BlobObjectVersion(format!("{mtime_secs}:{size}"));
+                let digest = Digest::parse(&digest_str).map_err(|e| {
+                    StorageError::Internal(format!("failed to parse digest from hex {hex}: {e}"))
+                })?;
+
+                candidates.push(GcBlobCandidate {
+                    digest,
+                    size,
+                    last_modified: modified,
+                    version,
+                });
+
+                if candidates.len() >= limit {
+                    next_cursor = Some(GcCursor(digest_str));
+                    break 'outer;
+                }
+            }
+        }
+
+        Ok(GcBlobPage {
+            items: candidates,
+            next_cursor,
+        })
+    }
+
+    async fn quarantine_blob(
+        &self,
+        permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        digest: &Digest,
+        _version: &BlobObjectVersion,
+    ) -> Result<GcQuarantineResult, StorageError> {
+        if !permit.is_valid() {
+            return Err(StorageError::Internal(
+                "invalid or inactive GC mutation permit".to_string(),
+            ));
+        }
+
+        let src = self
+            .root
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex());
+
+        let meta = match tokio::fs::metadata(&src).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(GcQuarantineResult::Skipped);
+            }
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "metadata {}: {e}",
+                    src.display()
+                )));
+            }
+        };
+
+        let dest_dir = self
+            .root
+            .join("quarantine")
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2());
+        tokio::fs::create_dir_all(&dest_dir)
+            .await
+            .map_err(|e| StorageError::Internal(format!("mkdir {}: {e}", dest_dir.display())))?;
+
+        let dest = dest_dir.join(digest.hex());
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            return Ok(GcQuarantineResult::Skipped);
+        }
+
+        match tokio::fs::rename(&src, &dest).await {
+            Ok(()) => {
+                let now = SystemTime::now();
+                self.write_quarantine_timestamp(digest, now).await?;
+                Ok(GcQuarantineResult::Quarantined { size: meta.len() })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GcQuarantineResult::Skipped),
+            Err(e) => Err(StorageError::Internal(format!(
+                "rename {} -> {}: {e}",
+                src.display(),
+                dest.display()
+            ))),
+        }
+    }
+
+    async fn restore_quarantined_blob(
+        &self,
+        permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        digest: &Digest,
+    ) -> Result<Option<u64>, StorageError> {
+        if !permit.is_valid() {
+            return Err(StorageError::Internal(
+                "invalid or inactive GC mutation permit".to_string(),
+            ));
+        }
+
+        let src = self
+            .root
+            .join("quarantine")
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex());
+
+        let meta = match tokio::fs::metadata(&src).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "metadata {}: {e}",
+                    src.display()
+                )));
+            }
+        };
+
+        let dest_dir = self
+            .root
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2());
+        tokio::fs::create_dir_all(&dest_dir)
+            .await
+            .map_err(|e| StorageError::Internal(format!("mkdir {}: {e}", dest_dir.display())))?;
+        let dest = dest_dir.join(digest.hex());
+
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            let _ = tokio::fs::remove_file(&src).await;
+            let _ = self.remove_quarantine_timestamp(digest).await;
+            return Ok(Some(meta.len()));
+        }
+
+        match tokio::fs::rename(&src, &dest).await {
+            Ok(()) => {
+                let _ = self.remove_quarantine_timestamp(digest).await;
+                Ok(Some(meta.len()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::Internal(format!(
+                "rename {} -> {}: {e}",
+                src.display(),
+                dest.display()
+            ))),
+        }
+    }
+
+    async fn quarantined_blob_version(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<BlobObjectVersion>, StorageError> {
+        let path = self
+            .root
+            .join("quarantine")
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex());
+        if tokio::fs::metadata(&path).await.is_err() {
+            return Ok(None);
+        }
+        compute_fs_blob_version(&path).await.map(Some)
+    }
+
+    async fn delete_blob_conditional(
+        &self,
+        permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        if !permit.is_valid() {
+            return Err(StorageError::Internal(
+                "invalid or inactive GC mutation permit".to_string(),
+            ));
+        }
+
+        let Some(expected_version) = version else {
+            return Err(StorageError::Internal(
+                "conditional delete on filesystem storage requires expected version".to_string(),
+            ));
+        };
+
+        let path = self
+            .root
+            .join("quarantine")
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex());
+
+        if tokio::fs::metadata(&path).await.is_err() {
+            let _ = self.remove_quarantine_timestamp(digest).await;
+            return Ok(GcDeleteResult::NotFound);
+        }
+
+        let current_version = compute_fs_blob_version(&path).await?;
+        if &current_version != expected_version {
+            return Ok(GcDeleteResult::PreconditionFailed {
+                current_version: Some(current_version),
+            });
+        }
+
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                let _ = self.remove_quarantine_timestamp(digest).await;
+                Ok(GcDeleteResult::Deleted)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = self.remove_quarantine_timestamp(digest).await;
+                Ok(GcDeleteResult::NotFound)
+            }
+            Err(e) => Err(StorageError::Internal(format!(
+                "remove_file {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn gc_strategy(&self) -> GcStorageStrategy {
+        GcStorageStrategy::FilesystemQuarantine
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4574,5 +5005,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_fs_cas_enumeration_fails_closed_on_malformed_prefix_dir() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        // Put an invalid file directly in blobs/sha256/
+        let invalid_file = root.join("blobs").join("sha256").join("not_a_dir.txt");
+        tokio::fs::create_dir_all(invalid_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&invalid_file, b"corrupted").await.unwrap();
+
+        let res = storage.list_cas_blobs_page(None, 100).await;
+        assert!(
+            res.is_err(),
+            "enumeration must fail closed on non-dir prefix"
+        );
+        assert!(matches!(res.unwrap_err(), StorageError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn test_fs_cas_enumeration_fails_closed_on_malformed_blob_file() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        // Put an invalid file name in blobs/sha256/ab/
+        let invalid_blob = root
+            .join("blobs")
+            .join("sha256")
+            .join("ab")
+            .join("short_hex");
+        tokio::fs::create_dir_all(invalid_blob.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&invalid_blob, b"corrupted").await.unwrap();
+
+        let res = storage.list_cas_blobs_page(None, 100).await;
+        assert!(
+            res.is_err(),
+            "enumeration must fail closed on malformed hex filename"
+        );
+        assert!(matches!(res.unwrap_err(), StorageError::Internal(_)));
     }
 }

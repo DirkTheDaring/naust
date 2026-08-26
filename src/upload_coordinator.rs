@@ -249,6 +249,7 @@ impl Drop for PinLeaseGuard {
 pub struct BlobUploadCoordinator {
     storage: Arc<dyn Storage>,
     ref_index: Option<Arc<BlobRefIndex>>,
+    consistency_gate: Arc<tokio::sync::Mutex<()>>,
     config: BlobUploadCoordinatorConfig,
 }
 
@@ -258,9 +259,24 @@ impl BlobUploadCoordinator {
         ref_index: Option<Arc<BlobRefIndex>>,
         config: BlobUploadCoordinatorConfig,
     ) -> Self {
+        Self::with_gate(
+            storage,
+            ref_index,
+            Arc::new(tokio::sync::Mutex::new(())),
+            config,
+        )
+    }
+
+    pub fn with_gate(
+        storage: Arc<dyn Storage>,
+        ref_index: Option<Arc<BlobRefIndex>>,
+        consistency_gate: Arc<tokio::sync::Mutex<()>>,
+        config: BlobUploadCoordinatorConfig,
+    ) -> Self {
         Self {
             storage,
             ref_index,
+            consistency_gate,
             config,
         }
     }
@@ -540,13 +556,15 @@ impl BlobUploadCoordinator {
                 .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
         }
 
-        // STEP 4: Commit finalize in storage backend (copies/links to CAS destination, writes membership, writes receipt)
+        // STEP 4: Commit finalize in storage backend under the consistency gate
+        let _gate = self.consistency_gate.lock().await;
         let outcome = if let Some(ref mut guard) = pin_guard {
             tokio::select! {
                 outcome_res = self.storage.commit_finalize(&prepared) => {
                     outcome_res?
                 }
                 failure_msg = guard.wait_for_failure() => {
+                    drop(_gate);
                     guard.stop().await;
                     return Err(CoordinatorError::Storage(StorageError::Internal(
                         failure_msg.unwrap_or_else(|| "pin renewal heartbeat failed during commit".to_string())
@@ -566,6 +584,7 @@ impl BlobUploadCoordinator {
             idx.mark_ready()
                 .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
         }
+        drop(_gate);
 
         // STEP 6: Stop renewal and release pin
         if let Some(ref mut guard) = pin_guard {
@@ -625,6 +644,34 @@ impl BlobUploadCoordinator {
             .await?;
 
         Ok(MonolithicUploadResult::Created(res))
+    }
+
+    /// Unified publication of verified blob content for proxy caching.
+    ///
+    /// Required state transition:
+    /// 1. Download/stage and digest-verify content via session creation and streaming.
+    /// 2. Acquire a durable upload/publication pin for the digest in BlobRefIndex.
+    /// 3. Publish into CAS store.
+    /// 4. Under the shared consistency gate, create repository membership and record in ref-index.
+    /// 5. Durably flush required state.
+    /// 6. Release the pin only after membership succeeds.
+    pub async fn publish_proxy_blob(
+        &self,
+        local_repo: &crate::registry::canonical_name::CanonicalRepoName,
+        digest: &Digest,
+        stream: UploadByteStream,
+    ) -> Result<(), CoordinatorError> {
+        let session = self.storage.create_session(local_repo.as_str()).await?;
+        self.finalize_upload(
+            local_repo.as_str(),
+            &session.uuid,
+            None,
+            None,
+            Some(stream),
+            digest,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Performs cross-repository blob mounting with full membership verification and GC protection.
@@ -690,13 +737,14 @@ impl BlobUploadCoordinator {
                 .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
         }
 
-        // 5. Durably create target repository membership
+        // 5. Durably create target repository membership under the consistency gate
         let target_record =
             crate::storage::repo_membership::RepoBlobMembershipRecord::new_cross_mount(
                 canonical_target,
                 digest.clone(),
                 canonical_from,
             );
+        let _gate = self.consistency_gate.lock().await;
         let link_res = self.storage.link_repo_blob(&target_record).await;
 
         if let Ok(()) = link_res
@@ -706,6 +754,7 @@ impl BlobUploadCoordinator {
             let _ = idx.flush();
             let _ = idx.mark_ready();
         }
+        drop(_gate);
 
         if let Some(ref mut guard) = pin_guard {
             guard.stop().await;

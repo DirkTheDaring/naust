@@ -652,6 +652,9 @@ async fn phase_5_kill_switch_and_delete_gate_and_delete_flow() {
         assert!(!live.exists());
         assert!(quarantined.exists());
 
+        // Simulate that repository unlinked the unreferenced blob membership (count == 0)
+        let _ = std::fs::remove_dir_all(fs_root.join("repo-memberships"));
+
         // Delete immediately.
         let d = admin_post_json(
             &base,

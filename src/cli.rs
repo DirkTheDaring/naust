@@ -51,7 +51,7 @@ pub enum CliCommand {
         command: RefIndexCommand,
     },
 
-    /// Reclaim storage by quarantining/deleting unreferenced blobs (filesystem backend only).
+    /// Reclaim storage by quarantining/deleting unreferenced blobs.
     #[command(name = "blob-gc")]
     BlobGc {
         #[command(subcommand)]
@@ -451,21 +451,33 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 return 1;
             }
 
+            let mut gc_cfg = cfg.clone();
+            gc_cfg.blob_gc_enabled = true;
+            gc_cfg.blob_gc_enable_delete = true;
+
             match command {
                 BlobGcCommand::Plan {
                     policy,
                     min_age_secs,
                     max_per_run,
                 } => {
-                    let stats = match crate::blob_gc::blob_gc_plan(
-                        &cfg,
-                        &storage,
-                        &idx,
-                        policy,
-                        std::time::Duration::from_secs(min_age_secs),
-                        crate::blob_gc::BlobGcLimits::unlimited(max_per_run),
-                    )
-                    .await
+                    let service = crate::gc_service::GcService::new(
+                        std::sync::Arc::new(gc_cfg),
+                        storage.clone(),
+                        std::sync::Arc::new(idx),
+                    );
+                    let budgets = crate::gc_service::GcBudgets {
+                        max_blobs: max_per_run,
+                        max_bytes: u64::MAX,
+                        max_seconds: u64::MAX,
+                    };
+                    let stats = match service
+                        .plan(
+                            policy,
+                            std::time::Duration::from_secs(min_age_secs),
+                            budgets,
+                        )
+                        .await
                     {
                         Ok(s) => s,
                         Err(e) => {
@@ -489,7 +501,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                     max_per_run,
                     ..
                 } => {
-                    let mut authority =
+                    let authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
                             storage.clone(),
                             "blob-gc-quarantine",
@@ -505,24 +517,34 @@ pub async fn run_cli(cli: Cli) -> i32 {
                             }
                         };
 
-                    let stats = match crate::blob_gc::blob_gc_quarantine(
-                        &cfg,
-                        &storage,
-                        &idx,
-                        policy,
-                        std::time::Duration::from_secs(min_age_secs),
-                        crate::blob_gc::BlobGcLimits::unlimited(max_per_run),
-                    )
-                    .await
+                    let service = crate::gc_service::GcService::with_authority(
+                        std::sync::Arc::new(gc_cfg),
+                        storage.clone(),
+                        std::sync::Arc::new(idx),
+                        authority,
+                    );
+
+                    let budgets = crate::gc_service::GcBudgets {
+                        max_blobs: max_per_run,
+                        max_bytes: u64::MAX,
+                        max_seconds: u64::MAX,
+                    };
+                    let stats = match service
+                        .quarantine(
+                            policy,
+                            std::time::Duration::from_secs(min_age_secs),
+                            budgets,
+                        )
+                        .await
                     {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("blob-gc: quarantine failed: {e}");
-                            let _ = authority.release().await;
                             return 1;
                         }
                     };
-                    let _ = authority.release().await;
+
+                    let _ = service.release_authority().await;
 
                     println!(
                         "scanned_blobs={} scanned_bytes={} quarantined_blobs={} quarantined_bytes={}",
@@ -539,7 +561,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                     max_per_run,
                     ..
                 } => {
-                    let mut authority =
+                    let authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
                             storage.clone(),
                             "blob-gc-delete",
@@ -555,24 +577,35 @@ pub async fn run_cli(cli: Cli) -> i32 {
                             }
                         };
 
-                    let stats = match crate::blob_gc::blob_gc_delete(
-                        &cfg,
-                        &storage,
-                        &idx,
-                        policy,
-                        std::time::Duration::from_secs(quarantine_delay_secs),
-                        crate::blob_gc::BlobGcLimits::unlimited(max_per_run),
-                    )
-                    .await
+                    let service = crate::gc_service::GcService::with_authority(
+                        std::sync::Arc::new(gc_cfg),
+                        storage.clone(),
+                        std::sync::Arc::new(idx),
+                        authority,
+                    );
+
+                    let budgets = crate::gc_service::GcBudgets {
+                        max_blobs: max_per_run,
+                        max_bytes: u64::MAX,
+                        max_seconds: u64::MAX,
+                    };
+                    let stats = match service
+                        .delete(
+                            policy,
+                            std::time::Duration::from_secs(quarantine_delay_secs),
+                            budgets,
+                        )
+                        .await
                     {
                         Ok(s) => s,
                         Err(e) => {
+                            let _ = service.release_authority().await;
                             eprintln!("blob-gc: delete failed: {e}");
-                            let _ = authority.release().await;
                             return 1;
                         }
                     };
-                    let _ = authority.release().await;
+
+                    let _ = service.release_authority().await;
 
                     println!(
                         "restored_blobs={} restored_bytes={} deleted_blobs={} deleted_bytes={}",

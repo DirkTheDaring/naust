@@ -60,6 +60,16 @@ pub struct RuntimeMutationAuthority {
     released: bool,
 }
 
+impl std::fmt::Debug for RuntimeMutationAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeMutationAuthority")
+            .field("doc", &self.doc)
+            .field("etag", &self.etag)
+            .field("released", &self.released)
+            .finish()
+    }
+}
+
 impl RuntimeMutationAuthority {
     /// Attempts to acquire the exclusive deployment mutation authority.
     pub async fn acquire(
@@ -95,6 +105,15 @@ impl RuntimeMutationAuthority {
     #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         !self.released
+    }
+
+    /// Mints a sealed `GcMutationPermit` for mutating GC operations.
+    pub fn gc_mutation_permit(&self) -> GcMutationPermit<'_> {
+        assert!(
+            self.is_active(),
+            "cannot mint GC permit from released or inactive authority"
+        );
+        GcMutationPermit { _authority: self }
     }
 
     /// Conditionally releases the deployment lock upon clean shutdown.
@@ -182,4 +201,24 @@ pub async fn force_unlock_deployment_writer(
     storage
         .admin_clear_deployment_writer_lock(&doc.owner_id, &etag)
         .await
+}
+
+/// A sealed, non-forgeable permit required for mutating Garbage Collection operations
+/// (quarantine, deletion, and candidate unlinking sweeps).
+///
+/// This permit can ONLY be minted by a live holder of `RuntimeMutationAuthority`
+/// and statically cannot outlive the authority reference.
+#[derive(Debug)]
+pub struct GcMutationPermit<'a> {
+    _authority: &'a RuntimeMutationAuthority,
+}
+
+impl<'a> GcMutationPermit<'a> {
+    pub fn owner_id(&self) -> &str {
+        &self._authority.doc.owner_id
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self._authority.is_active()
+    }
 }

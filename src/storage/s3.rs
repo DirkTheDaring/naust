@@ -1,6 +1,8 @@
 use super::upload_session::*;
 use super::{
-    BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta,
+    BlobMeta, BlobObjectVersion, ConditionalDeleteResult, GcBlobCandidate, GcBlobPage, GcCursor,
+    GcDeleteResult, GcQuarantineResult, GcStorage, GcStorageStrategy, ManifestMeta,
+    ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta,
 };
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
@@ -34,9 +36,15 @@ fn shard_index(key: &str, num_shards: usize) -> usize {
 #[derive(Debug, Clone)]
 pub struct S3ObjectSummary {
     pub key: String,
-    #[allow(dead_code)]
     pub size: u64,
     pub last_modified_unix_secs: u64,
+    pub e_tag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct S3ObjectsPage {
+    pub objects: Vec<S3ObjectSummary>,
+    pub next_continuation_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -54,8 +62,20 @@ pub struct S3MultipartListResult {
     pub is_truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3BucketVersioningState {
+    Unversioned,
+    Enabled,
+    Suspended,
+    UnknownOrDenied(String),
+}
+
 #[async_trait]
 pub trait S3Driver: Send + Sync + 'static {
+    async fn get_bucket_versioning_state(&self, _bucket: &str) -> S3BucketVersioningState {
+        S3BucketVersioningState::Unversioned
+    }
+
     async fn create_multipart_upload(
         &self,
         bucket: &str,
@@ -123,6 +143,13 @@ pub trait S3Driver: Send + Sync + 'static {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<S3ObjectSummary>, StorageError>;
+    async fn list_objects_v2_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> Result<S3ObjectsPage, StorageError>;
 
     fn now_unix_secs(&self) -> u64 {
         SystemTime::now()
@@ -155,14 +182,38 @@ impl AwsS3Driver {
         let c = self
             .client
             .get_or_try_init(|| async {
+                let is_local = self
+                    .endpoint
+                    .as_deref()
+                    .map(|ep| {
+                        ep.contains("127.0.0.1")
+                            || ep.contains("localhost")
+                            || ep.contains("0.0.0.0")
+                            || ep.contains("::1")
+                    })
+                    .unwrap_or(false);
+
                 let loader = aws_config::defaults(BehaviorVersion::latest())
                     .region(Region::new(region_str.to_string()));
+                let loader = if is_local && std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+                    loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+                        "minioadmin",
+                        "minioadmin",
+                        None,
+                        None,
+                        "static",
+                    ))
+                } else {
+                    loader
+                };
                 let shared = loader.load().await;
 
                 let mut builder = aws_sdk_s3::config::Builder::from(&shared);
                 if let Some(ep) = self.endpoint.as_deref() {
                     builder = builder.endpoint_url(ep);
-                    builder = builder.force_path_style(true);
+                    if is_local {
+                        builder = builder.force_path_style(true);
+                    }
                 }
                 Ok::<_, StorageError>(Client::from_conf(builder.build()))
             })
@@ -173,6 +224,25 @@ impl AwsS3Driver {
 
 #[async_trait]
 impl S3Driver for AwsS3Driver {
+    async fn get_bucket_versioning_state(&self, bucket: &str) -> S3BucketVersioningState {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return S3BucketVersioningState::UnknownOrDenied(e.to_string()),
+        };
+        match client.get_bucket_versioning().bucket(bucket).send().await {
+            Ok(resp) => match resp.status() {
+                Some(aws_sdk_s3::types::BucketVersioningStatus::Enabled) => {
+                    S3BucketVersioningState::Enabled
+                }
+                Some(aws_sdk_s3::types::BucketVersioningStatus::Suspended) => {
+                    S3BucketVersioningState::Suspended
+                }
+                _ => S3BucketVersioningState::Unversioned,
+            },
+            Err(e) => S3BucketVersioningState::UnknownOrDenied(e.to_string()),
+        }
+    }
+
     async fn create_multipart_upload(
         &self,
         bucket: &str,
@@ -496,6 +566,7 @@ impl S3Driver for AwsS3Driver {
     ) -> Result<Vec<S3ObjectSummary>, StorageError> {
         let client = self.client().await?;
         let mut token: Option<String> = None;
+        let mut seen_tokens: HashSet<String> = HashSet::new();
         let mut out = Vec::new();
 
         loop {
@@ -518,17 +589,26 @@ impl S3Driver for AwsS3Driver {
                         .last_modified()
                         .map(|dt| dt.secs().max(0) as u64)
                         .unwrap_or(0);
+                    let e_tag = obj.e_tag().map(|et| et.trim_matches('"').to_string());
                     out.push(S3ObjectSummary {
                         key: k.to_string(),
                         size,
                         last_modified_unix_secs,
+                        e_tag,
                     });
                 }
             }
 
             if resp.is_truncated().unwrap_or(false) {
-                token = resp.next_continuation_token().map(|s| s.to_string());
-                if token.is_none() {
+                if let Some(next) = resp.next_continuation_token() {
+                    let next_str = next.to_string();
+                    if !seen_tokens.insert(next_str.clone()) {
+                        return Err(StorageError::Internal(
+                            "continuation token cycle detected during list_objects_v2".to_string(),
+                        ));
+                    }
+                    token = Some(next_str);
+                } else {
                     break;
                 }
             } else {
@@ -537,6 +617,57 @@ impl S3Driver for AwsS3Driver {
         }
 
         Ok(out)
+    }
+
+    async fn list_objects_v2_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> Result<S3ObjectsPage, StorageError> {
+        let client = self.client().await?;
+        let mut req = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix.to_string())
+            .max_keys(max_keys);
+        if let Some(t) = continuation_token {
+            req = req.continuation_token(t);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| StorageError::Internal(err.to_string()))?;
+
+        let mut objects = Vec::new();
+        for obj in resp.contents() {
+            if let Some(k) = obj.key() {
+                let size = obj.size().unwrap_or(0) as u64;
+                let last_modified_unix_secs = obj
+                    .last_modified()
+                    .map(|dt| dt.secs().max(0) as u64)
+                    .unwrap_or(0);
+                let e_tag = obj.e_tag().map(|et| et.trim_matches('"').to_string());
+                objects.push(S3ObjectSummary {
+                    key: k.to_string(),
+                    size,
+                    last_modified_unix_secs,
+                    e_tag,
+                });
+            }
+        }
+
+        let next_continuation_token = if resp.is_truncated().unwrap_or(false) {
+            resp.next_continuation_token().map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        Ok(S3ObjectsPage {
+            objects,
+            next_continuation_token,
+        })
     }
 }
 
@@ -709,6 +840,13 @@ impl S3Storage {
 
     fn session_key(&self, uuid: &str) -> String {
         self.key(&format!("uploads/{uuid}/session.json"))
+    }
+
+    pub async fn check_bucket_versioning(&self) -> S3BucketVersioningState {
+        match self.bucket() {
+            Ok(b) => self.driver.get_bucket_versioning_state(b).await,
+            Err(e) => S3BucketVersioningState::UnknownOrDenied(e.to_string()),
+        }
     }
 
     pub async fn reap_orphaned_multipart_uploads(
@@ -1016,6 +1154,174 @@ fn map_put_err(
 }
 
 #[async_trait]
+impl GcStorage for S3Storage {
+    async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
+        match self.check_bucket_versioning().await {
+            S3BucketVersioningState::Unversioned => Ok(()),
+            S3BucketVersioningState::Enabled => Err(StorageError::Internal(
+                "S3 physical GC requires an unversioned bucket; bucket versioning is Enabled (delete would create delete markers rather than reclaim physical space)"
+                    .to_string(),
+            )),
+            S3BucketVersioningState::Suspended => Err(StorageError::Internal(
+                "S3 physical GC requires an unversioned bucket; bucket versioning is Suspended (noncurrent versions exist and cannot be reclaimed without version-aware GC)"
+                    .to_string(),
+            )),
+            S3BucketVersioningState::UnknownOrDenied(err) => Err(StorageError::Internal(
+                format!("S3 bucket versioning preflight check failed or permission denied: {err}"),
+            )),
+        }
+    }
+
+    async fn list_cas_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        let max_limit = 1000;
+        let limit = limit.min(max_limit).max(1);
+        let bucket = self.bucket()?;
+        let prefix = self.key("blobs/sha256/");
+
+        let page = self
+            .driver
+            .list_objects_v2_page(bucket, &prefix, cursor.map(|c| c.0.as_str()), limit as i32)
+            .await?;
+
+        let mut items = Vec::new();
+        for obj in page.objects {
+            if obj.key == prefix || obj.key.ends_with('/') {
+                continue;
+            }
+            let suffix = match obj.key.strip_prefix(&prefix) {
+                Some(s) => s,
+                None => {
+                    return Err(StorageError::Internal(format!(
+                        "malformed object key not starting with CAS prefix: {}",
+                        obj.key
+                    )));
+                }
+            };
+            let parts: Vec<&str> = suffix.split('/').collect();
+            if parts.len() != 2 {
+                return Err(StorageError::Internal(format!(
+                    "malformed CAS object key structure in S3 (expected 2 parts): {}",
+                    obj.key
+                )));
+            }
+            let (p2, hex) = (parts[0], parts[1]);
+            if p2.len() != 2
+                || hex.len() != 64
+                || !hex
+                    .to_ascii_lowercase()
+                    .starts_with(&p2.to_ascii_lowercase())
+                || !p2.chars().all(|c| c.is_ascii_hexdigit())
+                || !hex.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Err(StorageError::Internal(format!(
+                    "malformed CAS object key hex/prefix in S3: {}",
+                    obj.key
+                )));
+            }
+
+            let digest = match Digest::parse(&format!("sha256:{}", hex.to_ascii_lowercase())) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err(StorageError::Internal(format!(
+                        "unparsable digest from CAS object key {}: {e}",
+                        obj.key
+                    )));
+                }
+            };
+
+            let last_modified = UNIX_EPOCH + Duration::from_secs(obj.last_modified_unix_secs);
+            let version = BlobObjectVersion(
+                obj.e_tag
+                    .unwrap_or_else(|| format!("{}:{}", obj.last_modified_unix_secs, obj.size)),
+            );
+
+            items.push(GcBlobCandidate {
+                digest,
+                size: obj.size,
+                last_modified,
+                version,
+            });
+        }
+
+        Ok(GcBlobPage {
+            items,
+            next_cursor: page.next_continuation_token.map(GcCursor),
+        })
+    }
+
+    async fn quarantine_blob(
+        &self,
+        permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        _digest: &Digest,
+        _version: &BlobObjectVersion,
+    ) -> Result<GcQuarantineResult, StorageError> {
+        if !permit.is_valid() {
+            return Err(StorageError::Internal(
+                "invalid or inactive GC mutation permit".to_string(),
+            ));
+        }
+        Ok(GcQuarantineResult::Skipped)
+    }
+
+    async fn restore_quarantined_blob(
+        &self,
+        permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        _digest: &Digest,
+    ) -> Result<Option<u64>, StorageError> {
+        if !permit.is_valid() {
+            return Err(StorageError::Internal(
+                "invalid or inactive GC mutation permit".to_string(),
+            ));
+        }
+        Ok(None)
+    }
+
+    async fn delete_blob_conditional(
+        &self,
+        permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        if !permit.is_valid() {
+            return Err(StorageError::Internal(
+                "invalid or inactive GC mutation permit".to_string(),
+            ));
+        }
+        let Some(version) = version else {
+            return Err(StorageError::Internal(
+                "S3 conditional delete requires an explicit object version/ETag; unconditional delete is forbidden in GC"
+                    .to_string(),
+            ));
+        };
+        let bucket = self.bucket()?;
+        let key = self.blob_key2(digest);
+        let if_match = Some(version.0.clone());
+        let res = self
+            .driver
+            .delete_object_conditional(bucket, &key, if_match)
+            .await?;
+
+        match res {
+            ConditionalDeleteResult::Deleted => Ok(GcDeleteResult::Deleted),
+            ConditionalDeleteResult::NotFound => Ok(GcDeleteResult::NotFound),
+            ConditionalDeleteResult::PreconditionFailed { current_version } => {
+                Ok(GcDeleteResult::PreconditionFailed {
+                    current_version: current_version.map(BlobObjectVersion),
+                })
+            }
+        }
+    }
+
+    fn gc_strategy(&self) -> GcStorageStrategy {
+        GcStorageStrategy::S3DirectConditional
+    }
+}
+
+#[async_trait]
 impl Storage for S3Storage {
     fn kind(&self) -> &'static str {
         "s3"
@@ -1037,6 +1343,8 @@ impl Storage for S3Storage {
                 Some(repo)
             } else if let Some((repo, _)) = rest.split_once("/referrers/") {
                 Some(repo)
+            } else if let Some((repo, _)) = rest.split_once("/meta/") {
+                Some(repo)
             } else {
                 None
             };
@@ -1044,6 +1352,23 @@ impl Storage for S3Storage {
                 && !repo.is_empty()
             {
                 set.insert(repo.to_string());
+            }
+        }
+
+        let mem_prefix = self.all_memberships_prefix();
+        let mem_objects = self.driver.list_objects_v2(bucket, &mem_prefix).await?;
+        for obj in mem_objects {
+            if let Some(rest) = obj.key.strip_prefix(&mem_prefix) {
+                if let Some((repo_enc, _)) = rest.split_once('/') {
+                    let canon =
+                        crate::storage::repo_membership::decode_canonical_repo_key(repo_enc)
+                            .map_err(|e| {
+                                StorageError::Internal(format!(
+                                    "malformed repository membership key in S3: {e}"
+                                ))
+                            })?;
+                    set.insert(canon.to_string());
+                }
             }
         }
 
@@ -1890,12 +2215,6 @@ impl Storage for S3Storage {
             .await;
         let _ = self.driver.delete_object(bucket, &key).await;
         Ok(())
-    }
-
-    async fn delete_blob(&self, digest: &Digest) -> Result<(), StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.blob_key2(digest);
-        self.driver.delete_object(bucket, &key).await
     }
 
     async fn list_referrers(
@@ -3308,14 +3627,13 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
     }
 
     async fn count_repo_blob_memberships(&self, digest: &Digest) -> Result<usize, StorageError> {
-        let repos = self.list_repositories().await?;
+        let bucket = self.bucket()?;
+        let prefix = self.all_memberships_prefix();
+        let objects = self.driver.list_objects_v2(bucket, &prefix).await?;
+        let suffix = format!("/{}/{}.json", digest.algorithm(), digest.hex());
         let mut count = 0;
-        for repo in repos {
-            if self
-                .get_repo_blob_membership(&repo, digest)
-                .await?
-                .is_some()
-            {
+        for obj in objects {
+            if obj.key.ends_with(&suffix) {
                 count += 1;
             }
         }
@@ -3438,6 +3756,7 @@ pub mod tests {
         pub etag_seq: AtomicU64,
         pub call_log: StdMutex<Vec<S3CallLogEntry>>,
         pub injected_412_keys: StdMutex<HashSet<String>>,
+        pub versioning_state: StdMutex<S3BucketVersioningState>,
         pub hook_before_op: StdMutex<Option<MockHookFn>>,
         pub hook_after_op: StdMutex<Option<MockHookFn>>,
     }
@@ -3451,6 +3770,7 @@ pub mod tests {
                 etag_seq: AtomicU64::new(1),
                 call_log: StdMutex::new(Vec::new()),
                 injected_412_keys: StdMutex::new(HashSet::new()),
+                versioning_state: StdMutex::new(S3BucketVersioningState::Unversioned),
                 hook_before_op: StdMutex::new(None),
                 hook_after_op: StdMutex::new(None),
             }
@@ -3520,6 +3840,10 @@ pub mod tests {
 
     #[async_trait]
     impl S3Driver for MockS3Driver {
+        async fn get_bucket_versioning_state(&self, _bucket: &str) -> S3BucketVersioningState {
+            self.versioning_state.lock().unwrap().clone()
+        }
+
         async fn create_multipart_upload(
             &self,
             _bucket: &str,
@@ -3921,12 +4245,13 @@ pub mod tests {
             let objs = self.objects.lock().unwrap();
             let clock = self.now_unix_secs();
             let mut out = Vec::new();
-            for (k, (b, _)) in objs.iter() {
+            for (k, (b, etag)) in objs.iter() {
                 if k.starts_with(prefix) {
                     out.push(S3ObjectSummary {
                         key: k.clone(),
                         size: b.len() as u64,
                         last_modified_unix_secs: clock,
+                        e_tag: Some(etag.clone()),
                     });
                 }
             }
@@ -3935,6 +4260,64 @@ pub mod tests {
             self.check_after_hook("list_objects_v2", prefix)?;
 
             Ok(out)
+        }
+
+        async fn list_objects_v2_page(
+            &self,
+            _bucket: &str,
+            prefix: &str,
+            continuation_token: Option<&str>,
+            max_keys: i32,
+        ) -> Result<S3ObjectsPage, StorageError> {
+            let mut log = self.call_log.lock().unwrap();
+            log.push(S3CallLogEntry {
+                method: "list_objects_v2_page".to_string(),
+                key: prefix.to_string(),
+                if_match: None,
+                if_none_match: None,
+                body_len: 0,
+            });
+            drop(log);
+
+            self.check_before_hook("list_objects_v2_page", prefix)?;
+
+            let objs = self.objects.lock().unwrap();
+            let clock = self.now_unix_secs();
+            let mut matched = Vec::new();
+            for (k, (b, etag)) in objs.iter() {
+                if k.starts_with(prefix) {
+                    if let Some(tok) = continuation_token {
+                        if k.as_str() <= tok {
+                            continue;
+                        }
+                    }
+                    matched.push(S3ObjectSummary {
+                        key: k.clone(),
+                        size: b.len() as u64,
+                        last_modified_unix_secs: clock,
+                        e_tag: Some(etag.clone()),
+                    });
+                }
+            }
+            drop(objs);
+
+            matched.sort_by(|a, b| a.key.cmp(&b.key));
+            let has_more = matched.len() as i32 > max_keys;
+            if has_more {
+                matched.truncate(max_keys as usize);
+            }
+            let next_continuation_token = if has_more {
+                matched.last().map(|o| o.key.clone())
+            } else {
+                None
+            };
+
+            self.check_after_hook("list_objects_v2_page", prefix)?;
+
+            Ok(S3ObjectsPage {
+                objects: matched,
+                next_continuation_token,
+            })
         }
 
         fn now_unix_secs(&self) -> u64 {
@@ -3951,7 +4334,7 @@ pub mod tests {
         Digest::parse(&format!("sha256:{}", hex::encode(hash))).unwrap()
     }
 
-    pub(crate) fn create_mock_storage() -> (S3Storage, Arc<MockS3Driver>) {
+    pub fn create_mock_storage() -> (S3Storage, Arc<MockS3Driver>) {
         let driver = Arc::new(MockS3Driver::new(1000));
         let storage = S3Storage::new_with_driver(
             Some("test-bucket".to_string()),
@@ -6829,5 +7212,23 @@ pub mod tests {
             objects.contains_key(&format!("test-bucket/{legacy_key}")),
             "Normal unlink must not delete legacy key"
         );
+    }
+
+    #[tokio::test]
+    async fn test_s3_cas_enumeration_fails_closed_on_malformed_key() {
+        let (storage, driver) = create_mock_storage();
+
+        // Insert a malformed CAS key directly into S3
+        driver.objects.lock().unwrap().insert(
+            "blobs/sha256/invalid_key_format".to_string(),
+            (Bytes::from_static(b"data"), "etag-bad".to_string()),
+        );
+
+        let res = storage.list_cas_blobs_page(None, 100).await;
+        assert!(
+            res.is_err(),
+            "S3 enumeration must fail closed on malformed key format"
+        );
+        assert!(matches!(res.unwrap_err(), StorageError::Internal(_)));
     }
 }
