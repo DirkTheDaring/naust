@@ -42,6 +42,7 @@ pub struct BlobRefIndex {
     pins: sled::Tree,
     repo_memberships: sled::Tree,
     fail_mark_dirty: Arc<std::sync::atomic::AtomicBool>,
+    fail_mark_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -110,6 +111,7 @@ impl BlobRefIndex {
             pins,
             repo_memberships,
             fail_mark_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_mark_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -311,7 +313,20 @@ impl BlobRefIndex {
             .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub fn set_fail_mark_ready(&self, fail: bool) {
+        self.fail_mark_ready
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn mark_ready(&self) -> Result<(), RefIndexError> {
+        if self
+            .fail_mark_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RefIndexError::Corrupt(
+                "injected mark_ready failure".to_string(),
+            ));
+        }
         self.meta.insert(META_STATE, META_STATE_READY)?;
         self.db.flush()?;
         Ok(())

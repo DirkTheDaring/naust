@@ -2347,3 +2347,759 @@ async fn test_shared_content_same_repo_client_and_proxy_gc_safety() {
         Bytes::from_static(b"mixed-shared-layer")
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// 48. Index durability ordering: crash between data flush and ready transition leaves DIRTY
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_index_durability_ordering_crash_between_flush_and_mark_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "durability-ordering-repo";
+
+    let (m_d, layer_d) = {
+        let (storage, ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"durability-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"durability-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        // Simulate crash: mark index dirty, flush data changes, fail before mark_ready
+        ref_index.mark_dirty().unwrap();
+        ref_index.flush().unwrap();
+        ref_index.set_fail_mark_ready(true);
+        assert!(ref_index.mark_ready().is_err());
+
+        // State on disk is strictly DIRTY (not ready-and-stale)
+        assert!(ref_index.check_health().is_err());
+
+        let journal = LifecycleJournalRecord {
+            op_id: "durability-op-1".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyManifestDeleted,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    // Recreate service & index from durable backend state (restart recovery)
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+
+    // Trigger production recovery
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    // Verify index is restored to healthy & ready, not corrupt/stale
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 49. Proxy eviction restart: manifest deleted before phase update
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_manifest_deleted_before_phase_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-manifest-del-unrecorded";
+
+    let (m_d, layer_d) = {
+        let (storage, _ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"unrecorded-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"unrecorded-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        // Delete tag and manifest in storage, but journal phase is still ProxyTagDeleted
+        storage.delete_tag(repo, "v1").await.unwrap();
+        storage.delete_manifest(repo, &m_d).await.unwrap();
+
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-unrecorded".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyTagDeleted,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 50. Proxy eviction restart: ProxyManifestDeleted phase persisted
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_proxy_manifest_deleted_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-manifest-del-persisted";
+
+    let (m_d, layer_d) = {
+        let (storage, _ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"persisted-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"persisted-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        storage.delete_tag(repo, "v1").await.unwrap();
+        storage.delete_manifest(repo, &m_d).await.unwrap();
+
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-manifest-deleted".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyManifestDeleted,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 51. Proxy eviction restart: memberships unlinked before phase update
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_memberships_unlinked_before_phase_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-unlinked-before-update";
+
+    let (m_d, layer_d) = {
+        let (storage, _ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"unlinked-before-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"unlinked-before-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        storage.delete_tag(repo, "v1").await.unwrap();
+        storage.delete_manifest(repo, &m_d).await.unwrap();
+        storage.unlink_repo_blob(repo, &layer).await.unwrap();
+
+        // Journal phase still recorded as ProxyManifestDeleted
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-unlinked-early".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyManifestDeleted,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 52. Proxy eviction restart: ProxyMembershipsUnlinked persisted
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_proxy_memberships_unlinked_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-memberships-unlinked-persisted";
+
+    let (m_d, layer_d) = {
+        let (storage, _ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"unlinked-persisted-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"unlinked-persisted-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        storage.delete_tag(repo, "v1").await.unwrap();
+        storage.delete_manifest(repo, &m_d).await.unwrap();
+        storage.unlink_repo_blob(repo, &layer).await.unwrap();
+
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-memberships-unlinked".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyMembershipsUnlinked,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 53. Proxy eviction restart: index reconciled but not flushed before crash
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_index_reconciled_not_flushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-unflushed-index";
+
+    let (m_d, layer_d) = {
+        let (storage, ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"unflushed-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"unflushed-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        ref_index.mark_dirty().unwrap();
+        ref_index.on_manifest_deleted(repo, &m_d).unwrap();
+        // Sled DB not flushed before simulated process crash
+
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-unflushed".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyManifestDeleted,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 54. Proxy eviction restart: index flushed but not ready before crash
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_index_flushed_not_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-flushed-not-ready";
+
+    let (m_d, layer_d) = {
+        let (storage, ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"flushed-not-ready-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"flushed-not-ready-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        ref_index.mark_dirty().unwrap();
+        ref_index.on_manifest_deleted(repo, &m_d).unwrap();
+        ref_index.flush().unwrap();
+        // Index is flushed to disk, but still in DIRTY state (not ready)
+
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-flushed-not-ready".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyManifestDeleted,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 55. Proxy eviction restart: ready set but journal still present
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_ready_set_journal_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-ready-set-journal-present";
+
+    let (m_d, layer_d) = {
+        let (storage, ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"ready-journal-present-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"ready-journal-present-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        storage.delete_tag(repo, "v1").await.unwrap();
+        storage.delete_manifest(repo, &m_d).await.unwrap();
+        storage.unlink_repo_blob(repo, &layer).await.unwrap();
+        ref_index.on_manifest_deleted(repo, &m_d).unwrap();
+        ref_index.flush().unwrap();
+        ref_index.mark_ready().unwrap();
+
+        // Journal still on disk (crash immediately before delete_journal)
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-ready-journal-present".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyMembershipsUnlinked,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// 56. Proxy eviction restart: journal deletion response lost / retry is idempotent
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_proxy_eviction_restart_journal_deletion_lost_retry_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = "evict-restart-lost-delete-retry";
+
+    let (m_d, layer_d) = {
+        let (storage, _ref_index, service) = setup_test_service(&dir).await;
+        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let layer = write_test_blob(&storage_trait, repo, b"lost-delete-layer").await;
+        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        storage.link_repo_blob(&proxy_record).await.unwrap();
+
+        let cfg = write_test_blob(&storage_trait, repo, b"lost-delete-cfg").await;
+        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+        let ev = ProxyPublicationEvidence::new_for_test(
+            repo,
+            "v1",
+            m_bytes.clone(),
+            None,
+            true,
+            m_d.clone(),
+        );
+        service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+        let journal = LifecycleJournalRecord {
+            op_id: "evict-op-lost-delete".to_string(),
+            repo: repo.to_string(),
+            op_kind: LifecycleOpKind::ProxyEvict,
+            target_digest: m_d.clone(),
+            target_reference: Some("v1".to_string()),
+            phase: LifecyclePhase::ProxyMembershipsUnlinked,
+            owner_id: "test-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        };
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        (m_d, layer)
+    };
+
+    let (storage, ref_index, service) = setup_test_service(&dir).await;
+
+    // First recovery attempt
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    // Second idempotent recovery attempt (simulating duplicate trigger or lost response)
+    service
+        .recover_and_ensure_index_healthy(repo)
+        .await
+        .unwrap();
+
+    assert!(ref_index.check_health().is_ok());
+    assert!(storage.get_manifest(repo, &m_d).await.is_err());
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_d)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

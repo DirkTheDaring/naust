@@ -685,8 +685,8 @@ impl ManifestLifecycleService {
 
                     if let Some(idx) = self.ref_index.as_ref() {
                         let _ = idx.on_manifest_deleted(repo, &journal.target_digest);
-                        idx.mark_ready()?;
                         idx.flush()?;
+                        idx.mark_ready()?;
                     }
 
                     if let Some(refs) = refs {
@@ -706,12 +706,41 @@ impl ManifestLifecycleService {
                                 }
                             }
                         }
+                    } else {
+                        // Manifest was already deleted prior to recovery; check all proxy memberships in this repo
+                        let mut page_tok: Option<String> = None;
+                        loop {
+                            let (page, next_tok) = match self
+                                .storage
+                                .list_repo_blob_memberships_page(repo, page_tok.as_deref(), 100)
+                                .await
+                            {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            };
+                            for rec in page {
+                                if rec.provenance
+                                    == crate::storage::repo_membership::MembershipProvenance::Proxy
+                                {
+                                    let still_referenced =
+                                        self.is_blob_referenced_in_repo(repo, &rec.digest).await;
+                                    if !still_referenced {
+                                        let _ =
+                                            self.storage.unlink_repo_blob(repo, &rec.digest).await;
+                                    }
+                                }
+                            }
+                            match next_tok {
+                                Some(tok) => page_tok = Some(tok),
+                                None => break,
+                            }
+                        }
                     }
                 }
 
                 if let Some(idx) = self.ref_index.as_ref() {
-                    idx.mark_ready()?;
                     idx.flush()?;
+                    idx.mark_ready()?;
                 }
 
                 self.delete_journal(repo).await?;
@@ -1200,8 +1229,8 @@ impl ManifestLifecycleService {
                 // Reconcile index
                 if let Some(idx) = self.ref_index.as_ref() {
                     let _ = idx.on_manifest_deleted(repo, target_digest);
-                    idx.mark_ready()?;
                     idx.flush()?;
+                    idx.mark_ready()?;
                 }
 
                 // If refs were parsed, check if remaining manifests in repo reference each blob
@@ -1232,8 +1261,8 @@ impl ManifestLifecycleService {
         }
 
         if let Some(idx) = self.ref_index.as_ref() {
-            idx.mark_ready()?;
             idx.flush()?;
+            idx.mark_ready()?;
         }
 
         self.delete_journal(repo).await?;
