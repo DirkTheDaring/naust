@@ -1,2 +1,27 @@
-// Intentionally empty for now.
-// Keeping a lib target makes it easier to add integration tests later.
+pub mod app_state;
+pub use app_state::{AppState, AuthMetrics, ProxyContext};
+
+pub mod auth;
+pub mod blob_delete_safety;
+pub mod blob_gc;
+pub mod blob_ref_index;
+pub mod config;
+pub mod gc_service;
+pub mod glob;
+pub mod http_api;
+pub mod ip_concurrency;
+pub mod manifest_lifecycle;
+pub mod manifest_publication;
+pub mod manifest_refs;
+pub mod membership_migration;
+pub mod proxy;
+pub mod rbac;
+pub mod registry;
+pub mod repository_membership_ledger;
+pub mod request_routing;
+pub mod robot_secrets;
+pub mod security;
+pub mod storage;
+pub mod task_supervisor;
+pub mod token_rate_limit;
+pub mod upload_coordinator;

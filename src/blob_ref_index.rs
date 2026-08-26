@@ -442,59 +442,106 @@ impl BlobRefIndex {
         Ok(())
     }
 
+    pub async fn sync_repo_manifests_and_tags(
+        &self,
+        storage: &Arc<dyn Storage>,
+        repo: &str,
+    ) -> Result<(), RefIndexError> {
+        // 1. Remove all existing tags for this repo from the index.
+        let prefix = tag_prefix(repo);
+        let existing_tags: Vec<Vec<u8>> = self
+            .tag_to_root
+            .scan_prefix(prefix)
+            .filter_map(|r| r.ok())
+            .map(|(k, _v)| k.to_vec())
+            .collect();
+
+        for k in existing_tags {
+            let _ = self.tag_to_root.remove(k);
+        }
+
+        // 2. Bounded pagination of ALL stored manifests in this repo (stored manifests are roots)
+        let mut manifest_token: Option<String> = None;
+        loop {
+            let (manifests, next_tok) = storage
+                .list_manifest_digests_page(repo, manifest_token.as_deref(), 128)
+                .await?;
+            for digest in manifests {
+                self.inc_root_count(digest.as_str().as_bytes())?;
+                self.ingest_root(storage, repo, &digest).await?;
+            }
+            match next_tok {
+                Some(tok) => manifest_token = Some(tok),
+                None => break,
+            }
+        }
+
+        // 3. Bounded pagination of tags in this repo (tags map alias -> digest)
+        let mut tag_token: Option<String> = None;
+        loop {
+            let (tags, next_tok) = storage
+                .list_tags_page(repo, tag_token.as_deref(), 128)
+                .await?;
+            for (tag, digest) in tags {
+                self.tag_to_root
+                    .insert(tag_key(repo, &tag), digest.as_str().as_bytes())?;
+            }
+            match next_tok {
+                Some(tok) => tag_token = Some(tok),
+                None => break,
+            }
+        }
+
+        self.db.flush()?;
+        Ok(())
+    }
+
     pub async fn sync_repo_tags(
         &self,
         storage: &Arc<dyn Storage>,
         repo: &str,
     ) -> Result<(), RefIndexError> {
-        // Remove all existing tags for this repo from the index.
+        self.sync_repo_manifests_and_tags(storage, repo).await
+    }
+
+    pub async fn on_manifest_published(
+        &self,
+        storage: &Arc<dyn Storage>,
+        repo: &str,
+        digest: &Digest,
+        tag: Option<&str>,
+    ) -> Result<(), RefIndexError> {
+        self.inc_root_count(digest.as_str().as_bytes())?;
+        self.ingest_root(storage, repo, digest).await?;
+        if let Some(t) = tag {
+            self.tag_to_root
+                .insert(tag_key(repo, t), digest.as_str().as_bytes())?;
+        }
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn on_tag_deleted(&self, repo: &str, tag: &str) -> Result<(), RefIndexError> {
+        self.tag_to_root.remove(tag_key(repo, tag))?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn on_manifest_deleted(&self, repo: &str, digest: &Digest) -> Result<(), RefIndexError> {
+        let digest_str = digest.as_str();
+        self.root_counts.remove(digest_str.as_bytes())?;
         let prefix = tag_prefix(repo);
-        let existing: Vec<(Vec<u8>, Vec<u8>)> = self
+        let digest_bytes = digest_str.as_bytes();
+        let tags_to_remove: Vec<Vec<u8>> = self
             .tag_to_root
             .scan_prefix(prefix)
             .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .filter(|(_k, v)| v.as_ref() == digest_bytes)
+            .map(|(k, _v)| k.to_vec())
             .collect();
-
-        for (k, v) in existing {
-            if let Ok(root) = String::from_utf8(v) {
-                let _ = self.dec_root_count(root.as_bytes());
-            }
+        for k in tags_to_remove {
             let _ = self.tag_to_root.remove(k);
         }
-
-        // Re-add current tags.
-        let tags = match storage.list_tags(repo).await {
-            Ok(t) => t,
-            Err(StorageError::NotFound) => {
-                self.db.flush()?;
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        // De-dup roots per repo to avoid repeated reads.
-        let mut roots: HashSet<String> = HashSet::new();
-
-        for tag in tags {
-            let root = match storage.resolve_tag(repo, &tag).await {
-                Ok(d) => d,
-                Err(StorageError::NotFound) => continue,
-                Err(e) => return Err(e.into()),
-            };
-
-            self.tag_to_root
-                .insert(tag_key(repo, &tag), root.as_str().as_bytes())?;
-            self.inc_root_count(root.as_str().as_bytes())?;
-            roots.insert(root.as_str().to_string());
-        }
-
-        for root in roots {
-            if let Ok(d) = Digest::parse(&root) {
-                self.ingest_root(storage, repo, &d).await?;
-            }
-        }
-
         self.db.flush()?;
         Ok(())
     }
@@ -512,7 +559,7 @@ impl BlobRefIndex {
 
         let repos = storage.list_repositories().await?;
         for repo in &repos {
-            self.sync_repo_tags(storage, repo).await?;
+            self.sync_repo_manifests_and_tags(storage, repo).await?;
         }
 
         // Global bounded pagination over ALL repository blob memberships
@@ -813,6 +860,13 @@ mod tests {
             }
         }
 
+        fn remove_manifest(&self, repo: &str, digest: &Digest) {
+            self.manifests
+                .lock()
+                .unwrap()
+                .remove(&(repo.to_string(), digest.as_str().to_string()));
+        }
+
         fn put_manifest_bytes(&self, repo: &str, digest: &Digest, bytes: Bytes) {
             self.add_repo(repo);
             self.manifests
@@ -941,6 +995,70 @@ mod tests {
 
         async fn delete_tag(&self, _name: &str, _tag: &str) -> Result<(), StorageError> {
             Err(StorageError::Unsupported)
+        }
+
+        async fn list_manifest_digests_page(
+            &self,
+            repo: &str,
+            _continuation_token: Option<&str>,
+            _page_limit: usize,
+        ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+            let mut res = Vec::new();
+            for (r, d_str) in self.manifests.lock().unwrap().keys() {
+                if r == repo {
+                    if let Ok(d) = Digest::parse(d_str) {
+                        res.push(d);
+                    }
+                }
+            }
+            Ok((res, None))
+        }
+
+        async fn list_tags_page(
+            &self,
+            repo: &str,
+            _continuation_token: Option<&str>,
+            _page_limit: usize,
+        ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+            let mut res = Vec::new();
+            if let Some(tags_map) = self.tags.lock().unwrap().get(repo) {
+                for (t, d) in tags_map {
+                    res.push((t.clone(), d.clone()));
+                }
+            }
+            Ok((res, None))
+        }
+
+        async fn list_referrers_page(
+            &self,
+            _repo: &str,
+            _subject: &Digest,
+            _continuation_token: Option<&str>,
+            _page_limit: usize,
+        ) -> Result<(Vec<crate::storage::ReferrerDescriptor>, Option<String>), StorageError>
+        {
+            Ok((Vec::new(), None))
+        }
+
+        async fn get_tag_with_version(
+            &self,
+            repo: &str,
+            tag: &str,
+        ) -> Result<Option<(Digest, String)>, StorageError> {
+            match self.resolve_tag(repo, tag).await {
+                Ok(d) => Ok(Some((d, "v1".to_string()))),
+                Err(StorageError::NotFound) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+
+        async fn delete_tag_conditional(
+            &self,
+            repo: &str,
+            tag: &str,
+            _expected_version: Option<&str>,
+        ) -> Result<bool, StorageError> {
+            self.delete_tag(repo, tag).await.map(|_| true)
         }
 
         async fn create_upload(&self) -> Result<crate::storage::UploadMeta, StorageError> {
@@ -1242,9 +1360,30 @@ mod tests {
 
         idx.rebuild(&storage).await.expect("rebuild");
 
-        // Remove one tag in storage; sync should drop its root count.
+        // 1. Removing tag t2 in storage removes tag alias from tag_to_root, but r2 is still a stored manifest and remains in root_counts.
         mock.remove_tag(repo, "t2");
         idx.sync_repo_tags(&storage, repo).await.expect("sync");
+
+        assert!(
+            idx.root_counts
+                .contains_key(r1.as_str().as_bytes())
+                .expect("contains")
+        );
+        assert!(
+            idx.root_counts
+                .contains_key(r2.as_str().as_bytes())
+                .expect("contains")
+        );
+        assert!(
+            idx.tag_to_root
+                .get(tag_key(repo, "t2"))
+                .expect("get")
+                .is_none()
+        );
+
+        // 2. Removing manifest r2 from storage removes r2 from root_counts on rebuild/sync.
+        mock.remove_manifest(repo, &r2);
+        idx.rebuild(&storage).await.expect("rebuild");
 
         assert!(
             idx.root_counts

@@ -754,85 +754,41 @@ async fn manifest_by_reference(
 
     match method {
         Method::DELETE => {
-            let _gate = state.consistency_gate.lock().await;
-
-            if let Some(idx) = state.ref_index.as_ref() {
-                if idx.check_health().is_err() {
-                    if let Err(err) = idx
-                        .ensure_healthy_or_rebuild(&state.storage, true, false)
-                        .await
-                    {
-                        tracing::error!(
-                            repo = name,
-                            error = %err,
-                            "failed to recover dirty ref-index before manifest delete"
-                        );
-                        return errors::internal_error().into_response();
+            let is_digest = Digest::parse(reference).is_ok();
+            if is_digest {
+                match state
+                    .manifest_lifecycle
+                    .delete_manifest(name, &digest)
+                    .await
+                {
+                    Ok(_) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::ManifestNotFound) => {
+                        errors::manifest_unknown().into_response()
                     }
-                }
-                if let Err(err) = idx.mark_dirty() {
-                    tracing::error!(
-                        repo = name,
-                        error = %err,
-                        "failed to mark ref-index dirty before manifest delete"
-                    );
-                    return errors::internal_error().into_response();
-                }
-            }
-
-            match state.storage.delete_manifest(name, &digest).await {
-                Ok(()) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        if let Err(err) = idx.sync_repo_tags(&state.storage, name).await {
-                            tracing::warn!(
-                                error = %err,
-                                repo = name,
-                                "ref-index: failed to resync tags after manifest delete"
-                            );
-                        } else if let Err(err) = idx.mark_ready() {
-                            tracing::warn!(
-                                error = %err,
-                                repo = name,
-                                "ref-index: failed to mark ready after manifest delete"
-                            );
-                        }
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName) => {
+                        errors::name_invalid().into_response()
                     }
-                    (StatusCode::ACCEPTED, registry_headers()).into_response()
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::Storage(
+                        StorageError::Unsupported,
+                    )) => errors::not_implemented().into_response(),
+                    Err(_) => errors::internal_error().into_response(),
                 }
-                Err(StorageError::NotFound) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        let _ = idx.mark_ready();
+            } else {
+                match state.manifest_lifecycle.delete_tag(name, reference).await {
+                    Ok(_) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::TagNotFound) => {
+                        errors::manifest_unknown().into_response()
                     }
-                    errors::manifest_unknown().into_response()
-                }
-                Err(StorageError::Unsupported) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        let _ = idx.mark_ready();
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName) => {
+                        errors::name_invalid().into_response()
                     }
-                    errors::not_implemented().into_response()
-                }
-                Err(StorageError::InsufficientStorage) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        let _ = idx.mark_ready();
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidTag) => {
+                        errors::tag_invalid().into_response()
                     }
-                    errors::insufficient_storage().into_response()
-                }
-                Err(StorageError::TooLarge) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        let _ = idx.mark_ready();
-                    }
-                    errors::internal_error().into_response()
-                }
-                Err(StorageError::DigestMismatch) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        let _ = idx.mark_ready();
-                    }
-                    errors::internal_error().into_response()
-                }
-                Err(StorageError::TagAlreadyExists)
-                | Err(StorageError::Internal(_))
-                | Err(StorageError::MigrationRequired(_)) => {
-                    errors::internal_error().into_response()
+                    Err(crate::manifest_lifecycle::ManifestLifecycleError::Storage(
+                        StorageError::Unsupported,
+                    )) => errors::not_implemented().into_response(),
+                    Err(_) => errors::internal_error().into_response(),
                 }
             }
         }
@@ -1360,6 +1316,11 @@ mod tests {
             ),
             upload_coordinator,
             delete_service: Arc::new(crate::blob_delete_safety::BlobDeleteService::new(
+                storage.clone(),
+                None,
+                Arc::new(tokio::sync::Mutex::new(())),
+            )),
+            manifest_lifecycle: Arc::new(crate::manifest_lifecycle::ManifestLifecycleService::new(
                 storage.clone(),
                 None,
                 Arc::new(tokio::sync::Mutex::new(())),
@@ -3050,13 +3011,7 @@ async fn manifest_put(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let publisher = crate::manifest_publication::ManifestPublisher::new(
-        state.storage,
-        state.ref_index,
-        state.consistency_gate,
-    );
-
-    let req = crate::manifest_publication::PublishManifestRequest {
+    let req = crate::manifest_lifecycle::PublishManifestRequest {
         repo: name.to_string(),
         reference: reference.to_string(),
         payload: bytes,
@@ -3064,7 +3019,7 @@ async fn manifest_put(
         allow_tag_overwrite: state.config.allow_tag_overwrite,
     };
 
-    match publisher.publish(req).await {
+    match state.manifest_lifecycle.publish_manifest(req).await {
         Ok(published) => {
             let mut headers = registry_headers();
             headers.insert(
@@ -3084,42 +3039,42 @@ async fn manifest_put(
             (StatusCode::CREATED, headers).into_response()
         }
         Err(err) => match err {
-            crate::manifest_publication::PublishManifestError::InvalidRepoName => {
+            crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName => {
                 errors::name_invalid().into_response()
             }
-            crate::manifest_publication::PublishManifestError::EmptyPayload
-            | crate::manifest_publication::PublishManifestError::PayloadTooLarge
-            | crate::manifest_publication::PublishManifestError::InvalidManifest(_) => {
+            crate::manifest_lifecycle::ManifestLifecycleError::EmptyPayload
+            | crate::manifest_lifecycle::ManifestLifecycleError::PayloadTooLarge
+            | crate::manifest_lifecycle::ManifestLifecycleError::InvalidManifest(_) => {
                 errors::manifest_invalid().into_response()
             }
-            crate::manifest_publication::PublishManifestError::Unverified(msg) => {
+            crate::manifest_lifecycle::ManifestLifecycleError::Unverified(msg) => {
                 errors::manifest_unverified(&msg)
             }
-            crate::manifest_publication::PublishManifestError::UnsupportedMediaType(_) => {
+            crate::manifest_lifecycle::ManifestLifecycleError::UnsupportedMediaType(_) => {
                 errors::not_implemented().into_response()
             }
-            crate::manifest_publication::PublishManifestError::MissingBlob(blob_d) => {
+            crate::manifest_lifecycle::ManifestLifecycleError::MissingBlob(blob_d) => {
                 errors::manifest_blob_unknown(&blob_d).into_response()
             }
-            crate::manifest_publication::PublishManifestError::MissingManifest(manifest_d) => {
+            crate::manifest_lifecycle::ManifestLifecycleError::MissingManifest(manifest_d) => {
                 errors::manifest_blob_unknown(&manifest_d).into_response()
             }
-            crate::manifest_publication::PublishManifestError::InvalidTag => {
+            crate::manifest_lifecycle::ManifestLifecycleError::InvalidTag => {
                 errors::tag_invalid().into_response()
             }
-            crate::manifest_publication::PublishManifestError::TagAlreadyExists => {
+            crate::manifest_lifecycle::ManifestLifecycleError::TagAlreadyExists => {
                 (StatusCode::CONFLICT, registry_headers(), Body::empty()).into_response()
             }
-            crate::manifest_publication::PublishManifestError::DigestMismatch { .. } => {
+            crate::manifest_lifecycle::ManifestLifecycleError::DigestMismatch { .. } => {
                 errors::manifest_unverified("manifest digest mismatch")
             }
-            crate::manifest_publication::PublishManifestError::Storage(
+            crate::manifest_lifecycle::ManifestLifecycleError::Storage(
                 StorageError::InsufficientStorage,
             ) => errors::insufficient_storage().into_response(),
-            crate::manifest_publication::PublishManifestError::Storage(
+            crate::manifest_lifecycle::ManifestLifecycleError::Storage(
                 StorageError::Unsupported,
             ) => errors::not_implemented().into_response(),
-            crate::manifest_publication::PublishManifestError::Storage(
+            crate::manifest_lifecycle::ManifestLifecycleError::Storage(
                 StorageError::DigestMismatch,
             ) => errors::digest_invalid().into_response(),
             _ => errors::internal_error().into_response(),

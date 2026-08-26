@@ -151,6 +151,46 @@ pub trait Storage: Send + Sync + UploadSessionStorage + RepositoryBlobMembership
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError>;
 
+    /// Bounded pagination of stored manifest digests in a repository.
+    async fn list_manifest_digests_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<Digest>, Option<String>), StorageError>;
+
+    /// Bounded pagination of tags and their target digests in a repository.
+    async fn list_tags_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError>;
+
+    /// Bounded pagination of referrers for a subject in a repository.
+    async fn list_referrers_page(
+        &self,
+        repo: &str,
+        subject: &Digest,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError>;
+
+    /// Retrieve a tag's target digest along with its backend version/ETag.
+    async fn get_tag_with_version(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<(Digest, String)>, StorageError>;
+
+    /// Conditionally delete a tag if its version matches (or unconditionally if expected_version is None).
+    async fn delete_tag_conditional(
+        &self,
+        repo: &str,
+        tag: &str,
+        expected_version: Option<&str>,
+    ) -> Result<bool, StorageError>;
+
     async fn create_upload(&self) -> Result<UploadMeta, StorageError>;
 
     async fn upload_status(&self, uuid: &str) -> Result<UploadMeta, StorageError>;

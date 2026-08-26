@@ -617,6 +617,13 @@ root = "{}"
                 None,
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
             )),
+            manifest_lifecycle: std::sync::Arc::new(
+                crate::manifest_lifecycle::ManifestLifecycleService::new(
+                    storage.clone(),
+                    None,
+                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                ),
+            ),
         };
 
         let app = axum::Router::new()
@@ -787,6 +794,13 @@ root = "{}"
                 None,
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
             )),
+            manifest_lifecycle: std::sync::Arc::new(
+                crate::manifest_lifecycle::ManifestLifecycleService::new(
+                    storage.clone(),
+                    None,
+                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                ),
+            ),
         };
 
         let app = axum::Router::new()

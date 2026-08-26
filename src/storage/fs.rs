@@ -918,6 +918,214 @@ impl Storage for FsStorage {
         }
     }
 
+    async fn list_manifest_digests_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+        let manifests_dir = self.root.join("repos").join(repo).join("manifests");
+        if !manifests_dir.exists() {
+            return Ok((Vec::new(), None));
+        }
+
+        let mut all_digests: Vec<Digest> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(&manifests_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with(".tmp.") || file_name.starts_with(".lock.") {
+                    continue;
+                }
+                if let Ok(d) = Digest::parse(&format!("sha256:{file_name}")) {
+                    all_digests.push(d);
+                } else if let Ok(d) = Digest::parse(&file_name) {
+                    all_digests.push(d);
+                }
+            }
+        }
+        all_digests.sort_by(|a, b| a.hex().cmp(b.hex()));
+
+        let start_idx = if let Some(token) = continuation_token {
+            match all_digests.binary_search_by(|d| d.as_str().as_str().cmp(token)) {
+                Ok(idx) => idx + 1,
+                Err(idx) => idx,
+            }
+        } else {
+            0
+        };
+
+        let end_idx = (start_idx + page_limit).min(all_digests.len());
+        let page_slice = &all_digests[start_idx..end_idx];
+
+        let next_token = if end_idx < all_digests.len() {
+            page_slice.last().map(|d| d.as_str().to_string())
+        } else {
+            None
+        };
+
+        Ok((page_slice.to_vec(), next_token))
+    }
+
+    async fn list_tags_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+        let tag_files = self.list_tag_files(repo).await?;
+        let tags_dir = self.root.join("repos").join(repo).join("tags");
+
+        let mut tags_with_digest: Vec<(String, Digest)> = Vec::new();
+        for path in tag_files {
+            let rel = match path.strip_prefix(&tags_dir) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            if rel.starts_with(".tmp.") || rel.starts_with(".lock.") {
+                continue;
+            }
+            if let Ok(content) = tokio::fs::read_to_string(&path).await
+                && let Ok(digest) = Digest::parse(content.trim())
+            {
+                tags_with_digest.push((rel, digest));
+            }
+        }
+        tags_with_digest.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let start_idx = if let Some(token) = continuation_token {
+            match tags_with_digest.binary_search_by(|(t, _)| t.as_str().cmp(token)) {
+                Ok(idx) => idx + 1,
+                Err(idx) => idx,
+            }
+        } else {
+            0
+        };
+
+        let end_idx = (start_idx + page_limit).min(tags_with_digest.len());
+        let page_slice = &tags_with_digest[start_idx..end_idx];
+
+        let next_token = if end_idx < tags_with_digest.len() {
+            page_slice.last().map(|(t, _)| t.clone())
+        } else {
+            None
+        };
+
+        Ok((page_slice.to_vec(), next_token))
+    }
+
+    async fn list_referrers_page(
+        &self,
+        repo: &str,
+        subject: &Digest,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError> {
+        let mut refs = self.list_referrers(repo, subject).await.unwrap_or_default();
+        refs.sort_by(|a, b| a.digest.cmp(&b.digest));
+
+        let start_idx = if let Some(token) = continuation_token {
+            match refs.binary_search_by(|r| r.digest.as_str().cmp(token)) {
+                Ok(idx) => idx + 1,
+                Err(idx) => idx,
+            }
+        } else {
+            0
+        };
+
+        let end_idx = (start_idx + page_limit).min(refs.len());
+        let page_slice = &refs[start_idx..end_idx];
+
+        let next_token = if end_idx < refs.len() {
+            page_slice.last().map(|r| r.digest.clone())
+        } else {
+            None
+        };
+
+        Ok((page_slice.to_vec(), next_token))
+    }
+
+    async fn get_tag_with_version(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<(Digest, String)>, StorageError> {
+        let tag_path = self.tag_path(repo, tag);
+        match tokio::fs::read(&tag_path).await {
+            Ok(bytes) => {
+                let s = String::from_utf8_lossy(&bytes);
+                let digest = Digest::parse(s.trim())
+                    .map_err(|e| StorageError::Internal(format!("corrupt tag {tag}: {e}")))?;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&bytes);
+                let version = hex::encode(hasher.finalize());
+                Ok(Some((digest, version)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::Internal(e.to_string())),
+        }
+    }
+
+    async fn delete_tag_conditional(
+        &self,
+        repo: &str,
+        tag: &str,
+        expected_version: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let dir = self.root.join("repos").join(repo).join("tags");
+        let path = self.tag_path(repo, tag);
+        let lock_path = dir.join(format!(".lock.{tag}"));
+        let exp_v = expected_version.map(|s| s.to_string());
+
+        tokio::task::spawn_blocking(move || {
+            use fs2::FileExt;
+            let lock_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(StorageError::NotFound);
+                }
+                Err(e) => return Err(map_fs_io_err(e)),
+            };
+
+            lock_file.lock_exclusive().map_err(map_fs_io_err)?;
+
+            let res = (|| {
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(StorageError::NotFound);
+                    }
+                    Err(e) => return Err(map_fs_io_err(e)),
+                };
+
+                if let Some(ref exp) = exp_v {
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(&bytes);
+                    let current_version = hex::encode(hasher.finalize());
+                    if current_version != *exp {
+                        return Ok(false);
+                    }
+                }
+
+                std::fs::remove_file(&path).map_err(map_fs_io_err)?;
+                if let Ok(dir_file) = std::fs::File::open(&dir) {
+                    let _ = dir_file.sync_all();
+                }
+                Ok(true)
+            })();
+
+            let _ = lock_file.unlock();
+            res
+        })
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?
+    }
+
     async fn create_upload(&self) -> Result<super::UploadMeta, StorageError> {
         let dir = self.uploads_dir();
         ensure_dir(&dir)?;
