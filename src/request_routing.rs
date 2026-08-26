@@ -52,10 +52,8 @@ pub fn effective_host_for_request(
     if host.is_empty() { None } else { Some(host) }
 }
 
-fn host_matches_any(patterns: &[String], host: &str) -> bool {
-    patterns
-        .iter()
-        .any(|p| crate::glob::wildcard_match(&p.to_ascii_lowercase(), host))
+fn host_matches_any(patterns: &[crate::proxy::ProxyHostPattern], host: &str) -> bool {
+    patterns.iter().any(|p| p.matches(host))
 }
 
 pub fn proxy_upstream_index_for_request(proxy: &ProxyConfig, headers: &HeaderMap) -> Option<usize> {
@@ -143,6 +141,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn proxy_cfg(proxy_hosts: Vec<&str>, trust_xfh: bool) -> ProxyConfig {
+        let routing_proxy_hosts = proxy_hosts
+            .into_iter()
+            .map(|s| crate::proxy::ProxyHostPattern::parse(s).unwrap())
+            .collect();
+        let allowed_repo_prefixes =
+            vec![crate::proxy::ProxyAllowedPrefix::parse("library").unwrap()];
         ProxyConfig {
             enabled: true,
             mode: ProxyMode::Allowlist,
@@ -150,7 +154,7 @@ mod tests {
             upstream_username: None,
             upstream_password: None,
             allowed_upstream_hosts: vec![],
-            allowed_repo_prefixes: vec!["library/".to_string()],
+            allowed_repo_prefixes,
             block_private_networks: true,
             redirect_policy: RedirectPolicy::AnyPublic,
             max_concurrent_upstream: 1,
@@ -164,7 +168,7 @@ mod tests {
             max_cache_bytes: None,
             repo_rules: vec![],
             upstreams: vec![],
-            routing_proxy_hosts: proxy_hosts.into_iter().map(|s| s.to_string()).collect(),
+            routing_proxy_hosts,
             routing_trust_x_forwarded_host: trust_xfh,
         }
     }
@@ -215,13 +219,17 @@ mod tests {
         let mut cfg = proxy_cfg(vec![], false);
         cfg.upstreams = vec![
             crate::config::ProxyUpstreamRoute {
-                hosts: vec!["dockerhub-cache.example.com".to_string()],
+                hosts: vec![
+                    crate::proxy::ProxyHostPattern::parse("dockerhub-cache.example.com").unwrap(),
+                ],
                 trust_x_forwarded_host: false,
                 upstream_base_url: "https://registry-1.docker.io".to_string(),
                 upstream_username: None,
                 upstream_password: None,
                 allowed_upstream_hosts: vec![],
-                allowed_repo_prefixes: vec!["library/".to_string()],
+                allowed_repo_prefixes: vec![
+                    crate::proxy::ProxyAllowedPrefix::parse("library").unwrap(),
+                ],
                 block_private_networks: true,
                 redirect_policy: RedirectPolicy::AnyPublic,
                 max_concurrent_upstream: 1,
@@ -231,7 +239,9 @@ mod tests {
                 max_cache_bytes: 1,
             },
             crate::config::ProxyUpstreamRoute {
-                hosts: vec!["ghcr-cache.example.com".to_string()],
+                hosts: vec![
+                    crate::proxy::ProxyHostPattern::parse("ghcr-cache.example.com").unwrap(),
+                ],
                 trust_x_forwarded_host: false,
                 upstream_base_url: "https://ghcr.io".to_string(),
                 upstream_username: None,

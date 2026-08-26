@@ -1255,8 +1255,12 @@ pub async fn compute_protected_blobs(
     let mut seen_manifests: HashSet<(String, String)> = HashSet::new();
 
     for repo in repos {
+        let Ok(canonical_repo) = crate::registry::canonical_name::CanonicalRepoName::parse(&repo)
+        else {
+            continue;
+        };
         for rule in repo_rules {
-            if !crate::glob::wildcard_match(&rule.match_pattern, &repo) {
+            if !rule.match_pattern.matches(&canonical_repo) {
                 continue;
             }
 
@@ -1849,7 +1853,7 @@ mod tests {
             .unwrap();
 
         let rules = vec![crate::config::ProxyRepoRule {
-            match_pattern: "library/*".to_string(),
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
             upstream_repo: None,
             tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
             eviction_policy: crate::config::EvictionPolicy::KeepTags(vec!["v1".to_string()]),

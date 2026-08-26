@@ -1,15 +1,141 @@
+use std::fmt;
+use std::str::FromStr;
+
+use crate::registry::canonical_name::{CanonicalRepoName, RepoNameError};
 use crate::security;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Dedicated closed domain model for RBAC repository grants.
+///
+/// Invariants:
+/// - `All`: wildcard `*` authorizes any valid repository.
+/// - `Namespace(prefix)`: namespace pattern `prefix/` (e.g. `org/`, `team/sub/`).
+///   Matches only repository names strictly under `{prefix}/` (e.g. `org/app`, `org/sub/app`).
+///   Never matches sibling names (e.g. `org-secret`), never matches bare `org`.
+/// - `Exact(repo)`: exact pattern `repo` (e.g. `org/app`).
+///   Matches iff `repo == candidate`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RbacRepoPattern {
+    All,
+    Namespace(CanonicalRepoName),
+    Exact(CanonicalRepoName),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RbacPatternError {
+    #[error("empty repository grant pattern")]
+    Empty,
+    #[error("invalid repository name in grant pattern: {0}")]
+    InvalidRepoName(#[from] RepoNameError),
+    #[error("unsupported wildcard or separator syntax in grant pattern: {0}")]
+    InvalidSyntax(String),
+}
+
+impl RbacRepoPattern {
+    pub fn parse(s: &str) -> Result<Self, RbacPatternError> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(RbacPatternError::Empty);
+        }
+        if trimmed == "*" {
+            return Ok(Self::All);
+        }
+        if trimmed.contains('*') {
+            return Err(RbacPatternError::InvalidSyntax(format!(
+                "arbitrary wildcards not supported in grant: '{trimmed}'"
+            )));
+        }
+        if trimmed.ends_with('/') {
+            let base = trimmed.trim_end_matches('/');
+            if base.is_empty() {
+                return Err(RbacPatternError::Empty);
+            }
+            let canonical = CanonicalRepoName::parse(base)?;
+            Ok(Self::Namespace(canonical))
+        } else {
+            let canonical = CanonicalRepoName::parse(trimmed)?;
+            Ok(Self::Exact(canonical))
+        }
+    }
+
+    /// Evaluates whether this grant pattern authorizes the candidate canonical repository name.
+    ///
+    /// Security Invariants:
+    /// - `All` -> returns `true`.
+    /// - `Exact(exact)` -> returns `true` iff `exact == candidate`.
+    /// - `Namespace(prefix)` -> returns `true` iff `candidate` starts with `{prefix}/` (strictly segment-delimited).
+    ///   Does NOT match bare `prefix` and does NOT match `prefix-secret` or `prefix_secret`.
+    pub fn matches(&self, candidate: &CanonicalRepoName) -> bool {
+        match self {
+            Self::All => true,
+            Self::Exact(exact) => exact == candidate,
+            Self::Namespace(prefix) => {
+                let cand_str = candidate.as_str();
+                let prefix_str = prefix.as_str();
+                if cand_str.starts_with(prefix_str) {
+                    let next_byte = cand_str.as_bytes().get(prefix_str.len());
+                    next_byte == Some(&b'/')
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for RbacRepoPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => write!(f, "*"),
+            Self::Namespace(ns) => write!(f, "{}/", ns.as_str()),
+            Self::Exact(exact) => write!(f, "{}", exact.as_str()),
+        }
+    }
+}
+
+impl FromStr for RbacRepoPattern {
+    type Err = RbacPatternError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Grant {
-    pub repo_prefix: String,
+    pub repo_pattern: RbacRepoPattern,
     pub actions: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Grant {
+    pub fn new(repo_pattern: RbacRepoPattern, actions: Vec<String>) -> Self {
+        Self {
+            repo_pattern,
+            actions,
+        }
+    }
+
+    pub fn try_new(repo_prefix: &str, actions: Vec<String>) -> Result<Self, PolicyError> {
+        let repo_pattern = RbacRepoPattern::parse(repo_prefix)?;
+        Ok(Self {
+            repo_pattern,
+            actions,
+        })
+    }
+
+    pub fn allows(&self, repo: &CanonicalRepoName, action: &str) -> bool {
+        if !self.repo_pattern.matches(repo) {
+            return false;
+        }
+        self.actions
+            .iter()
+            .any(|a| a == "*" || a.eq_ignore_ascii_case(action))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
-    EmptyRepoPrefix,
-    RepoPrefixMustEndWithSlash(String),
+    #[error("invalid repository grant pattern: {0}")]
+    InvalidPattern(#[from] RbacPatternError),
+    #[error("invalid action in grant: {0}")]
     InvalidAction(String),
 }
 
@@ -26,15 +152,6 @@ fn normalize_action(action: &str) -> Option<&'static str> {
 pub fn validate_grants(grants: &[Grant]) -> Result<Vec<Grant>, PolicyError> {
     let mut out: Vec<Grant> = Vec::with_capacity(grants.len());
     for g in grants {
-        let prefix = g.repo_prefix.trim().to_string();
-        if prefix.is_empty() {
-            return Err(PolicyError::EmptyRepoPrefix);
-        }
-        // Special-case: allow '*' as an explicit "match all repositories" grant.
-        if prefix != "*" && !prefix.ends_with('/') {
-            return Err(PolicyError::RepoPrefixMustEndWithSlash(prefix));
-        }
-
         let mut actions: Vec<String> = Vec::new();
         for a in &g.actions {
             let Some(norm) = normalize_action(a) else {
@@ -46,34 +163,26 @@ pub fn validate_grants(grants: &[Grant]) -> Result<Vec<Grant>, PolicyError> {
         }
 
         out.push(Grant {
-            repo_prefix: prefix,
+            repo_pattern: g.repo_pattern.clone(),
             actions,
         });
     }
     Ok(out)
 }
 
-/// Evaluates whether a validated repository grant prefix authorizes access to a repository.
+/// Evaluates whether a repository grant pattern authorizes access to a repository.
 ///
 /// Security Invariants:
-/// - `grant_prefix == "*"` authorizes any valid non-empty repository name.
-/// - If `grant_prefix` ends with `/` (e.g. `"org/"`), it matches `"org/app"` and `"org/sub/app"`,
-///   but NEVER matches `"org2/app"` (prefix boundary leakage) or bare `"org"`.
-/// - Empty repositories or empty grants fail closed (return `false`).
-/// - Exact repository grants match `grant_prefix == repo`.
+/// - Evaluates via typed `RbacRepoPattern` and `CanonicalRepoName`.
+/// - Empty repositories or invalid grant syntax fails closed (returns `false`).
 pub fn matches_repo_grant(grant_prefix: &str, repo: &str) -> bool {
-    let repo = repo.trim();
-    let grant = grant_prefix.trim();
-    if repo.is_empty() || grant.is_empty() {
+    let Ok(pattern) = RbacRepoPattern::parse(grant_prefix) else {
         return false;
-    }
-    if grant == "*" {
-        return true;
-    }
-    if grant.ends_with('/') {
-        return repo.starts_with(grant);
-    }
-    grant == repo
+    };
+    let Ok(candidate) = CanonicalRepoName::parse(repo) else {
+        return false;
+    };
+    pattern.matches(&candidate)
 }
 
 /// Compute granted token scopes as the intersection of:
@@ -101,7 +210,9 @@ pub fn grant_scopes_by_prefix(
 
     for req in requested {
         if req.typ == "registry" && (req.name == "catalog" || req.name == "*") {
-            let has_catalog = grants.iter().any(|g| g.repo_prefix == "*");
+            let has_catalog = grants
+                .iter()
+                .any(|g| matches!(g.repo_pattern, RbacRepoPattern::All));
             if has_catalog {
                 out.push(req.clone());
             }
@@ -110,14 +221,14 @@ pub fn grant_scopes_by_prefix(
         if req.typ != "repository" {
             continue;
         }
-        let repo = req.name.trim();
-        if repo.is_empty() {
+        let Ok(canonical_repo) = CanonicalRepoName::parse(req.name.trim()) else {
+            // Cannot grant access to invalid repository name
             continue;
-        }
+        };
 
         let mut allowed: Vec<&str> = Vec::new();
         for g in &grants {
-            if matches_repo_grant(&g.repo_prefix, repo) {
+            if g.repo_pattern.matches(&canonical_repo) {
                 for a in &g.actions {
                     if !allowed.iter().any(|x| x == a) {
                         allowed.push(a);
@@ -143,7 +254,7 @@ pub fn grant_scopes_by_prefix(
         if !granted_actions.is_empty() {
             out.push(security::TokenScope {
                 typ: req.typ.clone(),
-                name: repo.to_string(),
+                name: canonical_repo.to_string(),
                 actions: granted_actions,
             });
         }
@@ -157,17 +268,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_grants_requires_trailing_slash() {
-        let err = validate_grants(&[Grant {
-            repo_prefix: "org".to_string(),
-            actions: vec!["pull".to_string()],
-        }])
-        .expect_err("should reject");
-
+    fn validate_grants_rejects_invalid_syntax() {
+        let err = Grant::try_new("org/*", vec!["pull".to_string()])
+            .expect_err("should reject arbitrary star in grant");
         match err {
-            PolicyError::RepoPrefixMustEndWithSlash(p) => assert_eq!(p, "org"),
+            PolicyError::InvalidPattern(RbacPatternError::InvalidSyntax(p)) => {
+                assert!(p.contains("org/*"))
+            }
             other => panic!("unexpected error: {other:?}"),
         }
+
+        let err_empty =
+            Grant::try_new("", vec!["pull".to_string()]).expect_err("should reject empty");
+        assert!(matches!(
+            err_empty,
+            PolicyError::InvalidPattern(RbacPatternError::Empty)
+        ));
     }
 
     #[test]
@@ -178,10 +294,7 @@ mod tests {
             actions: vec!["pull".to_string(), "push".to_string()],
         }];
 
-        let grants = vec![Grant {
-            repo_prefix: "org/".to_string(),
-            actions: vec!["pull".to_string()],
-        }];
+        let grants = vec![Grant::try_new("org/", vec!["pull".to_string()]).unwrap()];
 
         let granted = grant_scopes_by_prefix(&requested, &grants);
         assert_eq!(
@@ -202,10 +315,7 @@ mod tests {
             actions: vec!["pull".to_string()],
         }];
 
-        let grants = vec![Grant {
-            repo_prefix: "org/".to_string(),
-            actions: vec!["pull".to_string()],
-        }];
+        let grants = vec![Grant::try_new("org/", vec!["pull".to_string()]).unwrap()];
 
         let granted = grant_scopes_by_prefix(&requested, &grants);
         assert!(granted.is_empty());
@@ -213,10 +323,8 @@ mod tests {
 
     #[test]
     fn prefix_boundary_does_not_match_similar_prefixes_or_bare_org() {
-        let grants = vec![Grant {
-            repo_prefix: "org/".to_string(),
-            actions: vec!["pull".to_string(), "push".to_string()],
-        }];
+        let grants =
+            vec![Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap()];
 
         let requested = vec![
             security::TokenScope {
@@ -243,10 +351,8 @@ mod tests {
             actions: vec!["push".to_string(), "pull".to_string()],
         }];
 
-        let grants = vec![Grant {
-            repo_prefix: "org/".to_string(),
-            actions: vec!["pull".to_string(), "push".to_string()],
-        }];
+        let grants =
+            vec![Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap()];
 
         let granted = grant_scopes_by_prefix(&requested, &grants);
         assert_eq!(
@@ -257,13 +363,13 @@ mod tests {
 
     #[test]
     fn validate_grants_allows_star_wildcard() {
-        let ok = validate_grants(&[Grant {
-            repo_prefix: "*".to_string(),
-            actions: vec!["pull".to_string(), "push".to_string()],
-        }])
-        .expect("should accept");
+        let ok =
+            validate_grants(&[
+                Grant::try_new("*", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ])
+            .expect("should accept");
 
-        assert_eq!(ok[0].repo_prefix, "*");
+        assert_eq!(ok[0].repo_pattern, RbacRepoPattern::All);
     }
 
     #[test]
@@ -274,10 +380,8 @@ mod tests {
             actions: vec!["pull".to_string(), "push".to_string()],
         }];
 
-        let grants = vec![Grant {
-            repo_prefix: "*".to_string(),
-            actions: vec!["pull".to_string(), "push".to_string()],
-        }];
+        let grants =
+            vec![Grant::try_new("*", vec!["pull".to_string(), "push".to_string()]).unwrap()];
 
         let granted = grant_scopes_by_prefix(&requested, &grants);
         assert_eq!(granted, requested);
@@ -285,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_matcher_truth_table_differential_analysis() {
-        use crate::auth::legacy_repo_allowed;
+        use crate::auth::push_repository_allowed;
         use crate::glob::wildcard_match;
 
         struct TruthRow {
@@ -293,7 +397,7 @@ mod tests {
             value: &'static str,
             expected_glob: bool,
             expected_rbac: bool,
-            expected_legacy: bool,
+            expected_push_allow: bool,
         }
 
         let rows = [
@@ -303,14 +407,14 @@ mod tests {
                 value: "org/app",
                 expected_glob: true,
                 expected_rbac: true, // exact repo match
-                expected_legacy: true,
+                expected_push_allow: true,
             },
             TruthRow {
                 pattern: "org/app",
                 value: "org/other",
                 expected_glob: false,
                 expected_rbac: false,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             // Global '*'
             TruthRow {
@@ -318,72 +422,72 @@ mod tests {
                 value: "org/app",
                 expected_glob: true,
                 expected_rbac: true,
-                expected_legacy: true,
+                expected_push_allow: true,
             },
             TruthRow {
                 pattern: "*",
                 value: "",
                 expected_glob: true,
-                expected_rbac: false,   // empty repo fails closed
-                expected_legacy: false, // empty repo fails closed for authorization
+                expected_rbac: false,       // empty repo fails closed
+                expected_push_allow: false, // empty repo fails closed for authorization
             },
             // Prefix boundary 'org/'
             TruthRow {
                 pattern: "org/",
                 value: "org/app",
-                expected_glob: false,   // glob is exact
-                expected_rbac: true,    // RBAC prefix match
-                expected_legacy: false, // legacy uses 'org/*'
+                expected_glob: false,       // glob is exact
+                expected_rbac: true,        // RBAC prefix match
+                expected_push_allow: false, // push allow uses 'org/*'
             },
             TruthRow {
                 pattern: "org/",
                 value: "org/sub/app",
                 expected_glob: false,
                 expected_rbac: true,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             TruthRow {
                 pattern: "org/",
                 value: "org",
                 expected_glob: false,
                 expected_rbac: false, // bare base repo not matched by prefix
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             TruthRow {
                 pattern: "org/",
                 value: "org2/app",
                 expected_glob: false,
                 expected_rbac: false, // prefix boundary enforced
-                expected_legacy: false,
+                expected_push_allow: false,
             },
-            // Legacy wildcard 'org/*'
+            // Legacy/push wildcard 'org/*'
             TruthRow {
                 pattern: "org/*",
                 value: "org/app",
                 expected_glob: true,
                 expected_rbac: false, // RBAC grants use 'org/', not 'org/*'
-                expected_legacy: true,
+                expected_push_allow: true,
             },
             TruthRow {
                 pattern: "org/*",
                 value: "org/sub/app",
                 expected_glob: true,
                 expected_rbac: false,
-                expected_legacy: true,
+                expected_push_allow: true,
             },
             TruthRow {
                 pattern: "org/*",
                 value: "org",
                 expected_glob: false,
                 expected_rbac: false,
-                expected_legacy: true, // legacy compatibility feature: org/* covers org
+                expected_push_allow: true, // push allow compatibility: org/* covers org
             },
             TruthRow {
                 pattern: "org/*",
                 value: "org2/app",
                 expected_glob: false,
                 expected_rbac: false,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             // Suffix and arbitrary glob
             TruthRow {
@@ -391,14 +495,14 @@ mod tests {
                 value: "my-app",
                 expected_glob: true,
                 expected_rbac: false,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             TruthRow {
                 pattern: "a*b*c",
                 value: "a1b2c",
                 expected_glob: true,
                 expected_rbac: false,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             // Empty pattern
             TruthRow {
@@ -406,21 +510,27 @@ mod tests {
                 value: "",
                 expected_glob: true,
                 expected_rbac: false,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
             TruthRow {
                 pattern: "",
                 value: "org/app",
                 expected_glob: false,
                 expected_rbac: false,
-                expected_legacy: false,
+                expected_push_allow: false,
             },
         ];
 
         for row in rows {
             let actual_glob = wildcard_match(row.pattern, row.value);
             let actual_rbac = matches_repo_grant(row.pattern, row.value);
-            let actual_legacy = legacy_repo_allowed(&[row.pattern.to_string()], row.value);
+            let actual_push_allow = match (
+                crate::registry::RepositoryAccessPattern::parse(row.pattern),
+                crate::registry::CanonicalRepoName::parse(row.value),
+            ) {
+                (Ok(pat), Ok(val)) => push_repository_allowed(&[pat], &val),
+                _ => false,
+            };
 
             assert_eq!(
                 actual_glob, row.expected_glob,
@@ -433,8 +543,8 @@ mod tests {
                 row.pattern, row.value
             );
             assert_eq!(
-                actual_legacy, row.expected_legacy,
-                "Legacy mismatch for pattern='{}' value='{}'",
+                actual_push_allow, row.expected_push_allow,
+                "Push allow mismatch for pattern='{}' value='{}'",
                 row.pattern, row.value
             );
         }
@@ -443,14 +553,8 @@ mod tests {
     #[test]
     fn test_authorization_regression_boundaries() {
         let grants = vec![
-            Grant {
-                repo_prefix: "teams/core/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            },
-            Grant {
-                repo_prefix: "teams/read-only/".to_string(),
-                actions: vec!["pull".to_string()],
-            },
+            Grant::try_new("teams/core/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            Grant::try_new("teams/read-only/", vec!["pull".to_string()]).unwrap(),
         ];
 
         // 1. Valid nested matches

@@ -1827,7 +1827,7 @@ async fn test_prod_25_cross_mount_containment_negative_matrix() {
         .expect("mount malformed from");
     assert_eq!(
         mount_malformed_from.status(),
-        reqwest::StatusCode::NOT_FOUND
+        reqwest::StatusCode::BAD_REQUEST
     );
 
     // Scenario 4: Nonexistent source repository

@@ -399,8 +399,10 @@ mod tests {
             .finalize_upload(&upload.uuid, &digest)
             .await
             .unwrap();
+        let canonical_repo =
+            crate::registry::canonical_name::CanonicalRepoName::parse("test/repo").unwrap();
         let membership = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "test/repo".to_string(),
+            canonical_repo,
             digest.clone(),
             Some(upload.uuid),
         );

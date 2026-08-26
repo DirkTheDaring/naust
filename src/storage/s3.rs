@@ -2,6 +2,7 @@ use super::upload_session::*;
 use super::{
     BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta,
 };
+use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
 use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
 use async_trait::async_trait;
@@ -375,8 +376,19 @@ impl S3Driver for AwsS3Driver {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(err) => {
+                let is_precondition_failed = match &err {
+                    aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                        let status = se.raw().status().as_u16();
+                        let code = se.err().meta().code().unwrap_or("");
+                        status == 412
+                            || code == "PreconditionFailed"
+                            || code == "AtLeastOnePreconditionFailed"
+                    }
+                    _ => false,
+                };
                 let err_str = err.to_string();
-                if err_str.contains("PreconditionFailed")
+                if is_precondition_failed
+                    || err_str.contains("PreconditionFailed")
                     || err_str.contains("AtLeastOnePreconditionFailed")
                     || err_str.contains("412")
                 {
@@ -400,28 +412,56 @@ impl S3Driver for AwsS3Driver {
         key: &str,
         if_match: Option<String>,
     ) -> Result<super::ConditionalDeleteResult, StorageError> {
+        let current = self.get_object(bucket, key).await?;
+        let current_etag = match current {
+            Some((_, etag)) => etag,
+            None => return Ok(super::ConditionalDeleteResult::NotFound),
+        };
+
+        if let Some(ref expected) = if_match {
+            if current_etag.trim_matches('"') != expected.trim_matches('"') {
+                return Ok(super::ConditionalDeleteResult::PreconditionFailed {
+                    current_version: Some(current_etag),
+                });
+            }
+        }
+
         let client = self.client().await?;
         let mut req = client.delete_object().bucket(bucket).key(key);
         if let Some(ref m) = if_match {
-            req = req.if_match(m);
+            req = req.if_match(format!("\"{}\"", m.trim_matches('"')));
         }
         match req.send().await {
             Ok(_) => Ok(super::ConditionalDeleteResult::Deleted),
             Err(e) => {
+                let (is_412, is_404) = match &e {
+                    aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                        let status = se.raw().status().as_u16();
+                        let code = se.err().meta().code().unwrap_or("");
+                        (
+                            status == 412
+                                || code == "PreconditionFailed"
+                                || code == "AtLeastOnePreconditionFailed",
+                            status == 404 || code == "NoSuchKey" || code == "NotFound",
+                        )
+                    }
+                    _ => (false, false),
+                };
                 let err_str = e.to_string();
-                if err_str.contains("PreconditionFailed")
+                if is_412
+                    || err_str.contains("PreconditionFailed")
                     || err_str
                         .contains("At least one of the pre-conditions you specified did not hold")
                     || err_str.contains("412")
                 {
-                    let current = match self.get_object(bucket, key).await {
+                    let latest = match self.get_object(bucket, key).await {
                         Ok(Some((_, etag))) => Some(etag),
                         _ => None,
                     };
                     Ok(super::ConditionalDeleteResult::PreconditionFailed {
-                        current_version: current,
+                        current_version: latest,
                     })
-                } else if err_str.contains("NoSuchKey") || err_str.contains("404") {
+                } else if is_404 || err_str.contains("NoSuchKey") || err_str.contains("404") {
                     Ok(super::ConditionalDeleteResult::NotFound)
                 } else {
                     Err(StorageError::Internal(err_str))
@@ -613,7 +653,19 @@ impl S3Storage {
             format!("{p}/{}", suffix.trim_start_matches('/'))
         }
     }
+}
 
+/// S3 repository key prefix codec: computes the S3 key prefix for a validated repository name.
+pub(crate) fn s3_repo_prefix(root_prefix: &str, repo: &CanonicalRepoName) -> String {
+    let prefix = root_prefix.trim_matches('/');
+    if prefix.is_empty() {
+        format!("repos/{}/", repo.as_str())
+    } else {
+        format!("{prefix}/repos/{}/", repo.as_str())
+    }
+}
+
+impl S3Storage {
     fn blob_key2(&self, digest: &Digest) -> String {
         self.key(&format!(
             "blobs/{}/{}/{}",
@@ -631,12 +683,12 @@ impl S3Storage {
         self.key(&format!("repos/{name}/tags/{tag}"))
     }
 
-    fn repo_blob_key(&self, name: &str, digest: &Digest) -> String {
-        self.key(&crate::storage::repo_membership::canonical_repo_membership_relpath(name, digest))
+    fn repo_blob_key(&self, repo: &CanonicalRepoName, digest: &Digest) -> String {
+        self.key(&crate::storage::repo_membership::canonical_repo_membership_relpath(repo, digest))
     }
 
-    fn repo_blobs_prefix(&self, name: &str) -> String {
-        self.key(&crate::storage::repo_membership::canonical_repo_membership_prefix(name))
+    fn repo_blobs_prefix(&self, repo: &CanonicalRepoName) -> String {
+        self.key(&crate::storage::repo_membership::canonical_repo_membership_prefix(repo))
     }
 
     fn all_memberships_prefix(&self) -> String {
@@ -822,18 +874,23 @@ impl S3Storage {
         self.key(&format!("uploads/{uuid}/pending/{op_id}.bin"))
     }
 
+    #[allow(dead_code)]
     fn encode_upload_token(base_uuid: &str, upload_id: &str) -> String {
         let upload_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(upload_id);
         format!("{base_uuid}~{upload_id_b64}")
     }
 
     fn decode_upload_token(token: &str) -> Result<(String, String), StorageError> {
-        let (base, b64) = token.split_once('~').ok_or(StorageError::NotFound)?;
-        let upload_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(b64.as_bytes())
-            .map_err(|_| StorageError::NotFound)?;
-        let upload_id = String::from_utf8(upload_id_bytes).map_err(|_| StorageError::NotFound)?;
-        Ok((base.to_string(), upload_id))
+        if let Some((base, b64)) = token.split_once('~') {
+            let upload_id_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64.as_bytes())
+                .map_err(|_| StorageError::NotFound)?;
+            let upload_id =
+                String::from_utf8(upload_id_bytes).map_err(|_| StorageError::NotFound)?;
+            Ok((base.to_string(), upload_id))
+        } else {
+            Ok((token.to_string(), String::new()))
+        }
     }
 
     async fn get_object_bytes(&self, key: &str) -> Result<Bytes, StorageError> {
@@ -917,8 +974,9 @@ fn map_s3_err(
 ) -> StorageError {
     match err {
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
+            let status = se.raw().status().as_u16();
             let code = se.err().meta().code().unwrap_or("");
-            if code == "NoSuchKey" || code == "NotFound" {
+            if status == 404 || code == "NoSuchKey" || code == "NotFound" {
                 StorageError::NotFound
             } else {
                 StorageError::Internal(se.err().to_string())
@@ -933,8 +991,9 @@ fn map_head_err(
 ) -> StorageError {
     match err {
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
+            let status = se.raw().status().as_u16();
             let code = se.err().meta().code().unwrap_or("");
-            if code == "NoSuchKey" || code == "NotFound" {
+            if status == 404 || code == "NoSuchKey" || code == "NotFound" {
                 StorageError::NotFound
             } else {
                 StorageError::Internal(se.err().to_string())
@@ -1673,11 +1732,11 @@ impl Storage for S3Storage {
                 }
             }
             let version_to_delete = expected_etag.or(Some(&etag)).map(ToString::to_string);
-            let _ = self
+            let del_res = self
                 .driver
                 .delete_object_conditional(bucket, &key, version_to_delete)
-                .await;
-            return Ok(true);
+                .await?;
+            return Ok(matches!(del_res, super::ConditionalDeleteResult::Deleted));
         }
         Ok(false)
     }
@@ -1760,21 +1819,16 @@ impl Storage for S3Storage {
     }
 
     async fn create_upload(&self) -> Result<UploadMeta, StorageError> {
-        let bucket = self.bucket()?;
         let base_uuid = uuid::Uuid::new_v4().to_string();
-        let key = self.upload_key(&base_uuid);
-
-        let upload_id = self.driver.create_multipart_upload(bucket, &key).await?;
-
         Ok(UploadMeta {
-            uuid: Self::encode_upload_token(&base_uuid, &upload_id),
+            uuid: base_uuid,
             offset: 0,
         })
     }
 
     async fn upload_status(&self, uuid: &str) -> Result<UploadMeta, StorageError> {
-        let (base_uuid, _upload_id) = Self::decode_upload_token(uuid)?;
         let bucket = self.bucket()?;
+        let (base_uuid, _) = Self::decode_upload_token(uuid)?;
         let key = self.upload_key(&base_uuid);
         let head = self.driver.head_object(bucket, &key).await?;
         let offset = head.unwrap_or(0);
@@ -1786,33 +1840,34 @@ impl Storage for S3Storage {
 
     async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<UploadMeta, StorageError> {
         let bucket = self.bucket()?;
-        let (base_uuid, upload_id) = Self::decode_upload_token(uuid)?;
+        let (base_uuid, _) = Self::decode_upload_token(uuid)?;
         let key = self.upload_key(&base_uuid);
 
-        let part_number = 1;
+        let mut current_bytes = match self.driver.get_object(bucket, &key).await? {
+            Some((b, _)) => b.to_vec(),
+            None => Vec::new(),
+        };
+        current_bytes.extend_from_slice(&chunk);
+        let len = current_bytes.len() as u64;
         self.driver
-            .upload_part(bucket, &key, &upload_id, part_number, chunk.clone())
+            .put_object_conditional(bucket, &key, Bytes::from(current_bytes), None, None)
             .await?;
 
         Ok(UploadMeta {
             uuid: uuid.to_string(),
-            offset: chunk.len() as u64,
+            offset: len,
         })
     }
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError> {
         let bucket = self.bucket()?;
-        let (base_uuid, upload_id) = Self::decode_upload_token(uuid)?;
+        let (base_uuid, _) = Self::decode_upload_token(uuid)?;
         let upload_key = self.upload_key(&base_uuid);
 
-        self.driver
-            .complete_multipart_upload(
-                bucket,
-                &upload_key,
-                &upload_id,
-                vec![(1, "dummy".to_string())],
-            )
-            .await?;
+        if let Ok(meta) = self.head_blob(digest).await {
+            let _ = self.driver.delete_object(bucket, &upload_key).await;
+            return Ok(meta);
+        }
 
         let dest_key = self.blob_key2(digest);
         self.driver
@@ -1953,7 +2008,7 @@ impl Storage for S3Storage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct S3SessionDoc {
     pub format_version: u32,
-    pub repo: String,
+    pub repo: crate::registry::canonical_name::CanonicalRepoName,
     pub uuid: String,
     pub multipart_upload_id: String,
     pub state: UploadSessionState,
@@ -2007,6 +2062,8 @@ pub struct S3FinalizingInfo {
 #[async_trait]
 impl UploadSessionStorage for S3Storage {
     async fn create_session(&self, repo: &str) -> Result<UploadSessionId, StorageError> {
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
         let bucket = self.bucket()?;
         let uuid = uuid::Uuid::new_v4().to_string();
         let data_key = self.multipart_data_key(&uuid);
@@ -2019,7 +2076,7 @@ impl UploadSessionStorage for S3Storage {
 
         let doc = S3SessionDoc {
             format_version: 1,
-            repo: repo.to_string(),
+            repo: canonical_repo.clone(),
             uuid: uuid.clone(),
             multipart_upload_id,
             state: UploadSessionState::Active,
@@ -2034,7 +2091,7 @@ impl UploadSessionStorage for S3Storage {
         };
 
         self.put_session_doc_conditional(&uuid, &doc, None).await?;
-        Ok(UploadSessionId::new(repo, uuid))
+        Ok(UploadSessionId::new(canonical_repo, uuid))
     }
 
     async fn session_status(
@@ -2949,7 +3006,7 @@ impl UploadSessionStorage for S3Storage {
                     && let Ok(doc) = serde_json::from_slice::<S3SessionDoc>(&bytes)
                     && now.saturating_sub(doc.last_active_at_unix_secs) >= max_age_secs
                 {
-                    let session = UploadSessionId::new(&doc.repo, &doc.uuid);
+                    let session = UploadSessionId::new(doc.repo.clone(), &doc.uuid);
                     if doc.state == UploadSessionState::Finalizing {
                         let _ = self.recover_session(&session).await;
                         count += 1;
@@ -2996,7 +3053,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
     ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
     {
         let bucket = self.bucket()?;
-        let key = self.repo_blob_key(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let key = self.repo_blob_key(&canonical, digest);
         if let Some((bytes, _etag)) = self.driver.get_object(bucket, &key).await? {
             let record = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
@@ -3032,7 +3091,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         since_unix_secs: u64,
     ) -> Result<bool, StorageError> {
         let bucket = self.bucket()?;
-        let key = self.repo_blob_key(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let key = self.repo_blob_key(&canonical, digest);
         if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
             let mut record = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
@@ -3078,7 +3139,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         digest: &Digest,
     ) -> Result<bool, StorageError> {
         let bucket = self.bucket()?;
-        let key = self.repo_blob_key(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let key = self.repo_blob_key(&canonical, digest);
         if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
             let mut record = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
@@ -3120,7 +3183,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
 
     async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
         let bucket = self.bucket()?;
-        let key = self.repo_blob_key(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let key = self.repo_blob_key(&canonical, digest);
         let _ = self.driver.delete_object(bucket, &key).await;
         Ok(true)
     }
@@ -3138,7 +3203,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         StorageError,
     > {
         let bucket = self.bucket()?;
-        let prefix = self.repo_blobs_prefix(repo);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let prefix = self.repo_blobs_prefix(&canonical);
         let objects = self.driver.list_objects_v2(bucket, &prefix).await?;
 
         let mut all_keys: Vec<String> = objects
@@ -3162,13 +3229,16 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
 
         let mut records = Vec::new();
         for key in page_slice {
-            if let Some((bytes, _etag)) = self.driver.get_object(bucket, key).await?
-                && let Ok(rec) = serde_json::from_slice::<
-                    crate::storage::repo_membership::RepoBlobMembershipRecord,
-                >(&bytes)
-            {
-                records.push(rec);
-            }
+            let (bytes, _etag) = self.driver.get_object(bucket, key).await?.ok_or_else(|| {
+                StorageError::Internal(format!("missing membership object for key '{key}'"))
+            })?;
+            let rec = serde_json::from_slice::<
+                crate::storage::repo_membership::RepoBlobMembershipRecord,
+            >(&bytes)
+            .map_err(|e| {
+                StorageError::Internal(format!("corrupt membership record at key '{key}': {e}"))
+            })?;
+            records.push(rec);
         }
 
         let next_token = if end_idx < all_keys.len() {
@@ -3216,13 +3286,16 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
 
         let mut records = Vec::new();
         for key in page_slice {
-            if let Some((bytes, _etag)) = self.driver.get_object(bucket, key).await?
-                && let Ok(rec) = serde_json::from_slice::<
-                    crate::storage::repo_membership::RepoBlobMembershipRecord,
-                >(&bytes)
-            {
-                records.push(rec);
-            }
+            let (bytes, _etag) = self.driver.get_object(bucket, key).await?.ok_or_else(|| {
+                StorageError::Internal(format!("missing membership object for key '{key}'"))
+            })?;
+            let rec = serde_json::from_slice::<
+                crate::storage::repo_membership::RepoBlobMembershipRecord,
+            >(&bytes)
+            .map_err(|e| {
+                StorageError::Internal(format!("corrupt membership record at key '{key}': {e}"))
+            })?;
+            records.push(rec);
         }
 
         let next_token = if end_idx < all_keys.len() {
@@ -3897,7 +3970,7 @@ pub mod tests {
     fn test_s3_session_doc_serialization_roundtrip() {
         let doc = S3SessionDoc {
             format_version: 1,
-            repo: "test/repo".to_string(),
+            repo: crate::registry::canonical_name::CanonicalRepoName::parse("test/repo").unwrap(),
             uuid: "12345678-1234-1234-1234-1234567890ab".to_string(),
             multipart_upload_id: "mp_upload_id_123".to_string(),
             state: UploadSessionState::Active,
@@ -3946,7 +4019,7 @@ pub mod tests {
     #[test]
     fn test_s3_finalized_receipt_serialization_roundtrip() {
         let receipt = FinalizedReceipt {
-            repo: "my/repo".to_string(),
+            repo: crate::registry::canonical_name::CanonicalRepoName::parse("my/repo").unwrap(),
             uuid: "98765432-1234-1234-1234-1234567890ab".to_string(),
             digest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
                 .to_string(),
@@ -3958,7 +4031,7 @@ pub mod tests {
         let json = serde_json::to_vec(&receipt).unwrap();
         let decoded: FinalizedReceipt = serde_json::from_slice(&json).unwrap();
 
-        assert_eq!(decoded.repo, "my/repo");
+        assert_eq!(decoded.repo.as_str(), "my/repo");
         assert_eq!(decoded.uuid, "98765432-1234-1234-1234-1234567890ab");
         assert_eq!(decoded.size, 10485760);
         assert_eq!(decoded.format_version, 1);
@@ -4165,7 +4238,7 @@ pub mod tests {
             .find(|e| e.method == "put_object" && e.key.ends_with("/session.json"))
             .unwrap();
         assert_eq!(put_entry.if_none_match.as_deref(), Some("*"));
-        assert_eq!(session.repo, "repo1");
+        assert_eq!(session.repo.as_str(), "repo1");
     }
 
     #[tokio::test]
@@ -6230,7 +6303,10 @@ pub mod tests {
                     let doc = S3SessionDoc {
                         format_version: 1,
                         state: UploadSessionState::Active,
-                        repo: "race-repo".into(),
+                        repo: crate::registry::canonical_name::CanonicalRepoName::parse(
+                            "race-repo",
+                        )
+                        .unwrap(),
                         uuid: "race-uuid".into(),
                         created_at_unix_secs: 100,
                         last_active_at_unix_secs: 150,
@@ -6432,12 +6508,12 @@ pub mod tests {
         )
         .unwrap();
         let rec1 = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "repo-a",
+            crate::registry::canonical_name::CanonicalRepoName::parse("repo-a").unwrap(),
             digest.clone(),
             Some("uuid-1".into()),
         );
         let rec2 = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "repo-a",
+            crate::registry::canonical_name::CanonicalRepoName::parse("repo-a").unwrap(),
             digest.clone(),
             Some("uuid-2".into()),
         );
@@ -6451,7 +6527,7 @@ pub mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fetched.repo, "repo-a");
+        assert_eq!(fetched.repo.as_str(), "repo-a");
         assert_eq!(fetched.digest, digest);
     }
 
@@ -6463,14 +6539,16 @@ pub mod tests {
         )
         .unwrap();
         let rec = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "racing-repo",
+            crate::registry::canonical_name::CanonicalRepoName::parse("racing-repo").unwrap(),
             digest.clone(),
             None,
         );
         storage.link_repo_blob(&rec).await.unwrap();
 
         // Inject hook to simulate concurrent modification (etag change) during set_candidate
-        let key = storage.repo_blob_key("racing-repo", &digest);
+        let canonical_racing =
+            crate::registry::canonical_name::CanonicalRepoName::parse("racing-repo").unwrap();
+        let key = storage.repo_blob_key(&canonical_racing, &digest);
         let key_clone = key.clone();
         driver.set_hook_before(move |method, k| {
             if method == "put_object" && k == key_clone {
@@ -6482,13 +6560,13 @@ pub mod tests {
             }
         });
 
-        let changed = storage
-            .set_membership_candidate("racing-repo", &digest, 1000)
-            .await
-            .unwrap();
-        assert!(
-            !changed,
-            "Stale ETag update on set_candidate must return false safely without error or corrupting state"
+        let res = storage
+            .set_membership_candidate("racing-repo", &digest, 1740000000)
+            .await;
+        assert_eq!(
+            res.unwrap(),
+            false,
+            "412 ETag mismatch on candidate transition must fail-safe returning Ok(false)"
         );
     }
 
@@ -6499,7 +6577,9 @@ pub mod tests {
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         )
         .unwrap();
-        let key = storage.repo_blob_key("corrupt-repo", &digest);
+        let canonical_corrupt =
+            crate::registry::canonical_name::CanonicalRepoName::parse("corrupt-repo").unwrap();
+        let key = storage.repo_blob_key(&canonical_corrupt, &digest);
 
         // Put invalid JSON in the membership key
         driver.objects.lock().unwrap().insert(
@@ -6517,7 +6597,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_membership_pagination_with_continuation_and_sha512() {
+    async fn test_s3_membership_pagination_bounded_and_consistent() {
         let (storage, _driver) = create_mock_storage();
         let repo = "paged-repo";
 
@@ -6528,12 +6608,12 @@ pub mod tests {
         let d_sha512 = Digest::parse("sha512:ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f").unwrap();
 
         let rec1 = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            repo,
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap(),
             d_sha256.clone(),
             None,
         );
         let rec2 = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            repo,
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap(),
             d_sha512.clone(),
             None,
         );
@@ -6569,17 +6649,17 @@ pub mod tests {
 
         // Repo "foo" vs Repo "foo/bar" vs Repo "foo-bar"
         let rec_foo = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "foo",
+            crate::registry::canonical_name::CanonicalRepoName::parse("foo").unwrap(),
             digest.clone(),
             None,
         );
         let rec_foo_bar = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "foo/bar",
+            crate::registry::canonical_name::CanonicalRepoName::parse("foo/bar").unwrap(),
             digest.clone(),
             None,
         );
         let rec_foo_dash = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            "foo-bar",
+            crate::registry::canonical_name::CanonicalRepoName::parse("foo-bar").unwrap(),
             digest.clone(),
             None,
         );
@@ -6604,9 +6684,9 @@ pub mod tests {
         assert_eq!(p_foo.len(), 1);
         assert_eq!(p_bar.len(), 1);
         assert_eq!(p_dash.len(), 1);
-        assert_eq!(p_foo[0].repo, "foo");
-        assert_eq!(p_bar[0].repo, "foo/bar");
-        assert_eq!(p_dash[0].repo, "foo-bar");
+        assert_eq!(p_foo[0].repo.as_str(), "foo");
+        assert_eq!(p_bar[0].repo.as_str(), "foo/bar");
+        assert_eq!(p_dash[0].repo.as_str(), "foo-bar");
     }
 
     #[tokio::test]

@@ -181,7 +181,7 @@ pub struct TagSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleJournalRecord {
     pub op_id: String,
-    pub repo: String,
+    pub repo: CanonicalRepoName,
     pub op_kind: LifecycleOpKind,
     pub target_digest: Digest,
     pub target_reference: Option<String>,
@@ -845,9 +845,8 @@ impl ManifestLifecycleService {
         allow_lazy_blobs: bool,
     ) -> Result<PublishedManifest, ManifestLifecycleError> {
         // --- 1. Pure Validation (Preflight Before Any Mutation) ---
-        if CanonicalRepoName::parse(&repo).is_err() {
-            return Err(ManifestLifecycleError::InvalidRepoName);
-        }
+        let canonical_repo =
+            CanonicalRepoName::parse(&repo).map_err(|_| ManifestLifecycleError::InvalidRepoName)?;
 
         if payload.is_empty() {
             return Err(ManifestLifecycleError::EmptyPayload);
@@ -994,7 +993,7 @@ impl ManifestLifecycleService {
 
         let mut journal = LifecycleJournalRecord {
             op_id: op_id.clone(),
-            repo: repo.clone(),
+            repo: canonical_repo,
             op_kind: LifecycleOpKind::Publish,
             target_digest: computed.clone(),
             target_reference: if is_tag {
@@ -1144,9 +1143,11 @@ impl ManifestLifecycleService {
         }
 
         // 3. Write initial lifecycle journal
+        let canonical_repo =
+            CanonicalRepoName::parse(repo).map_err(|_| ManifestLifecycleError::InvalidRepoName)?;
         let mut journal = LifecycleJournalRecord {
             op_id: uuid::Uuid::new_v4().to_string(),
-            repo: repo.to_string(),
+            repo: canonical_repo,
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: target_digest.clone(),
             target_reference: tag.map(|s| s.to_string()),
@@ -1322,9 +1323,11 @@ impl ManifestLifecycleService {
         // 3. Write Initial Operation Journal
         let op_id = uuid::Uuid::new_v4().to_string();
         let now = now_unix_secs();
+        let canonical_repo =
+            CanonicalRepoName::parse(repo).map_err(|_| ManifestLifecycleError::InvalidRepoName)?;
         let mut journal = LifecycleJournalRecord {
             op_id: op_id.clone(),
-            repo: repo.to_string(),
+            repo: canonical_repo,
             op_kind: LifecycleOpKind::DeleteManifest,
             target_digest: digest.clone(),
             target_reference: None,
@@ -1528,9 +1531,11 @@ impl ManifestLifecycleService {
 
         let op_id = uuid::Uuid::new_v4().to_string();
         let now = now_unix_secs();
+        let canonical_repo =
+            CanonicalRepoName::parse(repo).map_err(|_| ManifestLifecycleError::InvalidRepoName)?;
         let mut journal = LifecycleJournalRecord {
             op_id: op_id.clone(),
-            repo: repo.to_string(),
+            repo: canonical_repo,
             op_kind: LifecycleOpKind::DeleteTag,
             target_digest: target_digest.clone(),
             target_reference: Some(tag.to_string()),

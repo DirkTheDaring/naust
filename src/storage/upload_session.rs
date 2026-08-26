@@ -1,3 +1,4 @@
+use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
 use crate::storage::{BlobMeta, StorageError};
 use async_trait::async_trait;
@@ -8,14 +9,14 @@ use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UploadSessionId {
-    pub repo: String,
+    pub repo: CanonicalRepoName,
     pub uuid: String,
 }
 
 impl UploadSessionId {
-    pub fn new(repo: impl Into<String>, uuid: impl Into<String>) -> Self {
+    pub fn new(repo: CanonicalRepoName, uuid: impl Into<String>) -> Self {
         Self {
-            repo: repo.into(),
+            repo,
             uuid: uuid.into(),
         }
     }
@@ -80,7 +81,7 @@ pub enum FinalizeOutcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinalizedReceipt {
-    pub repo: String,
+    pub repo: CanonicalRepoName,
     pub uuid: String,
     pub digest: String,
     pub size: u64,

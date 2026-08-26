@@ -1,20 +1,226 @@
-use crate::{
-    config::{EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, RedirectPolicy, TagPolicy},
-    registry::digest::Digest,
-    storage::StorageError,
-};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use sha2::Digest as _;
 use std::{
     collections::HashMap,
+    fmt,
     net::IpAddr,
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
+
+use crate::{
+    config::{EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, RedirectPolicy, TagPolicy},
+    registry::canonical_name::{CanonicalRepoName, RepoNameError},
+    registry::digest::Digest,
+    storage::StorageError,
+};
+
+/// Host pattern for proxy upstream routing.
+///
+/// Invariants:
+/// - `All`: wildcard `*` matches all hosts.
+/// - `DomainWildcard(suffix)`: domain wildcard pattern starting with `*.` (e.g. `*.docker.io`).
+///   Matches subdomains (e.g. `sub.docker.io`, `a.b.docker.io`). Does NOT match bare `docker.io`.
+/// - `Exact(host)`: exact host matching (e.g. `docker.io`, `registry.company.com`).
+///   Case-insensitive ASCII matching.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ProxyHostPattern {
+    All,
+    DomainWildcard(String),
+    Exact(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProxyHostPatternError {
+    #[error("empty proxy host pattern")]
+    Empty,
+    #[error("invalid wildcard in proxy host pattern: '{0}'")]
+    InvalidWildcard(String),
+}
+
+impl ProxyHostPattern {
+    pub fn parse(s: &str) -> Result<Self, ProxyHostPatternError> {
+        let trimmed = s.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Err(ProxyHostPatternError::Empty);
+        }
+        if trimmed == "*" {
+            return Ok(Self::All);
+        }
+        if trimmed.starts_with("*.") {
+            let suffix = &trimmed[2..];
+            if suffix.is_empty() || suffix.contains('*') {
+                return Err(ProxyHostPatternError::InvalidWildcard(trimmed));
+            }
+            return Ok(Self::DomainWildcard(suffix.to_string()));
+        }
+        if trimmed.contains('*') {
+            return Err(ProxyHostPatternError::InvalidWildcard(trimmed));
+        }
+        Ok(Self::Exact(trimmed))
+    }
+
+    pub fn matches(&self, host: &str) -> bool {
+        let host_norm = host.trim().to_ascii_lowercase();
+        if host_norm.is_empty() {
+            return false;
+        }
+        match self {
+            Self::All => true,
+            Self::Exact(exact) => exact == &host_norm,
+            Self::DomainWildcard(suffix) => {
+                if host_norm.ends_with(suffix) && host_norm.len() > suffix.len() {
+                    let prefix_part = &host_norm[..host_norm.len() - suffix.len()];
+                    prefix_part.ends_with('.')
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for ProxyHostPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => write!(f, "*"),
+            Self::DomainWildcard(s) => write!(f, "*.{s}"),
+            Self::Exact(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl FromStr for ProxyHostPattern {
+    type Err = ProxyHostPatternError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+/// Repository pattern for proxy routing and caching rules.
+///
+/// Invariants:
+/// - `All`: wildcard `*` matches any repository.
+/// - `Subtree(prefix)`: pattern `prefix/*` (e.g. `library/*`, `org/sub/*`).
+///   Matches repository names strictly under `{prefix}/` (e.g. `library/ubuntu`) and `{prefix}`.
+///   Never matches sibling names (e.g. `library-secret`).
+/// - `Exact(repo)`: pattern `repo` (e.g. `library/ubuntu`).
+///   Matches iff `repo == candidate`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ProxyRepoPattern {
+    All,
+    Subtree(CanonicalRepoName),
+    Exact(CanonicalRepoName),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProxyRepoPatternError {
+    #[error("empty proxy repository pattern")]
+    Empty,
+    #[error("invalid repository name in proxy pattern: {0}")]
+    InvalidRepoName(#[from] RepoNameError),
+    #[error("invalid wildcard syntax in proxy repository pattern: '{0}'")]
+    InvalidSyntax(String),
+}
+
+impl ProxyRepoPattern {
+    pub fn parse(s: &str) -> Result<Self, ProxyRepoPatternError> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(ProxyRepoPatternError::Empty);
+        }
+        if trimmed == "*" {
+            return Ok(Self::All);
+        }
+        if trimmed.ends_with("/*") {
+            let base = &trimmed[..trimmed.len() - 2];
+            if base.is_empty() {
+                return Err(ProxyRepoPatternError::Empty);
+            }
+            let canonical = CanonicalRepoName::parse(base)?;
+            Ok(Self::Subtree(canonical))
+        } else if trimmed.contains('*') {
+            Err(ProxyRepoPatternError::InvalidSyntax(trimmed.to_string()))
+        } else {
+            let canonical = CanonicalRepoName::parse(trimmed)?;
+            Ok(Self::Exact(canonical))
+        }
+    }
+
+    pub fn matches(&self, candidate: &CanonicalRepoName) -> bool {
+        match self {
+            Self::All => true,
+            Self::Exact(exact) => exact == candidate,
+            Self::Subtree(prefix) => {
+                if prefix == candidate {
+                    return true;
+                }
+                let cand_str = candidate.as_str();
+                let prefix_str = prefix.as_str();
+                if cand_str.starts_with(prefix_str) {
+                    let next_byte = cand_str.as_bytes().get(prefix_str.len());
+                    next_byte == Some(&b'/')
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for ProxyRepoPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => write!(f, "*"),
+            Self::Subtree(ns) => write!(f, "{}/*", ns.as_str()),
+            Self::Exact(exact) => write!(f, "{}", exact.as_str()),
+        }
+    }
+}
+
+impl FromStr for ProxyRepoPattern {
+    type Err = ProxyRepoPatternError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+/// Allowed repository namespace prefix for proxy safety checks.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProxyAllowedPrefix(pub CanonicalRepoName);
+
+impl ProxyAllowedPrefix {
+    pub fn parse(s: &str) -> Result<Self, RepoNameError> {
+        let trimmed = s.trim().trim_end_matches('/');
+        let canonical = CanonicalRepoName::parse(trimmed)?;
+        Ok(Self(canonical))
+    }
+
+    pub fn matches(&self, candidate: &CanonicalRepoName) -> bool {
+        let cand_str = candidate.as_str();
+        let prefix_str = self.0.as_str();
+        if cand_str == prefix_str {
+            return true;
+        }
+        if cand_str.starts_with(prefix_str) {
+            let next_byte = cand_str.as_bytes().get(prefix_str.len());
+            next_byte == Some(&b'/')
+        } else {
+            false
+        }
+    }
+}
+
+impl fmt::Display for ProxyAllowedPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/", self.0.as_str())
+    }
+}
 
 #[derive(Clone)]
 pub struct Proxy {
@@ -32,8 +238,8 @@ const MAX_TOKEN_CACHE_ENTRIES: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct RepoDecision {
-    pub local_repo: String,
-    pub upstream_repo: String,
+    pub local_repo: CanonicalRepoName,
+    pub upstream_repo: CanonicalRepoName,
     pub tag_policy: TagPolicy,
     pub eviction_policy: EvictionPolicy,
 }
@@ -154,11 +360,14 @@ impl Proxy {
             return Err(ProxyError::Disabled);
         }
 
-        if !self.allowed_by_prefix_safety(repo) {
+        let canonical_repo =
+            CanonicalRepoName::parse(repo).map_err(|_| ProxyError::RepoNotAllowed)?;
+
+        if !self.allowed_by_prefix_safety(&canonical_repo) {
             return Err(ProxyError::RepoNotAllowed);
         }
 
-        let matched_rule = self.match_rule(repo);
+        let matched_rule = self.match_rule(&canonical_repo);
         let (tag_policy, eviction_policy, upstream_repo) = match (&self.cfg.mode, matched_rule) {
             (ProxyMode::Allowlist, None) => return Err(ProxyError::RepoNotAllowed),
             (_, Some(rule)) => (
@@ -166,38 +375,58 @@ impl Proxy {
                 rule.eviction_policy.clone(),
                 rule.upstream_repo
                     .clone()
-                    .unwrap_or_else(|| repo.to_string()),
+                    .unwrap_or_else(|| canonical_repo.clone()),
             ),
             (ProxyMode::Any, None) => (
                 TagPolicy::DigestOnly,
                 EvictionPolicy::Default,
-                repo.to_string(),
+                canonical_repo.clone(),
             ),
         };
 
         Ok(RepoDecision {
-            local_repo: repo.to_string(),
+            local_repo: canonical_repo,
             upstream_repo,
             tag_policy,
             eviction_policy,
         })
     }
 
-    fn allowed_by_prefix_safety(&self, repo: &str) -> bool {
+    fn allowed_by_prefix_safety(&self, repo: &CanonicalRepoName) -> bool {
         if self.cfg.allowed_repo_prefixes.is_empty() {
             return true;
         }
         self.cfg
             .allowed_repo_prefixes
             .iter()
-            .any(|p| repo.starts_with(p))
+            .any(|p| p.matches(repo))
     }
 
-    fn match_rule(&self, repo: &str) -> Option<&ProxyRepoRule> {
-        self.cfg
-            .repo_rules
-            .iter()
-            .find(|r| crate::glob::wildcard_match(&r.match_pattern, repo))
+    fn match_rule(&self, repo: &CanonicalRepoName) -> Option<&ProxyRepoRule> {
+        // Precedence: Exact > Subtree (longer prefix first) > All
+        let mut best_match: Option<(usize, usize, &ProxyRepoRule)> = None;
+        for rule in &self.cfg.repo_rules {
+            if rule.match_pattern.matches(repo) {
+                let rank_info = match &rule.match_pattern {
+                    ProxyRepoPattern::Exact(_) => (3, repo.as_str().len()),
+                    ProxyRepoPattern::Subtree(ns) => (2, ns.as_str().len()),
+                    ProxyRepoPattern::All => (1, 0),
+                };
+                match best_match {
+                    None => {
+                        best_match = Some((rank_info.0, rank_info.1, rule));
+                    }
+                    Some((best_rank, best_len, _)) => {
+                        if rank_info.0 > best_rank
+                            || (rank_info.0 == best_rank && rank_info.1 > best_len)
+                        {
+                            best_match = Some((rank_info.0, rank_info.1, rule));
+                        }
+                    }
+                }
+            }
+        }
+        best_match.map(|(_, _, rule)| rule)
     }
 
     fn upstream_base_url(&self) -> Result<Url, ProxyError> {
@@ -404,7 +633,7 @@ impl Proxy {
                 return Err(map_storage_err(e));
             }
             let record = crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                &decision.local_repo,
+                decision.local_repo.clone(),
                 digest.clone(),
             );
             let _ = storage.link_repo_blob(&record).await;
@@ -429,14 +658,15 @@ impl Proxy {
         lifecycle: Option<&crate::manifest_lifecycle::ManifestLifecycleService>,
     ) -> Result<FetchManifestResult, ProxyError> {
         // Singleflight per repo+reference.
-        let key = format!("manifest:{}:{}", decision.local_repo, reference);
+        let key = format!("manifest:{}:{}", decision.local_repo.as_str(), reference);
         let (sf_key, sf_arc, sf_guard) = self.singleflight.lock_key(&key).await;
 
         let result = async {
             let mut url = self.upstream_base_url()?;
             url.set_path(&format!(
                 "/v2/{}/manifests/{}",
-                decision.upstream_repo, reference
+                decision.upstream_repo.as_str(),
+                reference
             ));
             self.ensure_upstream_allowed(&url).await?;
 
@@ -557,7 +787,7 @@ impl Proxy {
             };
 
             let evidence = crate::manifest_lifecycle::ProxyPublicationEvidence::new(
-                &decision.local_repo,
+                decision.local_repo.as_str(),
                 reference,
                 bytes.clone(),
                 Some(media_type.clone()),
@@ -570,8 +800,8 @@ impl Proxy {
                 .await
                 .map_err(|e| ProxyError::Internal(format!("lifecycle publication failed: {e}")))?;
 
-            self.index_manifest(&decision.local_repo, &published.digest, &bytes);
-            self.note_manifest_access(&decision.local_repo, &published.digest);
+            self.index_manifest(decision.local_repo.as_str(), &published.digest, &bytes);
+            self.note_manifest_access(decision.local_repo.as_str(), &published.digest);
 
             Ok(FetchManifestResult::Fetched {
                 digest: published.digest,
@@ -729,9 +959,9 @@ impl Proxy {
                 };
 
                 // Compute scope if not present (Docker Hub usually includes it).
-                let scope = challenge
-                    .scope
-                    .or_else(|| decision.map(|d| format!("repository:{}:pull", d.upstream_repo)));
+                let scope = challenge.scope.or_else(|| {
+                    decision.map(|d| format!("repository:{}:pull", d.upstream_repo.as_str()))
+                });
                 let token = self
                     .get_token(&challenge.realm, &challenge.service, scope.as_deref())
                     .await?;

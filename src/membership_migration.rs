@@ -114,7 +114,9 @@ pub async fn apply_membership_migration(
         }
 
         // Set current repository cursor
-        checkpoint.current_repository = Some(repo.clone());
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        checkpoint.current_repository = Some(canonical_repo);
         let cur_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -144,8 +146,11 @@ pub async fn apply_membership_migration(
                             checkpoint.stats.memberships_already_present += 1;
                         }
                         None => {
+                            let canonical_repo =
+                                crate::registry::canonical_name::CanonicalRepoName::parse(&repo)
+                                    .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
                             let record = RepoBlobMembershipRecord::new_migration(
-                                repo.clone(),
+                                canonical_repo,
                                 blob_d.clone(),
                             );
                             storage.link_repo_blob(&record).await?;

@@ -3,6 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use toml::Value;
 use url::Url;
 
+use crate::registry::CanonicalRepoName;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SlowConnectionPolicy {
@@ -102,7 +104,7 @@ pub struct Config {
 
     pub push_username: Option<String>,
     pub push_password: Option<String>,
-    pub push_allow_repos: Option<Vec<String>>,
+    pub push_allow_repos: Option<Vec<crate::registry::RepositoryAccessPattern>>,
 
     pub auth_strategy: AuthStrategy,
     pub anonymous_pull: bool,
@@ -342,7 +344,7 @@ pub struct ProxyConfig {
 
     // Safety net: even in proxy-any mode, only allow these prefixes.
     // Examples: ["library/", "myorg/"]
-    pub allowed_repo_prefixes: Vec<String>,
+    pub allowed_repo_prefixes: Vec<crate::proxy::ProxyAllowedPrefix>,
 
     // SSRF guard: block loopback/link-local/private IPs.
     pub block_private_networks: bool,
@@ -383,7 +385,7 @@ pub struct ProxyConfig {
     pub upstreams: Vec<ProxyUpstreamRoute>,
 
     // Request routing: select proxy behavior based on Host (or X-Forwarded-Host).
-    pub routing_proxy_hosts: Vec<String>,
+    pub routing_proxy_hosts: Vec<crate::proxy::ProxyHostPattern>,
     pub routing_trust_x_forwarded_host: bool,
 }
 
@@ -391,7 +393,7 @@ pub struct ProxyConfig {
 pub struct ProxyUpstreamRoute {
     // Host patterns (minimal '*' glob). If the effective request host matches, this upstream is
     // selected and the request runs in proxy-only mode.
-    pub hosts: Vec<String>,
+    pub hosts: Vec<crate::proxy::ProxyHostPattern>,
 
     // Whether to use X-Forwarded-Host when matching hosts for this upstream route.
     // Only enable this if the registry is reachable only via a trusted reverse proxy.
@@ -403,7 +405,7 @@ pub struct ProxyUpstreamRoute {
 
     // Safety settings (can be different per upstream).
     pub allowed_upstream_hosts: Vec<String>,
-    pub allowed_repo_prefixes: Vec<String>,
+    pub allowed_repo_prefixes: Vec<crate::proxy::ProxyAllowedPrefix>,
     pub block_private_networks: bool,
     pub redirect_policy: RedirectPolicy,
     pub max_concurrent_upstream: usize,
@@ -450,8 +452,8 @@ impl std::str::FromStr for RedirectPolicy {
 
 #[derive(Clone, Debug)]
 pub struct ProxyRepoRule {
-    pub match_pattern: String,
-    pub upstream_repo: Option<String>,
+    pub match_pattern: crate::proxy::ProxyRepoPattern,
+    pub upstream_repo: Option<crate::registry::canonical_name::CanonicalRepoName>,
     pub tag_policy: TagPolicy,
     pub eviction_policy: EvictionPolicy,
 }
@@ -1388,7 +1390,7 @@ impl Config {
                 .or_else(|| file_cfg.auth.anonymous_pull)
                 .unwrap_or(true);
 
-        let push_allow_repos = env_str_opt(&[
+        let push_allow_repos_raw = env_str_opt(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
             "REGISTRY_PUSH_ALLOW_REPOS",
         ])
@@ -1401,6 +1403,26 @@ impl Config {
         .filter(|v| !v.is_empty())
         .or_else(|| file_cfg.auth.push.allow_repos.clone())
         .filter(|v| !v.is_empty());
+
+        let push_allow_repos = match push_allow_repos_raw {
+            Some(raw_list) => {
+                let mut parsed_list = Vec::with_capacity(raw_list.len());
+                for entry in raw_list {
+                    let pat =
+                        crate::registry::RepositoryAccessPattern::parse(&entry).map_err(|err| {
+                            ConfigError::InvalidValue {
+                                field: "auth.push.allow_repos",
+                                message: format!(
+                                    "invalid repository access pattern '{entry}': {err}"
+                                ),
+                            }
+                        })?;
+                    parsed_list.push(pat);
+                }
+                Some(parsed_list)
+            }
+            None => None,
+        };
 
         let storage_backend_raw = env_str_opt(&["REGISTRY__STORAGE__BACKEND", "STORAGE_BACKEND"])
             .or_else(|| file_cfg.storage.backend.clone())
@@ -1949,7 +1971,7 @@ impl Config {
         .or_else(|| file_cfg.proxy.safety.allowed_upstream_hosts.clone())
         .unwrap_or_default();
 
-        let allowed_repo_prefixes = env_str_opt(&[
+        let allowed_repo_prefixes_raw = env_str_opt(&[
             "REGISTRY__PROXY__SAFETY__ALLOWED_REPO_PREFIXES",
             "PROXY_ALLOWED_REPO_PREFIXES",
         ])
@@ -1962,6 +1984,17 @@ impl Config {
         .filter(|v| !v.is_empty())
         .or_else(|| file_cfg.proxy.safety.allowed_repo_prefixes.clone())
         .unwrap_or_default();
+
+        let mut allowed_repo_prefixes = Vec::new();
+        for p in allowed_repo_prefixes_raw {
+            let prefix = crate::proxy::ProxyAllowedPrefix::parse(&p).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "proxy.safety.allowed_repo_prefixes",
+                    message: format!("invalid allowed_repo_prefix '{p}': {e}"),
+                }
+            })?;
+            allowed_repo_prefixes.push(prefix);
+        }
 
         let block_private_networks = env_bool_opt(&[
             "REGISTRY__PROXY__SAFETY__BLOCK_PRIVATE_NETWORKS",
@@ -2056,37 +2089,55 @@ impl Config {
         .unwrap_or(2000)
         .max(1);
 
-        let repo_rules = file_cfg
-            .proxy
-            .repos
-            .iter()
-            .map(|r| {
-                let tag_policy = match r.tag_policy {
-                    FileTagPolicy::DigestOnly => TagPolicy::DigestOnly,
-                    FileTagPolicy::TtlSeconds(s) => TagPolicy::TtlSeconds(s),
-                    FileTagPolicy::AlwaysRevalidate => TagPolicy::AlwaysRevalidate,
-                };
-                let eviction_policy = match &r.eviction {
-                    FileEvictionPolicy::Default => EvictionPolicy::Default,
-                    FileEvictionPolicy::KeepTags { tags } => EvictionPolicy::KeepTags(tags.clone()),
-                    FileEvictionPolicy::KeepLatestCachedSemver {
-                        tag_regex,
-                        allow_prerelease,
-                    } => EvictionPolicy::KeepLatestCachedSemver {
-                        tag_regex: tag_regex.clone(),
-                        allow_prerelease: allow_prerelease.unwrap_or(false),
-                    },
-                };
-                ProxyRepoRule {
-                    match_pattern: r.match_pattern.trim().to_string(),
-                    upstream_repo: r.upstream_repo.clone().map(|s| s.trim().to_string()),
-                    tag_policy,
-                    eviction_policy,
+        let mut repo_rules = Vec::new();
+        for r in &file_cfg.proxy.repos {
+            let tag_policy = match r.tag_policy {
+                FileTagPolicy::DigestOnly => TagPolicy::DigestOnly,
+                FileTagPolicy::TtlSeconds(s) => TagPolicy::TtlSeconds(s),
+                FileTagPolicy::AlwaysRevalidate => TagPolicy::AlwaysRevalidate,
+            };
+            let eviction_policy = match &r.eviction {
+                FileEvictionPolicy::Default => EvictionPolicy::Default,
+                FileEvictionPolicy::KeepTags { tags } => EvictionPolicy::KeepTags(tags.clone()),
+                FileEvictionPolicy::KeepLatestCachedSemver {
+                    tag_regex,
+                    allow_prerelease,
+                } => EvictionPolicy::KeepLatestCachedSemver {
+                    tag_regex: tag_regex.clone(),
+                    allow_prerelease: allow_prerelease.unwrap_or(false),
+                },
+            };
+            let match_pattern =
+                crate::proxy::ProxyRepoPattern::parse(&r.match_pattern).map_err(|e| {
+                    ConfigError::InvalidValue {
+                        field: "proxy.repos.match_pattern",
+                        message: format!(
+                            "invalid proxy repo match_pattern '{}': {e}",
+                            r.match_pattern
+                        ),
+                    }
+                })?;
+            let upstream_repo = match &r.upstream_repo {
+                Some(s) if !s.trim().is_empty() => {
+                    let canon = CanonicalRepoName::parse(s.trim()).map_err(|e| {
+                        ConfigError::InvalidValue {
+                            field: "proxy.repos.upstream_repo",
+                            message: format!("invalid upstream_repo '{s}': {e}"),
+                        }
+                    })?;
+                    Some(canon)
                 }
-            })
-            .collect::<Vec<_>>();
+                _ => None,
+            };
+            repo_rules.push(ProxyRepoRule {
+                match_pattern,
+                upstream_repo,
+                tag_policy,
+                eviction_policy,
+            });
+        }
 
-        let routing_proxy_hosts = env_str_opt(&[
+        let routing_proxy_hosts_raw = env_str_opt(&[
             "REGISTRY__PROXY__ROUTING__PROXY_HOSTS",
             "PROXY_ROUTING_PROXY_HOSTS",
         ])
@@ -2099,6 +2150,17 @@ impl Config {
         .filter(|v| !v.is_empty())
         .or_else(|| file_cfg.proxy.routing.proxy_hosts.clone())
         .unwrap_or_default();
+
+        let mut routing_proxy_hosts = Vec::new();
+        for h in routing_proxy_hosts_raw {
+            let pat = crate::proxy::ProxyHostPattern::parse(&h).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "proxy.routing.proxy_hosts",
+                    message: format!("invalid host pattern '{h}': {e}"),
+                }
+            })?;
+            routing_proxy_hosts.push(pat);
+        }
 
         let routing_trust_x_forwarded_host = env_bool_opt(&[
             "REGISTRY__PROXY__ROUTING__TRUST_X_FORWARDED_HOST",
@@ -2375,21 +2437,29 @@ fn resolve_users_config(file_cfg: &FileConfig) -> Result<UsersConfig, ConfigErro
         .auth
         .groups
         .iter()
-        .map(|g| GroupConfig {
-            name: g.name.trim().to_string(),
-            grants: g
-                .grants
-                .iter()
-                .map(|gr| crate::rbac::Grant {
-                    repo_prefix: gr.repo_prefix.trim().to_string(),
+        .map(|g| {
+            let mut grants = Vec::with_capacity(g.grants.len());
+            for gr in &g.grants {
+                let repo_pattern = crate::rbac::RbacRepoPattern::parse(&gr.repo_prefix)
+                    .unwrap_or_else(|_| {
+                        crate::rbac::RbacRepoPattern::Exact(
+                            CanonicalRepoName::parse("invalid-grant").unwrap(),
+                        )
+                    });
+                grants.push(crate::rbac::Grant {
+                    repo_pattern,
                     actions: gr
                         .actions
                         .iter()
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
-                })
-                .collect(),
+                });
+            }
+            GroupConfig {
+                name: g.name.trim().to_string(),
+                grants,
+            }
         })
         .filter(|g| !g.name.is_empty())
         .collect::<Vec<_>>();
@@ -2404,6 +2474,19 @@ fn resolve_users_config(file_cfg: &FileConfig) -> Result<UsersConfig, ConfigErro
                     field: "auth.groups",
                     message: format!("contains duplicate name='{}'", g.name),
                 });
+            }
+            if let Some(fg) = file_cfg.auth.groups.iter().find(|fg| fg.name == g.name) {
+                for gr in &fg.grants {
+                    crate::rbac::RbacRepoPattern::parse(&gr.repo_prefix).map_err(|e| {
+                        ConfigError::InvalidValue {
+                            field: "auth.groups.grants",
+                            message: format!(
+                                "invalid grant repo_prefix '{}' in group '{}': {e}",
+                                gr.repo_prefix, g.name
+                            ),
+                        }
+                    })?;
+                }
             }
             crate::rbac::validate_grants(&g.grants).map_err(|e| ConfigError::InvalidValue {
                 field: "auth.groups.grants",
@@ -2472,14 +2555,22 @@ fn resolve_robots_config(file_cfg: &FileConfig) -> Result<RobotsConfig, ConfigEr
                 grants: a
                     .grants
                     .iter()
-                    .map(|g| crate::rbac::Grant {
-                        repo_prefix: g.repo_prefix.trim().to_string(),
-                        actions: g
-                            .actions
-                            .iter()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect(),
+                    .map(|g| {
+                        let repo_pattern = crate::rbac::RbacRepoPattern::parse(&g.repo_prefix)
+                            .unwrap_or_else(|_| {
+                                crate::rbac::RbacRepoPattern::Exact(
+                                    CanonicalRepoName::parse("invalid-grant").unwrap(),
+                                )
+                            });
+                        crate::rbac::Grant {
+                            repo_pattern,
+                            actions: g
+                                .actions
+                                .iter()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                        }
                     })
                     .collect(),
                 max_ttl_secs: a.max_ttl_secs,
@@ -2503,6 +2594,25 @@ fn resolve_robots_config(file_cfg: &FileConfig) -> Result<RobotsConfig, ConfigEr
                     message: format!("entry '{}' has empty secret_hash", a.name),
                 });
             }
+            if let Some(fa) = file_cfg
+                .auth
+                .robots
+                .accounts
+                .iter()
+                .find(|fa| fa.name == a.name)
+            {
+                for gr in &fa.grants {
+                    crate::rbac::RbacRepoPattern::parse(&gr.repo_prefix).map_err(|e| {
+                        ConfigError::InvalidValue {
+                            field: "auth.robots.accounts.grants",
+                            message: format!(
+                                "invalid grant repo_prefix '{}' for robot '{}': {e}",
+                                gr.repo_prefix, a.name
+                            ),
+                        }
+                    })?;
+                }
+            }
             crate::rbac::validate_grants(&a.grants).map_err(|e| ConfigError::InvalidValue {
                 field: "auth.robots.accounts.grants",
                 message: format!("invalid grants for robot '{}': {:?}", a.name, e),
@@ -2523,26 +2633,37 @@ fn resolve_proxy_upstreams(
 ) -> Result<Vec<ProxyUpstreamRoute>, ConfigError> {
     let mut upstreams = Vec::new();
     for (_i, r) in file_upstreams.iter().enumerate() {
-        let mut hosts = Vec::new();
-        hosts.extend(
+        let mut raw_hosts = Vec::new();
+        raw_hosts.extend(
             r.hosts
                 .iter()
                 .map(|h| h.trim().to_string())
                 .filter(|h| !h.is_empty()),
         );
         if let Some(extra) = r.routing.hosts.as_ref() {
-            hosts.extend(
+            raw_hosts.extend(
                 extra
                     .iter()
                     .map(|h| h.trim().to_string())
                     .filter(|h| !h.is_empty()),
             );
         }
-        hosts.sort();
-        hosts.dedup();
 
-        if hosts.is_empty() {
+        if raw_hosts.is_empty() {
             continue;
+        }
+
+        let mut hosts = Vec::new();
+        for h in raw_hosts {
+            let pat = crate::proxy::ProxyHostPattern::parse(&h).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "proxy.upstreams.hosts",
+                    message: format!("invalid upstream host pattern '{h}': {e}"),
+                }
+            })?;
+            if !hosts.contains(&pat) {
+                hosts.push(pat);
+            }
         }
 
         let upstream_base_url = r
@@ -2616,12 +2737,24 @@ fn resolve_proxy_upstreams(
             .clone()
             .or_else(|| global_safety.allowed_upstream_hosts.clone())
             .unwrap_or_default();
-        let allowed_repo_prefixes = r
+
+        let raw_prefixes = r
             .safety
             .allowed_repo_prefixes
             .clone()
             .or_else(|| global_safety.allowed_repo_prefixes.clone())
             .unwrap_or_default();
+        let mut allowed_repo_prefixes = Vec::new();
+        for p in raw_prefixes {
+            let prefix = crate::proxy::ProxyAllowedPrefix::parse(&p).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "proxy.upstreams.safety.allowed_repo_prefixes",
+                    message: format!("invalid allowed_repo_prefix '{p}': {e}"),
+                }
+            })?;
+            allowed_repo_prefixes.push(prefix);
+        }
+
         let block_private_networks = r
             .safety
             .block_private_networks
@@ -2689,14 +2822,11 @@ fn resolve_proxy_upstreams(
     }
 
     // Validate: upstream host patterns must be unique across routes.
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<crate::proxy::ProxyHostPattern, usize> =
+        std::collections::HashMap::new();
     for (idx, up) in upstreams.iter().enumerate() {
         for host_pat in &up.hosts {
-            let key = host_pat.trim().to_ascii_lowercase();
-            if key.is_empty() {
-                continue;
-            }
-            if let Some(prev) = seen.insert(key.clone(), idx) {
+            if let Some(prev) = seen.insert(host_pat.clone(), idx) {
                 return Err(ConfigError::InvalidValue {
                     field: "proxy.upstreams.hosts",
                     message: format!(
@@ -2890,7 +3020,10 @@ max_cache_bytes = 456
             .iter()
             .find(|u| u.upstream_base_url == "https://registry-1.docker.io")
             .expect("dockerhub upstream");
-        assert_eq!(dockerhub.hosts, vec!["dockerhub-cache.local".to_string()]);
+        assert_eq!(
+            dockerhub.hosts,
+            vec![crate::proxy::ProxyHostPattern::parse("dockerhub-cache.local").unwrap()]
+        );
         assert_eq!(dockerhub.max_cache_bytes, 123);
         assert_eq!(
             dockerhub
@@ -2909,7 +3042,10 @@ max_cache_bytes = 456
             .iter()
             .find(|u| u.upstream_base_url == "https://ghcr.io")
             .expect("ghcr upstream");
-        assert_eq!(ghcr.hosts, vec!["ghcr-cache.local".to_string()]);
+        assert_eq!(
+            ghcr.hosts,
+            vec![crate::proxy::ProxyHostPattern::parse("ghcr-cache.local").unwrap()]
+        );
         assert_eq!(ghcr.max_cache_bytes, 456);
         assert_eq!(
             ghcr.cache_fs_root
@@ -3112,7 +3248,9 @@ allow_repos = ["org/repo3"]
 
         let cfg = Config::from_env_with_files(&[path1, path2]).expect("load merged configs");
         assert_eq!(cfg.listen_addr, ([127, 0, 0, 1], 8080).into());
-        assert_eq!(cfg.push_allow_repos, Some(vec!["org/repo3".to_string()]));
+        let expected_pattern =
+            crate::registry::RepositoryAccessPattern::parse("org/repo3").unwrap();
+        assert_eq!(cfg.push_allow_repos, Some(vec![expected_pattern]));
     }
 
     #[test]

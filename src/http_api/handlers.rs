@@ -236,6 +236,9 @@ pub async fn v2_dispatch(
     let route = crate::http_api::routing::OciRoute::parse(&full_path);
 
     match route {
+        crate::http_api::routing::OciRoute::InvalidRepoName { .. } => {
+            errors::name_invalid().into_response()
+        }
         crate::http_api::routing::OciRoute::Catalog => {
             if method != Method::GET && method != Method::HEAD {
                 return errors::method_not_allowed("GET, HEAD");
@@ -259,7 +262,7 @@ pub async fn v2_dispatch(
             if method != Method::POST {
                 return errors::method_not_allowed("POST");
             }
-            upload_create(state, &headers, method, &repo, &query, body).await
+            upload_create(state, &headers, method, repo.as_str(), &query, body).await
         }
         crate::http_api::routing::OciRoute::UploadSession { repo, uuid } => {
             if method != Method::GET
@@ -270,7 +273,7 @@ pub async fn v2_dispatch(
             {
                 return errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE");
             }
-            upload_session(state, method, &headers, &repo, &uuid, query, body).await
+            upload_session(state, method, &headers, repo.as_str(), &uuid, query, body).await
         }
         crate::http_api::routing::OciRoute::TagsList { repo } => {
             if method != Method::GET && method != Method::HEAD {
@@ -279,7 +282,7 @@ pub async fn v2_dispatch(
             crate::http_api::tags::tags_list(
                 state,
                 method,
-                &repo,
+                repo.as_str(),
                 &query,
                 route_mode,
                 proxy_ctx.clone(),
@@ -290,7 +293,7 @@ pub async fn v2_dispatch(
             if method != Method::DELETE {
                 return errors::method_not_allowed("DELETE");
             }
-            crate::http_api::tags::tag_delete(state, method, &repo, &tag).await
+            crate::http_api::tags::tag_delete(state, method, repo.as_str(), &tag).await
         }
         crate::http_api::routing::OciRoute::Referrers { repo, digest } => {
             if method != Method::GET && method != Method::HEAD {
@@ -299,7 +302,7 @@ pub async fn v2_dispatch(
             crate::http_api::referrers::referrers_list(
                 state,
                 method,
-                &repo,
+                repo.as_str(),
                 &digest,
                 &query,
                 route_mode,
@@ -309,7 +312,7 @@ pub async fn v2_dispatch(
         }
         crate::http_api::routing::OciRoute::Manifest { repo, reference } => {
             if method == Method::PUT {
-                return manifest_put(state, &headers, &repo, &reference, body).await;
+                return manifest_put(state, &headers, repo.as_str(), &reference, body).await;
             }
             if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
                 return errors::method_not_allowed("GET, HEAD, PUT, DELETE");
@@ -317,7 +320,7 @@ pub async fn v2_dispatch(
             manifest_by_reference(
                 state,
                 method,
-                &repo,
+                repo.as_str(),
                 &reference,
                 route_mode,
                 proxy_ctx.clone(),
@@ -329,7 +332,15 @@ pub async fn v2_dispatch(
             if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
                 return errors::method_not_allowed("GET, HEAD, DELETE");
             }
-            blob_by_digest(state, method, &repo, &digest, route_mode, proxy_ctx.clone()).await
+            blob_by_digest(
+                state,
+                method,
+                repo.as_str(),
+                &digest,
+                route_mode,
+                proxy_ctx.clone(),
+            )
+            .await
         }
         _ => errors::not_implemented().into_response(),
     }
@@ -343,9 +354,10 @@ async fn blob_by_digest(
     route_mode: V2RouteMode,
     proxy_ctx: Option<ProxyContext>,
 ) -> Response {
-    if !is_valid_repo_name(name) {
-        return errors::name_invalid().into_response();
-    }
+    let canonical_repo = match crate::registry::canonical_name::CanonicalRepoName::parse(name) {
+        Ok(r) => r,
+        Err(_) => return errors::name_invalid().into_response(),
+    };
 
     let digest = match Digest::parse(digest_str) {
         Ok(d) => d,
@@ -358,9 +370,12 @@ async fn blob_by_digest(
 
     // Check repository-scoped blob membership
     let membership_opt = match state.storage.get_repo_blob_membership(name, &digest).await {
-        Ok(opt) => opt,
-        Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
-        Err(_) => None,
+        Ok(m) => m,
+        Err(StorageError::InvalidRepoName(_)) => return errors::name_invalid().into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to read blob membership");
+            return errors::internal_error().into_response();
+        }
     };
 
     match method {
@@ -399,7 +414,7 @@ async fn blob_by_digest(
                         .membership_ledger
                         .link(
                             &crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                                name,
+                                canonical_repo.clone(),
                                 digest.clone(),
                             ),
                         )
@@ -453,7 +468,7 @@ async fn blob_by_digest(
                         .membership_ledger
                         .link(
                             &crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                                name,
+                                canonical_repo.clone(),
                                 digest.clone(),
                             ),
                         )
@@ -483,7 +498,7 @@ async fn blob_by_digest(
                             if let Err(e) = state
                                 .membership_ledger
                                 .link(&crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                                    name,
+                                    canonical_repo.clone(),
                                     digest.clone(),
                                 ))
                                 .await
@@ -1697,7 +1712,8 @@ mod tests {
         assert!(!is_valid_repo_name("a b"));
         assert!(!is_valid_repo_name("INVALID/UPPERCASE"));
         assert!(!is_valid_repo_name("-invalid-leading-dash"));
-        assert!(!is_valid_repo_name("invalid__double_dot"));
+        assert!(is_valid_repo_name("valid__double_underscore"));
+        assert!(!is_valid_repo_name("invalid___triple_underscore"));
         assert!(!is_valid_repo_name("invalid..dots"));
     }
 
@@ -1861,7 +1877,7 @@ mod tests {
             anonymous_pull: true,
             push_username: None,
             push_password: None,
-            push_allow_repos: Some(vec!["*".to_string()]),
+            push_allow_repos: Some(vec![crate::registry::RepositoryAccessPattern::All]),
             storage_backend: crate::config::StorageBackend::Filesystem,
             fs_root: PathBuf::from("./data"),
             s3_endpoint: None,
@@ -1992,10 +2008,9 @@ mod tests {
         cfg.robots.accounts.push(crate::config::RobotAccountConfig {
             name: "ci".to_string(),
             secret_hash: hash,
-            grants: vec![Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
             max_ttl_secs: Some(120),
         });
 
@@ -2026,10 +2041,9 @@ mod tests {
         cfg.robots.accounts.push(crate::config::RobotAccountConfig {
             name: "ci".to_string(),
             secret_hash: hash,
-            grants: vec![Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
             max_ttl_secs: None,
         });
 
@@ -2061,10 +2075,9 @@ mod tests {
         cfg.robots.accounts.push(crate::config::RobotAccountConfig {
             name: "ci".to_string(),
             secret_hash: hash,
-            grants: vec![Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
             max_ttl_secs: None,
         });
 
@@ -2096,10 +2109,9 @@ mod tests {
         cfg.robots.accounts.push(crate::config::RobotAccountConfig {
             name: "ci".to_string(),
             secret_hash: hash,
-            grants: vec![Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
             max_ttl_secs: None,
         });
 
@@ -2127,10 +2139,9 @@ mod tests {
 
         cfg.users.groups.push(crate::config::GroupConfig {
             name: "dev".to_string(),
-            grants: vec![Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
         });
 
         let hash = robot_secrets::hash_robot_secret("pw").expect("hash");
@@ -2166,10 +2177,9 @@ mod tests {
 
         cfg.users.groups.push(crate::config::GroupConfig {
             name: "dev".to_string(),
-            grants: vec![Grant {
-                repo_prefix: "other/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("other/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
         });
 
         let hash = robot_secrets::hash_robot_secret("pw").expect("hash");
@@ -2210,20 +2220,18 @@ mod tests {
         cfg.robots.accounts.push(crate::config::RobotAccountConfig {
             name: "sam".to_string(),
             secret_hash: shared_hash.clone(),
-            grants: vec![Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("org/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
             max_ttl_secs: None,
         });
 
         // User would allow it via group grants, but must not be reached.
         cfg.users.groups.push(crate::config::GroupConfig {
             name: "writers".to_string(),
-            grants: vec![Grant {
-                repo_prefix: "other/".to_string(),
-                actions: vec!["pull".to_string(), "push".to_string()],
-            }],
+            grants: vec![
+                Grant::try_new("other/", vec!["pull".to_string(), "push".to_string()]).unwrap(),
+            ],
         });
         cfg.users.accounts.push(crate::config::UserAccountConfig {
             name: "sam".to_string(),
@@ -2824,8 +2832,11 @@ async fn ensure_tag_fresh(
     always_revalidate: bool,
 ) -> Result<(), Response> {
     let now = crate::proxy::Proxy::now_unix();
-    let current_digest = storage.resolve_tag(&decision.local_repo, tag).await.ok();
-    let meta = proxy.get_tag_meta(&decision.local_repo, tag);
+    let current_digest = storage
+        .resolve_tag(decision.local_repo.as_str(), tag)
+        .await
+        .ok();
+    let meta = proxy.get_tag_meta(decision.local_repo.as_str(), tag);
 
     if !always_revalidate {
         if let (Some(d), Some(m)) = (&current_digest, &meta) {
@@ -2854,7 +2865,10 @@ async fn ensure_tag_fresh(
             // If we don't have the manifest locally (or no tag pointer), fetch the body.
             if current_digest.is_none()
                 || storage
-                    .head_manifest(&decision.local_repo, current_digest.as_ref().unwrap())
+                    .head_manifest(
+                        decision.local_repo.as_str(),
+                        current_digest.as_ref().unwrap(),
+                    )
                     .await
                     .is_err()
             {
@@ -2876,13 +2890,13 @@ async fn ensure_tag_fresh(
                     )
                     .await
                     .map_err(|e| {
-                        tracing::warn!(error = %e, repo = decision.local_repo, tag, "proxy: fetch manifest after 304 failed");
+                        tracing::warn!(error = %e, repo = %decision.local_repo, tag, "proxy: fetch manifest after 304 failed");
                         errors::internal_error().into_response()
                     })?;
             }
 
             if let Some(d) = storage
-                .resolve_tag(&decision.local_repo, tag)
+                .resolve_tag(decision.local_repo.as_str(), tag)
                 .await
                 .ok()
                 .or(digest)
@@ -2896,14 +2910,14 @@ async fn ensure_tag_fresh(
                     },
                     etag,
                 };
-                proxy.put_tag_meta(&decision.local_repo, tag, &m);
+                proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
             }
             Ok(())
         }
         Ok(crate::proxy::FetchManifestResult::HeadOk { etag, digest, .. }) => {
             let needs_get = match (&current_digest, &digest) {
                 (Some(local), Some(up)) if local.hex() == up.hex() => storage
-                    .head_manifest(&decision.local_repo, local)
+                    .head_manifest(decision.local_repo.as_str(), local)
                     .await
                     .is_err(),
                 _ => true,
@@ -2928,7 +2942,7 @@ async fn ensure_tag_fresh(
                     )
                     .await
                     .map_err(|e| {
-                        tracing::warn!(error = %e, repo = decision.local_repo, tag, "proxy: fetch manifest failed");
+                        tracing::warn!(error = %e, repo = %decision.local_repo, tag, "proxy: fetch manifest failed");
                         errors::internal_error().into_response()
                     })?;
                 if let crate::proxy::FetchManifestResult::Fetched { digest, etag, .. } = fetched {
@@ -2941,7 +2955,7 @@ async fn ensure_tag_fresh(
                         },
                         etag,
                     };
-                    proxy.put_tag_meta(&decision.local_repo, tag, &m);
+                    proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
                 }
             } else if let Some(d) = current_digest {
                 let m = crate::proxy::TagMeta {
@@ -2953,7 +2967,7 @@ async fn ensure_tag_fresh(
                     },
                     etag,
                 };
-                proxy.put_tag_meta(&decision.local_repo, tag, &m);
+                proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
             }
             Ok(())
         }
@@ -2967,13 +2981,13 @@ async fn ensure_tag_fresh(
                 },
                 etag,
             };
-            proxy.put_tag_meta(&decision.local_repo, tag, &m);
+            proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
             Ok(())
         }
         Err(crate::proxy::ProxyError::NotFound) => Err(errors::manifest_unknown().into_response()),
         Err(crate::proxy::ProxyError::TooLarge) => Err(errors::payload_too_large().into_response()),
         Err(err) => {
-            tracing::warn!(error = %err, repo = decision.local_repo, tag, "proxy: revalidate failed");
+            tracing::warn!(error = %err, repo = %decision.local_repo, tag, "proxy: revalidate failed");
             Err(errors::internal_error().into_response())
         }
     }

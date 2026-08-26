@@ -32,6 +32,9 @@ pub mod task_supervisor;
 pub mod token_rate_limit;
 pub mod upload_coordinator;
 
+#[doc(hidden)]
+pub mod test_support;
+
 pub fn install_rustls_crypto_provider() {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let _ = rustls::crypto::CryptoProvider::install_default(provider);

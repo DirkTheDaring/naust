@@ -1584,11 +1584,11 @@ async fn test_audit_remediation_suite() {
         "/v2/"
     );
 
-    // 18. Reject malformed repository names in tags route
+    // 18. Reject malformed repository names in tags route (400 Bad Request with NAME_INVALID)
     for bad_name in &[
         "INVALID/UPPERCASE",
         "-invalid-leading-dash",
-        "invalid__double_dot",
+        "invalid___triple_underscore",
         "invalid..dots",
     ] {
         let bad_repo_resp = client
@@ -1596,7 +1596,7 @@ async fn test_audit_remediation_suite() {
             .send()
             .await
             .expect("get bad repo tags");
-        assert_eq!(bad_repo_resp.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(bad_repo_resp.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
     // 19. Delete unreferenced blob layer by digest -> 202 Accepted
@@ -1622,9 +1622,9 @@ async fn test_audit_remediation_suite() {
         .expect("mount fallback");
     assert_eq!(mount_resp.status(), reqwest::StatusCode::ACCEPTED);
 
-    // 21. Private repository challenge before repo validation
+    // 21. Private repository challenge
     let priv_resp = client
-        .get(format!("{base_url}/v2/<PRIVATE_REPO>/tags/list"))
+        .get(format!("{base_url}/v2/private-repo/tags/list"))
         .send()
         .await
         .expect("priv tags");
@@ -1695,9 +1695,9 @@ async fn test_audit_remediation_suite() {
         .expect("denied upload create");
     assert_eq!(denied_upload_resp.status(), reqwest::StatusCode::FORBIDDEN);
 
-    // 24. Unauthenticated request to private or uppercase repo returns 401 challenge
+    // 24. Unauthenticated request to private repo returns 401 challenge
     let challenge_resp = client
-        .get(format!("{base_url}/v2/PRIVATE_TEST_REPO/tags/list"))
+        .get(format!("{base_url}/v2/private-test-repo/tags/list"))
         .send()
         .await
         .expect("unauth private tags");

@@ -327,7 +327,9 @@ impl BlobUploadCoordinator {
         // Optional state validation if present
         let _ = self.validate_state_token(state_param, repo, uuid, None, false)?;
 
-        let session = UploadSessionId::new(repo, uuid);
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| CoordinatorError::InvalidRepoName(e.to_string()))?;
+        let session = UploadSessionId::new(canonical_repo, uuid);
         let status = self.storage.session_status(&session).await?;
 
         Ok(UploadStatusResult {
@@ -349,7 +351,9 @@ impl BlobUploadCoordinator {
         content_length: Option<u64>,
         stream: UploadByteStream,
     ) -> Result<AppendResult, CoordinatorError> {
-        let session = UploadSessionId::new(repo, uuid);
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| CoordinatorError::InvalidRepoName(e.to_string()))?;
+        let session = UploadSessionId::new(canonical_repo, uuid);
 
         // 1. Query authoritative status first to validate state token against authoritative offset
         let status = self.storage.session_status(&session).await?;
@@ -363,51 +367,60 @@ impl BlobUploadCoordinator {
             true,
         )?;
 
-        // 3. Content-Range validation if provided
-        if let Some((start, end)) = content_range {
-            if let Some(cl) = content_length
-                && (end.saturating_sub(start).saturating_add(1)) != cl
-            {
-                return Err(CoordinatorError::SizeInvalid(
-                    "provided range length did not match content length".to_string(),
-                ));
-            }
-            if start != status.committed_offset {
-                return Err(CoordinatorError::RangeInvalid(format!(
-                    "range start {start} does not match current committed offset {}",
-                    status.committed_offset
-                )));
+        // 3. Optional Content-Length pre-check against max configured limit
+        if let Some(len) = content_length {
+            let next_total = status.committed_offset.saturating_add(len);
+            if self.config.max_upload_bytes > 0 && next_total > self.config.max_upload_bytes {
+                return Err(CoordinatorError::TooLarge);
             }
         }
 
-        // 4. Perform atomic append under session lock/lease
-        let precondition = UploadOffsetPrecondition::Exact(status.committed_offset);
+        // 4. Content-Range start validation if supplied
+        let expected_offset = match content_range {
+            Some((start, _)) => {
+                if start != status.committed_offset {
+                    return Err(CoordinatorError::RangeInvalid(format!(
+                        "range start {start} does not match current committed offset {}",
+                        status.committed_offset
+                    )));
+                }
+                UploadOffsetPrecondition::Exact(start)
+            }
+            None => UploadOffsetPrecondition::Exact(status.committed_offset),
+        };
+
+        // 5. Append chunk via storage under session lock
         let append_res = self
             .storage
-            .append_if_offset(&session, precondition, stream, self.config.max_upload_bytes)
+            .append_if_offset(
+                &session,
+                expected_offset,
+                stream,
+                self.config.max_upload_bytes,
+            )
             .await?;
 
-        match append_res {
-            UploadAppendResult::Committed { new_offset } => {
-                let next_state_token = self.generate_state_token(repo, uuid, new_offset);
-                Ok(AppendResult {
-                    session,
-                    new_offset,
-                    state_token: next_state_token,
-                })
-            }
+        let new_offset = match append_res {
+            UploadAppendResult::Committed { new_offset } => new_offset,
             UploadAppendResult::OffsetMismatch { current_offset } => {
-                Err(CoordinatorError::OffsetMismatch {
-                    expected: precondition,
+                return Err(CoordinatorError::OffsetMismatch {
+                    expected: expected_offset,
                     current: current_offset,
-                })
+                });
             }
-            UploadAppendResult::Conflict => Err(CoordinatorError::Conflict),
-        }
+            UploadAppendResult::Conflict => return Err(CoordinatorError::Conflict),
+        };
+
+        // 6. Sign and return fresh state token bound to new offset
+        let new_token = self.generate_state_token(repo, uuid, new_offset);
+        Ok(AppendResult {
+            session: session.clone(),
+            new_offset,
+            state_token: new_token,
+        })
     }
 
-    /// Finalizes an upload session by verifying digest, durably pinning in reference index,
-    /// and committing to the CAS store.
+    /// Finalizes an upload session and durably links it into the repository-scoped ledger and CAS store.
     pub async fn finalize_upload(
         &self,
         repo: &str,
@@ -417,12 +430,14 @@ impl BlobUploadCoordinator {
         trailing_stream: Option<UploadByteStream>,
         expected_digest: &Digest,
     ) -> Result<FinalizeResult, CoordinatorError> {
-        let session = UploadSessionId::new(repo, uuid);
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| CoordinatorError::InvalidRepoName(e.to_string()))?;
+        let session = UploadSessionId::new(canonical_repo, uuid);
 
         // 1. Check if finalized receipt already exists (idempotent retry)
         if let Ok(Some(receipt)) = self.storage.get_finalized_receipt(&session).await {
             // Receipt must strictly match the target repository and upload UUID
-            if receipt.repo != repo || receipt.uuid != uuid {
+            if receipt.repo.as_str() != repo || receipt.uuid != uuid {
                 return Err(CoordinatorError::SessionNotFound);
             }
             if receipt.digest != expected_digest.as_str() {
@@ -439,32 +454,14 @@ impl BlobUploadCoordinator {
                     ),
                 ));
             }
-            // Verify repository membership exists; if absent (e.g. intentionally deleted), DO NOT resurrect it!
+            // Fail closed if repository membership is missing (e.g. deleted) or corrupt
             let membership = self
                 .storage
                 .get_repo_blob_membership(repo, expected_digest)
-                .await?;
-            let Some(record) = membership else {
+                .await
+                .map_err(CoordinatorError::Storage)?;
+            if membership.is_none() {
                 return Err(CoordinatorError::SessionNotFound);
-            };
-            // Fail closed if membership record is corrupt or mismatching
-            if record.repo != repo || record.digest != *expected_digest {
-                return Err(CoordinatorError::Storage(
-                    crate::storage::StorageError::Internal(
-                        "corrupt repository membership record".to_string(),
-                    ),
-                ));
-            }
-
-            // Ensure reverse index is healthy and synchronized on retry
-            if let Some(ref idx) = self.ref_index {
-                idx.ensure_healthy_or_rebuild(&self.storage, true, false)
-                    .await
-                    .map_err(|e| {
-                        CoordinatorError::Storage(StorageError::Internal(e.to_string()))
-                    })?;
-                let _ = idx.record_membership(expected_digest, repo);
-                let _ = idx.mark_ready();
             }
 
             return Ok(FinalizeResult {
@@ -474,6 +471,7 @@ impl BlobUploadCoordinator {
             });
         }
 
+        // 2. Fetch authoritative session status to check state and validate pre-conditions
         let status = match self.storage.session_status(&session).await {
             Ok(s) => s,
             Err(UploadTransitionError::NotFound) => {
@@ -585,7 +583,7 @@ impl BlobUploadCoordinator {
         }
     }
 
-    /// Handles monolithic upload (POST /v2/<repo>/blobs/uploads/?digest=<digest>).
+    /// Performs a single-request monolithic upload or fast session creation.
     pub async fn monolithic_upload(
         &self,
         repo: &str,
@@ -632,9 +630,9 @@ impl BlobUploadCoordinator {
         from_repo: Option<&str>,
         digest: &Digest,
     ) -> Result<CrossMountResult, CoordinatorError> {
-        if !is_valid_repo_name(target_repo) {
-            return Err(CoordinatorError::InvalidRepoName(target_repo.to_string()));
-        }
+        let canonical_target =
+            crate::registry::canonical_name::CanonicalRepoName::parse(target_repo)
+                .map_err(|e| CoordinatorError::InvalidRepoName(e.to_string()))?;
 
         let Some(from_repo) = from_repo else {
             // Missing from parameter -> safe fallback to normal 202 upload session
@@ -642,9 +640,8 @@ impl BlobUploadCoordinator {
             return Ok(CrossMountResult::Fallback(start));
         };
 
-        if !is_valid_repo_name(from_repo) {
-            return Err(CoordinatorError::InvalidRepoName(from_repo.to_string()));
-        }
+        let canonical_from = crate::registry::canonical_name::CanonicalRepoName::parse(from_repo)
+            .map_err(|e| CoordinatorError::InvalidRepoName(e.to_string()))?;
 
         // 1. Verify source repository membership
         let src_membership = self
@@ -658,23 +655,14 @@ impl BlobUploadCoordinator {
             return Ok(CrossMountResult::Fallback(start));
         };
 
-        // 2. Verify global CAS blob exists
-        let meta = match self.storage.head_blob(digest).await {
-            Ok(m) => m,
-            Err(_) => {
-                let start = self.start_upload(target_repo).await?;
-                return Ok(CrossMountResult::Fallback(start));
-            }
-        };
-
-        // 3. Pin digest to protect against concurrent GC during mount
-        let pin_op_id = format!("mount-{}", uuid::Uuid::new_v4());
+        // 2. Durably pin the verified digest in BlobRefIndex
+        let op_id = uuid::Uuid::new_v4().to_string();
         let mut pin_guard = if let Some(ref idx) = self.ref_index {
             Some(
                 PinLeaseGuard::acquire_and_start(
                     Arc::clone(idx),
                     digest,
-                    &pin_op_id,
+                    &op_id,
                     self.config.gc_pin_duration_secs,
                 )
                 .await?,
@@ -683,7 +671,13 @@ impl BlobUploadCoordinator {
             None
         };
 
-        // 4. Mark dirty before linking target repository membership
+        // 3. Verify underlying CAS blob existence
+        let meta = match self.storage.head_blob(digest).await {
+            Ok(m) => m,
+            Err(e) => return Err(CoordinatorError::from(e)),
+        };
+
+        // 4. Durably mark reverse index dirty before storage mutation
         if let Some(ref idx) = self.ref_index {
             idx.ensure_healthy_or_rebuild(&self.storage, true, false)
                 .await
@@ -695,9 +689,9 @@ impl BlobUploadCoordinator {
         // 5. Durably create target repository membership
         let target_record =
             crate::storage::repo_membership::RepoBlobMembershipRecord::new_cross_mount(
-                target_repo,
+                canonical_target,
                 digest.clone(),
-                from_repo,
+                canonical_from,
             );
         let link_res = self.storage.link_repo_blob(&target_record).await;
 
@@ -733,7 +727,9 @@ impl BlobUploadCoordinator {
         // Validate optional state token if provided
         let _ = self.validate_state_token(state_param, repo, uuid, None, false)?;
 
-        let session = UploadSessionId::new(repo, uuid);
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| CoordinatorError::InvalidRepoName(e.to_string()))?;
+        let session = UploadSessionId::new(canonical_repo, uuid);
         self.storage.abort_session(&session).await?;
         Ok(())
     }

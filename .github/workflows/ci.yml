@@ -27,6 +27,17 @@ jobs:
           REGISTRY_PASSWORD: demo
         run: scripts/smoke.sh
 
+      - name: MinIO Live S3 contract test suite
+        env:
+          TEST_S3_ENDPOINT: "http://127.0.0.1:9000"
+          TEST_S3_REGION: "us-east-1"
+          TEST_S3_BUCKET: "registry-live-test"
+          AWS_ACCESS_KEY_ID: "minioadmin"
+          AWS_SECRET_ACCESS_KEY: "minioadmin"
+        run: |
+          scripts/start-minio.sh
+          cargo test --test s3_live_integration -- --nocapture
+
       - name: MinIO (S3 backend) smoke test
         env:
           REGISTRY_USERNAME: demo

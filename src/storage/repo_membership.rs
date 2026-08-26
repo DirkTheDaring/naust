@@ -1,3 +1,4 @@
+use crate::registry::canonical_name::{CanonicalRepoName, RepoNameError};
 use crate::registry::digest::Digest;
 use crate::storage::StorageError;
 use async_trait::async_trait;
@@ -7,21 +8,45 @@ use serde::{Deserialize, Serialize};
 pub const MEMBERSHIP_SCHEMA_VERSION: u32 = 1;
 pub const MEMBERSHIP_FORMAT_VERSION: u32 = 1;
 
-/// Encode repository name into a collision-free, single-segment URL-safe base64 string.
-pub fn encode_canonical_repo_key(repo: &str) -> String {
-    BASE64_URL_SAFE_NO_PAD.encode(repo.as_bytes())
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RepoKeyDecodeError {
+    #[error("malformed base64 encoding: {0}")]
+    MalformedEncoding(String),
+    #[error("non-utf8 bytes in decoded repository key")]
+    NonUtf8,
+    #[error("decoded value violates repository grammar: {0}")]
+    InvalidRepoName(#[from] RepoNameError),
+    #[error("unsupported key version: {0}")]
+    UnsupportedKeyVersion(String),
 }
 
-/// Decode a base64 URL-safe repository key back to its canonical UTF-8 string.
-pub fn decode_canonical_repo_key(encoded: &str) -> Option<String> {
-    BASE64_URL_SAFE_NO_PAD
+/// Encode canonical repository name into a collision-free, single-segment URL-safe base64 string.
+pub(crate) fn encode_canonical_repo_key(repo: &CanonicalRepoName) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(repo.as_str().as_bytes())
+}
+
+/// Decode a base64 URL-safe repository key back to its canonical repository identity with classified errors.
+pub(crate) fn decode_canonical_repo_key(
+    encoded: &str,
+) -> Result<CanonicalRepoName, RepoKeyDecodeError> {
+    if encoded.is_empty() {
+        return Err(RepoKeyDecodeError::MalformedEncoding(
+            "empty encoded repository key".to_string(),
+        ));
+    }
+    let bytes = BASE64_URL_SAFE_NO_PAD
         .decode(encoded.as_bytes())
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map_err(|e| RepoKeyDecodeError::MalformedEncoding(e.to_string()))?;
+    let s = String::from_utf8(bytes).map_err(|_| RepoKeyDecodeError::NonUtf8)?;
+    let canonical = CanonicalRepoName::parse(&s)?;
+    Ok(canonical)
 }
 
 /// Returns the canonical relative storage path for a repository blob membership record.
-pub fn canonical_repo_membership_relpath(repo: &str, digest: &Digest) -> String {
+pub(crate) fn canonical_repo_membership_relpath(
+    repo: &CanonicalRepoName,
+    digest: &Digest,
+) -> String {
     format!(
         "repo-memberships/by-repo/{}/{}/{}.json",
         encode_canonical_repo_key(repo),
@@ -31,7 +56,7 @@ pub fn canonical_repo_membership_relpath(repo: &str, digest: &Digest) -> String 
 }
 
 /// Returns the canonical relative storage prefix for all blob memberships of a specific repository.
-pub fn canonical_repo_membership_prefix(repo: &str) -> String {
+pub(crate) fn canonical_repo_membership_prefix(repo: &CanonicalRepoName) -> String {
     format!(
         "repo-memberships/by-repo/{}/",
         encode_canonical_repo_key(repo)
@@ -39,7 +64,7 @@ pub fn canonical_repo_membership_prefix(repo: &str) -> String {
 }
 
 /// Returns the global root prefix for all repository blob memberships.
-pub fn canonical_all_memberships_prefix() -> &'static str {
+pub(crate) fn canonical_all_memberships_prefix() -> &'static str {
     "repo-memberships/by-repo/"
 }
 
@@ -47,7 +72,7 @@ pub fn canonical_all_memberships_prefix() -> &'static str {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MembershipProvenance {
     Upload,
-    CrossMount { from_repo: String },
+    CrossMount { from_repo: CanonicalRepoName },
     Proxy,
     Migration,
 }
@@ -66,7 +91,7 @@ fn default_membership_state() -> MembershipState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoBlobMembershipRecord {
     pub schema_version: u32,
-    pub repo: String,
+    pub repo: CanonicalRepoName,
     pub digest: Digest,
     pub created_at_unix_secs: u64,
     pub provenance: MembershipProvenance,
@@ -80,14 +105,14 @@ pub struct RepoBlobMembershipRecord {
 }
 
 impl RepoBlobMembershipRecord {
-    pub fn new_upload(repo: impl Into<String>, digest: Digest, session_id: Option<String>) -> Self {
+    pub fn new_upload(repo: CanonicalRepoName, digest: Digest, session_id: Option<String>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         Self {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
-            repo: repo.into(),
+            repo,
             digest,
             created_at_unix_secs: now,
             provenance: MembershipProvenance::Upload,
@@ -99,9 +124,9 @@ impl RepoBlobMembershipRecord {
     }
 
     pub fn new_cross_mount(
-        repo: impl Into<String>,
+        repo: CanonicalRepoName,
         digest: Digest,
-        from_repo: impl Into<String>,
+        from_repo: CanonicalRepoName,
     ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -109,12 +134,10 @@ impl RepoBlobMembershipRecord {
             .unwrap_or(0);
         Self {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
-            repo: repo.into(),
+            repo,
             digest,
             created_at_unix_secs: now,
-            provenance: MembershipProvenance::CrossMount {
-                from_repo: from_repo.into(),
-            },
+            provenance: MembershipProvenance::CrossMount { from_repo },
             session_id: None,
             format_version: MEMBERSHIP_FORMAT_VERSION,
             state: MembershipState::Active,
@@ -122,14 +145,14 @@ impl RepoBlobMembershipRecord {
         }
     }
 
-    pub fn new_proxy(repo: impl Into<String>, digest: Digest) -> Self {
+    pub fn new_proxy(repo: CanonicalRepoName, digest: Digest) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         Self {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
-            repo: repo.into(),
+            repo,
             digest,
             created_at_unix_secs: now,
             provenance: MembershipProvenance::Proxy,
@@ -140,14 +163,14 @@ impl RepoBlobMembershipRecord {
         }
     }
 
-    pub fn new_migration(repo: impl Into<String>, digest: Digest) -> Self {
+    pub fn new_migration(repo: CanonicalRepoName, digest: Digest) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         Self {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
-            repo: repo.into(),
+            repo,
             digest,
             created_at_unix_secs: now,
             provenance: MembershipProvenance::Migration,
@@ -156,6 +179,39 @@ impl RepoBlobMembershipRecord {
             state: MembershipState::Active,
             unreferenced_since_unix_secs: None,
         }
+    }
+
+    pub fn try_new_upload(
+        repo: &str,
+        digest: Digest,
+        session_id: Option<String>,
+    ) -> Result<Self, RepoNameError> {
+        let canonical_repo = CanonicalRepoName::parse(repo)?;
+        Ok(Self::new_upload(canonical_repo, digest, session_id))
+    }
+
+    pub fn try_new_cross_mount(
+        repo: &str,
+        digest: Digest,
+        from_repo: &str,
+    ) -> Result<Self, RepoNameError> {
+        let canonical_repo = CanonicalRepoName::parse(repo)?;
+        let canonical_from = CanonicalRepoName::parse(from_repo)?;
+        Ok(Self::new_cross_mount(
+            canonical_repo,
+            digest,
+            canonical_from,
+        ))
+    }
+
+    pub fn try_new_proxy(repo: &str, digest: Digest) -> Result<Self, RepoNameError> {
+        let canonical_repo = CanonicalRepoName::parse(repo)?;
+        Ok(Self::new_proxy(canonical_repo, digest))
+    }
+
+    pub fn try_new_migration(repo: &str, digest: Digest) -> Result<Self, RepoNameError> {
+        let canonical_repo = CanonicalRepoName::parse(repo)?;
+        Ok(Self::new_migration(canonical_repo, digest))
     }
 
     pub fn mark_candidate(&mut self, since_unix_secs: u64) {
@@ -199,7 +255,7 @@ pub struct MigrationCheckpointRecord {
     pub owner_id: Option<String>,
     pub lease_expiry_unix_secs: Option<u64>,
     pub source_continuation_token: Option<String>,
-    pub current_repository: Option<String>,
+    pub current_repository: Option<CanonicalRepoName>,
     pub current_cursor: Option<String>,
     pub stats: MigrationStats,
     pub started_unix_secs: u64,

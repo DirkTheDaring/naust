@@ -2,6 +2,7 @@ use super::upload_session::*;
 use super::{
     BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage, StorageError, ensure_dir,
 };
+use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
 use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
 use async_trait::async_trait;
@@ -157,6 +158,23 @@ impl SerializableSha256 {
     }
 }
 
+/// Filesystem repository path codec: safely computes the directory path for a validated repository name,
+/// ensuring strict containment under `<base_root>/repos/`.
+pub(crate) fn fs_repo_dir(
+    base_root: &Path,
+    repo: &CanonicalRepoName,
+) -> Result<PathBuf, StorageError> {
+    let path = base_root.join("repos").join(repo.as_str());
+    for component in path.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err(StorageError::InvalidRepoName(
+                "path traversal attempt detected in repository path".to_string(),
+            ));
+        }
+    }
+    Ok(path)
+}
+
 const HASH_SHARDS: usize = 64;
 const REFERRER_SHARDS: usize = 64;
 
@@ -199,6 +217,11 @@ impl FsStorage {
         Self::try_new(root, max_upload_bytes).unwrap_or_else(|err| {
             panic!("failed to initialize FsStorage: {err}");
         })
+    }
+
+    /// Computes the repository root directory for a validated canonical repository identity.
+    pub fn repo_dir(&self, repo: &CanonicalRepoName) -> Result<PathBuf, StorageError> {
+        fs_repo_dir(&self.root, repo)
     }
 
     fn upload_hash_shard(
@@ -362,19 +385,19 @@ impl FsStorage {
         self.root.join("repos").join(name).join("tags").join(tag)
     }
 
-    fn repo_blobs_dir(&self, name: &str, algorithm: &str) -> PathBuf {
+    fn repo_blobs_dir(&self, repo: &CanonicalRepoName, algorithm: &str) -> PathBuf {
         self.root
             .join("repo-memberships")
             .join("by-repo")
             .join(crate::storage::repo_membership::encode_canonical_repo_key(
-                name,
+                repo,
             ))
             .join(algorithm)
     }
 
-    fn repo_blob_path(&self, name: &str, digest: &Digest) -> PathBuf {
+    fn repo_blob_path(&self, repo: &CanonicalRepoName, digest: &Digest) -> PathBuf {
         self.root
-            .join(crate::storage::repo_membership::canonical_repo_membership_relpath(name, digest))
+            .join(crate::storage::repo_membership::canonical_repo_membership_relpath(repo, digest))
     }
 
     fn referrers_path(&self, name: &str, subject: &Digest) -> PathBuf {
@@ -1136,9 +1159,7 @@ impl Storage for FsStorage {
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
         let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let path = canonical
-            .fs_repo_dir(&self.root)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?
+        let path = fs_repo_dir(&self.root, &canonical)?
             .join("meta")
             .join("lifecycle_journal.json");
         match tokio::fs::read(&path).await {
@@ -1151,10 +1172,7 @@ impl Storage for FsStorage {
     async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
         let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let meta_dir = canonical
-            .fs_repo_dir(&self.root)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?
-            .join("meta");
+        let meta_dir = fs_repo_dir(&self.root, &canonical)?.join("meta");
         ensure_dir(&meta_dir)?;
         let path = meta_dir.join("lifecycle_journal.json");
         let tmp_path = meta_dir.join(format!(".tmp.journal.{}", uuid::Uuid::new_v4()));
@@ -1171,10 +1189,7 @@ impl Storage for FsStorage {
     async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
         let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let meta_dir = canonical
-            .fs_repo_dir(&self.root)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?
-            .join("meta");
+        let meta_dir = fs_repo_dir(&self.root, &canonical)?.join("meta");
         let path = meta_dir.join("lifecycle_journal.json");
         match tokio::fs::remove_file(&path).await {
             Ok(_) => {
@@ -1195,9 +1210,7 @@ impl Storage for FsStorage {
     ) -> Result<bool, StorageError> {
         let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let repo_dir = canonical
-            .fs_repo_dir(&self.root)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let repo_dir = fs_repo_dir(&self.root, &canonical)?;
         ensure_dir(&repo_dir)?;
         let lock_path = repo_dir.join(".repo_lock");
         let key = format!("{}:{owner_id}:{lease_id}", canonical.as_str());
@@ -1644,7 +1657,7 @@ impl Storage for FsStorage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FsSessionMetaRecord {
     pub format_version: u32,
-    pub repo: String,
+    pub repo: crate::registry::canonical_name::CanonicalRepoName,
     pub uuid: String,
     pub state: UploadSessionState,
     pub committed_offset: u64,
@@ -1758,10 +1771,12 @@ async fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError
 #[async_trait]
 impl UploadSessionStorage for FsStorage {
     async fn create_session(&self, repo: &str) -> Result<UploadSessionId, StorageError> {
+        let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
         let dir = self.uploads_dir();
         ensure_dir(&dir)?;
         let uuid = uuid::Uuid::new_v4().to_string();
-        let session = UploadSessionId::new(repo, &uuid);
+        let session = UploadSessionId::new(canonical_repo.clone(), &uuid);
         let lock_path = self.session_lock_path(&uuid);
         let _lock = acquire_fs_session_lock(lock_path).await?;
 
@@ -1781,7 +1796,7 @@ impl UploadSessionStorage for FsStorage {
 
         let meta = FsSessionMetaRecord {
             format_version: 1,
-            repo: repo.to_string(),
+            repo: canonical_repo,
             uuid: uuid.clone(),
             state: UploadSessionState::Active,
             committed_offset: 0,
@@ -2631,7 +2646,7 @@ impl UploadSessionStorage for FsStorage {
                         && let Ok(meta) = serde_json::from_slice::<FsSessionMetaRecord>(&bytes)
                         && now.saturating_sub(meta.last_active_at_unix_secs) >= max_age_secs
                     {
-                        let session = UploadSessionId::new(&meta.repo, uuid);
+                        let session = UploadSessionId::new(meta.repo.clone(), uuid);
                         drop(_guard);
                         if meta.state == UploadSessionState::Finalizing {
                             let _ = self.recover_session(&session).await;
@@ -2679,7 +2694,9 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         digest: &Digest,
     ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
     {
-        let path = self.repo_blob_path(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let path = self.repo_blob_path(&canonical, digest);
         match tokio::fs::read(&path).await {
             Ok(bytes) => {
                 let record = serde_json::from_slice::<
@@ -2717,7 +2734,9 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         digest: &Digest,
         since_unix_secs: u64,
     ) -> Result<bool, StorageError> {
-        let path = self.repo_blob_path(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let path = self.repo_blob_path(&canonical, digest);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2743,7 +2762,9 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
-        let path = self.repo_blob_path(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let path = self.repo_blob_path(&canonical, digest);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -2767,7 +2788,9 @@ impl RepositoryBlobMembershipStorage for FsStorage {
     }
 
     async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
-        let path = self.repo_blob_path(repo, digest);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let path = self.repo_blob_path(&canonical, digest);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -2790,7 +2813,9 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         let max_limit = 1000;
         let limit = page_limit.min(max_limit).max(1);
 
-        let encoded_repo = crate::storage::repo_membership::encode_canonical_repo_key(repo);
+        let canonical = CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let encoded_repo = crate::storage::repo_membership::encode_canonical_repo_key(&canonical);
         let repo_dir = self
             .root
             .join("repo-memberships")
@@ -2926,7 +2951,7 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         #[derive(Eq, PartialEq)]
         struct Candidate {
             sort_key: String,
-            repo: String,
+            repo: crate::registry::canonical_name::CanonicalRepoName,
             digest: Digest,
             path: PathBuf,
         }
@@ -2954,11 +2979,13 @@ impl RepositoryBlobMembershipStorage for FsStorage {
                     .unwrap_or(false)
                 {
                     let repo_encoded = repo_entry.file_name().to_string_lossy().to_string();
-                    let Some(repo) =
+                    let repo =
                         crate::storage::repo_membership::decode_canonical_repo_key(&repo_encoded)
-                    else {
-                        continue;
-                    };
+                            .map_err(|e| {
+                            StorageError::Internal(format!(
+                                "corrupt repository membership directory '{repo_encoded}': {e}"
+                            ))
+                        })?;
                     let repo_path = repo_entry.path();
                     if let Ok(mut algo_entries) = tokio::fs::read_dir(&repo_path).await {
                         while let Ok(Some(algo_entry)) = algo_entries.next_entry().await {
@@ -4082,7 +4109,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(receipt.repo, "myrepo");
+        assert_eq!(receipt.repo.as_str(), "myrepo");
         assert_eq!(receipt.uuid, session.uuid);
         assert_eq!(receipt.digest, digest.as_str());
         assert_eq!(receipt.size, data.len() as u64);
@@ -4356,7 +4383,7 @@ mod tests {
             .await
             .unwrap()
             .expect("receipt exists");
-        assert_eq!(receipt.repo, repo);
+        assert_eq!(receipt.repo.as_str(), repo);
         assert_eq!(receipt.uuid, session.uuid);
         assert_eq!(receipt.digest, digest.as_str());
         assert_eq!(receipt.size, full.len() as u64);
@@ -4382,7 +4409,10 @@ mod tests {
         tokio::fs::write(&legacy_file, legacy_data).await.unwrap();
 
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
-        let session = UploadSessionId::new("legacy/repo", &legacy_uuid);
+        let session = UploadSessionId::new(
+            crate::registry::canonical_name::CanonicalRepoName::parse("legacy/repo").unwrap(),
+            &legacy_uuid,
+        );
 
         // First access via session_status triggers migration
         let status = storage.session_status(&session).await.unwrap();
@@ -4457,9 +4487,21 @@ mod tests {
         )
         .unwrap();
 
-        let r_upload =
-            RepoBlobMembershipRecord::new_upload(repo, d1.clone(), Some("sess-1".to_string()));
-        let r_cross = RepoBlobMembershipRecord::new_cross_mount(repo, d2.clone(), "source-repo");
+        let canonical_repo =
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+        let canonical_source =
+            crate::registry::canonical_name::CanonicalRepoName::parse("source-repo").unwrap();
+
+        let r_upload = RepoBlobMembershipRecord::new_upload(
+            canonical_repo.clone(),
+            d1.clone(),
+            Some("sess-1".to_string()),
+        );
+        let r_cross = RepoBlobMembershipRecord::new_cross_mount(
+            canonical_repo.clone(),
+            d2.clone(),
+            canonical_source.clone(),
+        );
 
         storage.link_repo_blob(&r_upload).await.unwrap();
         storage.link_repo_blob(&r_cross).await.unwrap();
@@ -4481,7 +4523,7 @@ mod tests {
         assert_eq!(
             fetched2.provenance,
             MembershipProvenance::CrossMount {
-                from_repo: "source-repo".to_string()
+                from_repo: canonical_source
             }
         );
 

@@ -10,6 +10,7 @@ use registry_rust::manifest_lifecycle::{
     LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase, ManifestLifecycleError,
     ManifestLifecycleService, ProxyPublicationEvidence, PublishManifestRequest, TagSnapshot,
 };
+use registry_rust::registry::canonical_name::CanonicalRepoName;
 use registry_rust::registry::digest::Digest;
 use registry_rust::storage::fs::FsStorage;
 use registry_rust::storage::mutation_authority::{
@@ -77,7 +78,13 @@ async fn write_test_blob(storage: &Arc<dyn Storage>, repo: &str, content: &[u8])
         .await
         .unwrap();
 
-    let rec = RepoBlobMembershipRecord::new_upload(repo, digest.clone(), Some("s1".to_string()));
+    let canonical_repo =
+        registry_rust::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+    let rec = RepoBlobMembershipRecord::new_upload(
+        canonical_repo,
+        digest.clone(),
+        Some("s1".to_string()),
+    );
     storage.link_repo_blob(&rec).await.unwrap();
     digest
 }
@@ -187,7 +194,7 @@ async fn test_interruption_after_manifest_storage_recovery() {
 
     let journal = LifecycleJournalRecord {
         op_id: "op-1".to_string(),
-        repo: repo.to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
         op_kind: LifecycleOpKind::Publish,
         target_digest: m_d.clone(),
         target_reference: Some("v1.0".to_string()),
@@ -256,7 +263,7 @@ async fn test_interruption_after_referrer_registration_recovery() {
 
     let journal = LifecycleJournalRecord {
         op_id: "op-ref".to_string(),
-        repo: repo.to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
         op_kind: LifecycleOpKind::Publish,
         target_digest: art_d.clone(),
         target_reference: Some("sig-tag".to_string()),
@@ -307,7 +314,7 @@ async fn test_interruption_after_tag_mutation_recovery() {
 
     let journal = LifecycleJournalRecord {
         op_id: "op-tag".to_string(),
-        repo: repo.to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
         op_kind: LifecycleOpKind::Publish,
         target_digest: m_d.clone(),
         target_reference: Some("release".to_string()),
@@ -417,7 +424,7 @@ async fn test_restart_recovery_all_journal_phases() {
             .unwrap();
         let journal = LifecycleJournalRecord {
             op_id: format!("op-{phase:?}"),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::Publish,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -474,7 +481,7 @@ async fn test_manifest_delete_interrupted_after_partial_tags() {
 
     let journal = LifecycleJournalRecord {
         op_id: "op-del-5".to_string(),
-        repo: repo.to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
         op_kind: LifecycleOpKind::DeleteManifest,
         target_digest: m_d.clone(),
         target_reference: None,
@@ -1104,11 +1111,7 @@ async fn test_cancellation_during_all_lifecycle_stages() {
         declared_media_type: None,
         allow_tag_overwrite: true,
     });
-    // Abort future mid-flight
-    tokio::select! {
-        _ = fut => {},
-        _ = tokio::time::sleep(Duration::from_millis(0)) => {},
-    };
+    drop(fut);
 
     // Subsequent operation must succeed without deadlock or leaked lock
     let pub_res = service
@@ -1250,7 +1253,7 @@ async fn test_gc_fails_closed_when_journal_incomplete_or_index_dirty() {
     // Write incomplete lifecycle journal
     let journal = LifecycleJournalRecord {
         op_id: "incomplete-op".to_string(),
-        repo: repo.to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
         op_kind: LifecycleOpKind::Publish,
         target_digest: m_d.clone(),
         target_reference: Some("v1".to_string()),
@@ -1427,7 +1430,8 @@ async fn test_shared_content_proxy_eviction_and_physical_gc_safety() {
     // Shared base layer
     let shared_layer = write_test_blob(&storage_trait, local_repo, b"shared-layer-bytes").await;
     // Proxy repo also links membership
-    let proxy_record = RepoBlobMembershipRecord::new_proxy(proxy_repo, shared_layer.clone());
+    let proxy_record =
+        RepoBlobMembershipRecord::try_new_proxy(proxy_repo, shared_layer.clone()).unwrap();
     storage.link_repo_blob(&proxy_record).await.unwrap();
 
     let local_cfg = write_test_blob(&storage_trait, local_repo, b"local-cfg").await;
@@ -1864,7 +1868,7 @@ async fn test_proxy_eviction_two_manifests_sharing_blob_preserves_live_manifest(
     let storage_trait = storage.clone() as Arc<dyn Storage>;
 
     let shared_blob = write_test_blob(&storage_trait, repo, b"shared-content").await;
-    let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, shared_blob.clone());
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, shared_blob.clone()).unwrap();
     storage.link_repo_blob(&proxy_record).await.unwrap();
 
     let cfg1 = write_test_blob(&storage_trait, repo, b"cfg1").await;
@@ -2054,7 +2058,7 @@ async fn test_proxy_eviction_restart_after_dirty_marker_and_initiated_journal() 
         let (storage, ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"proxy-evict-crash-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"proxy-cfg").await;
@@ -2074,7 +2078,7 @@ async fn test_proxy_eviction_restart_after_dirty_marker_and_initiated_journal() 
         ref_index.mark_dirty().unwrap();
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-1".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2149,7 +2153,7 @@ async fn test_proxy_eviction_restart_after_tag_alias_deleted() {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"proxy-tag-crash-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"proxy-cfg").await;
@@ -2171,7 +2175,7 @@ async fn test_proxy_eviction_restart_after_tag_alias_deleted() {
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-2".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2239,7 +2243,8 @@ async fn test_shared_content_across_two_repositories_gc_safety() {
 
     let storage_trait = storage.clone() as Arc<dyn Storage>;
     let shared_blob = write_test_blob(&storage_trait, repo_a, b"shared-cross-repo-blob").await;
-    let proxy_record = RepoBlobMembershipRecord::new_proxy(repo_b, shared_blob.clone());
+    let proxy_record =
+        RepoBlobMembershipRecord::try_new_proxy(repo_b, shared_blob.clone()).unwrap();
     storage.link_repo_blob(&proxy_record).await.unwrap();
 
     let cfg_a = write_test_blob(&storage_trait, repo_a, b"cfg-a").await;
@@ -2360,7 +2365,7 @@ async fn test_index_durability_ordering_crash_between_flush_and_mark_ready() {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"durability-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"durability-cfg").await;
@@ -2387,7 +2392,7 @@ async fn test_index_durability_ordering_crash_between_flush_and_mark_ready() {
 
         let journal = LifecycleJournalRecord {
             op_id: "durability-op-1".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2451,7 +2456,7 @@ async fn test_proxy_eviction_restart_manifest_deleted_before_phase_update() {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"unrecorded-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"unrecorded-cfg").await;
@@ -2473,7 +2478,7 @@ async fn test_proxy_eviction_restart_manifest_deleted_before_phase_update() {
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-unrecorded".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2533,7 +2538,7 @@ async fn test_proxy_eviction_restart_proxy_manifest_deleted_persisted() {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"persisted-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"persisted-cfg").await;
@@ -2554,7 +2559,7 @@ async fn test_proxy_eviction_restart_proxy_manifest_deleted_persisted() {
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-manifest-deleted".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2614,7 +2619,7 @@ async fn test_proxy_eviction_restart_memberships_unlinked_before_phase_update() 
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"unlinked-before-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"unlinked-before-cfg").await;
@@ -2637,7 +2642,7 @@ async fn test_proxy_eviction_restart_memberships_unlinked_before_phase_update() 
         // Journal phase still recorded as ProxyManifestDeleted
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-unlinked-early".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2697,7 +2702,7 @@ async fn test_proxy_eviction_restart_proxy_memberships_unlinked_persisted() {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"unlinked-persisted-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"unlinked-persisted-cfg").await;
@@ -2719,7 +2724,7 @@ async fn test_proxy_eviction_restart_proxy_memberships_unlinked_persisted() {
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-memberships-unlinked".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2779,7 +2784,7 @@ async fn test_proxy_eviction_restart_index_reconciled_not_flushed() {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"unflushed-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"unflushed-cfg").await;
@@ -2801,7 +2806,7 @@ async fn test_proxy_eviction_restart_index_reconciled_not_flushed() {
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-unflushed".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2861,7 +2866,7 @@ async fn test_proxy_eviction_restart_index_flushed_not_ready() {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"flushed-not-ready-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"flushed-not-ready-cfg").await;
@@ -2884,7 +2889,7 @@ async fn test_proxy_eviction_restart_index_flushed_not_ready() {
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-flushed-not-ready".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -2905,8 +2910,11 @@ async fn test_proxy_eviction_restart_index_flushed_not_ready() {
             .await
             .unwrap();
 
+        drop(service);
+        drop(ref_index);
         (m_d, layer)
     };
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     service
@@ -2944,7 +2952,7 @@ async fn test_proxy_eviction_restart_ready_set_journal_present() {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"ready-journal-present-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"ready-journal-present-cfg").await;
@@ -2970,7 +2978,7 @@ async fn test_proxy_eviction_restart_ready_set_journal_present() {
         // Journal still on disk (crash immediately before delete_journal)
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-ready-journal-present".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),
@@ -3030,7 +3038,7 @@ async fn test_proxy_eviction_restart_journal_deletion_lost_retry_is_idempotent()
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
         let storage_trait = storage.clone() as Arc<dyn Storage>;
         let layer = write_test_blob(&storage_trait, repo, b"lost-delete-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::new_proxy(repo, layer.clone());
+        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
 
         let cfg = write_test_blob(&storage_trait, repo, b"lost-delete-cfg").await;
@@ -3048,7 +3056,7 @@ async fn test_proxy_eviction_restart_journal_deletion_lost_retry_is_idempotent()
 
         let journal = LifecycleJournalRecord {
             op_id: "evict-op-lost-delete".to_string(),
-            repo: repo.to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
             op_kind: LifecycleOpKind::ProxyEvict,
             target_digest: m_d.clone(),
             target_reference: Some("v1".to_string()),

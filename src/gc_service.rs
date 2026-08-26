@@ -358,7 +358,7 @@ impl GcService {
                 stats.scanned += 1;
                 let is_referenced = match crate::blob_delete_safety::find_repo_blob_reference(
                     &self.storage,
-                    &rec.repo,
+                    rec.repo.as_str(),
                     &rec.digest,
                 )
                 .await
@@ -377,7 +377,7 @@ impl GcService {
                         || rec.unreferenced_since_unix_secs.is_some()
                     {
                         match ledger
-                            .reactivate_with_guard(&guard, &rec.repo, &rec.digest)
+                            .reactivate_with_guard(&guard, rec.repo.as_str(), &rec.digest)
                             .await
                         {
                             Ok(true) => stats.activated += 1,
@@ -398,7 +398,7 @@ impl GcService {
                         || rec.unreferenced_since_unix_secs.is_none()
                     {
                         match ledger
-                            .set_candidate_with_guard(&guard, &rec.repo, &rec.digest, now)
+                            .set_candidate_with_guard(&guard, rec.repo.as_str(), &rec.digest, now)
                             .await
                         {
                             Ok(true) => stats.candidated += 1,
@@ -419,7 +419,7 @@ impl GcService {
                             let still_referenced =
                                 match crate::blob_delete_safety::find_repo_blob_reference(
                                     &self.storage,
-                                    &rec.repo,
+                                    rec.repo.as_str(),
                                     &rec.digest,
                                 )
                                 .await
@@ -430,7 +430,7 @@ impl GcService {
 
                             if !still_referenced {
                                 match ledger
-                                    .unlink_with_guard(&guard, &rec.repo, &rec.digest)
+                                    .unlink_with_guard(&guard, rec.repo.as_str(), &rec.digest)
                                     .await
                                 {
                                     Ok(true) => {
@@ -914,7 +914,9 @@ mod tests {
         let blob = Digest::parse(&format!("sha256:{}", "e".repeat(64))).expect("digest");
         write_blob(&fs_root, &blob, b"agingdata").await;
 
-        let rec = RepoBlobMembershipRecord::new_upload(repo, blob.clone(), None);
+        let canonical_repo =
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+        let rec = RepoBlobMembershipRecord::new_upload(canonical_repo, blob.clone(), None);
         storage.link_repo_blob(&rec).await.unwrap();
         idx.record_membership(&blob, repo).unwrap();
 

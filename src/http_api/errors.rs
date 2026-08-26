@@ -114,7 +114,7 @@ pub fn name_invalid() -> Response {
             detail: None,
         }],
     };
-    error_response(StatusCode::NOT_FOUND, body)
+    error_response(StatusCode::BAD_REQUEST, body)
 }
 
 pub fn name_unknown() -> Response {

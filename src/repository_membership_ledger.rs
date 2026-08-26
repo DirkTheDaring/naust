@@ -119,7 +119,7 @@ impl RepositoryMembershipLedger {
 
         // 4. Update and flush reverse index
         if let LedgerIndexMode::Indexed(ref idx) = self.mode {
-            idx.record_membership(&record.digest, &record.repo)?;
+            idx.record_membership(&record.digest, record.repo.as_str())?;
             idx.flush()?;
             // 5. Mark index ready
             idx.mark_ready()?;
@@ -288,7 +288,9 @@ mod tests {
         .unwrap();
         let repo = "my-test-app";
 
-        let record = RepoBlobMembershipRecord::new_upload(repo, digest.clone(), None);
+        let canonical_repo =
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+        let record = RepoBlobMembershipRecord::new_upload(canonical_repo, digest.clone(), None);
 
         // 1. Link via ledger
         ledger.link(&record).await.expect("link");
@@ -321,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ledger_dirty_index_reconciliation() {
+    async fn test_ledger_dirty_index_rebuilds_from_storage() {
         let (_dir, ledger, idx, storage) = setup_test_ledger();
         let digest = Digest::parse(
             "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -330,7 +332,9 @@ mod tests {
         let repo = "reconcile-app";
 
         // Create storage marker directly
-        let record = RepoBlobMembershipRecord::new_upload(repo, digest.clone(), None);
+        let canonical_repo =
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+        let record = RepoBlobMembershipRecord::new_upload(canonical_repo, digest.clone(), None);
         storage.link_repo_blob(&record).await.unwrap();
 
         // Mark index dirty
@@ -366,7 +370,9 @@ mod tests {
         .unwrap();
         let repo = "storage-only-app";
 
-        let record = RepoBlobMembershipRecord::new_upload(repo, digest.clone(), None);
+        let canonical_repo =
+            crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+        let record = RepoBlobMembershipRecord::new_upload(canonical_repo, digest.clone(), None);
         ledger.link(&record).await.expect("link");
 
         let has = ledger.has_any_membership(&digest).await.expect("has");

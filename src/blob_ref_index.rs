@@ -600,7 +600,7 @@ impl BlobRefIndex {
                 .list_all_repo_blob_memberships_page(token.as_deref(), 256)
                 .await?;
             for rec in page {
-                self.record_membership(&rec.digest, &rec.repo)?;
+                self.record_membership(&rec.digest, rec.repo.as_str())?;
             }
             match next_tok {
                 Some(tok) => token = Some(tok),

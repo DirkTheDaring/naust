@@ -1,18 +1,46 @@
+use crate::registry::canonical_name::{CanonicalRepoName, RepoNameError};
 use crate::security::RepoAction;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OciRoute {
     V2Ping,
     Catalog,
-    ExtensionDiscovery { repo: Option<String> },
-    UploadInitiate { repo: String },
-    UploadSession { repo: String, uuid: String },
-    Blob { repo: String, digest: String },
-    Manifest { repo: String, reference: String },
-    TagsList { repo: String },
-    TagDelete { repo: String, tag: String },
-    Referrers { repo: String, digest: String },
-    Unknown { path: String },
+    ExtensionDiscovery {
+        repo: Option<CanonicalRepoName>,
+    },
+    UploadInitiate {
+        repo: CanonicalRepoName,
+    },
+    UploadSession {
+        repo: CanonicalRepoName,
+        uuid: String,
+    },
+    Blob {
+        repo: CanonicalRepoName,
+        digest: String,
+    },
+    Manifest {
+        repo: CanonicalRepoName,
+        reference: String,
+    },
+    TagsList {
+        repo: CanonicalRepoName,
+    },
+    TagDelete {
+        repo: CanonicalRepoName,
+        tag: String,
+    },
+    Referrers {
+        repo: CanonicalRepoName,
+        digest: String,
+    },
+    InvalidRepoName {
+        raw_repo: String,
+        error: RepoNameError,
+    },
+    Unknown {
+        path: String,
+    },
 }
 
 impl OciRoute {
@@ -47,14 +75,28 @@ impl OciRoute {
             return OciRoute::ExtensionDiscovery { repo: None };
         }
 
+        // Helper closure to parse repo segment into CanonicalRepoName
+        let parse_repo = |repo_str: &str| -> Result<CanonicalRepoName, RepoNameError> {
+            if repo_str.contains('%') {
+                return Err(RepoNameError::InvalidCharacter('%'));
+            }
+            CanonicalRepoName::parse(repo_str)
+        };
+
         // Repo-level /v2/<name>/_oci/ext/discover
         if segments.len() >= 4
             && segments[segments.len() - 3] == "_oci"
             && segments[segments.len() - 2] == "ext"
             && segments[segments.len() - 1] == "discover"
         {
-            let repo = segments[..segments.len() - 3].join("/");
-            return OciRoute::ExtensionDiscovery { repo: Some(repo) };
+            let repo_str = segments[..segments.len() - 3].join("/");
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::ExtensionDiscovery { repo: Some(repo) },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // Tags endpoints:
@@ -63,8 +105,14 @@ impl OciRoute {
             && segments[segments.len() - 2] == "tags"
             && segments[segments.len() - 1] == "list"
         {
-            let repo = segments[..segments.len() - 2].join("/");
-            return OciRoute::TagsList { repo };
+            let repo_str = segments[..segments.len() - 2].join("/");
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::TagsList { repo },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // /v2/<name>/tags/reference/<tag>
@@ -72,25 +120,43 @@ impl OciRoute {
             && segments[segments.len() - 3] == "tags"
             && segments[segments.len() - 2] == "reference"
         {
-            let repo = segments[..segments.len() - 3].join("/");
+            let repo_str = segments[..segments.len() - 3].join("/");
             let tag = segments[segments.len() - 1].to_string();
-            return OciRoute::TagDelete { repo, tag };
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::TagDelete { repo, tag },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // Referrers endpoint:
         // /v2/<name>/referrers/<digest>
         if segments.len() >= 2 && segments[segments.len() - 2] == "referrers" {
-            let repo = segments[..segments.len() - 2].join("/");
+            let repo_str = segments[..segments.len() - 2].join("/");
             let digest = segments[segments.len() - 1].to_string();
-            return OciRoute::Referrers { repo, digest };
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::Referrers { repo, digest },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // Manifests endpoint:
         // /v2/<name>/manifests/<reference>
         if segments.len() >= 2 && segments[segments.len() - 2] == "manifests" {
-            let repo = segments[..segments.len() - 2].join("/");
+            let repo_str = segments[..segments.len() - 2].join("/");
             let reference = segments[segments.len() - 1].to_string();
-            return OciRoute::Manifest { repo, reference };
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::Manifest { repo, reference },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // Upload initiation:
@@ -99,8 +165,14 @@ impl OciRoute {
             && segments[segments.len() - 2] == "blobs"
             && segments[segments.len() - 1] == "uploads"
         {
-            let repo = segments[..segments.len() - 2].join("/");
-            return OciRoute::UploadInitiate { repo };
+            let repo_str = segments[..segments.len() - 2].join("/");
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::UploadInitiate { repo },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // Upload session:
@@ -109,17 +181,29 @@ impl OciRoute {
             && segments[segments.len() - 3] == "blobs"
             && segments[segments.len() - 2] == "uploads"
         {
-            let repo = segments[..segments.len() - 3].join("/");
+            let repo_str = segments[..segments.len() - 3].join("/");
             let uuid = segments[segments.len() - 1].to_string();
-            return OciRoute::UploadSession { repo, uuid };
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::UploadSession { repo, uuid },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         // Blob endpoint:
         // /v2/<name>/blobs/<digest>
         if segments.len() >= 2 && segments[segments.len() - 2] == "blobs" {
-            let repo = segments[..segments.len() - 2].join("/");
+            let repo_str = segments[..segments.len() - 2].join("/");
             let digest = segments[segments.len() - 1].to_string();
-            return OciRoute::Blob { repo, digest };
+            return match parse_repo(&repo_str) {
+                Ok(repo) => OciRoute::Blob { repo, digest },
+                Err(error) => OciRoute::InvalidRepoName {
+                    raw_repo: repo_str,
+                    error,
+                },
+            };
         }
 
         OciRoute::Unknown {
@@ -127,10 +211,13 @@ impl OciRoute {
         }
     }
 
-    pub fn repository(&self) -> Option<&str> {
+    pub fn repository(&self) -> Option<&CanonicalRepoName> {
         match self {
-            OciRoute::V2Ping | OciRoute::Catalog | OciRoute::Unknown { .. } => None,
-            OciRoute::ExtensionDiscovery { repo } => repo.as_deref(),
+            OciRoute::V2Ping
+            | OciRoute::Catalog
+            | OciRoute::InvalidRepoName { .. }
+            | OciRoute::Unknown { .. } => None,
+            OciRoute::ExtensionDiscovery { repo } => repo.as_ref(),
             OciRoute::UploadInitiate { repo }
             | OciRoute::UploadSession { repo, .. }
             | OciRoute::Blob { repo, .. }
@@ -143,7 +230,10 @@ impl OciRoute {
 
     pub fn required_action(&self, method: &http::Method) -> Option<RepoAction> {
         match self {
-            OciRoute::V2Ping | OciRoute::ExtensionDiscovery { .. } | OciRoute::Catalog => None,
+            OciRoute::V2Ping
+            | OciRoute::ExtensionDiscovery { .. }
+            | OciRoute::Catalog
+            | OciRoute::InvalidRepoName { .. } => None,
             OciRoute::UploadInitiate { .. } => Some(RepoAction::Push),
             OciRoute::UploadSession { .. } => match *method {
                 http::Method::GET | http::Method::HEAD => Some(RepoAction::Pull),
@@ -190,55 +280,67 @@ mod tests {
         assert_eq!(
             OciRoute::parse("/v2/org/app/_oci/ext/discover"),
             OciRoute::ExtensionDiscovery {
-                repo: Some("org/app".to_string())
+                repo: Some(CanonicalRepoName::parse("org/app").unwrap())
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/org/app/blobs/uploads/"),
             OciRoute::UploadInitiate {
-                repo: "org/app".to_string()
+                repo: CanonicalRepoName::parse("org/app").unwrap()
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/v2-repo/blobs/uploads/123-uuid"),
             OciRoute::UploadSession {
-                repo: "v2-repo".to_string(),
+                repo: CanonicalRepoName::parse("v2-repo").unwrap(),
                 uuid: "123-uuid".to_string()
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/2026/app/blobs/sha256:123"),
             OciRoute::Blob {
-                repo: "2026/app".to_string(),
+                repo: CanonicalRepoName::parse("2026/app").unwrap(),
                 digest: "sha256:123".to_string()
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/org/app/manifests/v1.0.0"),
             OciRoute::Manifest {
-                repo: "org/app".to_string(),
+                repo: CanonicalRepoName::parse("org/app").unwrap(),
                 reference: "v1.0.0".to_string()
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/org/app/tags/list"),
             OciRoute::TagsList {
-                repo: "org/app".to_string()
+                repo: CanonicalRepoName::parse("org/app").unwrap()
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/org/app/tags/reference/tag1"),
             OciRoute::TagDelete {
-                repo: "org/app".to_string(),
+                repo: CanonicalRepoName::parse("org/app").unwrap(),
                 tag: "tag1".to_string()
             }
         );
         assert_eq!(
             OciRoute::parse("/v2/org/app/referrers/sha256:123"),
             OciRoute::Referrers {
-                repo: "org/app".to_string(),
+                repo: CanonicalRepoName::parse("org/app").unwrap(),
                 digest: "sha256:123".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_invalid_repo_route_parsing() {
+        assert!(matches!(
+            OciRoute::parse("/v2/INVALID/manifests/latest"),
+            OciRoute::InvalidRepoName { .. }
+        ));
+        assert!(matches!(
+            OciRoute::parse("/v2/team%2fimage/manifests/latest"),
+            OciRoute::InvalidRepoName { .. }
+        ));
     }
 }

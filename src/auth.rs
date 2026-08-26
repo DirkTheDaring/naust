@@ -72,29 +72,16 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
 
 /// Legacy repository push allowlist matcher.
 ///
-/// Compatibility Contract:
-/// - `*` authorizes any repository.
-/// - `prefix/*` authorizes `prefix` itself as well as any `prefix/...` descendants.
-/// - Exact string `pat == repo` authorizes only the specified repository name.
+/// Push allowlist authorization evaluator:
+/// - `*` (`RepositoryAccessPattern::All`) authorizes any repository.
+/// - `prefix/*` (`RepositoryAccessPattern::Subtree`) authorizes `prefix` itself as well as any `prefix/...` descendants.
+/// - Exact repository (`RepositoryAccessPattern::Exact`) authorizes only the specified repository name.
 /// - Empty allowlist or non-matching repository returns `false`.
-pub(crate) fn legacy_repo_allowed(allowlist: &[String], repo: &str) -> bool {
-    let repo = repo.trim();
-    if repo.is_empty() {
-        return false;
-    }
-    allowlist.iter().any(|pat| {
-        let pat = pat.trim();
-        if pat.is_empty() {
-            return false;
-        }
-        if pat == "*" {
-            return true;
-        }
-        if let Some(prefix) = pat.strip_suffix("/*") {
-            return repo == prefix || repo.starts_with(&format!("{prefix}/"));
-        }
-        pat == repo
-    })
+pub(crate) fn push_repository_allowed(
+    allowlist: &[crate::registry::RepositoryAccessPattern],
+    repo: &crate::registry::CanonicalRepoName,
+) -> bool {
+    allowlist.iter().any(|pat| pat.matches(repo))
 }
 
 pub(crate) fn unauthorized_registry_challenge(state: &AppState, repo: Option<&str>) -> Response {
@@ -221,12 +208,12 @@ fn verify_direct_basic_access(
     cfg: &crate::config::Config,
     user: &str,
     pass: &str,
-    repo_name: &str,
+    repo: &crate::registry::CanonicalRepoName,
     action: &str,
 ) -> bool {
     let token_scopes = [crate::security::TokenScope {
         typ: "repository".to_string(),
-        name: repo_name.to_string(),
+        name: repo.as_str().to_string(),
         actions: vec![action.to_string()],
     }];
 
@@ -264,7 +251,7 @@ fn verify_direct_basic_access(
     {
         if user == expected_user && pass == expected_pass {
             if let Some(allowlist) = cfg.push_allow_repos.as_deref() {
-                return legacy_repo_allowed(allowlist, repo_name);
+                return push_repository_allowed(allowlist, repo);
             }
             return true;
         }
@@ -286,6 +273,13 @@ pub async fn require_auth_middleware(
     }
 
     let route = crate::http_api::routing::OciRoute::parse(&path);
+
+    if matches!(
+        route,
+        crate::http_api::routing::OciRoute::InvalidRepoName { .. }
+    ) {
+        return crate::http_api::errors::name_invalid().into_response();
+    }
 
     // V2 ping and extension discovery are public discovery endpoints
     if matches!(
@@ -313,7 +307,7 @@ pub async fn require_auth_middleware(
         _ => {}
     }
 
-    let repo = route.repository().map(|s| s.to_string());
+    let repo = route.repository().map(|r| r.as_str().to_string());
     let is_private_repo = repo
         .as_deref()
         .map(|r| state.config.is_repo_private(r))
@@ -367,9 +361,10 @@ pub async fn require_auth_middleware(
         return unauthorized_catalog_challenge(&state);
     }
 
-    let Some(repo_name) = repo.as_deref() else {
+    let Some(canonical_repo) = route.repository() else {
         return unauthorized_registry_challenge(&state, None);
     };
+    let repo_name = canonical_repo.as_str();
 
     if required_action == security::RepoAction::Pull
         && !pull_needs_auth
@@ -393,7 +388,7 @@ pub async fn require_auth_middleware(
 
                 if required_action == security::RepoAction::Push {
                     if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                        if !legacy_repo_allowed(allowlist, repo_name) {
+                        if !push_repository_allowed(allowlist, canonical_repo) {
                             return errors::denied("push not allowed for this repository")
                                 .into_response();
                         }
@@ -415,7 +410,7 @@ pub async fn require_auth_middleware(
                 &state.config,
                 basic.username(),
                 basic.password(),
-                repo_name,
+                canonical_repo,
                 action_str,
             ) {
                 return next.run(request).await;
@@ -430,7 +425,7 @@ pub async fn require_auth_middleware(
 mod tests {
     use super::{
         bearer_claims_are_authenticated, bearer_token_from_headers, extract_repo_from_v2_path,
-        legacy_repo_allowed,
+        push_repository_allowed,
     };
     use crate::security;
     use axum::http::HeaderMap;
@@ -498,27 +493,37 @@ mod tests {
     }
 
     #[test]
-    fn legacy_repo_allowed_matches_exact_and_prefix() {
-        let allowlist = vec!["org/repo".to_string(), "org/*".to_string()];
-        assert!(legacy_repo_allowed(&allowlist, "org/repo"));
-        assert!(legacy_repo_allowed(&allowlist, "org/other"));
-        assert!(!legacy_repo_allowed(&allowlist, "other/repo"));
+    fn push_repository_allowed_matches_exact_and_prefix() {
+        let allowlist = vec![
+            crate::registry::RepositoryAccessPattern::parse("org/repo").unwrap(),
+            crate::registry::RepositoryAccessPattern::parse("org/*").unwrap(),
+        ];
+        let cand_repo = crate::registry::CanonicalRepoName::parse("org/repo").unwrap();
+        let cand_other = crate::registry::CanonicalRepoName::parse("org/other").unwrap();
+        let cand_diff = crate::registry::CanonicalRepoName::parse("other/repo").unwrap();
+        assert!(push_repository_allowed(&allowlist, &cand_repo));
+        assert!(push_repository_allowed(&allowlist, &cand_other));
+        assert!(!push_repository_allowed(&allowlist, &cand_diff));
     }
 
     #[test]
-    fn legacy_repo_allowed_star_allows_everything() {
-        let allowlist = vec!["*".to_string()];
-        assert!(legacy_repo_allowed(&allowlist, "anything/here"));
-        assert!(legacy_repo_allowed(&allowlist, "single"));
+    fn push_repository_allowed_star_allows_everything() {
+        let allowlist = vec![crate::registry::RepositoryAccessPattern::parse("*").unwrap()];
+        let cand_anything = crate::registry::CanonicalRepoName::parse("anything/here").unwrap();
+        let cand_single = crate::registry::CanonicalRepoName::parse("single").unwrap();
+        assert!(push_repository_allowed(&allowlist, &cand_anything));
+        assert!(push_repository_allowed(&allowlist, &cand_single));
     }
 
     #[test]
-    fn legacy_repo_allowed_prefix_matches_exact_prefix_repo_too() {
-        let allowlist = vec!["org/*".to_string()];
-        // This registry treats 'org/*' as allowing 'org' and 'org/...'.
-        assert!(legacy_repo_allowed(&allowlist, "org"));
-        assert!(legacy_repo_allowed(&allowlist, "org/repo"));
-        assert!(!legacy_repo_allowed(&allowlist, "org2/repo"));
+    fn push_repository_allowed_prefix_matches_exact_prefix_repo_too() {
+        let allowlist = vec![crate::registry::RepositoryAccessPattern::parse("org/*").unwrap()];
+        let cand_org = crate::registry::CanonicalRepoName::parse("org").unwrap();
+        let cand_org_repo = crate::registry::CanonicalRepoName::parse("org/repo").unwrap();
+        let cand_org2_repo = crate::registry::CanonicalRepoName::parse("org2/repo").unwrap();
+        assert!(push_repository_allowed(&allowlist, &cand_org));
+        assert!(push_repository_allowed(&allowlist, &cand_org_repo));
+        assert!(!push_repository_allowed(&allowlist, &cand_org2_repo));
     }
 
     #[test]

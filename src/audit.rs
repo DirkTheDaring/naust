@@ -9,7 +9,7 @@ pub struct AuditReport {
 fn merge_grants(grants: &[rbac::Grant]) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for g in grants {
-        let prefix = g.repo_prefix.trim().to_string();
+        let prefix = g.repo_pattern.to_string();
         if prefix.is_empty() {
             continue;
         }
@@ -241,14 +241,8 @@ mod tests {
     #[test]
     fn merge_grants_unions_actions_per_prefix() {
         let grants = vec![
-            rbac::Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["pull".to_string()],
-            },
-            rbac::Grant {
-                repo_prefix: "org/".to_string(),
-                actions: vec!["push".to_string(), "pull".to_string()],
-            },
+            rbac::Grant::try_new("org/", vec!["pull".to_string()]).unwrap(),
+            rbac::Grant::try_new("org/", vec!["push".to_string(), "pull".to_string()]).unwrap(),
         ];
 
         let merged = merge_grants(&grants);
