@@ -261,7 +261,22 @@ pub fn size_invalid(message: &str) -> Response {
     error_response(StatusCode::BAD_REQUEST, body)
 }
 
+/// Standard OCI error response for invalid upload chunk range:
+/// HTTP 416 Range Not Satisfiable with standard OCI code `BLOB_UPLOAD_INVALID`.
 pub fn range_invalid(message: &str) -> Response {
+    let body = ErrorBody {
+        errors: vec![RegistryErrorItem {
+            code: "BLOB_UPLOAD_INVALID",
+            message: message.to_string(),
+            detail: None,
+        }],
+    };
+    error_response(StatusCode::RANGE_NOT_SATISFIABLE, body)
+}
+
+/// Compatibility extension error response for nonstandard clients expecting `RANGE_INVALID`.
+#[allow(dead_code)]
+pub fn range_invalid_compat(message: &str) -> Response {
     let body = ErrorBody {
         errors: vec![RegistryErrorItem {
             code: "RANGE_INVALID",

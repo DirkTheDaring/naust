@@ -40,6 +40,7 @@ pub struct BlobRefIndex {
     root_counts: sled::Tree,
     rev_edges: sled::Tree,
     pins: sled::Tree,
+    repo_memberships: sled::Tree,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,6 +69,27 @@ fn encode_pin_record(rec: &PinRecord) -> Result<Vec<u8>, RefIndexError> {
     serde_json::to_vec(rec).map_err(|e| RefIndexError::Corrupt(format!("invalid pin record: {e}")))
 }
 
+fn encode_repo_membership_key(digest: &Digest, repo: &str) -> Vec<u8> {
+    let s = digest.as_str();
+    let digest_bytes = s.as_bytes();
+    let repo_bytes = repo.as_bytes();
+    let mut key = Vec::with_capacity(2 + digest_bytes.len() + 4 + repo_bytes.len());
+    key.extend_from_slice(&(digest_bytes.len() as u16).to_be_bytes());
+    key.extend_from_slice(digest_bytes);
+    key.extend_from_slice(&(repo_bytes.len() as u32).to_be_bytes());
+    key.extend_from_slice(repo_bytes);
+    key
+}
+
+fn encode_repo_membership_prefix(digest: &Digest) -> Vec<u8> {
+    let s = digest.as_str();
+    let digest_bytes = s.as_bytes();
+    let mut prefix = Vec::with_capacity(2 + digest_bytes.len());
+    prefix.extend_from_slice(&(digest_bytes.len() as u16).to_be_bytes());
+    prefix.extend_from_slice(digest_bytes);
+    prefix
+}
+
 impl BlobRefIndex {
     pub fn open(path: PathBuf) -> Result<Self, RefIndexError> {
         let db = sled::open(path)?;
@@ -76,6 +98,7 @@ impl BlobRefIndex {
         let root_counts = db.open_tree("root_counts")?;
         let rev_edges = db.open_tree("rev_edges")?;
         let pins = db.open_tree("pins")?;
+        let repo_memberships = db.open_tree("repo_memberships")?;
 
         Ok(Self {
             db,
@@ -84,15 +107,17 @@ impl BlobRefIndex {
             root_counts,
             rev_edges,
             pins,
+            repo_memberships,
         })
     }
 
     // Pin/lease store (for online blob GC safety): best-effort and conservative.
     // - The server owns the sled DB; external tools must not mutate it.
     // - Pinning should never break pushes; callers should treat errors as non-fatal.
-    pub fn pin_blob(
+    pub fn acquire_pin(
         &self,
         digest: &Digest,
+        pin_id: &str,
         until: SystemTime,
         reason: &str,
     ) -> Result<(), RefIndexError> {
@@ -101,7 +126,7 @@ impl BlobRefIndex {
             return Ok(());
         };
 
-        let key = digest.as_str();
+        let key = format!("{}:{}", digest.as_str(), pin_id);
 
         if let Some(existing) = self.pins.get(key.as_bytes())? {
             if let Some(old) = decode_pin_record(&existing) {
@@ -121,23 +146,56 @@ impl BlobRefIndex {
         Ok(())
     }
 
+    pub fn release_pin(&self, digest: &Digest, pin_id: &str) -> Result<bool, RefIndexError> {
+        let key = format!("{}:{}", digest.as_str(), pin_id);
+        let removed = self.pins.remove(key.as_bytes())?.is_some();
+        if removed {
+            self.db.flush()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn pin_blob(
+        &self,
+        digest: &Digest,
+        until: SystemTime,
+        reason: &str,
+    ) -> Result<(), RefIndexError> {
+        self.acquire_pin(digest, "default", until, reason)
+    }
+
+    pub fn unpin_blob(&self, digest: &Digest, pin_id: &str) -> Result<bool, RefIndexError> {
+        self.release_pin(digest, pin_id)
+    }
+
     pub fn is_blob_pinned(&self, digest: &Digest, now: SystemTime) -> Result<bool, RefIndexError> {
         let Some(now_secs) = system_time_to_unix_secs(now) else {
             // Clock backwards / invalid: conservative.
             return Ok(true);
         };
 
-        let key = digest.as_str();
-        let Some(v) = self.pins.get(key.as_bytes())? else {
-            return Ok(false);
-        };
+        // Check exact key (backward compatibility with legacy single-key pins)
+        let exact_key = digest.as_str();
+        if let Some(v) = self.pins.get(exact_key.as_bytes())? {
+            if let Some(rec) = decode_pin_record(&v) {
+                if rec.until_unix_secs > now_secs {
+                    return Ok(true);
+                }
+            }
+        }
 
-        let Some(rec) = decode_pin_record(&v) else {
-            // Corrupt record: conservative.
-            return Ok(true);
-        };
+        // Check all scoped pin leases starting with "digest:"
+        let prefix = format!("{}:", digest.as_str());
+        for item in self.pins.scan_prefix(prefix.as_bytes()) {
+            let (_k, v) = item?;
+            if let Some(rec) = decode_pin_record(&v) {
+                if rec.until_unix_secs > now_secs {
+                    return Ok(true);
+                }
+            }
+        }
 
-        Ok(rec.until_unix_secs > now_secs)
+        Ok(false)
     }
 
     pub fn purge_expired_pins(&self, now: SystemTime) -> Result<u64, RefIndexError> {
@@ -162,6 +220,32 @@ impl BlobRefIndex {
             self.db.flush()?;
         }
         Ok(removed)
+    }
+
+    pub fn record_membership(&self, digest: &Digest, repo: &str) -> Result<(), RefIndexError> {
+        let key = encode_repo_membership_key(digest, repo);
+        self.repo_memberships.insert(&key, &[1u8])?;
+        Ok(())
+    }
+
+    pub fn remove_membership(&self, digest: &Digest, repo: &str) -> Result<bool, RefIndexError> {
+        let key = encode_repo_membership_key(digest, repo);
+        let removed = self.repo_memberships.remove(&key)?.is_some();
+        Ok(removed)
+    }
+
+    pub fn has_any_repo_membership(&self, digest: &Digest) -> Result<bool, RefIndexError> {
+        self.check_health()?;
+        let prefix = encode_repo_membership_prefix(digest);
+        let mut iter = self.repo_memberships.scan_prefix(&prefix);
+        Ok(iter.next().is_some())
+    }
+
+    pub fn get_membership_count(&self, digest: &Digest) -> Result<usize, RefIndexError> {
+        self.check_health()?;
+        let prefix = encode_repo_membership_prefix(digest);
+        let count = self.repo_memberships.scan_prefix(&prefix).count();
+        Ok(count)
     }
 
     pub fn check_health(&self) -> Result<(), RefIndexError> {
@@ -214,6 +298,11 @@ impl BlobRefIndex {
 
     pub fn mark_ready(&self) -> Result<(), RefIndexError> {
         self.meta.insert(META_STATE, META_STATE_READY)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), RefIndexError> {
         self.db.flush()?;
         Ok(())
     }
@@ -419,10 +508,27 @@ impl BlobRefIndex {
         self.tag_to_root.clear()?;
         self.root_counts.clear()?;
         self.rev_edges.clear()?;
+        self.repo_memberships.clear()?;
 
         let repos = storage.list_repositories().await?;
-        for repo in repos {
-            self.sync_repo_tags(storage, &repo).await?;
+        for repo in &repos {
+            self.sync_repo_tags(storage, repo).await?;
+        }
+
+        // Global bounded pagination over ALL repository blob memberships
+        // (Ensures membership-only repositories with zero tags/manifests are fully indexed)
+        let mut token: Option<String> = None;
+        loop {
+            let (page, next_tok) = storage
+                .list_all_repo_blob_memberships_page(token.as_deref(), 256)
+                .await?;
+            for rec in page {
+                self.record_membership(&rec.digest, &rec.repo)?;
+            }
+            match next_tok {
+                Some(tok) => token = Some(tok),
+                None => break,
+            }
         }
 
         self.meta.insert(META_STATE, META_STATE_READY)?;
@@ -715,6 +821,12 @@ mod tests {
                 .insert((repo.to_string(), digest.as_str().to_string()), bytes);
         }
     }
+
+    #[async_trait]
+    impl crate::storage::UploadSessionStorage for MockStorage {}
+
+    #[async_trait]
+    impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for MockStorage {}
 
     #[async_trait]
     impl Storage for MockStorage {
@@ -1212,6 +1324,142 @@ mod tests {
             RefIndexError::Corrupt(_) => {}
             other => panic!("unexpected: {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_success_removes_pin() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let digest = d('e');
+        let op_id = "op-12345";
+        let now = SystemTime::now();
+        let until = now + Duration::from_secs(3600);
+
+        // 1. Acquire pin before publication
+        idx.acquire_pin(&digest, op_id, until, "upload_finalizing")
+            .unwrap();
+        assert!(idx.is_blob_pinned(&digest, now).unwrap());
+
+        // 2. Publication completes -> release pin
+        let released = idx.release_pin(&digest, op_id).unwrap();
+        assert!(released);
+        assert!(!idx.is_blob_pinned(&digest, now).unwrap());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_failed_commit_retains_protection() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let digest = d('e');
+        let op_id = "op-crash-test";
+        let now = SystemTime::now();
+        let until = now + Duration::from_secs(3600);
+
+        // Acquire pin
+        idx.acquire_pin(&digest, op_id, until, "upload_finalizing")
+            .unwrap();
+
+        // Simulate crash during commit: pin remains active and protected
+        assert!(idx.is_blob_pinned(&digest, now).unwrap());
+        assert!(
+            idx.is_blob_pinned(&digest, now + Duration::from_secs(1800))
+                .unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_recovery_removes_pin() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let digest = d('e');
+        let op_id = "op-recovered";
+        let now = SystemTime::now();
+        let until = now + Duration::from_secs(3600);
+
+        idx.acquire_pin(&digest, op_id, until, "upload_finalizing")
+            .unwrap();
+        assert!(idx.is_blob_pinned(&digest, now).unwrap());
+
+        // Recovery succeeds -> releases pin
+        idx.release_pin(&digest, op_id).unwrap();
+        assert!(!idx.is_blob_pinned(&digest, now).unwrap());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_expired_abandoned_pin_purged() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let digest = d('e');
+        let op_id = "op-abandoned";
+        let now = SystemTime::now();
+        let until = now + Duration::from_secs(10);
+
+        idx.acquire_pin(&digest, op_id, until, "upload_finalizing")
+            .unwrap();
+        assert!(idx.is_blob_pinned(&digest, now).unwrap());
+
+        // Advance past expiration
+        let future = now + Duration::from_secs(20);
+        assert!(!idx.is_blob_pinned(&digest, future).unwrap());
+
+        // Purge expired
+        let purged = idx.purge_expired_pins(future).unwrap();
+        assert_eq!(purged, 1);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_idempotent_cleanup() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let digest = d('e');
+        let op_id = "op-idempotent";
+        let now = SystemTime::now();
+        let until = now + Duration::from_secs(100);
+
+        idx.acquire_pin(&digest, op_id, until, "upload_finalizing")
+            .unwrap();
+
+        // First release returns true
+        assert!(idx.release_pin(&digest, op_id).unwrap());
+        // Second release returns false without error
+        assert!(!idx.release_pin(&digest, op_id).unwrap());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_unreferenced_blob_becomes_gc_eligible() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .expect("meta");
+        idx.meta.insert(META_STATE, META_STATE_READY).expect("meta");
+
+        let digest = d('e');
+        let op_id = "op-gc-eligible";
+        let now = SystemTime::now();
+        let until = now + Duration::from_secs(10);
+
+        idx.acquire_pin(&digest, op_id, until, "upload_finalizing")
+            .unwrap();
+
+        // Release pin upon commit
+        idx.release_pin(&digest, op_id).unwrap();
+
+        // Not referenced by any manifest and not pinned -> GC eligible
+        assert!(!idx.is_blob_pinned(&digest, now).unwrap());
+        assert!(!idx.is_blob_referenced(&digest).unwrap());
 
         let _ = std::fs::remove_dir_all(path);
     }

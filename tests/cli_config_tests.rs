@@ -221,3 +221,282 @@ fn test_cli_env_invalid_value_redacts_secrets() {
         "stderr must NOT contain panic output: {stderr}"
     );
 }
+
+#[test]
+fn test_topology_1_fs_with_online_gc_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("fs_gc.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[storage]
+backend = "fs"
+
+[storage.fs]
+root = "./data"
+
+[ref_index]
+enabled = true
+path = "./data/ref-index"
+
+[blob_gc]
+enabled = true
+enable_delete = true
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .expect("run binary");
+
+    assert!(
+        output.status.success(),
+        "Filesystem backend with online destructive GC must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_topology_2_s3_local_index_online_gc_without_single_instance_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3_unsafe_gc.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "my-bucket"
+region = "us-east-1"
+single_instance_mode = false
+
+[ref_index]
+enabled = true
+path = "./data/ref-index"
+
+[blob_gc]
+enabled = true
+enable_delete = true
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .expect("run binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "S3 with local Sled index and destructive GC must fail closed unless single_instance_mode=true"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("single_instance_mode")
+            || stderr.contains("S3 storage with local reference index"),
+        "stderr should mention single_instance_mode safety requirement: {stderr}"
+    );
+}
+
+#[test]
+fn test_topology_3_s3_local_index_online_gc_disabled_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3_gc_disabled.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "my-bucket"
+region = "us-east-1"
+single_instance_mode = false
+
+[ref_index]
+enabled = true
+path = "./data/ref-index"
+
+[blob_gc]
+enabled = false
+enable_delete = false
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .expect("run binary");
+
+    assert!(
+        output.status.success(),
+        "S3 with local index and online GC disabled must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_topology_4_s3_with_affirmative_single_instance_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3_single_instance.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "my-bucket"
+region = "us-east-1"
+single_instance_mode = true
+
+[ref_index]
+enabled = true
+path = "./data/ref-index"
+
+[blob_gc]
+enabled = true
+enable_delete = true
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .output()
+        .expect("run binary");
+
+    assert!(
+        output.status.success(),
+        "S3 with affirmative single_instance_mode=true and online GC must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_cli_offline_s3_gc_rejected_without_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3_cfg.toml");
+    let ref_path = dir.path().join("ref-index");
+    std::fs::create_dir_all(&ref_path).unwrap();
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "test-bucket"
+region = "us-east-1"
+single_instance_mode = true
+
+[storage.ref_index]
+enabled = true
+path = "{}"
+"#,
+            ref_path.display()
+        ),
+    )
+    .unwrap();
+
+    // 1. Destructive 'quarantine' without --confirm-all-writers-stopped fails with exit code 2
+    let output = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("blob-gc")
+        .arg("quarantine")
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("confirm-all-writers-stopped"),
+        "stderr must explain confirmation requirement: {stderr}"
+    );
+
+    // 2. Destructive 'delete' without --confirm-all-writers-stopped fails with exit code 2
+    let output_del = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("blob-gc")
+        .arg("delete")
+        .output()
+        .expect("run binary");
+
+    assert_eq!(output_del.status.code(), Some(2));
+}
+
+#[test]
+fn test_cli_offline_s3_gc_plan_dry_run_allowed_without_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("s3_cfg.toml");
+    let ref_path = dir.path().join("ref-index");
+    std::fs::create_dir_all(&ref_path).unwrap();
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+listen_addr = "127.0.0.1:5000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "test-bucket"
+region = "us-east-1"
+single_instance_mode = true
+
+[storage.ref_index]
+enabled = true
+path = "{}"
+"#,
+            ref_path.display()
+        ),
+    )
+    .unwrap();
+
+    // Dry run 'plan' is allowed without confirmation (does not exit with code 2)
+    let output = Command::new(bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("blob-gc")
+        .arg("plan")
+        .output()
+        .expect("run binary");
+
+    // Exit code should not be 2 (the confirmation error)
+    assert_ne!(output.status.code(), Some(2));
+}

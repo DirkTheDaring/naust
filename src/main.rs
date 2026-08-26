@@ -11,14 +11,20 @@ mod http_api;
 mod ip_concurrency;
 mod manifest_publication;
 mod manifest_refs;
+mod membership_migration;
 mod proxy;
 mod rbac;
 mod registry;
+pub mod repository_membership_ledger;
 mod request_routing;
 mod robot_secrets;
 mod security;
 mod storage;
+pub mod task_supervisor;
 mod token_rate_limit;
+mod upload_coordinator;
+
+use task_supervisor::{TaskClassification, TaskSupervisor};
 
 use axum::{
     Router,
@@ -260,6 +266,28 @@ enum CliCommand {
         #[command(subcommand)]
         command: BlobGcCommand,
     },
+
+    /// Migrate or verify repository-scoped blob memberships.
+    #[command(name = "migrate-membership")]
+    MigrateMembership {
+        #[command(subcommand)]
+        command: MigrateMembershipCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrateMembershipCommand {
+    /// Plan repository blob membership backfill (dry-run).
+    #[command(name = "plan")]
+    Plan,
+
+    /// Apply repository blob membership backfill and mark storage Ready.
+    #[command(name = "apply")]
+    Apply,
+
+    /// Verify that all repository-referenced blobs have durable membership records.
+    #[command(name = "verify")]
+    Verify,
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,6 +334,10 @@ enum BlobGcCommand {
 
         #[arg(long, default_value_t = 10_000)]
         max_per_run: usize,
+
+        /// Explicit confirmation that all active registry writers operating against this S3 bucket are stopped.
+        #[arg(long, default_value_t = false)]
+        confirm_all_writers_stopped: bool,
     },
 
     /// Permanently delete blobs from quarantine after a delay (re-checks reachability).
@@ -320,6 +352,10 @@ enum BlobGcCommand {
 
         #[arg(long, default_value_t = 10_000)]
         max_per_run: usize,
+
+        /// Explicit confirmation that all active registry writers operating against this S3 bucket are stopped.
+        #[arg(long, default_value_t = false)]
+        confirm_all_writers_stopped: bool,
     },
 }
 
@@ -373,6 +409,15 @@ pub struct AppState {
 
     // Shared Consistency Coordinator:
     pub consistency_gate: Arc<tokio::sync::Mutex<()>>,
+
+    // Authoritative Repository Membership Ledger:
+    pub membership_ledger: Arc<repository_membership_ledger::RepositoryMembershipLedger>,
+
+    // Centralized Upload Session Lifecycle Coordinator:
+    pub upload_coordinator: Arc<upload_coordinator::BlobUploadCoordinator>,
+
+    // Isolated Blob Deletion Service:
+    pub delete_service: Arc<blob_delete_safety::BlobDeleteService>,
 }
 
 #[derive(Clone)]
@@ -547,24 +592,47 @@ async fn main() {
         CliCommand::BlobGc { command } => {
             let cfg = load_config_or_exit("blob-gc", &config_paths);
 
-            if cfg.storage_backend != StorageBackend::Filesystem {
-                eprintln!("blob-gc: only filesystem backend is supported");
-                std::process::exit(2);
-            }
-
-            if !cfg.ref_index.enabled {
-                eprintln!("blob-gc: ref-index is disabled (storage.ref_index.enabled=false)");
-                std::process::exit(2);
-            }
-
-            let _fs_root_lock = match crate::fs_root_lock::FsRootLock::try_acquire(&cfg.fs_root) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!(
-                        "blob-gc: refusing to run while registry is active ({e}); stop the server first"
-                    );
-                    std::process::exit(2);
+            if cfg.storage_backend == StorageBackend::S3 {
+                match &command {
+                    BlobGcCommand::Plan { .. } => {}
+                    BlobGcCommand::Quarantine {
+                        confirm_all_writers_stopped,
+                        ..
+                    }
+                    | BlobGcCommand::Delete {
+                        confirm_all_writers_stopped,
+                        ..
+                    } => {
+                        if !confirm_all_writers_stopped {
+                            eprintln!(
+                                "blob-gc: destructive offline GC on S3 storage requires explicit confirmation that all writers using bucket '{}' (prefix '{}') are stopped.\n\
+                                 Re-run with --confirm-all-writers-stopped to proceed, or use 'plan' for dry-run.",
+                                cfg.s3_bucket.as_deref().unwrap_or(""),
+                                cfg.s3_prefix
+                            );
+                            std::process::exit(2);
+                        }
+                        println!(
+                            "blob-gc: S3 destructive operation confirmed (all writers stopped) for bucket='{}' prefix='{}'",
+                            cfg.s3_bucket.as_deref().unwrap_or(""),
+                            cfg.s3_prefix
+                        );
+                    }
                 }
+            }
+
+            let _fs_root_lock = if cfg.storage_backend == StorageBackend::Filesystem {
+                match crate::fs_root_lock::FsRootLock::try_acquire(&cfg.fs_root) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        eprintln!(
+                            "blob-gc: refusing to run while registry is active ({e}); stop the server first"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                None
             };
 
             let idx = match blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()) {
@@ -627,6 +695,7 @@ async fn main() {
                     policy,
                     min_age_secs,
                     max_per_run,
+                    ..
                 } => {
                     let stats = match crate::blob_gc::blob_gc_quarantine(
                         &cfg,
@@ -658,6 +727,7 @@ async fn main() {
                     policy,
                     quarantine_delay_secs,
                     max_per_run,
+                    ..
                 } => {
                     let stats = match crate::blob_gc::blob_gc_delete(
                         &cfg,
@@ -706,7 +776,122 @@ async fn main() {
                 }
             }
         }
+        CliCommand::MigrateMembership { command } => {
+            let config = Arc::new(load_config_or_exit("migrate-membership", &config_paths));
+            let storage = storage::from_config(config.as_ref());
+            match command {
+                MigrateMembershipCommand::Plan => {
+                    println!("Planning repository blob membership migration (dry-run)...");
+                    match membership_migration::plan_membership_migration(&storage).await {
+                        Ok(stats) => {
+                            println!("Migration Plan Summary:");
+                            println!("  Repositories scanned: {}", stats.repositories_scanned);
+                            println!("  Manifests scanned:    {}", stats.manifests_scanned);
+                            println!("  Memberships to create: {}", stats.memberships_created);
+                            println!(
+                                "  Memberships present:  {}",
+                                stats.memberships_already_present
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!("migrate-membership plan failed: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                MigrateMembershipCommand::Apply => {
+                    println!("Applying repository blob membership migration...");
+                    match membership_migration::apply_membership_migration(&storage).await {
+                        Ok(stats) => {
+                            println!("Migration Applied Successfully:");
+                            println!("  Repositories scanned: {}", stats.repositories_scanned);
+                            println!("  Manifests scanned:    {}", stats.manifests_scanned);
+                            println!("  Memberships created:  {}", stats.memberships_created);
+                            println!(
+                                "  Memberships present:  {}",
+                                stats.memberships_already_present
+                            );
+                            println!("  Membership marker marked Ready.");
+                        }
+                        Err(err) => {
+                            eprintln!("migrate-membership apply failed: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                MigrateMembershipCommand::Verify => {
+                    println!("Verifying repository blob memberships...");
+                    match membership_migration::verify_membership_migration(&storage).await {
+                        Ok(true) => {
+                            println!(
+                                "Verification passed: all repository-referenced blobs have valid membership records."
+                            );
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "Verification failed: one or more referenced blobs lack membership records. Run `migrate-membership apply`."
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(err) => {
+                            eprintln!("migrate-membership verify failed: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         CliCommand::Server => {}
+    }
+
+    async fn has_any_file_or_dir(path: &std::path::Path) -> bool {
+        if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let file_type = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() {
+                    if Box::pin(has_any_file_or_dir(&entry.path())).await {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    async fn is_store_completely_empty(
+        storage: &Arc<dyn storage::Storage>,
+        config: &Config,
+    ) -> bool {
+        let repos = storage.list_repositories().await.unwrap_or_default();
+        if !repos.is_empty() {
+            return false;
+        }
+
+        if config.storage_backend == StorageBackend::Filesystem {
+            let root = &config.fs_root;
+            if has_any_file_or_dir(&root.join("blobs")).await {
+                return false;
+            }
+            if has_any_file_or_dir(&root.join("uploads")).await {
+                return false;
+            }
+            if has_any_file_or_dir(&root.join("quarantine")).await {
+                return false;
+            }
+            if has_any_file_or_dir(&root.join("repo-blobs")).await {
+                return false;
+            }
+            if has_any_file_or_dir(&root.join("repos")).await {
+                return false;
+            }
+        }
+        true
     }
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -745,6 +930,33 @@ async fn main() {
 
     let storage = storage::from_config(config.as_ref());
 
+    // Fail-closed repository blob membership startup check
+    match storage.is_membership_ready().await {
+        Ok(true) => {}
+        Ok(false) => {
+            let is_empty = is_store_completely_empty(&storage, config.as_ref()).await;
+            if is_empty {
+                if let Err(e) = storage.mark_membership_ready().await {
+                    eprintln!(
+                        "server: failed to initialize membership marker on fresh storage: {e}"
+                    );
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!(
+                    "FATAL: Storage contains existing data (repositories, blobs, uploads, or legacy markers) but repository-scoped blob membership is not initialized.\n\
+                     Silent fallback to global visibility is disabled for security and tenant isolation.\n\
+                     Please run: `registry-rust migrate-membership apply` to backfill membership records before starting the server."
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("server: failed to inspect membership readiness: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let ref_index: Option<Arc<blob_ref_index::BlobRefIndex>> = if config.ref_index.enabled {
         match blob_ref_index::BlobRefIndex::open(config.ref_index.path.clone()) {
             Ok(idx) => {
@@ -756,23 +968,20 @@ async fn main() {
                     )
                     .await
                 {
-                    tracing::error!(
-                        error = %err,
-                        path = %config.ref_index.path.display(),
-                        "ref-index init failed; falling back to scan-based safe delete"
+                    eprintln!(
+                        "FATAL: ref-index init failed at {}: {err}",
+                        config.ref_index.path.display()
                     );
-                    None
-                } else {
-                    Some(Arc::new(idx))
+                    std::process::exit(1);
                 }
+                Some(Arc::new(idx))
             }
             Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    path = %config.ref_index.path.display(),
-                    "ref-index open failed; falling back to scan-based safe delete"
+                eprintln!(
+                    "FATAL: ref-index open failed at {}: {err}",
+                    config.ref_index.path.display()
                 );
-                None
+                std::process::exit(1);
             }
         }
     } else {
@@ -954,10 +1163,22 @@ async fn main() {
         _ => None,
     };
 
-    if config.storage_backend == StorageBackend::S3 && ref_index.is_some() {
-        tracing::warn!(
-            "topology: S3 storage backend is active with local Sled BlobRefIndex; this deployment is strictly restricted to a single active registry writer instance per S3 namespace. Multi-node concurrent writers cannot safely share a local index without a distributed coordinator."
+    if config.storage_backend == StorageBackend::S3 {
+        tracing::info!(
+            policy = ?config.s3_legacy_multipart_cleanup_policy,
+            "S3 legacy multipart cleanup policy configured"
         );
+        if ref_index.is_some() {
+            if config.s3_single_instance_mode {
+                tracing::info!(
+                    "topology: S3 storage backend is active with local Sled BlobRefIndex in affirmative single-instance mode (s3_single_instance_mode = true)."
+                );
+            } else {
+                tracing::warn!(
+                    "topology: S3 storage backend is active with local Sled BlobRefIndex; online destructive GC is disabled by default for safety across multi-instance deployments."
+                );
+            }
+        }
     }
 
     let ip_limiter = Arc::new(ip_concurrency::IpConcurrencyLimiter::new(
@@ -966,11 +1187,29 @@ async fn main() {
     ));
     let is_high_pressure = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let upload_coord_config = upload_coordinator::BlobUploadCoordinatorConfig {
+        signing_key: config
+            .token_signing_keys
+            .first()
+            .map(|k| k.key.as_bytes().to_vec())
+            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec()),
+        max_upload_bytes: config.max_upload_bytes,
+        abort_on_digest_mismatch: config.upload_policy.abort_on_digest_mismatch,
+        disallow_monolithic_uploads: config.disallow_monolithic_uploads,
+        upload_chunk_min_bytes: config.upload_chunk_min_bytes.map(|v| v as u64),
+        gc_pin_duration_secs: config.gc_pin_duration_secs,
+    };
+    let upload_coordinator = Arc::new(upload_coordinator::BlobUploadCoordinator::new(
+        storage.clone(),
+        ref_index.clone(),
+        upload_coord_config,
+    ));
+
     let state = AppState {
         config,
         auth_metrics: Arc::new(AuthMetrics::default()),
-        storage,
-        ref_index,
+        storage: storage.clone(),
+        ref_index: ref_index.clone(),
         gc_service,
         gc_run_seq: Arc::new(AtomicU64::new(0)),
         proxy,
@@ -984,7 +1223,20 @@ async fn main() {
         last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
         ip_limiter,
         is_high_pressure,
-        consistency_gate,
+        consistency_gate: consistency_gate.clone(),
+        membership_ledger: Arc::new(
+            repository_membership_ledger::RepositoryMembershipLedger::new(
+                storage.clone(),
+                ref_index.clone(),
+                consistency_gate.clone(),
+            ),
+        ),
+        upload_coordinator,
+        delete_service: Arc::new(blob_delete_safety::BlobDeleteService::new(
+            storage.clone(),
+            ref_index.clone(),
+            consistency_gate.clone(),
+        )),
     };
 
     // For large blobs we stream request bodies; enforce blob size via MAX_UPLOAD_BYTES and
@@ -1027,11 +1279,20 @@ async fn main() {
     let tls_cert_path = state.config.tls_cert_path.clone();
     let tls_key_path = state.config.tls_key_path.clone();
 
-    spawn_upload_gc(state.clone());
-    spawn_blob_gc_scheduler(state.clone());
-    spawn_proxy_gc(state.clone());
-    spawn_proxy_scrub(state.clone());
-    spawn_fd_diagnostics_logger(state.clone());
+    let shutdown_timeout = Duration::from_secs(15);
+    let supervisor = TaskSupervisor::new(shutdown_timeout);
+
+    if let Some(idx) = state.ref_index.clone() {
+        supervisor
+            .register_flush_hook(move || idx.flush().map_err(|e| e.to_string()))
+            .await;
+    }
+
+    spawn_upload_reaper(&supervisor, state.clone()).await;
+    spawn_blob_gc_scheduler(&supervisor, state.clone()).await;
+    spawn_proxy_gc(&supervisor, state.clone()).await;
+    spawn_proxy_scrub(&supervisor, state.clone()).await;
+    spawn_fd_diagnostics_logger(&supervisor, state.clone()).await;
 
     // Token endpoint hardening: rate limit expensive credential checks.
     // Defaults are conservative and should not impact normal clients.
@@ -1109,16 +1370,27 @@ async fn main() {
 
     tracing::info!(%addr, tls = tls_enabled, "registry listening");
 
+    let root_token = supervisor.root_token().clone();
+
     if let (Some(cert), Some(key)) = (tls_cert_path, tls_key_path) {
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
             .expect("load TLS cert/key");
         let handle = axum_server::Handle::new();
         let handle_for_shutdown = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            handle_for_shutdown.graceful_shutdown(Some(Duration::from_secs(10)));
-        });
+        supervisor
+            .spawn(
+                "tls_server_shutdown_watcher",
+                TaskClassification::PublicServer,
+                move |token_tls| async move {
+                    tokio::select! {
+                        _ = shutdown_signal() => {},
+                        _ = token_tls.cancelled() => {},
+                    }
+                    handle_for_shutdown.graceful_shutdown(Some(shutdown_timeout));
+                },
+            )
+            .await;
 
         axum_server::bind_rustls(addr, tls)
             .handle(handle)
@@ -1133,9 +1405,23 @@ async fn main() {
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown_signal() => {},
+                _ = root_token.cancelled() => {},
+            }
+        })
         .await
         .expect("serve http");
+    }
+
+    let report = supervisor.shutdown().await;
+    if !report.success {
+        tracing::warn!(
+            timed_out = ?report.timed_out_tasks,
+            panicked = ?report.panicked_tasks,
+            "graceful shutdown completed with warnings"
+        );
     }
 }
 
@@ -1160,7 +1446,7 @@ async fn log_server_errors(req: Request<axum::body::Body>, next: Next) -> impl I
     response
 }
 
-fn spawn_proxy_gc(state: AppState) {
+async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
     if !state.config.proxy.enabled {
         return;
     }
@@ -1188,23 +1474,25 @@ fn spawn_proxy_gc(state: AppState) {
             let proxy_for_gc = ctx.proxy;
             let repo_rules_for_gc = repo_rules.clone();
 
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                loop {
-                    ticker.tick().await;
-                    if let Err(err) = proxy_gc_once(
-                        &storage,
-                        &fs_root,
-                        max_cache_bytes,
-                        &repo_rules_for_gc,
-                        &proxy_for_gc,
-                    )
-                    .await
-                    {
-                        tracing::warn!(upstream_index = i, error = %err, "proxy gc failed");
-                    }
-                }
-            });
+            supervisor
+                .spawn_loop(
+                    format!("proxy_gc_upstream_{i}"),
+                    TaskClassification::MaintenanceScheduler,
+                    interval,
+                    None,
+                    move || {
+                        let st = storage.clone();
+                        let fs = fs_root.clone();
+                        let rules = repo_rules_for_gc.clone();
+                        let prx = proxy_for_gc.clone();
+                        async move {
+                            proxy_gc_once(&st, &fs, max_cache_bytes, &rules, &prx)
+                                .await
+                                .map_err(|e| format!("proxy gc failed: {e}"))
+                        }
+                    },
+                )
+                .await;
         }
         return;
     }
@@ -1233,29 +1521,30 @@ fn spawn_proxy_gc(state: AppState) {
         .unwrap_or_else(|| state.config.fs_root.join("cache"));
     let repo_rules = state.config.proxy.repo_rules.clone();
     let storage = cache_storage;
-
     let proxy_for_gc = proxy;
 
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            ticker.tick().await;
-            if let Err(err) = proxy_gc_once(
-                &storage,
-                &fs_root,
-                max_cache_bytes,
-                &repo_rules,
-                &proxy_for_gc,
-            )
-            .await
-            {
-                tracing::warn!(error = %err, "proxy gc: run failed");
-            }
-        }
-    });
+    supervisor
+        .spawn_loop(
+            "proxy_gc",
+            TaskClassification::MaintenanceScheduler,
+            interval,
+            None,
+            move || {
+                let st = storage.clone();
+                let fs = fs_root.clone();
+                let rules = repo_rules.clone();
+                let prx = proxy_for_gc.clone();
+                async move {
+                    proxy_gc_once(&st, &fs, max_cache_bytes, &rules, &prx)
+                        .await
+                        .map_err(|e| format!("proxy gc run failed: {e}"))
+                }
+            },
+        )
+        .await;
 }
 
-fn spawn_proxy_scrub(state: AppState) {
+async fn spawn_proxy_scrub(supervisor: &TaskSupervisor, state: AppState) {
     if !state.config.proxy.enabled {
         return;
     }
@@ -1279,27 +1568,33 @@ fn spawn_proxy_scrub(state: AppState) {
                 .clone()
                 .unwrap_or_else(|| state.config.fs_root.join(format!("cache-upstream-{i}")));
 
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                loop {
-                    ticker.tick().await;
-                    match proxy_scrub_once(&fs_root, max_files).await {
-                        Ok((scanned, removed)) => {
-                            if removed > 0 {
-                                tracing::info!(
-                                    upstream_index = i,
-                                    scanned,
-                                    removed,
-                                    "proxy scrub: removed corrupt cache files"
-                                );
+            supervisor
+                .spawn_loop(
+                    format!("proxy_scrub_upstream_{i}"),
+                    TaskClassification::MaintenanceScheduler,
+                    interval,
+                    None,
+                    move || {
+                        let fs = fs_root.clone();
+                        async move {
+                            match proxy_scrub_once(&fs, max_files).await {
+                                Ok((scanned, removed)) => {
+                                    if removed > 0 {
+                                        tracing::info!(
+                                            upstream_index = i,
+                                            scanned,
+                                            removed,
+                                            "proxy scrub: removed corrupt cache files"
+                                        );
+                                    }
+                                    Ok(())
+                                }
+                                Err(err) => Err(format!("proxy scrub failed: {err}")),
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(upstream_index = i, error = %err, "proxy scrub failed");
-                        }
-                    }
-                }
-            });
+                    },
+                )
+                .await;
         }
         return;
     }
@@ -1317,32 +1612,38 @@ fn spawn_proxy_scrub(state: AppState) {
         .clone()
         .unwrap_or_else(|| state.config.fs_root.join("cache"));
 
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            ticker.tick().await;
-            match proxy_scrub_once(&fs_root, max_files).await {
-                Ok((scanned, removed)) => {
-                    if removed > 0 {
-                        tracing::info!(
-                            scanned,
-                            removed,
-                            "proxy scrub: removed corrupted cache entries"
-                        );
-                    } else {
-                        tracing::debug!(scanned, removed, "proxy scrub: ok");
+    supervisor
+        .spawn_loop(
+            "proxy_scrub",
+            TaskClassification::MaintenanceScheduler,
+            interval,
+            None,
+            move || {
+                let fs = fs_root.clone();
+                async move {
+                    match proxy_scrub_once(&fs, max_files).await {
+                        Ok((scanned, removed)) => {
+                            if removed > 0 {
+                                tracing::info!(
+                                    scanned,
+                                    removed,
+                                    "proxy scrub: removed corrupted cache entries"
+                                );
+                            } else {
+                                tracing::debug!(scanned, removed, "proxy scrub: ok");
+                            }
+                            Ok(())
+                        }
+                        Err(err) => Err(format!("proxy scrub run failed: {err}")),
                     }
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, "proxy scrub: run failed");
-                }
-            }
-        }
-    });
+            },
+        )
+        .await;
 }
 
 async fn proxy_scrub_once(
-    fs_root: &std::path::PathBuf,
+    fs_root: &std::path::Path,
     max_files: usize,
 ) -> Result<(u64, u64), String> {
     let repos_root = fs_root.join("repos");
@@ -1449,7 +1750,7 @@ async fn proxy_scrub_once(
 
 async fn proxy_gc_once(
     storage: &Arc<dyn storage::Storage>,
-    fs_root: &std::path::PathBuf,
+    fs_root: &std::path::Path,
     max_cache_bytes: u64,
     repo_rules: &[config::ProxyRepoRule],
     proxy: &proxy::Proxy,
@@ -1580,12 +1881,11 @@ async fn compute_protected_blobs(
                     tag_regex,
                     allow_prerelease,
                 } => {
-                    if let Ok(tags) = storage.list_tags(&repo).await {
-                        if let Some(latest) =
+                    if let Ok(tags) = storage.list_tags(&repo).await
+                        && let Some(latest) =
                             pick_latest_semver_tag(tags, tag_regex.as_deref(), *allow_prerelease)
-                        {
-                            pinned_tags.push(latest);
-                        }
+                    {
+                        pinned_tags.push(latest);
                     }
                 }
                 _ => {}
@@ -1662,10 +1962,10 @@ fn pick_latest_semver_tag(
     let mut best: Option<(Version, String)> = None;
 
     for tag in tags {
-        if let Some(re) = &re {
-            if !re.is_match(&tag) {
-                continue;
-            }
+        if let Some(re) = &re
+            && !re.is_match(&tag)
+        {
+            continue;
         }
 
         let parsed = Version::parse(tag.strip_prefix('v').unwrap_or(&tag)).ok();
@@ -1866,81 +2166,47 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-fn spawn_upload_gc(state: AppState) {
-    if state.config.storage_backend != StorageBackend::Filesystem {
-        return;
-    }
+async fn spawn_upload_reaper(supervisor: &TaskSupervisor, state: AppState) {
     if !state.config.upload_gc_enabled {
         return;
     }
 
-    let uploads_dir = state.config.fs_root.join("uploads");
     let interval = Duration::from_secs(state.config.upload_gc_interval_secs.max(1));
-    let max_age = Duration::from_secs(state.config.upload_gc_max_age_secs);
+    let max_age_secs = state.config.upload_gc_max_age_secs;
+    let receipt_ttl_secs = 3600; // retain finalized receipts for 1 hour
+    let coordinator = state.upload_coordinator.clone();
 
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            ticker.tick().await;
-            let now = std::time::SystemTime::now();
-
-            let mut dir = match tokio::fs::read_dir(&uploads_dir).await {
-                Ok(d) => d,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    tracing::warn!(error = %err, path = %uploads_dir.display(), "upload gc: read_dir failed");
-                    continue;
-                }
-            };
-
-            let mut removed = 0u64;
-            let mut scanned = 0u64;
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                scanned += 1;
-                let path = entry.path();
-
-                let meta = match entry.metadata().await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let modified = match meta.modified() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let age = match now.duration_since(modified) {
-                    Ok(d) => d,
-                    Err(_) => Duration::from_secs(0),
-                };
-
-                if age >= max_age {
-                    let removed_this = tokio::fs::remove_file(&path).await.is_ok();
-
-                    // If we removed a partial upload file, also remove its stored hash state.
-                    // And vice versa, to avoid leaving orphan sidecars around.
-                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        if let Some(uuid) = name.strip_suffix(".data") {
-                            let sidecar = uploads_dir.join(format!("{uuid}.sha256state"));
-                            let _ = tokio::fs::remove_file(&sidecar).await;
-                        } else if let Some(uuid) = name.strip_suffix(".sha256state") {
-                            let data = uploads_dir.join(format!("{uuid}.data"));
-                            let _ = tokio::fs::remove_file(&data).await;
+    supervisor
+        .spawn_loop(
+            "upload_reaper",
+            TaskClassification::MaintenanceScheduler,
+            interval,
+            None,
+            move || {
+                let coord = coordinator.clone();
+                async move {
+                    match coord
+                        .reap_expired_uploads(max_age_secs, receipt_ttl_secs)
+                        .await
+                    {
+                        Ok(count) => {
+                            if count > 0 {
+                                tracing::info!(
+                                    reaped = count,
+                                    "upload reaper: cleaned expired upload sessions / receipts"
+                                );
+                            }
+                            Ok(())
                         }
-                    }
-
-                    if removed_this {
-                        removed += 1;
+                        Err(err) => Err(format!("upload reaper cleanup failed: {err}")),
                     }
                 }
-            }
-
-            if removed > 0 {
-                tracing::info!(scanned, removed, path = %uploads_dir.display(), "upload gc: removed stale temp files");
-            }
-        }
-    });
+            },
+        )
+        .await;
 }
 
-fn spawn_fd_diagnostics_logger(state: AppState) {
+async fn spawn_fd_diagnostics_logger(supervisor: &TaskSupervisor, state: AppState) {
     let interval_secs = std::env::var("REGISTRY_DIAG_FD_LOG_INTERVAL_SECS")
         .ok()
         .or_else(|| std::env::var("FD_LOG_INTERVAL_SECS").ok())
@@ -1951,23 +2217,31 @@ fn spawn_fd_diagnostics_logger(state: AppState) {
         return;
     }
 
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-        loop {
-            ticker.tick().await;
-            tracing::info!(
-                open_fds = open_fd_count_linux(),
-                active_non_upload = state.active_non_upload_requests.load(Ordering::Relaxed),
-                active_upload = state.active_upload_requests.load(Ordering::Relaxed),
-                non_upload_available_permits = state.request_sem.available_permits(),
-                upload_available_permits = state.upload_request_sem.available_permits(),
-                "fd diagnostics"
-            );
-        }
-    });
+    supervisor
+        .spawn_loop(
+            "fd_diagnostics_logger",
+            TaskClassification::LongLivedTask,
+            Duration::from_secs(interval_secs.max(1)),
+            None,
+            move || {
+                let st = state.clone();
+                async move {
+                    tracing::info!(
+                        open_fds = open_fd_count_linux(),
+                        active_non_upload = st.active_non_upload_requests.load(Ordering::Relaxed),
+                        active_upload = st.active_upload_requests.load(Ordering::Relaxed),
+                        non_upload_available_permits = st.request_sem.available_permits(),
+                        upload_available_permits = st.upload_request_sem.available_permits(),
+                        "fd diagnostics"
+                    );
+                    Ok(())
+                }
+            },
+        )
+        .await;
 }
 
-fn spawn_blob_gc_scheduler(state: AppState) {
+async fn spawn_blob_gc_scheduler(supervisor: &TaskSupervisor, state: AppState) {
     if state.config.storage_backend != StorageBackend::Filesystem {
         return;
     }
@@ -1982,54 +2256,60 @@ fn spawn_blob_gc_scheduler(state: AppState) {
 
     let interval = Duration::from_secs(state.config.blob_gc_schedule_interval_secs.max(1));
 
-    tokio::spawn(async move {
-        // Delay first run until after one full interval.
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await; // consume immediate tick
-        loop {
-            ticker.tick().await;
-            tracing::info!(
-                event = "blob_gc",
-                action = "scheduled_cleanup",
-                "starting scheduled blob gc cleanup"
-            );
+    supervisor
+        .spawn_loop(
+            "blob_gc_scheduler",
+            TaskClassification::MaintenanceScheduler,
+            interval,
+            Some(tokio::time::MissedTickBehavior::Skip),
+            move || {
+                let s = service.clone();
+                async move {
+                    tracing::info!(
+                        event = "blob_gc",
+                        action = "scheduled_cleanup",
+                        "starting scheduled blob gc cleanup"
+                    );
 
-            match service.scheduled_cleanup_once().await {
-                Ok(stats) => {
-                    tracing::info!(
-                        event = "blob_gc",
-                        action = "scheduled_cleanup",
-                        quarantined_blobs = stats.quarantine.quarantined_blobs,
-                        quarantined_bytes = stats.quarantine.quarantined_bytes,
-                        restored_blobs = stats.quarantine.restored_blobs,
-                        restored_bytes = stats.quarantine.restored_bytes,
-                        deleted_blobs = stats.delete.as_ref().map(|s| s.deleted_blobs).unwrap_or(0),
-                        deleted_bytes = stats.delete.as_ref().map(|s| s.deleted_bytes).unwrap_or(0),
-                        "scheduled blob gc cleanup finished"
-                    );
+                    match s.scheduled_cleanup_once().await {
+                        Ok(stats) => {
+                            tracing::info!(
+                                event = "blob_gc",
+                                action = "scheduled_cleanup",
+                                quarantined_blobs = stats.quarantine.quarantined_blobs,
+                                quarantined_bytes = stats.quarantine.quarantined_bytes,
+                                restored_blobs = stats.quarantine.restored_blobs,
+                                restored_bytes = stats.quarantine.restored_bytes,
+                                deleted_blobs =
+                                    stats.delete.as_ref().map(|s| s.deleted_blobs).unwrap_or(0),
+                                deleted_bytes =
+                                    stats.delete.as_ref().map(|s| s.deleted_bytes).unwrap_or(0),
+                                "scheduled blob gc cleanup finished"
+                            );
+                            Ok(())
+                        }
+                        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
+                            tracing::info!(
+                                event = "blob_gc",
+                                action = "scheduled_cleanup",
+                                "scheduled blob gc skipped (already running)"
+                            );
+                            Ok(())
+                        }
+                        Err(crate::gc_service::GcServiceError::Disabled) => {
+                            tracing::warn!(
+                                event = "blob_gc",
+                                action = "scheduled_cleanup",
+                                "blob gc scheduler enabled but blob_gc.enabled=false"
+                            );
+                            Ok(())
+                        }
+                        Err(err) => Err(format!("scheduled blob gc cleanup failed: {err}")),
+                    }
                 }
-                Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-                    tracing::info!(
-                        event = "blob_gc",
-                        action = "scheduled_cleanup",
-                        "scheduled blob gc skipped (already running)"
-                    );
-                }
-                Err(crate::gc_service::GcServiceError::Disabled) => {
-                    tracing::warn!(
-                        event = "blob_gc",
-                        action = "scheduled_cleanup",
-                        "blob gc scheduler enabled but blob_gc.enabled=false; stopping scheduler"
-                    );
-                    return;
-                }
-                Err(err) => {
-                    tracing::warn!(event = "blob_gc", action = "scheduled_cleanup", error = %err, "scheduled blob gc cleanup failed");
-                }
-            }
-        }
-    });
+            },
+        )
+        .await;
 }
 
 #[cfg(test)]

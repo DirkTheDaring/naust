@@ -1,4 +1,5 @@
 use crate::{
+    blob_ref_index::BlobRefIndex,
     manifest_refs::parse_manifest_refs,
     registry::digest::Digest,
     storage::{Storage, StorageError},
@@ -88,6 +89,7 @@ async fn scan_repo_for_blob(
 ///   config/layer/subject digests.
 /// - If it cannot fetch a referenced manifest, it skips that node (treating the repo
 ///   as already inconsistent).
+#[allow(dead_code)]
 pub async fn find_blob_reference(
     storage: &Arc<dyn Storage>,
     target: &Digest,
@@ -123,6 +125,115 @@ pub async fn find_blob_reference(
     }
 
     Ok(None)
+}
+
+/// Returns the first known reference to `target` in the specified repository `repo`.
+pub async fn find_repo_blob_reference(
+    storage: &Arc<dyn Storage>,
+    repo: &str,
+    target: &Digest,
+) -> Result<Option<BlobReference>, StorageError> {
+    let tags = match storage.list_tags(repo).await {
+        Ok(t) => t,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let mut roots: HashMap<Digest, String> = HashMap::new();
+    for tag in tags {
+        let root = match storage.resolve_tag(repo, &tag).await {
+            Ok(d) => d,
+            Err(StorageError::NotFound) => continue,
+            Err(e) => return Err(e),
+        };
+        roots.entry(root).or_insert(tag);
+    }
+
+    let mut refs_cache: HashMap<Digest, Option<ManifestRefs>> = HashMap::new();
+    for (root, tag) in roots {
+        if let Some(r) =
+            scan_repo_for_blob(storage, repo, root, Some(tag), target, &mut refs_cache).await?
+        {
+            return Ok(Some(r));
+        }
+    }
+
+    Ok(None)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlobDeleteResult {
+    Success,
+    NotFound,
+    InUse { message: String },
+}
+
+pub struct BlobDeleteService {
+    ledger: crate::repository_membership_ledger::RepositoryMembershipLedger,
+}
+
+impl BlobDeleteService {
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        ref_index: Option<Arc<BlobRefIndex>>,
+        consistency_gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            ledger: crate::repository_membership_ledger::RepositoryMembershipLedger::new(
+                storage,
+                ref_index,
+                consistency_gate,
+            ),
+        }
+    }
+
+    pub fn from_ledger(
+        ledger: crate::repository_membership_ledger::RepositoryMembershipLedger,
+    ) -> Self {
+        Self { ledger }
+    }
+
+    pub fn ledger(&self) -> &crate::repository_membership_ledger::RepositoryMembershipLedger {
+        &self.ledger
+    }
+
+    /// Safely handles a repository-scoped blob deletion request:
+    /// 1. Acquires consistency gate via ledger.
+    /// 2. Ensures ref-index is healthy / rebuilt if dirty.
+    /// 3. Verifies membership in the requested repository (returns NotFound if absent).
+    /// 4. Verifies whether any manifest in the requested repository still references the blob (returns InUse if so).
+    /// 5. Unlinks only the requested repository's membership record through the ledger.
+    pub async fn delete_repo_blob(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<BlobDeleteResult, StorageError> {
+        // 1. Acquire consistency gate for atomic reference validation and unlinking
+        let guard = self.ledger.lock_gate().await;
+
+        // 2. Verify membership exists in the requested repository
+        let membership = self.ledger.get_membership(repo, digest).await?;
+        if membership.is_none() {
+            return Ok(BlobDeleteResult::NotFound);
+        }
+
+        // 3. Check if referenced by manifest in this repository
+        if let Some(r) = find_repo_blob_reference(self.ledger.storage(), repo, digest).await? {
+            let mut msg = format!("blob is still referenced by manifest {}", r.manifest);
+            if let Some(tag) = r.tag {
+                msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
+            }
+            return Ok(BlobDeleteResult::InUse { message: msg });
+        }
+
+        // 4. Unlink repository membership via ledger under guard
+        match self.ledger.unlink_with_guard(&guard, repo, digest).await {
+            Ok(true) => Ok(BlobDeleteResult::Success),
+            Ok(false) => Ok(BlobDeleteResult::NotFound),
+            Err(crate::repository_membership_ledger::LedgerError::Storage(e)) => Err(e),
+            Err(e) => Err(StorageError::Internal(e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]

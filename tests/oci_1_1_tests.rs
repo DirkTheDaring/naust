@@ -1463,7 +1463,7 @@ async fn test_audit_remediation_suite() {
     assert_eq!(zero_ref_body["manifests"].as_array().unwrap().len(), 0);
 
     // 14. Cross-Repository Blob Mount
-    // 14a. Mount existing blob -> 201 Created
+    // 14a. Mount existing blob with authorization -> 201 Created + target blob Location
     let mount_resp = client
         .post(format!(
             "{base_url}/v2/target/repo/blobs/uploads/?mount={layer_digest}&from={repo}"
@@ -1828,6 +1828,57 @@ async fn test_audit_remediation_suite() {
         .expect("get token for page_repo");
     let token_page_body: serde_json::Value = token_page_resp.json().await.expect("token json");
     let page_token = token_page_body["token"].as_str().unwrap();
+
+    let cfg_d = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+    let cfg_up = client
+        .post(format!("{base_url}/v2/{page_repo}/blobs/uploads/"))
+        .bearer_auth(page_token)
+        .send()
+        .await
+        .expect("post upload cfg");
+    let cfg_loc = cfg_up
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let cfg_put_url = if cfg_loc.starts_with("http") {
+        format!("{cfg_loc}&digest={cfg_d}")
+    } else {
+        format!("{base_url}{cfg_loc}&digest={cfg_d}")
+    };
+    client
+        .put(cfg_put_url)
+        .bearer_auth(page_token)
+        .body(b"{}".to_vec())
+        .send()
+        .await
+        .expect("put cfg blob");
+
+    let layer_up = client
+        .post(format!("{base_url}/v2/{page_repo}/blobs/uploads/"))
+        .bearer_auth(page_token)
+        .send()
+        .await
+        .expect("post upload layer");
+    let layer_loc = layer_up
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let layer_put_url = if layer_loc.starts_with("http") {
+        format!("{layer_loc}&digest={sha512_digest}")
+    } else {
+        format!("{base_url}{layer_loc}&digest={sha512_digest}")
+    };
+    client
+        .put(layer_put_url)
+        .bearer_auth(page_token)
+        .body(sha512_data.to_vec())
+        .send()
+        .await
+        .expect("put layer blob");
 
     for tag_name in &["tag-alpha", "tag-beta", "tag-gamma"] {
         let manifest = serde_json::json!({

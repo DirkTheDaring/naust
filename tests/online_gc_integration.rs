@@ -45,6 +45,29 @@ fn quarantine_meta_path(fs_root: &Path, hex: &str) -> PathBuf {
         .join(format!("{hex}.ts"))
 }
 
+fn write_repo_blob_membership(fs_root: &Path, repo: &str, digest: &str) {
+    use base64::prelude::*;
+    let (algo, hex) = digest.split_once(':').unwrap();
+    let enc_repo = BASE64_URL_SAFE_NO_PAD.encode(repo.as_bytes());
+    let marker_dir = fs_root
+        .join("repo-memberships")
+        .join("by-repo")
+        .join(&enc_repo)
+        .join(algo);
+    std::fs::create_dir_all(&marker_dir).expect("mkdir membership");
+    let marker_path = marker_dir.join(format!("{hex}.json"));
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "repo": repo,
+        "digest": digest,
+        "created_at_unix_secs": 1000,
+        "provenance": { "type": "upload" },
+        "format_version": 1,
+        "state": "active"
+    });
+    std::fs::write(&marker_path, serde_json::to_vec(&record).unwrap()).expect("write membership");
+}
+
 fn bin_path() -> String {
     // Prefer Cargo-provided env var when available, otherwise derive the path from the
     // integration test executable location (target/<profile>/deps/...).
@@ -98,6 +121,17 @@ fn write_config(
     std::fs::create_dir_all(fs_root.join("quarantine").join("meta").join("sha256"))
         .expect("mkdir quarantine meta");
     std::fs::create_dir_all(&ref_index).expect("mkdir ref-index");
+    let meta_dir = fs_root.join("meta");
+    std::fs::create_dir_all(&meta_dir).expect("mkdir meta");
+    let ready_json = serde_json::json!({
+        "version": 1,
+        "ready_at_unix_secs": 1000
+    });
+    std::fs::write(
+        meta_dir.join("membership_ready.json"),
+        serde_json::to_vec(&ready_json).unwrap(),
+    )
+    .expect("write ready");
 
     let toml = format!(
         r#"
@@ -352,6 +386,45 @@ async fn push_blob_via_upload(base: &str, repo: &str, bytes: &[u8]) -> String {
     digest
 }
 
+async fn push_manifest_for_blob(
+    base: &str,
+    repo: &str,
+    tag: &str,
+    blob_digest: &str,
+    blob_size: usize,
+) {
+    let scope = format!("repository:{repo}:pull,push");
+    let token = get_token(base, &scope).await;
+    let client = reqwest::Client::new();
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "size": blob_size,
+            "digest": blob_digest
+        },
+        "layers": []
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let res = client
+        .put(format!("{base}/v2/{repo}/manifests/{tag}"))
+        .bearer_auth(&token)
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .body(manifest_bytes)
+        .send()
+        .await
+        .expect("put manifest");
+    assert!(
+        res.status().is_success(),
+        "put manifest status: {}",
+        res.status()
+    );
+}
+
 #[tokio::test]
 async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -392,6 +465,7 @@ async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
     let a_live = live_blob_path(&fs_root, &hex_a);
     std::fs::create_dir_all(a_live.parent().unwrap()).expect("mkdir live");
     std::fs::write(&a_live, &blob_a).expect("write blob A");
+    write_repo_blob_membership(&fs_root, "myrepo", &digest_a);
 
     // Read works before quarantine.
     let mut get = http_get_blob(&base, "myrepo", &digest_a, None).await;
@@ -434,10 +508,12 @@ async fn phases_1_to_4_quarantine_readable_budgeted_and_pins_skip() {
         blob_a.as_slice()
     );
 
-    // Phase 2: finalize pinning -> pinned blob should be skipped by quarantine.
-    let pinned_digest = push_blob_via_upload(&base, "myrepo", b"pinned-finalize-blob").await;
+    // Phase 2: finalize pinning / manifest reference -> protected blob should be skipped by quarantine.
+    let pinned_data = b"pinned-finalize-blob";
+    let pinned_digest = push_blob_via_upload(&base, "myrepo", pinned_data).await;
     let pinned_hex = pinned_digest.strip_prefix("sha256:").unwrap();
     let pinned_live = live_blob_path(&fs_root, pinned_hex);
+    push_manifest_for_blob(&base, "myrepo", "v1", &pinned_digest, pinned_data.len()).await;
 
     // Create another unpinned blob in live store.
     let blob_b = b"integration-blob-b".to_vec();
@@ -553,6 +629,7 @@ async fn phase_5_kill_switch_and_delete_gate_and_delete_flow() {
         let live = live_blob_path(&fs_root, &hex);
         std::fs::create_dir_all(live.parent().unwrap()).expect("mkdir live");
         std::fs::write(&live, &blob).expect("write blob");
+        write_repo_blob_membership(&fs_root, "myrepo", &digest);
 
         let mut get = http_get_blob(&base, "myrepo", &digest, None).await;
         if get.status().as_u16() == 401 {

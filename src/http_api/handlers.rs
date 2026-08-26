@@ -356,255 +356,161 @@ async fn blob_by_digest(
         return blob_by_digest_proxy_only(state, method, name, digest, proxy_ctx).await;
     }
 
+    // Check repository-scoped blob membership
+    let membership_opt = match state.storage.get_repo_blob_membership(name, &digest).await {
+        Ok(opt) => opt,
+        Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
+        Err(_) => None,
+    };
+
     match method {
-        Method::DELETE => {
-            // Fast path: if the blob doesn't exist, don't do an expensive reference scan.
-            match state.storage.head_blob(&digest).await {
-                Ok(_) => {}
-                Err(StorageError::NotFound) => return errors::blob_unknown().into_response(),
-                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => {
-                    return errors::insufficient_storage().into_response();
-                }
-                Err(_) => return errors::internal_error().into_response(),
+        Method::DELETE => match state.delete_service.delete_repo_blob(name, &digest).await {
+            Ok(crate::blob_delete_safety::BlobDeleteResult::Success) => {
+                (StatusCode::ACCEPTED, registry_headers()).into_response()
             }
-
-            // On Filesystem backend, fast local Sled ref-index can be used when available.
-            // On S3 backend, node-local Sled state must NEVER be the sole evidence permitting
-            // deletion of shared S3 content; it must always use authoritative storage traversal.
-            let is_fs = state.config.storage_backend == crate::config::StorageBackend::Filesystem;
-            if is_fs && let Some(idx) = state.ref_index.as_ref() {
-                match idx.is_blob_referenced(&digest) {
-                    Ok(true) => {
-                        return errors::blob_in_use("blob is still referenced").into_response();
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            digest = digest.as_str(),
-                            "ref-index lookup failed; attempting rebuild"
-                        );
-
-                        if state.config.ref_index.auto_rebuild_on_corruption {
-                            let _ = idx
-                                .ensure_healthy_or_rebuild(&state.storage, true, false)
-                                .await;
-                        }
-
-                        match idx.is_blob_referenced(&digest) {
-                            Ok(true) => {
-                                return errors::blob_in_use("blob is still referenced")
-                                    .into_response();
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    digest = digest.as_str(),
-                                    "ref-index still unhealthy; falling back to full scan"
-                                );
-                                match crate::blob_delete_safety::find_blob_reference(
-                                    &state.storage,
-                                    &digest,
-                                )
-                                .await
-                                {
-                                    Ok(Some(r)) => {
-                                        let mut msg = format!(
-                                            "blob is still referenced by manifest {}",
-                                            r.manifest
-                                        );
-                                        if let Some(tag) = r.tag {
-                                            msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
-                                        } else {
-                                            msg = format!("{msg} (repo={})", r.repo);
-                                        }
-                                        return errors::blob_in_use(&msg).into_response();
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            error = %err,
-                                            digest = digest.as_str(),
-                                            "safe blob delete: failed to scan for references"
-                                        );
-                                        return errors::internal_error().into_response();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                match crate::blob_delete_safety::find_blob_reference(&state.storage, &digest).await
-                {
-                    Ok(Some(r)) => {
-                        let mut msg =
-                            format!("blob is still referenced by manifest {}", r.manifest);
-                        if let Some(tag) = r.tag {
-                            msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
-                        } else {
-                            msg = format!("{msg} (repo={})", r.repo);
-                        }
-                        return errors::blob_in_use(&msg).into_response();
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            digest = digest.as_str(),
-                            "safe blob delete: failed to scan for references"
-                        );
-                        return errors::internal_error().into_response();
-                    }
-                }
+            Ok(crate::blob_delete_safety::BlobDeleteResult::NotFound) => {
+                errors::blob_unknown().into_response()
             }
-
-            match state.storage.delete_blob(&digest).await {
-                Ok(()) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
-                Err(StorageError::NotFound) => errors::blob_unknown().into_response(),
-                Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => {
-                    errors::insufficient_storage().into_response()
-                }
-                Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-                Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-                Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
-                Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
+            Ok(crate::blob_delete_safety::BlobDeleteResult::InUse { message }) => {
+                errors::blob_in_use(&message).into_response()
             }
-        }
-        Method::HEAD => match state.storage.head_blob(&digest).await {
-            Ok(meta) => {
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                (StatusCode::OK, headers).into_response()
-            }
-            Err(StorageError::NotFound) => {
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok(meta) = ctx.cache.head_blob(&digest).await {
-                        ctx.proxy.note_blob_access(&digest);
+            Err(_) => errors::internal_error().into_response(),
+        },
+        Method::HEAD => {
+            if membership_opt.is_some() {
+                match state.storage.head_blob(&digest).await {
+                    Ok(meta) => {
                         let mut headers = registry_headers();
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
                         headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
                         return (StatusCode::OK, headers).into_response();
                     }
+                    Err(StorageError::NotFound) => return errors::blob_unknown().into_response(),
+                    Err(_) => return errors::internal_error().into_response(),
+                }
+            }
+
+            // Proxy fallback if configured
+            if let Some(ctx) = proxy_ctx.as_ref() {
+                if let Ok(meta) = ctx.cache.head_blob(&digest).await {
+                    ctx.proxy.note_blob_access(&digest);
+                    if let Err(e) = state
+                        .membership_ledger
+                        .link(
+                            &crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
+                                name,
+                                digest.clone(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
+                        return errors::internal_error().into_response();
+                    }
+                    let mut headers = registry_headers();
+                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                    return (StatusCode::OK, headers).into_response();
                 }
 
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                        match ctx.proxy.head_blob_upstream(&decision, &digest).await {
-                            Ok(size) => {
-                                let mut headers = registry_headers();
-                                headers.insert(
-                                    "Docker-Content-Digest",
-                                    digest.as_str().parse().unwrap(),
-                                );
-                                headers.insert(
-                                    "Content-Type",
-                                    "application/octet-stream".parse().unwrap(),
-                                );
-                                headers.insert("Content-Length", size.to_string().parse().unwrap());
-                                return (StatusCode::OK, headers).into_response();
-                            }
-                            Err(crate::proxy::ProxyError::NotFound) => {}
-                            Err(err) => {
-                                tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: head blob failed");
-                                return errors::internal_error().into_response();
-                            }
-                        }
+                if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
+                    if let Ok(size) = ctx.proxy.head_blob_upstream(&decision, &digest).await {
+                        let mut headers = registry_headers();
+                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                        headers.insert("Content-Length", size.to_string().parse().unwrap());
+                        return (StatusCode::OK, headers).into_response();
                     }
                 }
-                errors::blob_unknown().into_response()
             }
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
-        Method::GET => match state.storage.open_blob(&digest).await {
-            Ok((meta, reader)) => {
-                let stream = ReaderStream::new(reader);
-                let body = Body::from_stream(stream);
 
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                (StatusCode::OK, headers, body).into_response()
-            }
-            Err(StorageError::NotFound) => {
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
-                        ctx.proxy.note_blob_access(&digest);
+            errors::blob_unknown().into_response()
+        }
+        Method::GET => {
+            if membership_opt.is_some() {
+                match state.storage.open_blob(&digest).await {
+                    Ok((meta, reader)) => {
                         let stream = ReaderStream::new(reader);
                         let body = Body::from_stream(stream);
-
                         let mut headers = registry_headers();
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
                         headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
                         return (StatusCode::OK, headers, body).into_response();
                     }
+                    Err(StorageError::NotFound) => return errors::blob_unknown().into_response(),
+                    Err(_) => return errors::internal_error().into_response(),
+                }
+            }
+
+            // Proxy fallback if configured
+            if let Some(ctx) = proxy_ctx.as_ref() {
+                if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
+                    ctx.proxy.note_blob_access(&digest);
+                    if let Err(e) = state
+                        .membership_ledger
+                        .link(
+                            &crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
+                                name,
+                                digest.clone(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
+                        return errors::internal_error().into_response();
+                    }
+                    let stream = ReaderStream::new(reader);
+                    let body = Body::from_stream(stream);
+                    let mut headers = registry_headers();
+                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                    return (StatusCode::OK, headers, body).into_response();
                 }
 
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                        match ctx
-                            .proxy
-                            .fetch_blob_into_storage(&decision, &digest, &ctx.cache)
-                            .await
-                        {
-                            Ok(()) => {
-                                // Retry from cache storage.
-                                if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
-                                    ctx.proxy.note_blob_access(&digest);
-                                    let stream = ReaderStream::new(reader);
-                                    let body = Body::from_stream(stream);
-
-                                    let mut headers = registry_headers();
-                                    headers.insert(
-                                        "Docker-Content-Digest",
-                                        digest.as_str().parse().unwrap(),
-                                    );
-                                    headers.insert(
-                                        "Content-Type",
-                                        "application/octet-stream".parse().unwrap(),
-                                    );
-                                    headers.insert(
-                                        "Content-Length",
-                                        meta.size.to_string().parse().unwrap(),
-                                    );
-                                    return (StatusCode::OK, headers, body).into_response();
-                                }
-                            }
-                            Err(crate::proxy::ProxyError::NotFound) => {}
-                            Err(err) => {
-                                tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: fetch blob failed");
+                if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
+                    if ctx
+                        .proxy
+                        .fetch_blob_into_storage(&decision, &digest, &ctx.cache)
+                        .await
+                        .is_ok()
+                    {
+                        if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
+                            ctx.proxy.note_blob_access(&digest);
+                            if let Err(e) = state
+                                .membership_ledger
+                                .link(&crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
+                                    name,
+                                    digest.clone(),
+                                ))
+                                .await
+                            {
+                                tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
                                 return errors::internal_error().into_response();
                             }
+                            let stream = ReaderStream::new(reader);
+                            let body = Body::from_stream(stream);
+                            let mut headers = registry_headers();
+                            headers
+                                .insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                            headers.insert(
+                                "Content-Type",
+                                "application/octet-stream".parse().unwrap(),
+                            );
+                            headers
+                                .insert("Content-Length", meta.size.to_string().parse().unwrap());
+                            return (StatusCode::OK, headers, body).into_response();
                         }
                     }
                 }
-                errors::blob_unknown().into_response()
             }
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
-        _ => errors::method_not_allowed("GET, HEAD, DELETE"),
+
+            errors::blob_unknown().into_response()
+        }
+        _ => errors::method_not_allowed("GET, HEAD, DELETE").into_response(),
     }
 }
 
@@ -831,7 +737,9 @@ async fn manifest_by_reference(
             Err(StorageError::InsufficientStorage) => {
                 return errors::insufficient_storage().into_response();
             }
-            Err(StorageError::TagAlreadyExists) | Err(StorageError::Internal(_)) => {
+            Err(StorageError::TagAlreadyExists)
+            | Err(StorageError::Internal(_))
+            | Err(StorageError::MigrationRequired(_)) => {
                 return errors::internal_error().into_response();
             }
         }
@@ -921,7 +829,9 @@ async fn manifest_by_reference(
                     }
                     errors::internal_error().into_response()
                 }
-                Err(StorageError::TagAlreadyExists) | Err(StorageError::Internal(_)) => {
+                Err(StorageError::TagAlreadyExists)
+                | Err(StorageError::Internal(_))
+                | Err(StorageError::MigrationRequired(_)) => {
                     errors::internal_error().into_response()
                 }
             }
@@ -1024,6 +934,7 @@ async fn manifest_by_reference(
                 errors::insufficient_storage().into_response()
             }
             Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
+            Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         Method::GET => match state.storage.get_manifest(name, &digest).await {
@@ -1115,6 +1026,7 @@ async fn manifest_by_reference(
                 errors::insufficient_storage().into_response()
             }
             Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
+            Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
         _ => errors::method_not_allowed("GET, HEAD, DELETE"),
@@ -1403,10 +1315,27 @@ mod tests {
             cfg.max_connections_per_ip,
             cfg.trusted_bypass_cidrs.clone(),
         ));
+        let signing_key = cfg
+            .token_signing_keys
+            .first()
+            .map(|k| k.key.as_bytes().to_vec())
+            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
+        let upload_coordinator = Arc::new(crate::upload_coordinator::BlobUploadCoordinator::new(
+            storage.clone(),
+            None,
+            crate::upload_coordinator::BlobUploadCoordinatorConfig {
+                signing_key,
+                max_upload_bytes: cfg.max_upload_bytes,
+                abort_on_digest_mismatch: cfg.upload_policy.abort_on_digest_mismatch,
+                disallow_monolithic_uploads: cfg.disallow_monolithic_uploads,
+                upload_chunk_min_bytes: cfg.upload_chunk_min_bytes.map(|v| v as u64),
+                gc_pin_duration_secs: cfg.gc_pin_duration_secs,
+            },
+        ));
         AppState {
             config: cfg,
             auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage,
+            storage: storage.clone(),
             ref_index: None,
             gc_service,
             proxy: None,
@@ -1422,6 +1351,19 @@ mod tests {
             ip_limiter,
             is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consistency_gate: Arc::new(tokio::sync::Mutex::new(())),
+            membership_ledger: Arc::new(
+                crate::repository_membership_ledger::RepositoryMembershipLedger::new(
+                    storage.clone(),
+                    None,
+                    Arc::new(tokio::sync::Mutex::new(())),
+                ),
+            ),
+            upload_coordinator,
+            delete_service: Arc::new(crate::blob_delete_safety::BlobDeleteService::new(
+                storage.clone(),
+                None,
+                Arc::new(tokio::sync::Mutex::new(())),
+            )),
         }
     }
 
@@ -1953,6 +1895,14 @@ mod tests {
             s3_region: None,
             s3_bucket: None,
             s3_prefix: "registry".to_string(),
+            s3_single_instance_mode: false,
+            s3_lease_duration_secs: 60,
+            s3_lease_renewal_interval_secs: 20,
+            s3_max_retry_attempts: 3,
+            s3_legacy_multipart_cleanup_policy:
+                crate::config::LegacyMultipartCleanupPolicy::Disabled,
+            upload_receipt_lifetime_secs: 86400,
+            gc_pin_duration_secs: 1800,
             ref_index: crate::config::RefIndexConfig {
                 enabled: true,
                 path: PathBuf::from("./data/ref-index"),
@@ -3330,13 +3280,19 @@ async fn upload_create(
 
     // Cross-repository blob mount:
     //   POST /v2/<name>/blobs/uploads/?mount=<digest>[&from=<repo>]
-    // If the blob exists and client has pull authorization on source repo, respond 201 Created.
-    // If client lacks pull permission on source repo, return 403 Forbidden per auth specification.
-    // If source blob is missing, gracefully fall back to standard 202 upload session per spec.
     if let Some(mount_str) = query.get("mount").map(|s| s.as_str()) {
-        if let Some(from_repo) = query.get("from") {
-            let from_is_private = state.config.is_repo_private(from_repo);
+        let digest = match Digest::parse(mount_str) {
+            Ok(d) => d,
+            Err(_) => return errors::digest_invalid().into_response(),
+        };
 
+        let from_repo = query.get("from").map(|s| s.as_str());
+        if let Some(src_repo) = from_repo {
+            if !is_valid_repo_name(src_repo) {
+                return errors::name_invalid().into_response();
+            }
+
+            let from_is_private = state.config.is_repo_private(src_repo);
             let allows_pull = if let Some(token) = crate::auth::bearer_token_from_headers(headers) {
                 if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
                     &state.config.token_signing_keys,
@@ -3346,7 +3302,7 @@ async fn upload_create(
                 ) {
                     crate::security::token_allows_repo_action(
                         &claims,
-                        from_repo,
+                        src_repo,
                         crate::security::RepoAction::Pull,
                     )
                 } else {
@@ -3361,41 +3317,54 @@ async fn upload_create(
             }
         }
 
-        if let Ok(digest) = Digest::parse(mount_str) {
-            let can_mount = if let Some(from_repo) = query.get("from") {
-                state.storage.list_tags(from_repo).await.is_ok()
-            } else {
-                state.config.automatic_crossmount
-            };
-
-            if can_mount && state.storage.head_blob(&digest).await.is_ok() {
+        match state
+            .upload_coordinator
+            .cross_mount_blob(name, from_repo, &digest)
+            .await
+        {
+            Ok(crate::upload_coordinator::CrossMountResult::Mounted(fin)) => {
                 let mut resp_headers = registry_headers();
                 resp_headers.insert(
                     "Location",
-                    format!("/v2/{name}/blobs/{}", digest.as_str())
+                    format!("/v2/{name}/blobs/{}", fin.digest.as_str())
                         .parse()
                         .unwrap(),
                 );
-                resp_headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
+                resp_headers.insert(
+                    "Docker-Content-Digest",
+                    fin.digest.as_str().parse().unwrap(),
+                );
                 resp_headers.insert("Content-Length", "0".parse().unwrap());
                 return (StatusCode::CREATED, resp_headers).into_response();
             }
-            // Graceful fallback to normal 202 upload session per OCI Distribution Spec.
+            Ok(crate::upload_coordinator::CrossMountResult::Fallback(start)) => {
+                let mut resp_headers = registry_headers();
+                let location = format!(
+                    "/v2/{name}/blobs/uploads/{}?_state={}",
+                    start.session.uuid, start.state_token
+                );
+                resp_headers.insert("Location", location.parse().unwrap());
+                resp_headers.insert("Docker-Upload-UUID", start.session.uuid.parse().unwrap());
+                if let Some(min_len) = state.config.upload_chunk_min_bytes {
+                    resp_headers
+                        .insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
+                }
+                return (StatusCode::ACCEPTED, resp_headers).into_response();
+            }
+            Err(err) => return coordinator_error_to_response(err),
         }
     }
 
     // Monolithic upload (body on POST): POST /v2/<name>/blobs/uploads/?digest=<digest>
     // Conformance allows this to either create an upload session (202) or create the blob (201).
-    // If the blob already exists, we return 201.
+    // If the blob already exists in this repository, we return 201.
     if let Some(digest_str) = query.get("digest").map(|s| s.as_str()) {
         let digest = match Digest::parse(digest_str) {
             Ok(d) => d,
             Err(_) => return errors::digest_invalid().into_response(),
         };
 
-        let policy = state.config.resolved_upload_policy_for_repo(name);
-
-        if state.storage.head_blob(&digest).await.is_ok() {
+        if let Ok(Some(_)) = state.storage.get_repo_blob_membership(name, &digest).await {
             let mut headers = registry_headers();
             headers.insert(
                 "Location",
@@ -3423,279 +3392,174 @@ async fn upload_create(
         let first = stream.next().await;
         let Some(first) = first else {
             // No body -> behave like normal upload creation.
-            match state.storage.create_upload().await {
-                Ok(meta) => {
+            return match state.upload_coordinator.start_upload(name).await {
+                Ok(start) => {
                     let mut headers = registry_headers();
-                    let key = state
-                        .config
-                        .token_signing_keys
-                        .first()
-                        .map(|k| k.key.as_bytes())
-                        .unwrap_or(b"registry-rust-state-secret");
-                    let state_token = crate::http_api::upload_state::UploadStateData::new(
-                        name,
-                        &meta.uuid,
-                        meta.offset,
-                    )
-                    .encode_and_sign(key);
                     let location = format!(
-                        "/v2/{name}/blobs/uploads/{}?_state={state_token}",
-                        meta.uuid
+                        "/v2/{name}/blobs/uploads/{}?_state={}",
+                        start.session.uuid, start.state_token
                     );
                     headers.insert("Location", location.parse().unwrap());
-                    headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
+                    headers.insert("Docker-Upload-UUID", start.session.uuid.parse().unwrap());
                     if let Some(min_len) = state.config.upload_chunk_min_bytes {
                         headers
                             .insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
                     }
-                    return (StatusCode::ACCEPTED, headers).into_response();
+                    (StatusCode::ACCEPTED, headers).into_response()
                 }
-                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::InsufficientStorage) => {
-                    return errors::insufficient_storage().into_response();
-                }
-                Err(_) => return errors::internal_error().into_response(),
-            }
+                Err(err) => coordinator_error_to_response(err),
+            };
         };
-
-        // We saw a request body on POST ?digest => this is a monolithic upload.
-        // Some clients do this; operators might want to forbid it for robustness.
-        tracing::warn!(
-            repo = name,
-            "monolithic blob upload detected (POST ?digest with body)"
-        );
-        if state.config.disallow_monolithic_uploads {
-            return errors::blob_upload_invalid(
-                "monolithic uploads are disabled; use PATCH-based chunked upload",
-            )
-            .into_response();
-        }
 
         let first_chunk = match first {
             Ok(c) => c,
-            Err(err) => {
-                tracing::warn!(
-                    repo = name,
-                    error = %err,
-                    "monolithic blob upload: failed to read initial request body chunk"
-                );
+            Err(_) => {
                 return errors::request_timeout("upload aborted while reading request body")
                     .into_response();
             }
         };
 
-        let meta = match state.storage.create_upload().await {
-            Ok(meta) => meta,
-            Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                return errors::insufficient_storage().into_response();
-            }
-            Err(StorageError::Internal(msg)) => {
-                tracing::error!(storage = state.storage.kind(), error = %msg, repo = name, "create_upload failed");
-                return errors::internal_error().into_response();
-            }
-            Err(_) => return errors::internal_error().into_response(),
-        };
-
-        if !first_chunk.is_empty() {
-            let chunk_len = first_chunk.len();
-            if let Err(err) = state.storage.append_upload(&meta.uuid, first_chunk).await {
-                tracing::warn!(storage = state.storage.kind(), repo = name, uuid = %meta.uuid, chunk_len, "append_upload failed");
-                if policy.abort_on_error {
-                    let _ = state.storage.abort_upload(&meta.uuid).await;
+        let first_stream = futures_util::stream::once(async move { Ok(first_chunk) });
+        let rest = stream.map(|res| {
+            res.map_err(|e| match e {
+                crate::http_api::stream_guard::StreamGuardError::IdleTimeout(_) => {
+                    crate::storage::upload_session::UploadStreamError::IdleTimeout
                 }
-                return match err {
-                    StorageError::NotFound => errors::blob_upload_unknown().into_response(),
-                    StorageError::TooLarge => {
-                        errors::blob_upload_invalid("upload too large").into_response()
-                    }
-                    StorageError::InsufficientStorage => {
-                        errors::insufficient_storage().into_response()
-                    }
-                    StorageError::Unsupported => errors::not_implemented().into_response(),
-                    StorageError::Internal(_)
-                    | StorageError::DigestMismatch
-                    | StorageError::TagAlreadyExists => errors::internal_error().into_response(),
-                };
-            }
-        }
-
-        while let Some(next) = stream.next().await {
-            let chunk = match next {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::warn!(
-                        repo = name,
-                        uuid = %meta.uuid,
-                        error = %err,
-                        "monolithic blob upload: failed to read request body"
-                    );
-                    if policy.abort_on_error {
-                        let _ = state.storage.abort_upload(&meta.uuid).await;
-                    }
-                    return errors::request_timeout("upload aborted while reading request body")
-                        .into_response();
+                crate::http_api::stream_guard::StreamGuardError::InsufficientThroughput {
+                    ..
+                } => crate::storage::upload_session::UploadStreamError::RateTooLow,
+                crate::http_api::stream_guard::StreamGuardError::BodyError(err) => {
+                    crate::storage::upload_session::UploadStreamError::Io(std::io::Error::other(
+                        err,
+                    ))
                 }
-            };
-            if chunk.is_empty() {
-                continue;
-            }
-            let chunk_len = chunk.len();
-            if let Err(err) = state.storage.append_upload(&meta.uuid, chunk).await {
-                tracing::warn!(storage = state.storage.kind(), repo = name, uuid = %meta.uuid, chunk_len, "append_upload failed");
-                if policy.abort_on_error {
-                    let _ = state.storage.abort_upload(&meta.uuid).await;
-                }
-                return match err {
-                    StorageError::NotFound => errors::blob_upload_unknown().into_response(),
-                    StorageError::TooLarge => {
-                        errors::blob_upload_invalid("upload too large").into_response()
-                    }
-                    StorageError::InsufficientStorage => {
-                        errors::insufficient_storage().into_response()
-                    }
-                    StorageError::Unsupported => errors::not_implemented().into_response(),
-                    StorageError::Internal(_)
-                    | StorageError::DigestMismatch
-                    | StorageError::TagAlreadyExists => errors::internal_error().into_response(),
-                };
-            }
-        }
+            })
+        });
+        let body_stream: crate::storage::upload_session::UploadByteStream =
+            Box::pin(first_stream.chain(rest));
 
-        return match state.storage.finalize_upload(&meta.uuid, &digest).await {
-            Ok(final_meta) => {
-                if let Some(idx) = state.ref_index.as_ref() {
-                    let grace =
-                        std::time::Duration::from_secs(state.config.blob_gc_finalize_grace_secs);
-                    if let Some(until) = std::time::SystemTime::now().checked_add(grace) {
-                        if let Err(err) = idx.pin_blob(&digest, until, "finalize_upload") {
-                            tracing::warn!(
-                                error = %err,
-                                digest = %digest.as_str(),
-                                grace_secs = state.config.blob_gc_finalize_grace_secs,
-                                "ref-index: failed to pin blob on finalize"
-                            );
-                        }
-                    }
-                }
-
+        match state
+            .upload_coordinator
+            .monolithic_upload(name, &digest, Some(body_stream))
+            .await
+        {
+            Ok(crate::upload_coordinator::MonolithicUploadResult::AlreadyFinalized(res))
+            | Ok(crate::upload_coordinator::MonolithicUploadResult::Created(res)) => {
                 let mut headers = registry_headers();
                 headers.insert(
                     "Location",
-                    format!("/v2/{name}/blobs/{}", digest.as_str())
+                    format!("/v2/{name}/blobs/{}", res.digest.as_str())
                         .parse()
                         .unwrap(),
                 );
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
                 headers.insert(
-                    "Content-Length",
-                    final_meta.size.to_string().parse().unwrap(),
+                    "Docker-Content-Digest",
+                    res.digest.as_str().parse().unwrap(),
                 );
+                headers.insert("Content-Length", res.size.to_string().parse().unwrap());
                 (StatusCode::CREATED, headers).into_response()
             }
-            Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::DigestMismatch) => {
-                if policy.abort_on_digest_mismatch {
-                    let _ = state.storage.abort_upload(&meta.uuid).await;
+            Ok(crate::upload_coordinator::MonolithicUploadResult::SessionStarted(start)) => {
+                let mut headers = registry_headers();
+                let location = format!(
+                    "/v2/{name}/blobs/uploads/{}?_state={}",
+                    start.session.uuid, start.state_token
+                );
+                headers.insert("Location", location.parse().unwrap());
+                headers.insert("Docker-Upload-UUID", start.session.uuid.parse().unwrap());
+                (StatusCode::ACCEPTED, headers).into_response()
+            }
+            Err(err) => coordinator_error_to_response(err),
+        }
+    } else {
+        match state.upload_coordinator.start_upload(name).await {
+            Ok(start) => {
+                let mut headers = registry_headers();
+                let location = format!(
+                    "/v2/{name}/blobs/uploads/{}?_state={}",
+                    start.session.uuid, start.state_token
+                );
+                headers.insert("Location", location.parse().unwrap());
+                headers.insert("Docker-Upload-UUID", start.session.uuid.parse().unwrap());
+                if let Some(min_len) = state.config.upload_chunk_min_bytes {
+                    headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
                 }
-                errors::digest_invalid().into_response()
+                (StatusCode::ACCEPTED, headers).into_response()
             }
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::TagAlreadyExists) | Err(StorageError::Internal(_)) => {
-                errors::internal_error().into_response()
-            }
-        };
-    }
-
-    match state.storage.create_upload().await {
-        Ok(meta) => {
-            let mut headers = registry_headers();
-            let key = state
-                .config
-                .token_signing_keys
-                .first()
-                .map(|k| k.key.as_bytes())
-                .unwrap_or(b"registry-rust-state-secret");
-            let state_token =
-                crate::http_api::upload_state::UploadStateData::new(name, &meta.uuid, 0)
-                    .encode_and_sign(key);
-            let location = format!(
-                "/v2/{name}/blobs/uploads/{}?_state={state_token}",
-                meta.uuid
-            );
-            headers.insert("Location", location.parse().unwrap());
-            headers.insert("Docker-Upload-UUID", meta.uuid.parse().unwrap());
-            if let Some(min_len) = state.config.upload_chunk_min_bytes {
-                headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
-            }
-            (StatusCode::ACCEPTED, headers).into_response()
+            Err(err) => coordinator_error_to_response(err),
         }
-        Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-        Err(StorageError::Internal(msg)) => {
-            tracing::error!(
-                storage = state.storage.kind(),
-                error = %msg,
-                repo = name,
-                "create_upload failed"
-            );
-            errors::internal_error().into_response()
-        }
-        Err(StorageError::DigestMismatch) | Err(StorageError::NotFound) => {
-            tracing::error!(
-                storage = state.storage.kind(),
-                repo = name,
-                "create_upload failed"
-            );
-            errors::internal_error().into_response()
-        }
-        Err(StorageError::TooLarge) | Err(StorageError::TagAlreadyExists) => {
-            errors::internal_error().into_response()
-        }
-        Err(StorageError::InsufficientStorage) => errors::insufficient_storage().into_response(),
     }
 }
 
-fn validate_upload_state(
-    query_state: Option<&str>,
-    key: &[u8],
-    route_repo: &str,
-    route_uuid: &str,
-    stored_offset: u64,
-    is_required: bool,
-) -> Result<Option<crate::http_api::upload_state::UploadStateData>, Response> {
-    let state_str = match query_state {
-        Some(st) if !st.trim().is_empty() => st.trim(),
-        _ => {
-            if is_required {
-                return Err(errors::blob_upload_invalid("missing _state parameter").into_response());
-            }
-            return Ok(None);
+fn coordinator_error_to_response(err: crate::upload_coordinator::CoordinatorError) -> Response {
+    use crate::http_api::upload_state::StateTokenError;
+    use crate::storage::StorageError;
+    use crate::upload_coordinator::CoordinatorError;
+    match err {
+        CoordinatorError::InvalidRepoName(_) => errors::name_invalid().into_response(),
+        CoordinatorError::SessionNotFound => errors::blob_upload_unknown().into_response(),
+        CoordinatorError::StateToken(StateTokenError::Missing) => {
+            errors::blob_upload_invalid("missing _state parameter").into_response()
         }
-    };
-
-    let state_data = match crate::http_api::upload_state::UploadStateData::verify_and_decode(
-        state_str, key, route_repo,
-    ) {
-        Ok(data) => data,
-        Err(_) => {
-            return Err(errors::blob_upload_invalid("invalid _state parameter").into_response());
-        }
-    };
-
-    if let Err(err) = state_data.validate_session(route_uuid, stored_offset) {
-        return Err(match err {
-            crate::http_api::upload_state::StateTokenError::OffsetMismatch { .. } => {
-                errors::range_invalid("storage size does not match state offset").into_response()
+        CoordinatorError::StateToken(StateTokenError::OffsetMismatch { expected, .. }) => {
+            let mut resp = errors::range_invalid("storage size does not match state offset");
+            if expected > 0 {
+                resp.headers_mut()
+                    .insert("Range", format!("0-{}", expected - 1).parse().unwrap());
             }
-            _ => errors::blob_upload_invalid("invalid _state parameter").into_response(),
-        });
+            resp.into_response()
+        }
+        CoordinatorError::StateToken(_) => {
+            errors::blob_upload_invalid("invalid _state parameter").into_response()
+        }
+        CoordinatorError::OffsetMismatch { current, .. } => {
+            let mut resp = errors::range_invalid("storage size does not match state offset");
+            if current > 0 {
+                resp.headers_mut()
+                    .insert("Range", format!("0-{}", current - 1).parse().unwrap());
+            }
+            resp.into_response()
+        }
+        CoordinatorError::RangeInvalid(msg) => errors::range_invalid(&msg).into_response(),
+        CoordinatorError::DigestMismatch { .. } => errors::digest_invalid().into_response(),
+        CoordinatorError::SizeInvalid(msg) => errors::size_invalid(&msg).into_response(),
+        CoordinatorError::TooLarge => {
+            errors::blob_upload_invalid("upload too large").into_response()
+        }
+        CoordinatorError::Conflict => {
+            (StatusCode::CONFLICT, "concurrent operation conflict").into_response()
+        }
+        CoordinatorError::MonolithicDisallowed => errors::blob_upload_invalid(
+            "monolithic uploads are disabled; use PATCH-based chunked upload",
+        )
+        .into_response(),
+        CoordinatorError::InvalidPreparedHandle => errors::internal_error().into_response(),
+        CoordinatorError::Storage(StorageError::NotFound) => {
+            errors::blob_upload_unknown().into_response()
+        }
+        CoordinatorError::Storage(StorageError::DigestMismatch) => {
+            errors::digest_invalid().into_response()
+        }
+        CoordinatorError::Storage(StorageError::TooLarge) => {
+            errors::blob_upload_invalid("upload too large").into_response()
+        }
+        CoordinatorError::Storage(StorageError::InsufficientStorage) => {
+            errors::insufficient_storage().into_response()
+        }
+        CoordinatorError::Storage(StorageError::Unsupported) => {
+            errors::not_implemented().into_response()
+        }
+        CoordinatorError::Storage(_) => errors::internal_error().into_response(),
+        CoordinatorError::Stream(
+            crate::storage::upload_session::UploadStreamError::IdleTimeout,
+        ) => errors::request_timeout("upload aborted while reading request body").into_response(),
+        CoordinatorError::Stream(crate::storage::upload_session::UploadStreamError::RateTooLow) => {
+            errors::request_timeout("upload aborted due to low transfer rate").into_response()
+        }
+        CoordinatorError::Stream(crate::storage::upload_session::UploadStreamError::Io(io_err)) => {
+            errors::request_timeout(&format!("stream io error: {io_err}")).into_response()
+        }
     }
-
-    Ok(Some(state_data))
 }
 
 async fn upload_session(
@@ -3717,10 +3581,6 @@ async fn upload_session(
         return errors::blob_upload_unknown().into_response();
     }
 
-    let location = format!("/v2/{name}/blobs/uploads/{uuid}");
-
-    let policy = state.config.resolved_upload_policy_for_repo(name);
-
     if let Some(token) = crate::auth::bearer_token_from_headers(req_headers) {
         if let Ok(claims) = crate::security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
@@ -3741,220 +3601,130 @@ async fn upload_session(
         }
     }
 
-    let current_meta = match state.storage.upload_status(uuid).await {
-        Ok(m) => m,
-        Err(StorageError::NotFound) => {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            return errors::blob_upload_unknown().into_response();
-        }
-        Err(StorageError::Unsupported) => {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            return errors::not_implemented().into_response();
-        }
-        Err(StorageError::InsufficientStorage) => {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            return errors::insufficient_storage().into_response();
-        }
-        Err(_) => {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            return errors::internal_error().into_response();
-        }
-    };
-
-    let key = state
-        .config
-        .token_signing_keys
-        .first()
-        .map(|k| k.key.as_bytes())
-        .unwrap_or(b"registry-rust-state-secret");
-
-    let is_patch = method == Method::PATCH;
-    let query_state = query.get("_state").map(|s| s.as_str());
-    if let Err(err_resp) =
-        validate_upload_state(query_state, key, name, uuid, current_meta.offset, is_patch)
-    {
-        let _ = axum::body::to_bytes(body, usize::MAX).await;
-        return err_resp;
-    }
-
     match method {
         Method::GET | Method::HEAD => {
-            let mut headers = registry_headers();
-            headers.insert("Location", location.parse().unwrap());
-            headers.insert("Docker-Upload-UUID", current_meta.uuid.parse().unwrap());
-            if current_meta.offset > 0 {
-                headers.insert(
-                    "Range",
-                    format!("0-{}", current_meta.offset - 1).parse().unwrap(),
-                );
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            match state
+                .upload_coordinator
+                .get_upload_status(name, uuid, query.get("_state").map(|s| s.as_str()))
+                .await
+            {
+                Ok(st) => {
+                    let mut headers = registry_headers();
+                    let location = format!("/v2/{name}/blobs/uploads/{uuid}");
+                    headers.insert("Location", location.parse().unwrap());
+                    headers.insert("Docker-Upload-UUID", uuid.parse().unwrap());
+                    if st.offset > 0 {
+                        headers.insert("Range", format!("0-{}", st.offset - 1).parse().unwrap());
+                    }
+                    (StatusCode::NO_CONTENT, headers).into_response()
+                }
+                Err(err) => coordinator_error_to_response(err),
             }
-            (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Method::DELETE => match state.storage.abort_upload(uuid).await {
-            Ok(()) => {
-                let mut headers = registry_headers();
-                headers.insert("Docker-Upload-UUID", uuid.parse().unwrap());
-                (StatusCode::NO_CONTENT, headers).into_response()
+        Method::DELETE => {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            match state
+                .upload_coordinator
+                .abort_upload(name, uuid, query.get("_state").map(|s| s.as_str()))
+                .await
+            {
+                Ok(()) => {
+                    let mut headers = registry_headers();
+                    headers.insert("Docker-Upload-UUID", uuid.parse().unwrap());
+                    (StatusCode::NO_CONTENT, headers).into_response()
+                }
+                Err(err) => coordinator_error_to_response(err),
             }
-            Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-            Err(StorageError::Unsupported) => {
-                errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE")
-            }
-            Err(_) => errors::internal_error().into_response(),
-        },
+        }
         Method::PATCH => {
-            // Enforce that Content-Range starts at the current offset.
-            if let Some((start, end)) = parse_content_range(req_headers) {
-                if let Some(cl) = req_headers
-                    .get(http::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    if (end.saturating_sub(start) + 1) != cl {
-                        let _ = axum::body::to_bytes(body, 1024 * 1024).await;
-                        return errors::size_invalid(
-                            "provided length did not match content length",
-                        );
-                    }
-                }
-                if current_meta.offset != start {
-                    let _ = axum::body::to_bytes(body, 1024 * 1024).await;
-                    let mut resp = errors::range_invalid("invalid content range");
-                    if current_meta.offset > 0 {
-                        resp.headers_mut().insert(
-                            "Range",
-                            format!("0-{}", current_meta.offset - 1).parse().unwrap(),
-                        );
-                    }
-                    return resp;
-                }
-            }
+            let range = parse_content_range(req_headers);
+            let content_len = req_headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            let Some(state_param) = query.get("_state").map(|s| s.as_str()) else {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+                return errors::blob_upload_invalid("missing _state parameter").into_response();
+            };
 
             let (idle_timeout, min_rate) = state.current_stream_guard_params();
             let audit_only = state.config.slow_connection_policy
                 == crate::config::SlowConnectionPolicy::AuditOnly;
-            let mut stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
+            let stream = crate::http_api::stream_guard::MonitoredUploadStream::new(
                 body.into_data_stream(),
                 idle_timeout,
                 Duration::from_secs(state.config.upload_rate_grace_period_secs),
                 Duration::from_secs(state.config.upload_rate_window_secs),
                 min_rate,
                 audit_only,
-            );
-            let mut last_meta = current_meta;
-
-            while let Some(next) = stream.next().await {
-                let chunk = match next {
-                    Ok(c) => c,
-                    Err(err) => {
-                        tracing::warn!(
-                            repo = name,
-                            uuid = uuid,
-                            error = %err,
-                            "blob upload PATCH: failed to read request body"
-                        );
-                        if policy.abort_on_error {
-                            let _ = state.storage.abort_upload(uuid).await;
-                        }
-                        return errors::request_timeout(
-                            "upload aborted while reading request body",
-                        )
-                        .into_response();
-                    }
-                };
-                if chunk.is_empty() {
-                    continue;
-                }
-                last_meta = match state.storage.append_upload(uuid, chunk).await {
-                    Ok(m) => m,
-                    Err(StorageError::NotFound) => {
-                        return errors::blob_upload_unknown().into_response();
-                    }
-                    Err(StorageError::TooLarge) => {
-                        if policy.abort_on_error {
-                            let _ = state.storage.abort_upload(uuid).await;
-                        }
-                        return errors::blob_upload_invalid("upload too large").into_response();
-                    }
-                    Err(StorageError::InsufficientStorage) => {
-                        if policy.abort_on_error {
-                            let _ = state.storage.abort_upload(uuid).await;
-                        }
-                        return errors::insufficient_storage().into_response();
-                    }
-                    Err(StorageError::Unsupported) => {
-                        return errors::not_implemented().into_response();
-                    }
-                    Err(StorageError::Internal(_))
-                    | Err(StorageError::DigestMismatch)
-                    | Err(StorageError::TagAlreadyExists) => {
-                        if policy.abort_on_error {
-                            let _ = state.storage.abort_upload(uuid).await;
-                        }
-                        return errors::internal_error().into_response();
-                    }
-                };
-            }
-
-            let mut headers = registry_headers();
-            let key = state
-                .config
-                .token_signing_keys
-                .first()
-                .map(|k| k.key.as_bytes())
-                .unwrap_or(b"registry-rust-state-secret");
-            let state_token = crate::http_api::upload_state::UploadStateData::new(
-                name,
-                &last_meta.uuid,
-                last_meta.offset,
             )
-            .encode_and_sign(key);
-            let patch_location = format!(
-                "/v2/{name}/blobs/uploads/{}?_state={state_token}",
-                last_meta.uuid
-            );
-            headers.insert("Location", patch_location.parse().unwrap());
-            headers.insert("Docker-Upload-UUID", last_meta.uuid.parse().unwrap());
-            if last_meta.offset > 0 {
-                headers.insert(
-                    "Range",
-                    format!("0-{}", last_meta.offset - 1).parse().unwrap(),
-                );
+            .map(|res| {
+                res.map_err(|e| match e {
+                    crate::http_api::stream_guard::StreamGuardError::IdleTimeout(_) => {
+                        crate::storage::upload_session::UploadStreamError::IdleTimeout
+                    }
+                    crate::http_api::stream_guard::StreamGuardError::InsufficientThroughput {
+                        ..
+                    } => crate::storage::upload_session::UploadStreamError::RateTooLow,
+                    crate::http_api::stream_guard::StreamGuardError::BodyError(err) => {
+                        crate::storage::upload_session::UploadStreamError::Io(
+                            std::io::Error::other(err),
+                        )
+                    }
+                })
+            });
+
+            match state
+                .upload_coordinator
+                .append_upload(
+                    name,
+                    uuid,
+                    state_param,
+                    range,
+                    content_len,
+                    Box::pin(stream),
+                )
+                .await
+            {
+                Ok(app) => {
+                    let mut headers = registry_headers();
+                    let patch_location = format!(
+                        "/v2/{name}/blobs/uploads/{}?_state={}",
+                        app.session.uuid, app.state_token
+                    );
+                    headers.insert("Location", patch_location.parse().unwrap());
+                    headers.insert("Docker-Upload-UUID", app.session.uuid.parse().unwrap());
+                    if app.new_offset > 0 {
+                        headers.insert(
+                            "Range",
+                            format!("0-{}", app.new_offset - 1).parse().unwrap(),
+                        );
+                    }
+                    if let Some(min_len) = state.config.upload_chunk_min_bytes {
+                        headers
+                            .insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
+                    }
+                    (StatusCode::ACCEPTED, headers).into_response()
+                }
+                Err(err) => coordinator_error_to_response(err),
             }
-            if let Some(min_len) = state.config.upload_chunk_min_bytes {
-                headers.insert("OCI-Chunk-Min-Length", min_len.to_string().parse().unwrap());
-            }
-            (StatusCode::ACCEPTED, headers).into_response()
         }
         Method::PUT => {
             let Some(digest_str) = query.get("digest").map(|s| s.as_str()) else {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
                 return errors::digest_invalid().into_response();
             };
             let digest = match Digest::parse(digest_str) {
                 Ok(d) => d,
-                Err(_) => return errors::digest_invalid().into_response(),
+                Err(_) => {
+                    let _ = axum::body::to_bytes(body, usize::MAX).await;
+                    return errors::digest_invalid().into_response();
+                }
             };
 
-            // Optional Content-Range enforcement.
-            if let Some((start, _end)) = parse_content_range(req_headers) {
-                match state.storage.upload_status(uuid).await {
-                    Ok(meta) if meta.offset == start => {}
-                    Ok(meta) => {
-                        let mut resp = errors::size_invalid("range not satisfiable");
-                        if meta.offset > 0 {
-                            resp.headers_mut()
-                                .insert("Range", format!("0-{}", meta.offset - 1).parse().unwrap());
-                        }
-                        return resp;
-                    }
-                    Err(StorageError::NotFound) => {
-                        return errors::blob_upload_unknown().into_response();
-                    }
-                    Err(_) => return errors::internal_error().into_response(),
-                }
-            }
-
-            // Stream any body bytes into the upload (some clients do monolithic finalize-on-PUT).
+            let range = parse_content_range(req_headers);
             let (idle_timeout, min_rate) = state.current_stream_guard_params();
             let audit_only = state.config.slow_connection_policy
                 == crate::config::SlowConnectionPolicy::AuditOnly;
@@ -3967,84 +3737,11 @@ async fn upload_session(
                 audit_only,
             );
             let first = stream.next().await;
-            if let Some(first) = first {
-                tracing::warn!(
-                    repo = name,
-                    uuid = uuid,
-                    "monolithic upload detected (PUT finalize with body)"
-                );
-                if state.config.disallow_monolithic_uploads {
-                    return errors::blob_upload_invalid(
-                        "monolithic uploads are disabled; use PATCH-based chunked upload",
-                    )
-                    .into_response();
-                }
-
-                let first_chunk = match first {
-                    Ok(c) => c,
-                    Err(err) => {
-                        tracing::warn!(
-                            repo = name,
-                            uuid = uuid,
-                            digest = digest.as_str(),
-                            error = %err,
-                            "monolithic finalize-on-PUT: failed to read request body"
-                        );
-                        if policy.abort_on_error {
-                            let _ = state.storage.abort_upload(uuid).await;
-                        }
-                        return errors::request_timeout(
-                            "upload aborted while reading request body",
-                        )
-                        .into_response();
-                    }
-                };
-                if !first_chunk.is_empty() {
-                    match state.storage.append_upload(uuid, first_chunk).await {
-                        Ok(_) => {}
-                        Err(StorageError::NotFound) => {
-                            return errors::blob_upload_unknown().into_response();
-                        }
-                        Err(StorageError::TooLarge) => {
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
-                            return errors::blob_upload_invalid("upload too large").into_response();
-                        }
-                        Err(StorageError::InsufficientStorage) => {
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
-                            return errors::insufficient_storage().into_response();
-                        }
-                        Err(StorageError::Unsupported) => {
-                            return errors::not_implemented().into_response();
-                        }
-                        Err(StorageError::Internal(_))
-                        | Err(StorageError::DigestMismatch)
-                        | Err(StorageError::TagAlreadyExists) => {
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
-                            return errors::internal_error().into_response();
-                        }
-                    }
-                }
-
-                while let Some(next) = stream.next().await {
-                    let chunk = match next {
+            let trailing_stream: Option<crate::storage::upload_session::UploadByteStream> =
+                if let Some(first_res) = first {
+                    let chunk = match first_res {
                         Ok(c) => c,
-                        Err(err) => {
-                            tracing::warn!(
-                                repo = name,
-                                uuid = uuid,
-                                digest = digest.as_str(),
-                                error = %err,
-                                "monolithic finalize-on-PUT: failed to read request body"
-                            );
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
+                        Err(_) => {
                             return errors::request_timeout(
                                 "upload aborted while reading request body",
                             )
@@ -4052,84 +3749,58 @@ async fn upload_session(
                         }
                     };
                     if chunk.is_empty() {
-                        continue;
+                        None
+                    } else {
+                        let first_stream = futures_util::stream::once(async move { Ok(chunk) });
+                        let rest = stream.map(|res| {
+                            res.map_err(|e| match e {
+                                crate::http_api::stream_guard::StreamGuardError::IdleTimeout(_) => {
+                                    crate::storage::upload_session::UploadStreamError::IdleTimeout
+                                }
+                                crate::http_api::stream_guard::StreamGuardError::InsufficientThroughput { .. } => {
+                                    crate::storage::upload_session::UploadStreamError::RateTooLow
+                                }
+                                crate::http_api::stream_guard::StreamGuardError::BodyError(err) => {
+                                    crate::storage::upload_session::UploadStreamError::Io(
+                                        std::io::Error::other(err),
+                                    )
+                                }
+                            })
+                        });
+                        Some(Box::pin(first_stream.chain(rest)))
                     }
-                    match state.storage.append_upload(uuid, chunk).await {
-                        Ok(_) => {}
-                        Err(StorageError::NotFound) => {
-                            return errors::blob_upload_unknown().into_response();
-                        }
-                        Err(StorageError::TooLarge) => {
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
-                            return errors::blob_upload_invalid("upload too large").into_response();
-                        }
-                        Err(StorageError::InsufficientStorage) => {
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
-                            return errors::insufficient_storage().into_response();
-                        }
-                        Err(StorageError::Unsupported) => {
-                            return errors::not_implemented().into_response();
-                        }
-                        Err(StorageError::Internal(_))
-                        | Err(StorageError::DigestMismatch)
-                        | Err(StorageError::TagAlreadyExists) => {
-                            if policy.abort_on_error {
-                                let _ = state.storage.abort_upload(uuid).await;
-                            }
-                            return errors::internal_error().into_response();
-                        }
-                    }
-                }
-            }
+                } else {
+                    None
+                };
 
-            match state.storage.finalize_upload(uuid, &digest).await {
-                Ok(meta) => {
-                    if let Some(idx) = state.ref_index.as_ref() {
-                        let grace = std::time::Duration::from_secs(
-                            state.config.blob_gc_finalize_grace_secs,
-                        );
-                        if let Some(until) = std::time::SystemTime::now().checked_add(grace) {
-                            if let Err(err) = idx.pin_blob(&digest, until, "finalize_upload") {
-                                tracing::warn!(
-                                    error = %err,
-                                    digest = %digest.as_str(),
-                                    grace_secs = state.config.blob_gc_finalize_grace_secs,
-                                    "ref-index: failed to pin blob on finalize"
-                                );
-                            }
-                        }
-                    }
-
+            match state
+                .upload_coordinator
+                .finalize_upload(
+                    name,
+                    uuid,
+                    query.get("_state").map(|s| s.as_str()),
+                    range,
+                    trailing_stream,
+                    &digest,
+                )
+                .await
+            {
+                Ok(fin) => {
                     let mut headers = registry_headers();
                     headers.insert(
                         "Location",
-                        format!("/v2/{name}/blobs/{}", digest.as_str())
+                        format!("/v2/{name}/blobs/{}", fin.digest.as_str())
                             .parse()
                             .unwrap(),
                     );
-                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                    headers.insert(
+                        "Docker-Content-Digest",
+                        fin.digest.as_str().parse().unwrap(),
+                    );
+                    headers.insert("Content-Length", fin.size.to_string().parse().unwrap());
                     (StatusCode::CREATED, headers).into_response()
                 }
-                Err(StorageError::NotFound) => errors::blob_upload_unknown().into_response(),
-                Err(StorageError::DigestMismatch) => {
-                    if policy.abort_on_digest_mismatch {
-                        let _ = state.storage.abort_upload(uuid).await;
-                    }
-                    errors::digest_invalid().into_response()
-                }
-                Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-                Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-                Err(StorageError::InsufficientStorage) => {
-                    errors::insufficient_storage().into_response()
-                }
-                Err(StorageError::TagAlreadyExists) | Err(StorageError::Internal(_)) => {
-                    errors::internal_error().into_response()
-                }
+                Err(err) => coordinator_error_to_response(err),
             }
         }
         _ => errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE"),

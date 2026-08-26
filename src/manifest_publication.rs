@@ -178,34 +178,6 @@ impl ManifestPublisher {
         let refs = parse_manifest_refs(&req.payload)
             .map_err(|e| PublishManifestError::InvalidManifest(e.to_string()))?;
 
-        // Pre-check referenced blobs (config, layers, artifact blobs)
-        for blob_d in refs.blob_references() {
-            if blob_d.as_str()
-                == "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
-                || blob_d.as_str()
-                    == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            {
-                continue;
-            }
-            if self.storage.head_blob(blob_d).await.is_err() {
-                return Err(PublishManifestError::MissingBlob(blob_d.to_string()));
-            }
-        }
-
-        // Pre-check referenced child manifests (in index or manifest lists)
-        for manifest_d in &refs.manifests {
-            if self
-                .storage
-                .head_manifest(&req.repo, manifest_d)
-                .await
-                .is_err()
-            {
-                return Err(PublishManifestError::MissingManifest(
-                    manifest_d.to_string(),
-                ));
-            }
-        }
-
         // Pre-parse referrer info
         let referrer_info = crate::manifest_refs::parse_referrer_info(&req.payload)
             .map_err(|e| PublishManifestError::InvalidManifest(e.to_string()))?;
@@ -245,6 +217,40 @@ impl ManifestPublisher {
             if idx.check_health().is_err() {
                 idx.ensure_healthy_or_rebuild(&self.storage, true, false)
                     .await?;
+            }
+        }
+
+        // Pre-check referenced blobs under consistency gate (config, layers, artifact blobs)
+        for blob_d in refs.blob_references() {
+            if blob_d.as_str()
+                == "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+                || blob_d.as_str()
+                    == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            {
+                continue;
+            }
+            // Require repository-scoped membership for referenced blobs
+            match self
+                .storage
+                .get_repo_blob_membership(&req.repo, blob_d)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(PublishManifestError::MissingBlob(blob_d.to_string())),
+                Err(e) => return Err(PublishManifestError::Storage(e)),
+            }
+        }
+
+        // Pre-check referenced child manifests (in index or manifest lists)
+        for manifest_d in &refs.manifests {
+            match self.storage.head_manifest(&req.repo, manifest_d).await {
+                Ok(_) => {}
+                Err(StorageError::NotFound) => {
+                    return Err(PublishManifestError::MissingManifest(
+                        manifest_d.to_string(),
+                    ));
+                }
+                Err(e) => return Err(PublishManifestError::Storage(e)),
             }
         }
 
@@ -348,6 +354,68 @@ mod tests {
                 fail_mutate_tag: AtomicBool::new(false),
                 fail_add_referrer: AtomicBool::new(false),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::UploadSessionStorage for FaultInjectableStorage {}
+
+    #[async_trait::async_trait]
+    impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for FaultInjectableStorage {
+        async fn get_repo_blob_membership(
+            &self,
+            repo: &str,
+            digest: &Digest,
+        ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
+        {
+            self.inner.get_repo_blob_membership(repo, digest).await
+        }
+
+        async fn link_repo_blob(
+            &self,
+            record: &crate::storage::repo_membership::RepoBlobMembershipRecord,
+        ) -> Result<(), StorageError> {
+            self.inner.link_repo_blob(record).await
+        }
+
+        async fn unlink_repo_blob(
+            &self,
+            repo: &str,
+            digest: &Digest,
+        ) -> Result<bool, StorageError> {
+            self.inner.unlink_repo_blob(repo, digest).await
+        }
+
+        async fn list_repo_blob_memberships_page(
+            &self,
+            repo: &str,
+            continuation_token: Option<&str>,
+            page_limit: usize,
+        ) -> Result<
+            (
+                Vec<crate::storage::repo_membership::RepoBlobMembershipRecord>,
+                Option<String>,
+            ),
+            StorageError,
+        > {
+            self.inner
+                .list_repo_blob_memberships_page(repo, continuation_token, page_limit)
+                .await
+        }
+
+        async fn count_repo_blob_memberships(
+            &self,
+            digest: &Digest,
+        ) -> Result<usize, StorageError> {
+            self.inner.count_repo_blob_memberships(digest).await
+        }
+
+        async fn is_membership_ready(&self) -> Result<bool, StorageError> {
+            self.inner.is_membership_ready().await
+        }
+
+        async fn mark_membership_ready(&self) -> Result<(), StorageError> {
+            self.inner.mark_membership_ready().await
         }
     }
 
@@ -532,6 +600,12 @@ mod tests {
             .finalize_upload(&upload.uuid, &digest)
             .await
             .unwrap();
+        let membership = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+            "test/repo".to_string(),
+            digest.clone(),
+            Some(upload.uuid),
+        );
+        let _ = storage.link_repo_blob(&membership).await;
         digest
     }
 

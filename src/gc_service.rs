@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +57,16 @@ pub struct GcService {
 
 struct FsGcLock {
     _file: std::fs::File,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MembershipSweepStats {
+    pub scanned: u64,
+    pub activated: u64,
+    pub candidated: u64,
+    pub unlinked: u64,
+    pub skipped: u64,
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +305,175 @@ impl GcService {
         })
     }
 
+    pub async fn sweep_repository_memberships(
+        &self,
+        grace_period: Duration,
+        page_limit: usize,
+    ) -> Result<MembershipSweepStats, GcServiceError> {
+        let guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
+        self.sweep_repository_memberships_with_guard(&guard, grace_period, page_limit)
+            .await
+    }
+
+    pub async fn sweep_repository_memberships_with_guard(
+        &self,
+        guard: &tokio::sync::MutexGuard<'_, ()>,
+        grace_period: Duration,
+        page_limit: usize,
+    ) -> Result<MembershipSweepStats, GcServiceError> {
+        use crate::storage::repo_membership::MembershipState;
+        use std::time::UNIX_EPOCH;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut stats = MembershipSweepStats::default();
+        let ledger = crate::repository_membership_ledger::RepositoryMembershipLedger::new(
+            Arc::clone(&self.storage),
+            Some(Arc::clone(&self.idx)),
+            Arc::clone(&self.run_lock),
+        );
+
+        let mut continuation: Option<String> = None;
+        loop {
+            let (records, next_tok) = match self
+                .storage
+                .list_all_repo_blob_memberships_page(continuation.as_deref(), page_limit)
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    return Err(GcServiceError::Failed(format!(
+                        "list global blob memberships: {e}"
+                    )));
+                }
+            };
+
+            for rec in records {
+                stats.scanned += 1;
+                let is_referenced = match crate::blob_delete_safety::find_repo_blob_reference(
+                    &self.storage,
+                    &rec.repo,
+                    &rec.digest,
+                )
+                .await
+                {
+                    Ok(r) => r.is_some(),
+                    Err(e) => {
+                        return Err(GcServiceError::Failed(format!(
+                            "check ref for blob {} in repo {}: {e}",
+                            rec.digest, rec.repo
+                        )));
+                    }
+                };
+
+                if is_referenced {
+                    if rec.state == MembershipState::Candidate
+                        || rec.unreferenced_since_unix_secs.is_some()
+                    {
+                        match ledger
+                            .reactivate_with_guard(&guard, &rec.repo, &rec.digest)
+                            .await
+                        {
+                            Ok(true) => stats.activated += 1,
+                            Ok(false) => stats.skipped += 1,
+                            Err(e) => {
+                                return Err(GcServiceError::Failed(format!(
+                                    "reactivate {} in {}: {e}",
+                                    rec.digest, rec.repo
+                                )));
+                            }
+                        }
+                    } else {
+                        stats.skipped += 1;
+                    }
+                } else {
+                    // Unreferenced in repository
+                    if rec.state == MembershipState::Active
+                        || rec.unreferenced_since_unix_secs.is_none()
+                    {
+                        match ledger
+                            .set_candidate_with_guard(&guard, &rec.repo, &rec.digest, now)
+                            .await
+                        {
+                            Ok(true) => stats.candidated += 1,
+                            Ok(false) => stats.skipped += 1,
+                            Err(e) => {
+                                return Err(GcServiceError::Failed(format!(
+                                    "set candidate for {} in {}: {e}",
+                                    rec.digest, rec.repo
+                                )));
+                            }
+                        }
+                    } else if rec.state == MembershipState::Candidate {
+                        let unref_time = rec
+                            .unreferenced_since_unix_secs
+                            .unwrap_or(rec.created_at_unix_secs);
+                        if now.saturating_sub(unref_time) >= grace_period.as_secs() {
+                            // Revalidate before unlinking
+                            let still_referenced =
+                                match crate::blob_delete_safety::find_repo_blob_reference(
+                                    &self.storage,
+                                    &rec.repo,
+                                    &rec.digest,
+                                )
+                                .await
+                                {
+                                    Ok(r) => r.is_some(),
+                                    Err(_) => true,
+                                };
+
+                            if !still_referenced {
+                                match ledger
+                                    .unlink_with_guard(&guard, &rec.repo, &rec.digest)
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        stats.unlinked += 1;
+                                    }
+                                    Ok(false) => stats.skipped += 1,
+                                    Err(e) => {
+                                        return Err(GcServiceError::Failed(format!(
+                                            "unlink membership for {} in {}: {e}",
+                                            rec.digest, rec.repo
+                                        )));
+                                    }
+                                }
+                            } else {
+                                stats.skipped += 1;
+                            }
+                        } else {
+                            stats.skipped += 1;
+                        }
+                    }
+                }
+            }
+
+            match next_tok {
+                Some(tok) => continuation = Some(tok),
+                None => break,
+            }
+        }
+
+        tracing::info!(
+            event = "blob_membership_gc",
+            scanned = stats.scanned,
+            activated = stats.activated,
+            candidated = stats.candidated,
+            unlinked = stats.unlinked,
+            skipped = stats.skipped,
+            failed = stats.failed,
+            "repository membership gc sweep completed"
+        );
+
+        Ok(stats)
+    }
+
     pub async fn scheduled_cleanup_once(&self) -> Result<ScheduledCleanupStats, GcServiceError> {
         let _guard = self
             .run_lock
@@ -308,6 +488,13 @@ impl GcService {
 
         self.ensure_ref_index_ready().await?;
 
+        let min_age = Duration::from_secs(self.config.blob_gc_default_min_age_secs);
+
+        // 1. Sweep repository memberships: Active -> Candidate(unreferenced_since) -> Unlink
+        let _membership_stats = self
+            .sweep_repository_memberships_with_guard(&_guard, min_age, 256)
+            .await?;
+
         let policy = BlobGcPolicy::ManifestRooted;
         let budgets = GcBudgets {
             max_blobs: self.config.blob_gc_default_max_blobs,
@@ -315,7 +502,6 @@ impl GcService {
             max_seconds: self.config.blob_gc_default_max_seconds,
         };
 
-        let min_age = Duration::from_secs(self.config.blob_gc_default_min_age_secs);
         let quarantine = blob_gc_quarantine(
             &self.config,
             &self.storage,
@@ -395,6 +581,13 @@ mod tests {
             s3_region: None,
             s3_bucket: None,
             s3_prefix: "registry".to_string(),
+            s3_single_instance_mode: false,
+            s3_lease_duration_secs: 300,
+            s3_lease_renewal_interval_secs: 60,
+            s3_max_retry_attempts: 3,
+            s3_legacy_multipart_cleanup_policy: Default::default(),
+            upload_receipt_lifetime_secs: 72 * 3600,
+            gc_pin_duration_secs: 3600,
             ref_index: RefIndexConfig {
                 enabled: true,
                 path: ref_index_path,
@@ -535,7 +728,7 @@ mod tests {
         let _ = digest;
     }
 
-    async fn write_blob(fs_root: &PathBuf, digest: &Digest, bytes: &[u8]) {
+    async fn write_blob(fs_root: &std::path::Path, digest: &Digest, bytes: &[u8]) {
         let dir = fs_root.join("blobs").join("sha256").join(digest.prefix2());
         tokio::fs::create_dir_all(&dir).await.expect("mkdir");
         tokio::fs::write(dir.join(digest.hex()), bytes)
@@ -544,7 +737,7 @@ mod tests {
     }
 
     async fn write_tag_and_manifest(
-        fs_root: &PathBuf,
+        fs_root: &std::path::Path,
         repo: &str,
         tag: &str,
         root_manifest: &Digest,
@@ -697,6 +890,68 @@ mod tests {
             .await
             .expect_err("should refuse");
         assert!(matches!(err, GcServiceError::AlreadyRunning));
+
+        let _ = std::fs::remove_dir_all(&fs_root);
+        let _ = std::fs::remove_dir_all(&ref_index_path);
+    }
+
+    #[tokio::test]
+    async fn test_gc_service_membership_aging_lifecycle() {
+        use crate::storage::repo_membership::{MembershipState, RepoBlobMembershipRecord};
+
+        let fs_root = tmp_dir("gc-fsroot-aging");
+        let ref_index_path = tmp_dir("gc-refindex-aging");
+
+        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
+        let storage: Arc<dyn storage::Storage> =
+            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
+        idx.rebuild(&storage).await.expect("rebuild");
+
+        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+
+        let repo = "aging-repo";
+        let blob = Digest::parse(&format!("sha256:{}", "e".repeat(64))).expect("digest");
+        write_blob(&fs_root, &blob, b"agingdata").await;
+
+        let rec = RepoBlobMembershipRecord::new_upload(repo, blob.clone(), None);
+        storage.link_repo_blob(&rec).await.unwrap();
+        idx.record_membership(&blob, repo).unwrap();
+
+        // 1. First scan: blob is unreferenced by any manifest, so Active -> Candidate with unreferenced_since
+        let s1 = service
+            .sweep_repository_memberships(Duration::from_secs(10), 256)
+            .await
+            .unwrap();
+        assert_eq!(s1.candidated, 1);
+        assert_eq!(s1.unlinked, 0);
+
+        let mem1 = storage
+            .get_repo_blob_membership(repo, &blob)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem1.state, MembershipState::Candidate);
+        assert!(mem1.unreferenced_since_unix_secs.is_some());
+
+        // 2. Second scan within grace period: stays Candidate, no unlink
+        let s2 = service
+            .sweep_repository_memberships(Duration::from_secs(10), 256)
+            .await
+            .unwrap();
+        assert_eq!(s2.candidated, 0);
+        assert_eq!(s2.unlinked, 0);
+
+        // 3. Third scan with 0 grace period: unlinks membership
+        let s3 = service
+            .sweep_repository_memberships(Duration::from_secs(0), 256)
+            .await
+            .unwrap();
+        assert_eq!(s3.unlinked, 1);
+
+        let mem_after = storage.get_repo_blob_membership(repo, &blob).await.unwrap();
+        assert!(mem_after.is_none());
+        assert!(!idx.has_any_repo_membership(&blob).unwrap());
 
         let _ = std::fs::remove_dir_all(&fs_root);
         let _ = std::fs::remove_dir_all(&ref_index_path);

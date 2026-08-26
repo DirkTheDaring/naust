@@ -1,0 +1,301 @@
+use crate::registry::digest::Digest;
+use crate::storage::StorageError;
+use async_trait::async_trait;
+use base64::prelude::*;
+use serde::{Deserialize, Serialize};
+
+pub const MEMBERSHIP_SCHEMA_VERSION: u32 = 1;
+pub const MEMBERSHIP_FORMAT_VERSION: u32 = 1;
+
+/// Encode repository name into a collision-free, single-segment URL-safe base64 string.
+pub fn encode_canonical_repo_key(repo: &str) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(repo.as_bytes())
+}
+
+/// Decode a base64 URL-safe repository key back to its canonical UTF-8 string.
+pub fn decode_canonical_repo_key(encoded: &str) -> Option<String> {
+    BASE64_URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Returns the canonical relative storage path for a repository blob membership record.
+pub fn canonical_repo_membership_relpath(repo: &str, digest: &Digest) -> String {
+    format!(
+        "repo-memberships/by-repo/{}/{}/{}.json",
+        encode_canonical_repo_key(repo),
+        digest.algorithm(),
+        digest.hex()
+    )
+}
+
+/// Returns the canonical relative storage prefix for all blob memberships of a specific repository.
+pub fn canonical_repo_membership_prefix(repo: &str) -> String {
+    format!(
+        "repo-memberships/by-repo/{}/",
+        encode_canonical_repo_key(repo)
+    )
+}
+
+/// Returns the global root prefix for all repository blob memberships.
+pub fn canonical_all_memberships_prefix() -> &'static str {
+    "repo-memberships/by-repo/"
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MembershipProvenance {
+    Upload,
+    CrossMount { from_repo: String },
+    Proxy,
+    Migration,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipState {
+    Active,
+    Candidate,
+}
+
+fn default_membership_state() -> MembershipState {
+    MembershipState::Active
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoBlobMembershipRecord {
+    pub schema_version: u32,
+    pub repo: String,
+    pub digest: Digest,
+    pub created_at_unix_secs: u64,
+    pub provenance: MembershipProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub format_version: u32,
+    #[serde(default = "default_membership_state")]
+    pub state: MembershipState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreferenced_since_unix_secs: Option<u64>,
+}
+
+impl RepoBlobMembershipRecord {
+    pub fn new_upload(repo: impl Into<String>, digest: Digest, session_id: Option<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            repo: repo.into(),
+            digest,
+            created_at_unix_secs: now,
+            provenance: MembershipProvenance::Upload,
+            session_id,
+            format_version: MEMBERSHIP_FORMAT_VERSION,
+            state: MembershipState::Active,
+            unreferenced_since_unix_secs: None,
+        }
+    }
+
+    pub fn new_cross_mount(
+        repo: impl Into<String>,
+        digest: Digest,
+        from_repo: impl Into<String>,
+    ) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            repo: repo.into(),
+            digest,
+            created_at_unix_secs: now,
+            provenance: MembershipProvenance::CrossMount {
+                from_repo: from_repo.into(),
+            },
+            session_id: None,
+            format_version: MEMBERSHIP_FORMAT_VERSION,
+            state: MembershipState::Active,
+            unreferenced_since_unix_secs: None,
+        }
+    }
+
+    pub fn new_proxy(repo: impl Into<String>, digest: Digest) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            repo: repo.into(),
+            digest,
+            created_at_unix_secs: now,
+            provenance: MembershipProvenance::Proxy,
+            session_id: None,
+            format_version: MEMBERSHIP_FORMAT_VERSION,
+            state: MembershipState::Active,
+            unreferenced_since_unix_secs: None,
+        }
+    }
+
+    pub fn new_migration(repo: impl Into<String>, digest: Digest) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            repo: repo.into(),
+            digest,
+            created_at_unix_secs: now,
+            provenance: MembershipProvenance::Migration,
+            session_id: None,
+            format_version: MEMBERSHIP_FORMAT_VERSION,
+            state: MembershipState::Active,
+            unreferenced_since_unix_secs: None,
+        }
+    }
+
+    pub fn mark_candidate(&mut self, since_unix_secs: u64) {
+        self.state = MembershipState::Candidate;
+        self.unreferenced_since_unix_secs = Some(since_unix_secs);
+    }
+
+    pub fn mark_active(&mut self) {
+        self.state = MembershipState::Active;
+        self.unreferenced_since_unix_secs = None;
+    }
+}
+
+/// Dedicated storage capability for repository-scoped blob membership ledger.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    Uninitialized,
+    Planning,
+    Applying,
+    Verifying,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationStats {
+    pub repositories_scanned: usize,
+    pub manifests_scanned: usize,
+    pub memberships_created: usize,
+    pub memberships_already_present: usize,
+    pub legacy_markers_migrated: usize,
+    pub legacy_markers_deleted: usize,
+    pub unattributable_blobs_detected: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationCheckpointRecord {
+    pub schema_version: u32,
+    pub phase: MigrationPhase,
+    pub owner_id: Option<String>,
+    pub lease_expiry_unix_secs: Option<u64>,
+    pub source_continuation_token: Option<String>,
+    pub current_repository: Option<String>,
+    pub current_cursor: Option<String>,
+    pub stats: MigrationStats,
+    pub started_unix_secs: u64,
+    pub last_updated_unix_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_info: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_result: Option<bool>,
+}
+
+#[async_trait]
+pub trait RepositoryBlobMembershipStorage: Send + Sync {
+    /// Retrieve the authoritative repository-blob membership record if one exists.
+    async fn get_repo_blob_membership(
+        &self,
+        _repo: &str,
+        _digest: &Digest,
+    ) -> Result<Option<RepoBlobMembershipRecord>, StorageError> {
+        Ok(None)
+    }
+
+    /// Create or overwrite a repository-blob membership record.
+    async fn link_repo_blob(&self, _record: &RepoBlobMembershipRecord) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Transition a membership record from Active to Candidate with an unreferenced timestamp.
+    async fn set_membership_candidate(
+        &self,
+        _repo: &str,
+        _digest: &Digest,
+        _since_unix_secs: u64,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Transition a membership record from Candidate back to Active (clearing timestamp).
+    async fn clear_membership_candidate(
+        &self,
+        _repo: &str,
+        _digest: &Digest,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Unlink (delete) an existing repository-blob membership record.
+    async fn unlink_repo_blob(&self, _repo: &str, _digest: &Digest) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// List a bounded page of repository-blob memberships for a single repository.
+    async fn list_repo_blob_memberships_page(
+        &self,
+        _repo: &str,
+        _continuation_token: Option<&str>,
+        _page_limit: usize,
+    ) -> Result<(Vec<RepoBlobMembershipRecord>, Option<String>), StorageError> {
+        Ok((Vec::new(), None))
+    }
+
+    /// List a bounded page of repository-blob memberships across ALL repositories globally.
+    async fn list_all_repo_blob_memberships_page(
+        &self,
+        _continuation_token: Option<&str>,
+        _page_limit: usize,
+    ) -> Result<(Vec<RepoBlobMembershipRecord>, Option<String>), StorageError> {
+        Ok((Vec::new(), None))
+    }
+
+    /// Count how many repositories currently have an active membership link for this digest.
+    async fn count_repo_blob_memberships(&self, _digest: &Digest) -> Result<usize, StorageError> {
+        Ok(0)
+    }
+
+    /// Check if the membership subsystem is initialized and ready.
+    async fn is_membership_ready(&self) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// Mark the membership subsystem as initialized and ready.
+    async fn mark_membership_ready(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Retrieve durable migration checkpoint record if present.
+    async fn get_migration_checkpoint(
+        &self,
+    ) -> Result<Option<MigrationCheckpointRecord>, StorageError> {
+        Ok(None)
+    }
+
+    /// Save durable migration checkpoint record.
+    async fn save_migration_checkpoint(
+        &self,
+        _checkpoint: &MigrationCheckpointRecord,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+}

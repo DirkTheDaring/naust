@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf};
 use toml::Value;
 use url::Url;
@@ -115,6 +115,14 @@ pub struct Config {
     pub s3_region: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
+    // Explicit operator assertion for single-instance S3 deployment (allows online destructive GC with local Sled index).
+    pub s3_single_instance_mode: bool,
+    pub s3_lease_duration_secs: u64,
+    pub s3_lease_renewal_interval_secs: u64,
+    pub s3_max_retry_attempts: u32,
+    pub s3_legacy_multipart_cleanup_policy: LegacyMultipartCleanupPolicy,
+    pub upload_receipt_lifetime_secs: u64,
+    pub gc_pin_duration_secs: u64,
 
     // Persistent blob reference index (used to make DELETE blob safe without full scans).
     pub ref_index: RefIndexConfig,
@@ -238,6 +246,15 @@ pub enum AuthStrategy {
     Token,
     Basic,
     Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyMultipartCleanupPolicy {
+    #[default]
+    Disabled,
+    CurrentFormatOnly,
+    OperatorConfirmedAllUnknown,
 }
 
 impl Config {
@@ -989,6 +1006,8 @@ struct FileStorageS3 {
     bucket: Option<String>,
     #[serde(default)]
     prefix: Option<String>,
+    #[serde(default)]
+    single_instance_mode: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -997,6 +1016,18 @@ struct FileFeatures {
     allow_tag_overwrite: Option<bool>,
     #[serde(default)]
     automatic_crossmount: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileUploadsS3 {
+    #[serde(default)]
+    lease_duration_secs: Option<u64>,
+    #[serde(default)]
+    lease_renewal_interval_secs: Option<u64>,
+    #[serde(default)]
+    max_retry_attempts: Option<u32>,
+    #[serde(default)]
+    legacy_multipart_cleanup_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1015,6 +1046,14 @@ struct FileUploads {
     gc_interval_secs: Option<u64>,
     #[serde(default)]
     gc_max_age_secs: Option<u64>,
+
+    #[serde(default)]
+    s3: FileUploadsS3,
+
+    #[serde(default)]
+    receipt_lifetime_secs: Option<u64>,
+    #[serde(default)]
+    gc_pin_duration_secs: Option<u64>,
 
     #[serde(default)]
     repos: Vec<FileUploadRepoPolicy>,
@@ -1402,6 +1441,72 @@ impl Config {
         let s3_prefix = env_str_opt(&["REGISTRY__STORAGE__S3__PREFIX", "STORAGE_S3_PREFIX"])
             .or_else(|| file_cfg.storage.s3.prefix.clone())
             .unwrap_or_else(|| "registry".to_string());
+        let s3_single_instance_mode = env_bool_opt(&[
+            "REGISTRY__STORAGE__S3__SINGLE_INSTANCE_MODE",
+            "S3_SINGLE_INSTANCE_MODE",
+        ])?
+        .or(file_cfg.storage.s3.single_instance_mode)
+        .unwrap_or(false);
+
+        let s3_lease_duration_secs = env_u64_opt(&[
+            "REGISTRY__UPLOADS__S3__LEASE_DURATION_SECS",
+            "S3_LEASE_DURATION_SECS",
+        ])?
+        .or(file_cfg.uploads.s3.lease_duration_secs)
+        .unwrap_or(300);
+
+        let s3_lease_renewal_interval_secs = env_u64_opt(&[
+            "REGISTRY__UPLOADS__S3__LEASE_RENEWAL_INTERVAL_SECS",
+            "S3_LEASE_RENEWAL_INTERVAL_SECS",
+        ])?
+        .or(file_cfg.uploads.s3.lease_renewal_interval_secs)
+        .unwrap_or(60);
+
+        let s3_max_retry_attempts = env_usize_opt(&[
+            "REGISTRY__UPLOADS__S3__MAX_RETRY_ATTEMPTS",
+            "S3_MAX_RETRY_ATTEMPTS",
+        ])?
+        .map(|v| v as u32)
+        .or(file_cfg.uploads.s3.max_retry_attempts)
+        .unwrap_or(3);
+
+        let s3_legacy_multipart_cleanup_policy_str = env_str_opt(&[
+            "REGISTRY__UPLOADS__S3__LEGACY_MULTIPART_CLEANUP_POLICY",
+            "S3_LEGACY_MULTIPART_CLEANUP_POLICY",
+        ])
+        .or_else(|| file_cfg.uploads.s3.legacy_multipart_cleanup_policy.clone());
+
+        let s3_legacy_multipart_cleanup_policy = match s3_legacy_multipart_cleanup_policy_str
+            .as_deref()
+        {
+            None | Some("disabled") | Some("") => LegacyMultipartCleanupPolicy::Disabled,
+            Some("current_format_only") => LegacyMultipartCleanupPolicy::CurrentFormatOnly,
+            Some("operator_confirmed_all_unknown") => {
+                LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown
+            }
+            Some(other) => {
+                return Err(ConfigError::InvalidValue {
+                    field: "uploads.s3.legacy_multipart_cleanup_policy",
+                    message: format!(
+                        "invalid policy '{other}': expected 'disabled', 'current_format_only', or 'operator_confirmed_all_unknown'"
+                    ),
+                });
+            }
+        };
+
+        let upload_receipt_lifetime_secs = env_u64_opt(&[
+            "REGISTRY__UPLOADS__RECEIPT_LIFETIME_SECS",
+            "UPLOAD_RECEIPT_LIFETIME_SECS",
+        ])?
+        .or(file_cfg.uploads.receipt_lifetime_secs)
+        .unwrap_or(72 * 3600);
+
+        let gc_pin_duration_secs = env_u64_opt(&[
+            "REGISTRY__UPLOADS__GC_PIN_DURATION_SECS",
+            "GC_PIN_DURATION_SECS",
+        ])?
+        .or(file_cfg.uploads.gc_pin_duration_secs)
+        .unwrap_or(3600);
 
         let ref_index_enabled = env_bool_opt(&[
             "REGISTRY__STORAGE__REF_INDEX__ENABLED",
@@ -2051,6 +2156,41 @@ impl Config {
             routing_trust_x_forwarded_host,
         };
 
+        if storage_backend == StorageBackend::S3 {
+            if s3_lease_renewal_interval_secs >= s3_lease_duration_secs {
+                return Err(ConfigError::InvalidValue {
+                    field: "uploads.s3.lease_renewal_interval_secs",
+                    message: format!(
+                        "lease_renewal_interval_secs ({s3_lease_renewal_interval_secs}) must be strictly less than lease_duration_secs ({s3_lease_duration_secs})"
+                    ),
+                });
+            }
+            if s3_max_retry_attempts == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "uploads.s3.max_retry_attempts",
+                    message: "max_retry_attempts must be at least 1".into(),
+                });
+            }
+            if blob_gc_enabled
+                && blob_gc_enable_delete
+                && ref_index_enabled
+                && !s3_single_instance_mode
+            {
+                return Err(ConfigError::Conflict {
+                    message: "Unsafe S3 online GC topology: destructive online GC (blob_gc.enable_delete = true) with S3 storage backend and a process-local Sled index is unsafe in multi-instance topologies. You must explicitly configure 'storage.s3.single_instance_mode = true' (or env 'S3_SINGLE_INSTANCE_MODE=1') to affirm that only a single registry instance operates against this S3 namespace, or disable destructive online GC.".into(),
+                });
+            }
+        }
+
+        if upload_receipt_lifetime_secs < upload_gc_max_age_secs {
+            return Err(ConfigError::InvalidValue {
+                field: "uploads.receipt_lifetime_secs",
+                message: format!(
+                    "receipt_lifetime_secs ({upload_receipt_lifetime_secs}) must be >= upload_gc_max_age_secs ({upload_gc_max_age_secs})"
+                ),
+            });
+        }
+
         Ok(Self {
             listen_addr,
             tls_cert_path,
@@ -2067,6 +2207,13 @@ impl Config {
             s3_region,
             s3_bucket,
             s3_prefix,
+            s3_single_instance_mode,
+            s3_lease_duration_secs,
+            s3_lease_renewal_interval_secs,
+            s3_max_retry_attempts,
+            s3_legacy_multipart_cleanup_policy,
+            upload_receipt_lifetime_secs,
+            gc_pin_duration_secs,
 
             ref_index: RefIndexConfig {
                 enabled: ref_index_enabled,

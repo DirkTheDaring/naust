@@ -7,12 +7,17 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
 pub mod fs;
+pub mod repo_membership;
 pub mod s3;
+pub mod upload_session;
+
+pub use repo_membership::*;
+pub use upload_session::*;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -34,6 +39,9 @@ pub enum StorageError {
     #[error("tag already exists")]
     TagAlreadyExists,
 
+    #[error("migration required: {0}")]
+    MigrationRequired(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -51,12 +59,12 @@ pub enum TagMutation {
     Replaced { previous: Digest },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobMeta {
     pub size: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestMeta {
     pub size: u64,
     pub media_type: String,
@@ -89,7 +97,7 @@ pub struct ReferrerDescriptor {
 }
 
 #[async_trait]
-pub trait Storage: Send + Sync {
+pub trait Storage: Send + Sync + UploadSessionStorage + RepositoryBlobMembershipStorage {
     fn kind(&self) -> &'static str;
 
     // Best-effort listing of repositories known to the backend.
@@ -182,24 +190,49 @@ pub trait Storage: Send + Sync {
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError>;
 }
 
-pub fn from_config(config: &Config) -> Arc<dyn Storage> {
+pub fn try_from_config(config: &Config) -> Result<Arc<dyn Storage>, StorageError> {
     match config.storage_backend {
-        StorageBackend::Filesystem => Arc::new(fs::FsStorage::new(
-            config.fs_root.clone(),
-            config.max_upload_bytes,
-        )),
-        StorageBackend::S3 => Arc::new(s3::S3Storage::new(
-            config.s3_endpoint.clone(),
-            config.s3_region.clone(),
-            config.s3_bucket.clone(),
-            config.s3_prefix.clone(),
-            config.max_upload_bytes,
-        )),
+        StorageBackend::Filesystem => {
+            let fs_storage =
+                fs::FsStorage::try_new(config.fs_root.clone(), config.max_upload_bytes)?;
+            Ok(Arc::new(fs_storage))
+        }
+        StorageBackend::S3 => {
+            let session_cfg = s3::S3SessionConfig {
+                lease_duration_secs: config.s3_lease_duration_secs,
+                lease_renewal_interval_secs: config.s3_lease_renewal_interval_secs,
+                max_retry_attempts: config.s3_max_retry_attempts,
+                receipt_lifetime_secs: config.upload_receipt_lifetime_secs,
+                upload_expiration_secs: config.upload_gc_max_age_secs,
+                legacy_multipart_cleanup_policy: config.s3_legacy_multipart_cleanup_policy,
+            };
+            Ok(Arc::new(
+                s3::S3Storage::new(
+                    config.s3_endpoint.clone(),
+                    config.s3_region.clone(),
+                    config.s3_bucket.clone(),
+                    config.s3_prefix.clone(),
+                    config.max_upload_bytes,
+                )
+                .with_session_config(session_cfg),
+            ))
+        }
     }
 }
 
-pub(crate) fn ensure_dir(path: &PathBuf) {
-    if let Err(err) = std::fs::create_dir_all(path) {
-        panic!("failed to create storage dir {}: {err}", path.display());
-    }
+pub fn from_config(config: &Config) -> Arc<dyn Storage> {
+    try_from_config(config).unwrap_or_else(|err| {
+        eprintln!("storage: initialization failed: {err}");
+        std::process::exit(1);
+    })
+}
+
+pub(crate) fn ensure_dir(path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
+    let p = path.as_ref();
+    std::fs::create_dir_all(p).map_err(|err| {
+        StorageError::Internal(format!(
+            "failed to create storage dir {}: {err}",
+            p.display()
+        ))
+    })
 }

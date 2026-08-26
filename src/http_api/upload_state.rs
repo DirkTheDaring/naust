@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const UPLOAD_STATE_DOMAIN: &str = "registry_upload_state_v1";
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StateTokenError {
     #[error("missing state token")]
@@ -12,6 +14,8 @@ pub enum StateTokenError {
     InvalidFormat,
     #[error("invalid cryptographic signature")]
     InvalidSignature,
+    #[error("invalid token domain identifier")]
+    InvalidDomain,
     #[error("repository mismatch")]
     RepoMismatch,
     #[error("uuid mismatch")]
@@ -24,6 +28,7 @@ pub enum StateTokenError {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadStateData {
+    pub domain: String,
     pub repo: String,
     pub uuid: String,
     pub offset: u64,
@@ -37,6 +42,7 @@ impl UploadStateData {
             .unwrap_or_default()
             .as_secs();
         Self {
+            domain: UPLOAD_STATE_DOMAIN.to_string(),
             repo: repo.into(),
             uuid: uuid.into(),
             offset,
@@ -82,6 +88,11 @@ impl UploadStateData {
             .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(sig_b64))
             .map_err(|_| StateTokenError::InvalidSignature)?;
 
+        // Enforce exact 32-byte SHA-256 MAC length to prevent truncation attacks
+        if expected_sig.len() != 32 {
+            return Err(StateTokenError::InvalidSignature);
+        }
+
         let mut mac = Hmac::<Sha256>::new_from_slice(signing_key)
             .map_err(|_| StateTokenError::InvalidSignature)?;
         mac.update(payload_b64.as_bytes());
@@ -97,7 +108,12 @@ impl UploadStateData {
         let data: UploadStateData =
             serde_json::from_slice(&payload_bytes).map_err(|_| StateTokenError::InvalidPayload)?;
 
-        // 3. Verify repository binding
+        // 3. Verify domain and format version
+        if data.domain != UPLOAD_STATE_DOMAIN {
+            return Err(StateTokenError::InvalidDomain);
+        }
+
+        // 4. Verify repository binding
         let norm_data_repo = data
             .repo
             .trim_start_matches('/')
@@ -308,5 +324,56 @@ mod tests {
         assert_eq!(decoded.uuid, uuid);
         assert_eq!(decoded.offset, offset);
         assert!(decoded.validate_session(uuid, offset).is_ok());
+    }
+
+    #[test]
+    fn test_11_cross_token_domain_replay_is_rejected() {
+        let key = b"secret-key-12345";
+        let mut state = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        );
+        state.domain = "some_other_system_token_v1".to_string();
+        let token = state.encode_and_sign(key);
+
+        let res = UploadStateData::verify_and_decode(&token, key, "library/test-repo");
+        assert_eq!(res, Err(StateTokenError::InvalidDomain));
+    }
+
+    #[test]
+    fn test_12_truncated_mac_is_rejected() {
+        let key = b"secret-key-12345";
+        let state = UploadStateData::new(
+            "library/test-repo",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        );
+        let token = state.encode_and_sign(key);
+        let payload = token.split('.').next().unwrap();
+        // 16-byte truncated signature instead of 32 bytes
+        let short_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 16]);
+        let tampered = format!("{payload}.{short_sig}");
+
+        let res = UploadStateData::verify_and_decode(&tampered, key, "library/test-repo");
+        assert_eq!(res, Err(StateTokenError::InvalidSignature));
+    }
+
+    #[test]
+    fn test_13_malformed_base64_in_payload_or_sig_rejected() {
+        let key = b"secret-key-12345";
+        let res1 = UploadStateData::verify_and_decode(
+            "not_valid_b64!.valid_sig",
+            key,
+            "library/test-repo",
+        );
+        assert_eq!(res1, Err(StateTokenError::InvalidSignature));
+
+        let res2 = UploadStateData::verify_and_decode(
+            "valid_b64.not_valid_b64!",
+            key,
+            "library/test-repo",
+        );
+        assert_eq!(res2, Err(StateTokenError::InvalidSignature));
     }
 }

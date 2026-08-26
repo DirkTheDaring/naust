@@ -53,6 +53,9 @@ pub async fn referrers_list(
                 Err(StorageError::TagAlreadyExists) => {
                     return errors::internal_error().into_response();
                 }
+                Err(StorageError::MigrationRequired(_)) => {
+                    return errors::internal_error().into_response();
+                }
             };
 
             let artifact_type_filter = query.get("artifactType").map(|s| s.as_str());

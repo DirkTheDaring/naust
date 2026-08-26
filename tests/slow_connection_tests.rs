@@ -42,6 +42,7 @@ impl Drop for ServerGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_config(
     dir: &tempfile::TempDir,
     port: u16,
@@ -134,10 +135,10 @@ async fn wait_for_server(port: u16, log_path: &Path) {
     let url = format!("http://127.0.0.1:{port}/v2/");
 
     for _ in 0..60 {
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().as_u16() >= 200 {
-                return;
-            }
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().as_u16() >= 200
+        {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

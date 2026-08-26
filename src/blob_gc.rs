@@ -419,13 +419,14 @@ pub async fn blob_gc_delete(
 struct PolicyContext {
     policy: BlobGcPolicy,
     idx: Arc<BlobRefIndex>,
+    storage: Arc<dyn storage::Storage>,
     manifest_protected: Option<HashSet<String>>,
 }
 
 impl PolicyContext {
     async fn build(
         cfg: &crate::config::Config,
-        _storage: &Arc<dyn storage::Storage>,
+        storage: &Arc<dyn storage::Storage>,
         idx: &BlobRefIndex,
         policy: BlobGcPolicy,
     ) -> Result<Self, String> {
@@ -433,6 +434,7 @@ impl PolicyContext {
         idx.check_health().map_err(|e| format!("ref-index: {e}"))?;
 
         let idx = Arc::new(idx.clone());
+        let storage = Arc::clone(storage);
 
         let manifest_protected = match policy {
             BlobGcPolicy::TagRooted => None,
@@ -442,11 +444,27 @@ impl PolicyContext {
         Ok(Self {
             policy,
             idx,
+            storage,
             manifest_protected,
         })
     }
 
     async fn is_referenced(&mut self, digest: &Digest) -> Result<bool, String> {
+        // Check if any repository currently holds an active or candidate membership link for this digest
+        let has_membership = match self.idx.has_any_repo_membership(digest) {
+            Ok(has) => has,
+            Err(_) => {
+                self.storage
+                    .count_repo_blob_memberships(digest)
+                    .await
+                    .map_err(|e| format!("count memberships: {e}"))?
+                    > 0
+            }
+        };
+        if has_membership {
+            return Ok(true);
+        }
+
         // Always treat tag-rooted reachability as protected.
         let tag_reachable = self
             .idx
