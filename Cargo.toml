@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 argon2 = "0.5"
 async-trait = "0.1"
-aws-config = "1"
-aws-sdk-s3 = "1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 axum = "0.7"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
