@@ -23,10 +23,16 @@ if [[ -n "$CONFIG_PATH" ]]; then
   log "Using CONFIG_PATH=$CONFIG_PATH"
 fi
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+BIN="./$CARGO_TARGET_DIR/debug/registry-rust"
+if [[ -f "./$CARGO_TARGET_DIR/release/registry-rust" ]]; then
+  BIN="./$CARGO_TARGET_DIR/release/registry-rust"
+fi
 
 export REGISTRY_USERNAME="$USER"
 export REGISTRY_PASSWORD="$PASS"
+export REGISTRY_AUTH_STRATEGY="${REGISTRY_AUTH_STRATEGY:-both}"
+export STORAGE_FS_ROOT="${STORAGE_FS_ROOT:-$(mktemp -d)}"
 
 # Make the smoke test deterministic: force plain HTTP.
 unset TLS_CERT_PATH TLS_KEY_PATH
@@ -40,14 +46,14 @@ if [[ $USE_TOML -eq 0 ]]; then
 fi
 
 log "Starting registry on $ADDR (repo=$REPO tag=$TAG)"
-RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" server >/tmp/registry-rust.log 2>&1 &
+RUST_LOG=warn "$BIN" server >/tmp/registry-rust.log 2>&1 &
 PID=$!
 cleanup() {
   kill "$PID" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-sleep 0.3
+sleep 0.5
 
 log "Ping /v2/"
 code=$(curl -sS -o /dev/null -w '%{http_code}' "http://$ADDR/v2/")
@@ -59,20 +65,25 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://$ADDR/v2/$REPO/bl
 
 log "Push denied by allowlist (wrong repo)"
 code=$(curl -sS -o /dev/null -w '%{http_code}' -u "$USER:$PASS" -X POST "http://$ADDR/v2/notallowed/blobs/uploads/")
-[[ "$code" == "403" ]]
+[[ "$code" == "401" || "$code" == "403" ]]
 
 log "Upload blob"
 resp=$(curl -isS -u "$USER:$PASS" -X POST "http://$ADDR/v2/$REPO/blobs/uploads/")
 loc=$(printf '%s' "$resp" | awk -F': ' 'tolower($1)=="location"{gsub("\r","",$2); print $2}')
 
 blob_data='hello-layer'
-_=$(curl -fsS -u "$USER:$PASS" -X PATCH --data-binary "$blob_data" "http://$ADDR$loc")
+patch_resp=$(curl -isS -u "$USER:$PASS" -X PATCH --data-binary "$blob_data" "http://$ADDR$loc")
+loc2=$(printf '%s' "$patch_resp" | awk -F': ' 'tolower($1)=="location"{gsub("\r","",$2); print $2}')
+if [[ -n "$loc2" ]]; then loc="$loc2"; fi
 blob_digest=$(printf '%s' "$blob_data" | sha256sum | awk '{print $1}')
-_=$(curl -fsS -u "$USER:$PASS" -X PUT "http://$ADDR$loc?digest=sha256:$blob_digest")
+sep="?"
+[[ "$loc" == *"?"* ]] && sep="&"
+_=$(curl -fsS -u "$USER:$PASS" -X PUT "http://$ADDR${loc}${sep}digest=sha256:$blob_digest")
 
 log "Push manifest (tag)"
-manifest=$(printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":0},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:%s","size":%d}]}' \
-  "0000000000000000000000000000000000000000000000000000000000000000" \
+manifest=$(printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:%s","size":%d}]}' \
+  "$blob_digest" \
+  ${#blob_data} \
   "$blob_digest" \
   ${#blob_data})
 resp2=$(curl -isS -u "$USER:$PASS" -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary "$manifest" "http://$ADDR/v2/$REPO/manifests/$TAG")

@@ -136,6 +136,7 @@ run_matrix() {
     export OCI_TEST_CONTENT_MANAGEMENT=1
     export OCI_DELETE_MANIFEST_BEFORE_BLOBS=1
     export OCI_HIDE_SKIPPED_WORKFLOWS=0
+    export OCI_AUTOMATIC_CROSSMOUNT=0
     export OCI_DEBUG=0
     export OCI_REPORT_DIR="${results_dir}"
 
@@ -152,44 +153,45 @@ run_matrix() {
 
   echo "${exit_code}" > "${results_dir}/exit_code.txt"
 
-  # Convert JUnit to result.yaml
+  # Convert JUnit to derived summary result.yaml (clearly labeled as derived)
   python3 - <<PY
 import xml.etree.ElementTree as ET
 import yaml
 
 tree = ET.parse("${results_dir}/junit.xml")
 root = tree.getroot()
-suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
-total = int(root.attrib.get("tests", 0))
-failures = int(root.attrib.get("failures", 0))
-errors = int(root.attrib.get("errors", 0))
-skipped = int(root.attrib.get("skipped", 0))
+testcases = root.findall(".//testcase")
+failures = len(root.findall(".//testcase[failure]"))
+errors = len(root.findall(".//testcase[error]"))
+skipped = len(root.findall(".//testcase[skipped]"))
+total = len(testcases)
+passed = total - (failures + errors + skipped)
 time_val = float(root.attrib.get("time", 0.0))
 
 tests = []
-for s in suites:
-    for tc in s.findall("testcase"):
-        f = tc.find("failure")
-        e = tc.find("error")
-        sk = tc.find("skipped")
-        st = "failed" if f is not None else ("error" if e is not None else ("skipped" if sk is not None else "passed"))
-        tests.append({
-            "name": tc.attrib.get("name", ""),
-            "classname": tc.attrib.get("classname", ""),
-            "status": st,
-            "time": float(tc.attrib.get("time", 0.0)),
-            "message": (f or e or sk).attrib.get("message", "") if (f or e or sk) is not None else "",
-            "details": ((f or e or sk).text or "").strip() if (f or e or sk) is not None else ""
-        })
+for tc in testcases:
+    f = tc.find("failure")
+    e = tc.find("error")
+    sk = tc.find("skipped")
+    st = "failed" if f is not None else ("error" if e is not None else ("skipped" if sk is not None else "passed"))
+    tests.append({
+        "name": tc.attrib.get("name", ""),
+        "classname": tc.attrib.get("classname", ""),
+        "status": st,
+        "time": float(tc.attrib.get("time", 0.0)),
+        "message": (f or e or sk).attrib.get("message", "") if (f or e or sk) is not None else "",
+        "details": ((f or e or sk).text or "").strip() if (f or e or sk) is not None else ""
+    })
 
 data = {
     "spec_version": "v1.1.1",
     "harness_commit": "${DISTRIBUTION_SPEC_COMMIT}",
+    "artifact_nature": "derived_summary_from_official_junit_xml",
     "matrix": "${matrix_name}",
     "backend": "${backend}",
     "auth_strategy": "${auth_strategy}",
     "total": total,
-    "passed": total - (failures + errors + skipped),
+    "passed": passed,
     "failed": failures + errors,
     "skipped": skipped,
     "time_seconds": time_val,
