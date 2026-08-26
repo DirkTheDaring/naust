@@ -106,6 +106,8 @@ pub async fn tags_list(
             }
             Err(StorageError::TooLarge) => errors::internal_error().into_response(),
             Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
+            Err(StorageError::InvalidRepoName(_)) => errors::name_invalid().into_response(),
+            Err(StorageError::ExclusiveWriterLocked(_)) => errors::internal_error().into_response(),
             Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
             Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),

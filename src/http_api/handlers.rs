@@ -673,6 +673,7 @@ async fn manifest_by_reference(
                                     state.config.max_request_body_bytes,
                                     false,
                                     None,
+                                    Some(&state.manifest_lifecycle),
                                 )
                                 .await
                             {
@@ -737,7 +738,9 @@ async fn manifest_by_reference(
             Err(StorageError::InsufficientStorage) => {
                 return errors::insufficient_storage().into_response();
             }
-            Err(StorageError::TagAlreadyExists)
+            Err(StorageError::InvalidRepoName(_)) => return errors::name_invalid().into_response(),
+            Err(StorageError::ExclusiveWriterLocked(_))
+            | Err(StorageError::TagAlreadyExists)
             | Err(StorageError::Internal(_))
             | Err(StorageError::MigrationRequired(_)) => {
                 return errors::internal_error().into_response();
@@ -846,6 +849,7 @@ async fn manifest_by_reference(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
+                                Some(&state.manifest_lifecycle),
                             )
                             .await
                         {
@@ -889,6 +893,8 @@ async fn manifest_by_reference(
             Err(StorageError::InsufficientStorage) => {
                 errors::insufficient_storage().into_response()
             }
+            Err(StorageError::InvalidRepoName(_)) => errors::name_invalid().into_response(),
+            Err(StorageError::ExclusiveWriterLocked(_)) => errors::internal_error().into_response(),
             Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
             Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
@@ -943,6 +949,7 @@ async fn manifest_by_reference(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
+                                Some(&state.manifest_lifecycle),
                             )
                             .await
                         {
@@ -981,6 +988,8 @@ async fn manifest_by_reference(
             Err(StorageError::InsufficientStorage) => {
                 errors::insufficient_storage().into_response()
             }
+            Err(StorageError::InvalidRepoName(_)) => errors::name_invalid().into_response(),
+            Err(StorageError::ExclusiveWriterLocked(_)) => errors::internal_error().into_response(),
             Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
             Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
@@ -1033,6 +1042,7 @@ async fn manifest_by_reference_proxy_only(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
+                                Some(&state.manifest_lifecycle),
                             )
                             .await
                         {
@@ -1135,6 +1145,7 @@ async fn manifest_by_reference_proxy_only(
                         state.config.max_request_body_bytes,
                         false,
                         None,
+                        Some(&state.manifest_lifecycle),
                     )
                     .await
                 {
@@ -1196,6 +1207,7 @@ async fn manifest_by_reference_proxy_only(
                         state.config.max_request_body_bytes,
                         false,
                         None,
+                        Some(&state.manifest_lifecycle),
                     )
                     .await
                 {
@@ -2833,6 +2845,7 @@ async fn ensure_tag_fresh(
             state.config.max_request_body_bytes,
             true,
             if_none_match,
+            Some(&state.manifest_lifecycle),
         )
         .await;
 
@@ -2859,6 +2872,7 @@ async fn ensure_tag_fresh(
                         state.config.max_request_body_bytes,
                         false,
                         None,
+                        Some(&state.manifest_lifecycle),
                     )
                     .await
                     .map_err(|e| {
@@ -2910,6 +2924,7 @@ async fn ensure_tag_fresh(
                         state.config.max_request_body_bytes,
                         false,
                         None,
+                        Some(&state.manifest_lifecycle),
                     )
                     .await
                     .map_err(|e| {
@@ -3011,13 +3026,13 @@ async fn manifest_put(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let req = crate::manifest_lifecycle::PublishManifestRequest {
-        repo: name.to_string(),
-        reference: reference.to_string(),
-        payload: bytes,
+    let req = crate::manifest_lifecycle::PublishManifestRequest::new(
+        name,
+        reference,
+        bytes,
         declared_media_type,
-        allow_tag_overwrite: state.config.allow_tag_overwrite,
-    };
+        state.config.allow_tag_overwrite,
+    );
 
     match state.manifest_lifecycle.publish_manifest(req).await {
         Ok(published) => {

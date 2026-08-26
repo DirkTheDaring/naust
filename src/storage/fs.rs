@@ -172,6 +172,7 @@ pub struct FsStorage {
     max_upload_bytes: u64,
     upload_hashes: Vec<Mutex<std::collections::HashMap<String, SerializableSha256>>>,
     referrer_locks: Vec<Mutex<()>>,
+    repo_locks: std::sync::Mutex<std::collections::HashMap<String, std::fs::File>>,
 }
 
 impl FsStorage {
@@ -190,6 +191,7 @@ impl FsStorage {
             max_upload_bytes,
             upload_hashes,
             referrer_locks,
+            repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1070,7 +1072,7 @@ impl Storage for FsStorage {
         repo: &str,
         tag: &str,
         expected_version: Option<&str>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<super::ConditionalDeleteResult, StorageError> {
         let dir = self.root.join("repos").join(repo).join("tags");
         let path = self.tag_path(repo, tag);
         let lock_path = dir.join(format!(".lock.{tag}"));
@@ -1078,6 +1080,9 @@ impl Storage for FsStorage {
 
         tokio::task::spawn_blocking(move || {
             use fs2::FileExt;
+            if let Some(parent) = lock_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let lock_file = match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1087,7 +1092,7 @@ impl Storage for FsStorage {
             {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(StorageError::NotFound);
+                    return Ok(super::ConditionalDeleteResult::NotFound);
                 }
                 Err(e) => return Err(map_fs_io_err(e)),
             };
@@ -1098,7 +1103,7 @@ impl Storage for FsStorage {
                 let bytes = match std::fs::read(&path) {
                     Ok(b) => b,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(StorageError::NotFound);
+                        return Ok(super::ConditionalDeleteResult::NotFound);
                     }
                     Err(e) => return Err(map_fs_io_err(e)),
                 };
@@ -1108,7 +1113,9 @@ impl Storage for FsStorage {
                     hasher.update(&bytes);
                     let current_version = hex::encode(hasher.finalize());
                     if current_version != *exp {
-                        return Ok(false);
+                        return Ok(super::ConditionalDeleteResult::PreconditionFailed {
+                            current_version: Some(current_version),
+                        });
                     }
                 }
 
@@ -1116,7 +1123,7 @@ impl Storage for FsStorage {
                 if let Ok(dir_file) = std::fs::File::open(&dir) {
                     let _ = dir_file.sync_all();
                 }
-                Ok(true)
+                Ok(super::ConditionalDeleteResult::Deleted)
             })();
 
             let _ = lock_file.unlock();
@@ -1124,6 +1131,116 @@ impl Storage for FsStorage {
         })
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
+    }
+
+    async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let path = canonical
+            .fs_repo_dir(&self.root)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?
+            .join("meta")
+            .join("lifecycle_journal.json");
+        match tokio::fs::read(&path).await {
+            Ok(b) => Ok(Some(Bytes::from(b))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::Internal(e.to_string())),
+        }
+    }
+
+    async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let meta_dir = canonical
+            .fs_repo_dir(&self.root)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?
+            .join("meta");
+        ensure_dir(&meta_dir)?;
+        let path = meta_dir.join("lifecycle_journal.json");
+        let tmp_path = meta_dir.join(format!(".tmp.journal.{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp_path, &data)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let _ = fsync_dir(&meta_dir).await;
+        Ok(())
+    }
+
+    async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let meta_dir = canonical
+            .fs_repo_dir(&self.root)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?
+            .join("meta");
+        let path = meta_dir.join("lifecycle_journal.json");
+        match tokio::fs::remove_file(&path).await {
+            Ok(_) => {
+                let _ = fsync_dir(&meta_dir).await;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::Internal(e.to_string())),
+        }
+    }
+
+    async fn acquire_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        _ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let repo_dir = canonical
+            .fs_repo_dir(&self.root)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        ensure_dir(&repo_dir)?;
+        let lock_path = repo_dir.join(".repo_lock");
+        let key = format!("{}:{owner_id}:{lease_id}", canonical.as_str());
+
+        let file = tokio::task::spawn_blocking(move || {
+            use fs2::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(map_fs_io_err)?;
+
+            file.lock_exclusive().map_err(map_fs_io_err)?;
+            Ok::<_, StorageError>(file)
+        })
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))??;
+
+        self.repo_locks.lock().unwrap().insert(key, file);
+        Ok(true)
+    }
+
+    async fn renew_repo_lease(
+        &self,
+        _repo: &str,
+        _owner_id: &str,
+        _lease_id: &str,
+        _ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    async fn release_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+    ) -> Result<(), StorageError> {
+        let key = format!("{repo}:{owner_id}:{lease_id}");
+        let _ = self.repo_locks.lock().unwrap().remove(&key);
+        Ok(())
     }
 
     async fn create_upload(&self) -> Result<super::UploadMeta, StorageError> {

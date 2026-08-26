@@ -403,6 +403,12 @@ impl Proxy {
                 let _ = storage.abort_upload(&upload.uuid).await;
                 return Err(map_storage_err(e));
             }
+            let record = crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
+                &decision.local_repo,
+                digest.clone(),
+            );
+            let _ = storage.link_repo_blob(&record).await;
+            self.note_blob_access(digest);
             Ok(())
         };
 
@@ -420,6 +426,7 @@ impl Proxy {
         max_bytes: usize,
         revalidate_only: bool,
         if_none_match: Option<String>,
+        lifecycle: Option<&crate::manifest_lifecycle::ManifestLifecycleService>,
     ) -> Result<FetchManifestResult, ProxyError> {
         // Singleflight per repo+reference.
         let key = format!("manifest:{}:{}", decision.local_repo, reference);
@@ -488,6 +495,7 @@ impl Proxy {
                 .get(reqwest::header::ETAG)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+
             let upstream_digest = resp
                 .headers()
                 .get("docker-content-digest")
@@ -495,23 +503,25 @@ impl Proxy {
                 .and_then(|s| Digest::parse(s).ok());
 
             if revalidate_only {
-                return Ok(FetchManifestResult::HeadOk {
-                    media_type,
+                return Ok(FetchManifestResult::NotModified {
                     etag,
                     digest: upstream_digest,
                 });
             }
 
-            let bytes = read_response_limited(resp, max_bytes).await?;
-            if bytes.is_empty() {
-                return Err(ProxyError::Upstream("empty manifest body".to_string()));
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+            if bytes.len() > max_bytes {
+                return Err(ProxyError::TooLarge);
             }
 
-            // Compute digest of the raw bytes.
+            // Digest check.
             let mut hasher = sha2::Sha256::new();
-            hasher.update(&bytes);
-            let digest_hex = hex::encode(hasher.finalize());
-            let computed = Digest::parse(&format!("sha256:{digest_hex}"))
+            sha2::Digest::update(&mut hasher, &bytes);
+            let hex = hex::encode(sha2::Digest::finalize(hasher));
+            let computed = Digest::parse(&format!("sha256:{hex}"))
                 .map_err(|_| ProxyError::Internal("failed to parse computed digest".to_string()))?;
 
             if let Ok(ref_digest) = Digest::parse(reference) {
@@ -533,24 +543,39 @@ impl Proxy {
                 )));
             }
 
-            storage
-                .put_manifest(&decision.local_repo, &computed, bytes.clone())
+            let default_lifecycle;
+            let lc = match lifecycle {
+                Some(lc) => lc,
+                None => {
+                    default_lifecycle = crate::manifest_lifecycle::ManifestLifecycleService::new(
+                        storage.clone(),
+                        None,
+                        Arc::new(tokio::sync::Mutex::new(())),
+                    );
+                    &default_lifecycle
+                }
+            };
+
+            let evidence = crate::manifest_lifecycle::ProxyPublicationEvidence::new(
+                &decision.local_repo,
+                reference,
+                bytes.clone(),
+                Some(media_type.clone()),
+                true,
+                computed.clone(),
+            );
+
+            let published = lc
+                .publish_proxy_cached_manifest(evidence)
                 .await
-                .map_err(map_storage_err)?;
+                .map_err(|e| ProxyError::Internal(format!("lifecycle publication failed: {e}")))?;
 
-            self.index_manifest(&decision.local_repo, &computed, &bytes);
-            self.note_manifest_access(&decision.local_repo, &computed);
-
-            if Digest::parse(reference).is_err() {
-                storage
-                    .set_tag(&decision.local_repo, reference, &computed)
-                    .await
-                    .map_err(map_storage_err)?;
-            }
+            self.index_manifest(&decision.local_repo, &published.digest, &bytes);
+            self.note_manifest_access(&decision.local_repo, &published.digest);
 
             Ok(FetchManifestResult::Fetched {
-                digest: computed,
-                media_type,
+                digest: published.digest,
+                media_type: published.media_type,
                 etag,
                 bytes,
             })
@@ -997,6 +1022,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
+#[allow(dead_code)]
 async fn read_response_limited(resp: reqwest::Response, limit: usize) -> Result<Bytes, ProxyError> {
     if let Some(len) = resp.content_length() {
         if len > limit as u64 {
@@ -1034,6 +1060,12 @@ fn map_storage_err(err: StorageError) -> ProxyError {
         }
         StorageError::Unsupported => ProxyError::Internal("storage unsupported".to_string()),
         StorageError::TagAlreadyExists => ProxyError::Internal("tag already exists".to_string()),
+        StorageError::ExclusiveWriterLocked(e) => {
+            ProxyError::Internal(format!("exclusive writer locked: {e}"))
+        }
+        StorageError::InvalidRepoName(e) => {
+            ProxyError::Internal(format!("invalid repository name: {e}"))
+        }
         StorageError::MigrationRequired(e) => ProxyError::Internal(e),
         StorageError::Internal(e) => ProxyError::Internal(e),
     }

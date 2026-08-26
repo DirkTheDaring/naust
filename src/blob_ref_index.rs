@@ -41,6 +41,7 @@ pub struct BlobRefIndex {
     rev_edges: sled::Tree,
     pins: sled::Tree,
     repo_memberships: sled::Tree,
+    fail_mark_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,6 +109,7 @@ impl BlobRefIndex {
             rev_edges,
             pins,
             repo_memberships,
+            fail_mark_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -291,9 +293,22 @@ impl BlobRefIndex {
     }
 
     pub fn mark_dirty(&self) -> Result<(), RefIndexError> {
+        if self
+            .fail_mark_dirty
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(RefIndexError::Corrupt(
+                "injected mark_dirty failure".to_string(),
+            ));
+        }
         self.meta.insert(META_STATE, META_STATE_DIRTY)?;
         self.db.flush()?;
         Ok(())
+    }
+
+    pub fn set_fail_mark_dirty(&self, fail: bool) {
+        self.fail_mark_dirty
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn mark_ready(&self) -> Result<(), RefIndexError> {
@@ -1057,8 +1072,62 @@ mod tests {
             repo: &str,
             tag: &str,
             _expected_version: Option<&str>,
+        ) -> Result<crate::storage::ConditionalDeleteResult, StorageError> {
+            match self.resolve_tag(repo, tag).await {
+                Ok(_) => {
+                    self.remove_tag(repo, tag);
+                    Ok(crate::storage::ConditionalDeleteResult::Deleted)
+                }
+                Err(StorageError::NotFound) => {
+                    Ok(crate::storage::ConditionalDeleteResult::NotFound)
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        async fn read_lifecycle_journal(&self, _repo: &str) -> Result<Option<Bytes>, StorageError> {
+            Ok(None)
+        }
+
+        async fn write_lifecycle_journal(
+            &self,
+            _repo: &str,
+            _data: Bytes,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn delete_lifecycle_journal(&self, _repo: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn acquire_repo_lease(
+            &self,
+            _repo: &str,
+            _owner_id: &str,
+            _lease_id: &str,
+            _ttl_secs: u64,
         ) -> Result<bool, StorageError> {
-            self.delete_tag(repo, tag).await.map(|_| true)
+            Ok(true)
+        }
+
+        async fn renew_repo_lease(
+            &self,
+            _repo: &str,
+            _owner_id: &str,
+            _lease_id: &str,
+            _ttl_secs: u64,
+        ) -> Result<bool, StorageError> {
+            Ok(true)
+        }
+
+        async fn release_repo_lease(
+            &self,
+            _repo: &str,
+            _owner_id: &str,
+            _lease_id: &str,
+        ) -> Result<(), StorageError> {
+            Ok(())
         }
 
         async fn create_upload(&self) -> Result<crate::storage::UploadMeta, StorageError> {

@@ -12,10 +12,13 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 
 pub mod fs;
+pub mod mutation_authority;
 pub mod repo_membership;
 pub mod s3;
 pub mod upload_session;
 
+#[allow(unused_imports)]
+pub use mutation_authority::*;
 pub use repo_membership::*;
 pub use upload_session::*;
 
@@ -38,6 +41,12 @@ pub enum StorageError {
 
     #[error("tag already exists")]
     TagAlreadyExists,
+
+    #[error("exclusive writer lock held by another deployment/instance: {0}")]
+    ExclusiveWriterLocked(String),
+
+    #[error("invalid repository name: {0}")]
+    InvalidRepoName(String),
 
     #[error("migration required: {0}")]
     MigrationRequired(String),
@@ -82,8 +91,14 @@ pub struct RepoTimestamps {
     pub last_manifest_update: Option<SystemTime>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConditionalDeleteResult {
+    Deleted,
+    NotFound,
+    PreconditionFailed { current_version: Option<String> },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct ReferrerDescriptor {
     pub media_type: String,
     pub digest: String,
@@ -189,7 +204,76 @@ pub trait Storage: Send + Sync + UploadSessionStorage + RepositoryBlobMembership
         repo: &str,
         tag: &str,
         expected_version: Option<&str>,
+    ) -> Result<ConditionalDeleteResult, StorageError>;
+
+    /// Reads the durable lifecycle journal for a repository if present.
+    async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError>;
+
+    /// Durably writes the lifecycle journal for a repository.
+    async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError>;
+
+    /// Deletes the durable lifecycle journal for a repository.
+    async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError>;
+
+    /// Acquires an exclusive repository lease (on S3 via conditional lease object; on FS via OS file lock).
+    async fn acquire_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
     ) -> Result<bool, StorageError>;
+
+    /// Renews an active repository lease.
+    async fn renew_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError>;
+
+    /// Releases an active repository lease.
+    async fn release_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+    ) -> Result<(), StorageError>;
+
+    /// Acquires a deployment-wide exclusive writer lock with structured ownership metadata.
+    async fn acquire_deployment_writer_lock(
+        &self,
+        _doc: &mutation_authority::DeploymentWriterLockDoc,
+    ) -> Result<(bool, Option<String>), StorageError> {
+        Ok((true, None))
+    }
+
+    /// Conditionally releases a deployment-wide exclusive writer lock upon clean shutdown.
+    async fn release_deployment_writer_lock(
+        &self,
+        _doc: &mutation_authority::DeploymentWriterLockDoc,
+        _expected_etag: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    /// Inspects the deployment writer lock without mutating it.
+    async fn inspect_deployment_writer_lock(
+        &self,
+    ) -> Result<Option<(mutation_authority::DeploymentWriterLockDoc, Option<String>)>, StorageError>
+    {
+        Ok(None)
+    }
+
+    /// Administratively clears an abandoned deployment writer lock matching expected owner and ETag.
+    async fn admin_clear_deployment_writer_lock(
+        &self,
+        _expected_owner: &str,
+        _expected_etag: &str,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
 
     async fn create_upload(&self) -> Result<UploadMeta, StorageError>;
 

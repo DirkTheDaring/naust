@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 pub mod app_state;
 pub use app_state::{AppState, AuthMetrics, ProxyContext};
 

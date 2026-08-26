@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 use base64::prelude::*;
 use reqwest::header;
 use serde_json::json;

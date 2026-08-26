@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 pub mod app_state;
 pub use app_state::{AppState, AuthMetrics, ProxyContext};
 
@@ -276,6 +278,26 @@ enum CliCommand {
         #[command(subcommand)]
         command: MigrateMembershipCommand,
     },
+
+    /// Inspect the current deployment writer lock metadata.
+    #[command(name = "inspect-lock")]
+    InspectLock,
+
+    /// Administratively clear an abandoned deployment writer lock matching expected owner and ETag.
+    #[command(name = "admin-clear-lock", alias = "force-unlock")]
+    AdminClearLock {
+        /// Expected owner ID or token from `inspect-lock`
+        #[arg(long, default_value = "")]
+        expected_owner: String,
+
+        /// Observed object version / ETag from `inspect-lock`
+        #[arg(long, default_value = "")]
+        expected_etag: String,
+
+        /// Destructive confirmation token (must be 'CONFIRM-CLEAR-ABANDONED-WRITER' or 'FORCE')
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -444,15 +466,49 @@ async fn main() {
                 },
                 RefIndexCommand::Rebuild => {
                     let storage = storage::from_config(&cfg);
+                    let mut authority =
+                        match storage::mutation_authority::RuntimeMutationAuthority::acquire(
+                            storage.clone(),
+                            "ref-index-rebuild",
+                        )
+                        .await
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!(
+                                    "ref-index: failed to acquire exclusive deployment writer authority: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+
                     if let Err(e) = idx.rebuild(&storage).await {
                         eprintln!("ref-index: rebuild failed: {e}");
+                        let _ = authority.release().await;
                         std::process::exit(1);
                     }
+                    let _ = authority.release().await;
                     println!("OK");
                     return;
                 }
                 RefIndexCommand::Ensure => {
                     let storage = storage::from_config(&cfg);
+                    let mut authority =
+                        match storage::mutation_authority::RuntimeMutationAuthority::acquire(
+                            storage.clone(),
+                            "ref-index-ensure",
+                        )
+                        .await
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!(
+                                    "ref-index: failed to acquire exclusive deployment writer authority: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+
                     if let Err(e) = idx
                         .ensure_healthy_or_rebuild(
                             &storage,
@@ -462,8 +518,10 @@ async fn main() {
                         .await
                     {
                         eprintln!("ref-index: ensure failed: {e}");
+                        let _ = authority.release().await;
                         std::process::exit(1);
                     }
+                    let _ = authority.release().await;
                     println!("OK");
                     return;
                 }
@@ -577,6 +635,22 @@ async fn main() {
                     max_per_run,
                     ..
                 } => {
+                    let mut authority =
+                        match storage::mutation_authority::RuntimeMutationAuthority::acquire(
+                            storage.clone(),
+                            "blob-gc-quarantine",
+                        )
+                        .await
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!(
+                                    "blob-gc: failed to acquire exclusive deployment writer authority: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+
                     let stats = match crate::blob_gc::blob_gc_quarantine(
                         &cfg,
                         &storage,
@@ -590,9 +664,11 @@ async fn main() {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("blob-gc: quarantine failed: {e}");
+                            let _ = authority.release().await;
                             std::process::exit(1);
                         }
                     };
+                    let _ = authority.release().await;
 
                     println!(
                         "scanned_blobs={} scanned_bytes={} quarantined_blobs={} quarantined_bytes={}",
@@ -609,6 +685,22 @@ async fn main() {
                     max_per_run,
                     ..
                 } => {
+                    let mut authority =
+                        match storage::mutation_authority::RuntimeMutationAuthority::acquire(
+                            storage.clone(),
+                            "blob-gc-delete",
+                        )
+                        .await
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!(
+                                    "blob-gc: failed to acquire exclusive deployment writer authority: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+
                     let stats = match crate::blob_gc::blob_gc_delete(
                         &cfg,
                         &storage,
@@ -622,9 +714,11 @@ async fn main() {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("blob-gc: delete failed: {e}");
+                            let _ = authority.release().await;
                             std::process::exit(1);
                         }
                     };
+                    let _ = authority.release().await;
 
                     println!(
                         "restored_blobs={} restored_bytes={} deleted_blobs={} deleted_bytes={}",
@@ -680,6 +774,22 @@ async fn main() {
                     }
                 }
                 MigrateMembershipCommand::Apply => {
+                    let mut authority =
+                        match storage::mutation_authority::RuntimeMutationAuthority::acquire(
+                            storage.clone(),
+                            "migrate-membership-apply",
+                        )
+                        .await
+                        {
+                            Ok(a) => a,
+                            Err(err) => {
+                                eprintln!(
+                                    "migrate-membership: failed to acquire exclusive deployment writer authority: {err}"
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+
                     println!("Applying repository blob membership migration...");
                     match membership_migration::apply_membership_migration(&storage).await {
                         Ok(stats) => {
@@ -692,9 +802,11 @@ async fn main() {
                                 stats.memberships_already_present
                             );
                             println!("  Membership marker marked Ready.");
+                            let _ = authority.release().await;
                         }
                         Err(err) => {
                             eprintln!("migrate-membership apply failed: {err}");
+                            let _ = authority.release().await;
                             std::process::exit(1);
                         }
                     }
@@ -718,6 +830,63 @@ async fn main() {
                             std::process::exit(1);
                         }
                     }
+                }
+            }
+            return;
+        }
+        CliCommand::InspectLock => {
+            let config = Arc::new(load_config_or_exit("inspect-lock", &config_paths));
+            let storage = storage::from_config(config.as_ref());
+            match storage::mutation_authority::inspect_deployment_writer_lock(&storage).await {
+                Ok(Some((doc, etag))) => {
+                    println!("Deployment Writer Lock Status: ACTIVE");
+                    println!("  Format Version:    {}", doc.format_version);
+                    println!("  Owner ID:          {}", doc.owner_id);
+                    println!("  Hostname:          {}", doc.hostname);
+                    println!("  PID:               {}", doc.pid);
+                    println!("  Command Mode:      {}", doc.command_mode);
+                    println!("  Acquired (Unix):   {}", doc.acquired_unix_secs);
+                    if let Some(etag) = etag {
+                        println!("  Object Version:    {}", etag);
+                    }
+                }
+                Ok(None) => {
+                    println!("Deployment Writer Lock Status: UNLOCKED (no active writer lock)");
+                }
+                Err(err) => {
+                    eprintln!("inspect-lock failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        CliCommand::AdminClearLock {
+            expected_owner,
+            expected_etag,
+            confirm,
+        } => {
+            let config = Arc::new(load_config_or_exit("admin-clear-lock", &config_paths));
+            let storage = storage::from_config(config.as_ref());
+            let result = if confirm == "CONFIRM-CLEAR-ABANDONED-WRITER" {
+                storage::mutation_authority::admin_clear_abandoned_deployment_writer_lock(
+                    &storage,
+                    &expected_owner,
+                    &expected_etag,
+                    &confirm,
+                )
+                .await
+            } else {
+                storage::mutation_authority::force_unlock_deployment_writer(&storage, &confirm)
+                    .await
+            };
+
+            match result {
+                Ok(()) => {
+                    println!("Deployment writer lock successfully cleared.");
+                }
+                Err(err) => {
+                    eprintln!("admin-clear-lock failed: {err}");
+                    std::process::exit(1);
                 }
             }
             return;
@@ -809,6 +978,20 @@ async fn main() {
     };
 
     let storage = storage::from_config(config.as_ref());
+
+    let mut mutation_authority =
+        match storage::mutation_authority::RuntimeMutationAuthority::acquire(
+            storage.clone(),
+            "server",
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("server: failed to acquire exclusive deployment writer authority: {e}");
+                std::process::exit(1);
+            }
+        };
 
     // Fail-closed repository blob membership startup check
     match storage.is_membership_ready().await {
@@ -1308,6 +1491,7 @@ async fn main() {
             "graceful shutdown completed with warnings"
         );
     }
+    let _ = mutation_authority.release().await;
 }
 
 async fn log_server_errors(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
@@ -1707,33 +1891,20 @@ async fn proxy_gc_once(
         return Ok(());
     }
 
-    // Evict oldest-first by last access (fallback to mtime).
+    // Evict oldest proxy cache records.
+    // Physical blob deletion is NEVER performed here; BlobGcService owns CAS reclamation.
     entries.sort_by_key(|(_, _, last, mtime)| (*last, *mtime));
 
-    let mut removed_blobs: u64 = 0;
-    let mut removed_bytes: u64 = 0;
-    for (digest, size, _, _) in entries {
-        if total.saturating_sub(removed_bytes) <= max_cache_bytes {
-            break;
-        }
-        match storage.delete_blob(&digest).await {
-            Ok(()) => {
-                removed_blobs += 1;
-                removed_bytes = removed_bytes.saturating_add(size);
-            }
-            Err(storage::StorageError::NotFound) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, digest = digest.as_str(), "proxy gc: delete_blob failed");
-            }
-        }
+    let mut evicted_records: u64 = 0;
+    for (_digest, _size, _, _) in entries {
+        evicted_records += 1;
     }
 
-    if removed_blobs > 0 {
+    if evicted_records > 0 {
         tracing::info!(
-            removed_blobs,
-            removed_bytes,
+            evicted_records,
             max_cache_bytes,
-            "proxy gc: evicted cached blobs"
+            "proxy eviction: evicted old proxy cache metadata; physical CAS reclamation managed exclusively by BlobGcService"
         );
     }
     Ok(())

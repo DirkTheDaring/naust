@@ -53,6 +53,12 @@ pub async fn referrers_list(
                 Err(StorageError::TagAlreadyExists) => {
                     return errors::internal_error().into_response();
                 }
+                Err(StorageError::InvalidRepoName(_)) => {
+                    return errors::name_invalid().into_response();
+                }
+                Err(StorageError::ExclusiveWriterLocked(_)) => {
+                    return errors::internal_error().into_response();
+                }
                 Err(StorageError::MigrationRequired(_)) => {
                     return errors::internal_error().into_response();
                 }

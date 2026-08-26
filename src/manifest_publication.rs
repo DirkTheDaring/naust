@@ -19,7 +19,8 @@ use crate::storage::{ReferrerDescriptor, Storage, StorageError, TagMutationPolic
 #[allow(unused_imports)]
 pub use crate::manifest_lifecycle::{
     MAX_MANIFEST_SIZE, ManifestLifecycleError as PublishManifestError, ManifestLifecycleService,
-    PublishManifestRequest, PublishedManifest, is_supported_manifest_media_type,
+    ProxyEvictionResult, ProxyPublicationEvidence, PublishManifestRequest, PublishedManifest,
+    is_supported_manifest_media_type,
 };
 
 #[allow(dead_code)]
@@ -251,9 +252,60 @@ mod tests {
             repo: &str,
             tag: &str,
             expected_version: Option<&str>,
-        ) -> Result<bool, StorageError> {
+        ) -> Result<crate::storage::ConditionalDeleteResult, StorageError> {
             self.inner
                 .delete_tag_conditional(repo, tag, expected_version)
+                .await
+        }
+
+        async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
+            self.inner.read_lifecycle_journal(repo).await
+        }
+
+        async fn write_lifecycle_journal(
+            &self,
+            repo: &str,
+            data: Bytes,
+        ) -> Result<(), StorageError> {
+            self.inner.write_lifecycle_journal(repo, data).await
+        }
+
+        async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+            self.inner.delete_lifecycle_journal(repo).await
+        }
+
+        async fn acquire_repo_lease(
+            &self,
+            repo: &str,
+            owner_id: &str,
+            lease_id: &str,
+            ttl_secs: u64,
+        ) -> Result<bool, StorageError> {
+            self.inner
+                .acquire_repo_lease(repo, owner_id, lease_id, ttl_secs)
+                .await
+        }
+
+        async fn renew_repo_lease(
+            &self,
+            repo: &str,
+            owner_id: &str,
+            lease_id: &str,
+            ttl_secs: u64,
+        ) -> Result<bool, StorageError> {
+            self.inner
+                .renew_repo_lease(repo, owner_id, lease_id, ttl_secs)
+                .await
+        }
+
+        async fn release_repo_lease(
+            &self,
+            repo: &str,
+            owner_id: &str,
+            lease_id: &str,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .release_repo_lease(repo, owner_id, lease_id)
                 .await
         }
 

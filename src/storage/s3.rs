@@ -104,6 +104,12 @@ pub trait S3Driver: Send + Sync + 'static {
         if_none_match: Option<String>,
     ) -> Result<String, StorageError>;
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError>;
+    async fn delete_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<String>,
+    ) -> Result<super::ConditionalDeleteResult, StorageError>;
     async fn copy_object(
         &self,
         src_bucket: &str,
@@ -386,6 +392,42 @@ impl S3Driver for AwsS3Driver {
         let client = self.client().await?;
         let _ = client.delete_object().bucket(bucket).key(key).send().await;
         Ok(())
+    }
+
+    async fn delete_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<String>,
+    ) -> Result<super::ConditionalDeleteResult, StorageError> {
+        let client = self.client().await?;
+        let mut req = client.delete_object().bucket(bucket).key(key);
+        if let Some(ref m) = if_match {
+            req = req.if_match(m);
+        }
+        match req.send().await {
+            Ok(_) => Ok(super::ConditionalDeleteResult::Deleted),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("PreconditionFailed")
+                    || err_str
+                        .contains("At least one of the pre-conditions you specified did not hold")
+                    || err_str.contains("412")
+                {
+                    let current = match self.get_object(bucket, key).await {
+                        Ok(Some((_, etag))) => Some(etag),
+                        _ => None,
+                    };
+                    Ok(super::ConditionalDeleteResult::PreconditionFailed {
+                        current_version: current,
+                    })
+                } else if err_str.contains("NoSuchKey") || err_str.contains("404") {
+                    Ok(super::ConditionalDeleteResult::NotFound)
+                } else {
+                    Err(StorageError::Internal(err_str))
+                }
+            }
+        }
     }
 
     async fn copy_object(
@@ -1355,22 +1397,366 @@ impl Storage for S3Storage {
         repo: &str,
         tag: &str,
         expected_version: Option<&str>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<super::ConditionalDeleteResult, StorageError> {
         let bucket = self.bucket()?;
         let key = self.tag_key(repo, tag);
+        self.driver
+            .delete_object_conditional(bucket, &key, expected_version.map(|s| s.to_string()))
+            .await
+    }
 
-        let Some((_bytes, current_etag)) = self.driver.get_object(bucket, &key).await? else {
-            return Err(StorageError::NotFound);
+    async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let bucket = self.bucket()?;
+        let key = self.key(&format!(
+            "repos/{}/meta/lifecycle_journal.json",
+            canonical.as_str()
+        ));
+        match self.driver.get_object(bucket, &key).await? {
+            Some((bytes, _etag)) => Ok(Some(bytes)),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let bucket = self.bucket()?;
+        let key = self.key(&format!(
+            "repos/{}/meta/lifecycle_journal.json",
+            canonical.as_str()
+        ));
+        self.driver
+            .put_object_conditional(bucket, &key, data, None, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let bucket = self.bucket()?;
+        let key = self.key(&format!(
+            "repos/{}/meta/lifecycle_journal.json",
+            canonical.as_str()
+        ));
+        let _ = self.driver.delete_object(bucket, &key).await;
+        Ok(())
+    }
+
+    async fn acquire_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let bucket = self.bucket()?;
+        let key = self.key(&format!(
+            "repos/{}/meta/repo_lease.json",
+            canonical.as_str()
+        ));
+        let now = self.driver.now_unix_secs();
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LeaseDoc {
+            owner_id: String,
+            lease_id: String,
+            acquired_unix_secs: u64,
+            expiry_unix_secs: u64,
+        }
+
+        let existing = self.driver.get_object(bucket, &key).await?;
+        match existing {
+            None => {
+                let doc = LeaseDoc {
+                    owner_id: owner_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    acquired_unix_secs: now,
+                    expiry_unix_secs: now + ttl_secs,
+                };
+                let body = Bytes::from(serde_json::to_vec(&doc).unwrap());
+                match self
+                    .driver
+                    .put_object_conditional(bucket, &key, body, None, Some("*".to_string()))
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(StorageError::TagAlreadyExists) => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            Some((bytes, _etag)) => {
+                if let Ok(parsed) = serde_json::from_slice::<LeaseDoc>(&bytes) {
+                    if parsed.owner_id == owner_id && parsed.lease_id == lease_id {
+                        return Ok(true);
+                    }
+                }
+                // Under Option B (explicit single-writer / no automatic expiry takeover),
+                // an active or unreleased lease held by another owner fails closed.
+                Ok(false)
+            }
+        }
+    }
+
+    async fn renew_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let bucket = self.bucket()?;
+        let key = self.key(&format!(
+            "repos/{}/meta/repo_lease.json",
+            canonical.as_str()
+        ));
+        let now = self.driver.now_unix_secs();
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LeaseDoc {
+            owner_id: String,
+            lease_id: String,
+            acquired_unix_secs: u64,
+            expiry_unix_secs: u64,
+        }
+
+        let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? else {
+            return Ok(false);
         };
 
-        if let Some(exp) = expected_version {
-            if current_etag != exp {
-                return Ok(false);
+        let Ok(parsed) = serde_json::from_slice::<LeaseDoc>(&bytes) else {
+            return Ok(false);
+        };
+
+        if parsed.owner_id != owner_id || parsed.lease_id != lease_id {
+            return Ok(false);
+        }
+
+        let doc = LeaseDoc {
+            owner_id: owner_id.to_string(),
+            lease_id: lease_id.to_string(),
+            acquired_unix_secs: parsed.acquired_unix_secs,
+            expiry_unix_secs: now + ttl_secs,
+        };
+        let body = Bytes::from(serde_json::to_vec(&doc).unwrap());
+        match self
+            .driver
+            .put_object_conditional(bucket, &key, body, Some(etag), None)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(StorageError::TagAlreadyExists) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn release_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+    ) -> Result<(), StorageError> {
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
+            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
+        let bucket = self.bucket()?;
+        let key = self.key(&format!(
+            "repos/{}/meta/repo_lease.json",
+            canonical.as_str()
+        ));
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LeaseDoc {
+            owner_id: String,
+            lease_id: String,
+            acquired_unix_secs: u64,
+            expiry_unix_secs: u64,
+        }
+
+        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
+            if let Ok(parsed) = serde_json::from_slice::<LeaseDoc>(&bytes) {
+                if parsed.owner_id == owner_id && parsed.lease_id == lease_id {
+                    let _ = self
+                        .driver
+                        .delete_object_conditional(bucket, &key, Some(etag))
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn acquire_deployment_writer_lock(
+        &self,
+        doc: &super::mutation_authority::DeploymentWriterLockDoc,
+    ) -> Result<(bool, Option<String>), StorageError> {
+        let bucket = self.bucket()?;
+        let key = self.key("meta/exclusive_writer.lock");
+
+        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
+            if let Ok(existing) =
+                serde_json::from_slice::<super::mutation_authority::DeploymentWriterLockDoc>(&bytes)
+            {
+                if existing.owner_token == doc.owner_token {
+                    return Ok((true, Some(etag)));
+                }
+                return Err(StorageError::ExclusiveWriterLocked(format!(
+                    "held by {} on {} (pid {}) in mode '{}' acquired at {}",
+                    existing.owner_id,
+                    existing.hostname,
+                    existing.pid,
+                    existing.command_mode,
+                    existing.acquired_unix_secs
+                )));
+            } else {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                return Err(StorageError::ExclusiveWriterLocked(s));
             }
         }
 
-        self.driver.delete_object(bucket, &key).await?;
-        Ok(true)
+        let body = Bytes::from(serde_json::to_vec(doc).unwrap());
+        match self
+            .driver
+            .put_object_conditional(bucket, &key, body, None, Some("*".to_string()))
+            .await
+        {
+            Ok(_) => {
+                let etag = self
+                    .driver
+                    .get_object(bucket, &key)
+                    .await?
+                    .map(|(_, tag)| tag);
+                Ok((true, etag))
+            }
+            Err(StorageError::TagAlreadyExists) => {
+                let current_owner = self
+                    .driver
+                    .get_object(bucket, &key)
+                    .await?
+                    .map(|(b, _)| {
+                        if let Ok(d) = serde_json::from_slice::<
+                            super::mutation_authority::DeploymentWriterLockDoc,
+                        >(&b)
+                        {
+                            format!("{} ({})", d.owner_id, d.command_mode)
+                        } else {
+                            String::from_utf8_lossy(&b).to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                Err(StorageError::ExclusiveWriterLocked(current_owner))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn release_deployment_writer_lock(
+        &self,
+        doc: &super::mutation_authority::DeploymentWriterLockDoc,
+        expected_etag: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let bucket = self.bucket()?;
+        let key = self.key("meta/exclusive_writer.lock");
+
+        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
+            if let Ok(existing) =
+                serde_json::from_slice::<super::mutation_authority::DeploymentWriterLockDoc>(&bytes)
+            {
+                if existing.owner_token != doc.owner_token {
+                    // Lock belongs to someone else; do not touch
+                    return Ok(false);
+                }
+            }
+            let version_to_delete = expected_etag.or(Some(&etag)).map(ToString::to_string);
+            let _ = self
+                .driver
+                .delete_object_conditional(bucket, &key, version_to_delete)
+                .await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn inspect_deployment_writer_lock(
+        &self,
+    ) -> Result<
+        Option<(
+            super::mutation_authority::DeploymentWriterLockDoc,
+            Option<String>,
+        )>,
+        StorageError,
+    > {
+        let bucket = self.bucket()?;
+        let key = self.key("meta/exclusive_writer.lock");
+
+        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
+            if let Ok(doc) =
+                serde_json::from_slice::<super::mutation_authority::DeploymentWriterLockDoc>(&bytes)
+            {
+                return Ok(Some((doc, Some(etag))));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn admin_clear_deployment_writer_lock(
+        &self,
+        expected_owner: &str,
+        expected_etag: &str,
+    ) -> Result<(), StorageError> {
+        let bucket = self.bucket()?;
+        let key = self.key("meta/exclusive_writer.lock");
+
+        let (bytes, current_etag) = match self.driver.get_object(bucket, &key).await? {
+            Some(res) => res,
+            None => return Err(StorageError::NotFound),
+        };
+
+        if !expected_etag.is_empty() && current_etag != expected_etag {
+            return Err(StorageError::ExclusiveWriterLocked(format!(
+                "lock etag mismatch: expected '{expected_etag}', current is '{current_etag}'"
+            )));
+        }
+
+        if let Ok(doc) =
+            serde_json::from_slice::<super::mutation_authority::DeploymentWriterLockDoc>(&bytes)
+        {
+            if !expected_owner.is_empty()
+                && doc.owner_id != expected_owner
+                && doc.owner_token != expected_owner
+            {
+                return Err(StorageError::Internal(format!(
+                    "lock owner mismatch: expected '{expected_owner}', current is '{}'",
+                    doc.owner_id
+                )));
+            }
+        }
+
+        let version = if expected_etag.is_empty() {
+            Some(current_etag)
+        } else {
+            Some(expected_etag.to_string())
+        };
+
+        let res = self
+            .driver
+            .delete_object_conditional(bucket, &key, version)
+            .await?;
+        match res {
+            super::ConditionalDeleteResult::Deleted => Ok(()),
+            super::ConditionalDeleteResult::PreconditionFailed { current_version } => {
+                Err(StorageError::ExclusiveWriterLocked(format!(
+                    "lock changed concurrently to generation {:?}",
+                    current_version
+                )))
+            }
+            super::ConditionalDeleteResult::NotFound => Err(StorageError::NotFound),
+        }
     }
 
     async fn create_upload(&self) -> Result<UploadMeta, StorageError> {
@@ -2949,9 +3335,10 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 pub mod tests {
     use super::*;
+    use crate::storage::ConditionalDeleteResult;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2975,6 +3362,7 @@ pub mod tests {
         pub objects: StdMutex<MockObjectStore>,
         pub multiparts: StdMutex<MockMultipartStore>,
         pub clock_secs: AtomicU64,
+        pub etag_seq: AtomicU64,
         pub call_log: StdMutex<Vec<S3CallLogEntry>>,
         pub injected_412_keys: StdMutex<HashSet<String>>,
         pub hook_before_op: StdMutex<Option<MockHookFn>>,
@@ -2987,6 +3375,7 @@ pub mod tests {
                 objects: StdMutex::new(HashMap::new()),
                 multiparts: StdMutex::new(HashMap::new()),
                 clock_secs: AtomicU64::new(initial_time),
+                etag_seq: AtomicU64::new(1),
                 call_log: StdMutex::new(Vec::new()),
                 injected_412_keys: StdMutex::new(HashSet::new()),
                 hook_before_op: StdMutex::new(None),
@@ -3333,7 +3722,8 @@ pub mod tests {
                 }
             }
 
-            let new_etag = format!("\"etag_{}_{}\"", key.replace('/', "_"), body.len());
+            let seq = self.etag_seq.fetch_add(1, Ordering::SeqCst);
+            let new_etag = format!("\"etag_{}_{}_{}\"", key.replace('/', "_"), body.len(), seq);
             objs.insert(key.to_string(), (body, new_etag.clone()));
             drop(objs);
 
@@ -3362,6 +3752,48 @@ pub mod tests {
             self.check_after_hook("delete_object", key)?;
 
             Ok(())
+        }
+
+        async fn delete_object_conditional(
+            &self,
+            _bucket: &str,
+            key: &str,
+            if_match: Option<String>,
+        ) -> Result<ConditionalDeleteResult, StorageError> {
+            let mut log = self.call_log.lock().unwrap();
+            log.push(S3CallLogEntry {
+                method: "delete_object_conditional".to_string(),
+                key: key.to_string(),
+                if_match: if_match.clone(),
+                if_none_match: None,
+                body_len: 0,
+            });
+            drop(log);
+
+            self.check_before_hook("delete_object", key)?;
+
+            let mut objs = self.objects.lock().unwrap();
+            let Some((_bytes, existing_etag)) = objs.get(key) else {
+                return Ok(ConditionalDeleteResult::NotFound);
+            };
+
+            if let Some(ref expected_etag) = if_match {
+                let norm_expected = expected_etag.trim_matches('"');
+                let norm_actual = existing_etag.trim_matches('"');
+                if norm_expected != "*" && norm_expected != norm_actual {
+                    let current_etag = existing_etag.trim_matches('"').to_string();
+                    drop(objs);
+                    return Ok(ConditionalDeleteResult::PreconditionFailed {
+                        current_version: Some(current_etag),
+                    });
+                }
+            }
+
+            objs.remove(key);
+            drop(objs);
+
+            self.check_after_hook("delete_object", key)?;
+            Ok(ConditionalDeleteResult::Deleted)
         }
 
         async fn copy_object(
