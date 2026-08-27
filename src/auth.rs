@@ -630,31 +630,31 @@ root = "{}"
             gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            consistency_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             membership_ledger: std::sync::Arc::new(
                 crate::repository_membership_ledger::RepositoryMembershipLedger::new(
                     storage.clone(),
                     None,
-                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    crate::consistency::ConsistencyCoordinator::new(),
                 ),
             ),
             upload_coordinator: std::sync::Arc::new(
                 crate::upload_coordinator::BlobUploadCoordinator::new(
                     storage.clone(),
                     None,
+                    crate::consistency::ConsistencyCoordinator::new(),
                     crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
                 ),
             ),
             delete_service: std::sync::Arc::new(crate::blob_delete_safety::BlobDeleteService::new(
                 storage.clone(),
                 None,
-                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                crate::consistency::ConsistencyCoordinator::new(),
             )),
             manifest_lifecycle: std::sync::Arc::new(
                 crate::manifest_lifecycle::ManifestLifecycleService::new(
                     storage.clone(),
                     None,
-                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    crate::consistency::ConsistencyCoordinator::new(),
                 ),
             ),
         };
@@ -807,31 +807,31 @@ root = "{}"
             gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            consistency_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             membership_ledger: std::sync::Arc::new(
                 crate::repository_membership_ledger::RepositoryMembershipLedger::new(
                     storage.clone(),
                     None,
-                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    crate::consistency::ConsistencyCoordinator::new(),
                 ),
             ),
             upload_coordinator: std::sync::Arc::new(
                 crate::upload_coordinator::BlobUploadCoordinator::new(
                     storage.clone(),
                     None,
+                    crate::consistency::ConsistencyCoordinator::new(),
                     crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
                 ),
             ),
             delete_service: std::sync::Arc::new(crate::blob_delete_safety::BlobDeleteService::new(
                 storage.clone(),
                 None,
-                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                crate::consistency::ConsistencyCoordinator::new(),
             )),
             manifest_lifecycle: std::sync::Arc::new(
                 crate::manifest_lifecycle::ManifestLifecycleService::new(
                     storage.clone(),
                     None,
-                    std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    crate::consistency::ConsistencyCoordinator::new(),
                 ),
             ),
         };

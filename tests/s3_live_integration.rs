@@ -10,6 +10,7 @@ use uuid::Uuid;
 use registry_rust::blob_gc::{BlobGcPolicy, CasBlobTraverser};
 use registry_rust::blob_ref_index::BlobRefIndex;
 use registry_rust::config::Config;
+use registry_rust::consistency::ConsistencyCoordinator;
 use registry_rust::gc_service::{GcBudgets, GcService, GcServiceError};
 use registry_rust::manifest_lifecycle::{
     LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase, ManifestLifecycleService,
@@ -945,11 +946,11 @@ async fn test_live_s3_lifecycle_service_and_recovery() {
     let ref_idx1 = Arc::new(BlobRefIndex::open(temp.path().join("ref_idx.db")).unwrap());
     ref_idx1.rebuild(&storage1).await.unwrap();
 
-    let consistency_gate = Arc::new(Mutex::new(()));
+    let coordinator = ConsistencyCoordinator::new();
     let service1 = ManifestLifecycleService::new(
         storage1.clone(),
         Some(ref_idx1.clone()),
-        consistency_gate.clone(),
+        coordinator.clone(),
     );
 
     let repo = "library/live-lifecycle";
@@ -984,11 +985,8 @@ async fn test_live_s3_lifecycle_service_and_recovery() {
     let ref_idx2 = Arc::new(BlobRefIndex::open(temp.path().join("ref_idx2.db")).unwrap());
     ref_idx2.rebuild(&storage2).await.unwrap();
 
-    let service2 = ManifestLifecycleService::new(
-        storage2.clone(),
-        Some(ref_idx2.clone()),
-        consistency_gate.clone(),
-    );
+    let service2 =
+        ManifestLifecycleService::new(storage2.clone(), Some(ref_idx2.clone()), coordinator);
 
     // Verify tag and manifest are resolved through fresh client
     let resolved = storage2.resolve_tag(repo, "v1.0.0").await.unwrap();
@@ -1201,7 +1199,13 @@ async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
         .await
         .unwrap();
 
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let stats = service
         .scheduled_cleanup_once()
@@ -1235,7 +1239,12 @@ async fn test_live_s3_gc_admin_plan_succeeds() {
         .await
         .unwrap();
 
-    let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+    let service = GcService::new(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+    );
     let budgets = GcBudgets {
         max_blobs: 100,
         max_bytes: u64::MAX,
@@ -1281,7 +1290,13 @@ async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "del-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1324,7 +1339,13 @@ async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "q-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1339,7 +1360,7 @@ async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
         )
         .await;
     assert!(
-        matches!(q_res, Err(GcServiceError::StrategyUnsupported(_))),
+        matches!(q_res, Err(GcServiceError::StrategyUnsupported { .. })),
         "S3 quarantine must return StrategyUnsupported"
     );
 
@@ -1369,7 +1390,13 @@ async fn test_live_s3_gc_repository_membership_protects_blob() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "mem-prot-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1444,7 +1471,13 @@ async fn test_live_s3_gc_manifest_reachability_protects_blob() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "m-prot-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1500,7 +1533,13 @@ async fn test_live_s3_gc_upload_pin_protects_blob() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "pin-prot-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1574,7 +1613,13 @@ async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "j-prot-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1695,7 +1740,13 @@ async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "multi-test")
         .await
         .unwrap();
-    let service = GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+    let service = GcService::with_authority(
+        cfg.clone(),
+        storage.clone(),
+        idx.clone(),
+        ConsistencyCoordinator::new(),
+        authority,
+    );
 
     let budgets = GcBudgets {
         max_blobs: 100,
@@ -1754,7 +1805,7 @@ async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bound
     storage.unlink_repo_blob("adv-repo", &d1).await.unwrap();
     storage.unlink_repo_blob("adv-repo", &d2).await.unwrap();
 
-    let consistency_gate = Arc::new(Mutex::new(()));
+    let coordinator = ConsistencyCoordinator::new();
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "bounded-test")
         .await
         .unwrap();
@@ -1762,7 +1813,7 @@ async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bound
         cfg.clone(),
         storage.clone(),
         idx.clone(),
-        consistency_gate.clone(),
+        coordinator,
         Arc::new(Mutex::new(Some(authority))),
     );
 

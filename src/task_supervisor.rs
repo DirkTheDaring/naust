@@ -677,6 +677,7 @@ mod tests {
         let coordinator = Arc::new(crate::upload_coordinator::BlobUploadCoordinator::new(
             storage.clone(),
             Some(ref_index.clone()),
+            crate::consistency::ConsistencyCoordinator::new(),
             crate::upload_coordinator::BlobUploadCoordinatorConfig {
                 signing_key: b"test-key".to_vec(),
                 max_upload_bytes: 10485760,

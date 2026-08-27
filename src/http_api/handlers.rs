@@ -678,7 +678,7 @@ async fn manifest_by_reference(
                                     state.config.max_request_body_bytes,
                                     false,
                                     None,
-                                    Some(&state.manifest_lifecycle),
+                                    &state.manifest_lifecycle,
                                 )
                                 .await
                             {
@@ -854,7 +854,7 @@ async fn manifest_by_reference(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
-                                Some(&state.manifest_lifecycle),
+                                &state.manifest_lifecycle,
                             )
                             .await
                         {
@@ -954,7 +954,7 @@ async fn manifest_by_reference(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
-                                Some(&state.manifest_lifecycle),
+                                &state.manifest_lifecycle,
                             )
                             .await
                         {
@@ -1047,7 +1047,7 @@ async fn manifest_by_reference_proxy_only(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
-                                Some(&state.manifest_lifecycle),
+                                &state.manifest_lifecycle,
                             )
                             .await
                         {
@@ -1150,7 +1150,7 @@ async fn manifest_by_reference_proxy_only(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        Some(&state.manifest_lifecycle),
+                        &state.manifest_lifecycle,
                     )
                     .await
                 {
@@ -1212,7 +1212,7 @@ async fn manifest_by_reference_proxy_only(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        Some(&state.manifest_lifecycle),
+                        &state.manifest_lifecycle,
                     )
                     .await
                 {
@@ -1293,9 +1293,11 @@ mod tests {
             .first()
             .map(|k| k.key.as_bytes().to_vec())
             .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
+        let consistency = crate::consistency::ConsistencyCoordinator::new();
         let upload_coordinator = Arc::new(crate::upload_coordinator::BlobUploadCoordinator::new(
             storage.clone(),
             None,
+            consistency.clone(),
             crate::upload_coordinator::BlobUploadCoordinatorConfig {
                 signing_key,
                 max_upload_bytes: cfg.max_upload_bytes,
@@ -1323,24 +1325,23 @@ mod tests {
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            consistency_gate: Arc::new(tokio::sync::Mutex::new(())),
             membership_ledger: Arc::new(
                 crate::repository_membership_ledger::RepositoryMembershipLedger::new(
                     storage.clone(),
                     None,
-                    Arc::new(tokio::sync::Mutex::new(())),
+                    consistency.clone(),
                 ),
             ),
             upload_coordinator,
             delete_service: Arc::new(crate::blob_delete_safety::BlobDeleteService::new(
                 storage.clone(),
                 None,
-                Arc::new(tokio::sync::Mutex::new(())),
+                consistency.clone(),
             )),
             manifest_lifecycle: Arc::new(crate::manifest_lifecycle::ManifestLifecycleService::new(
                 storage.clone(),
                 None,
-                Arc::new(tokio::sync::Mutex::new(())),
+                consistency,
             )),
         }
     }
@@ -1395,6 +1396,7 @@ mod tests {
             cfg.clone(),
             storage.clone(),
             idx,
+            crate::consistency::ConsistencyCoordinator::new(),
         ));
         let service_for_state = service.clone();
         let held = service.test_try_lock().expect("lock");
@@ -1433,6 +1435,7 @@ mod tests {
             cfg.clone(),
             storage.clone(),
             idx,
+            crate::consistency::ConsistencyCoordinator::new(),
         ));
 
         let state = test_app_state(cfg, storage, Some(service));
@@ -1472,6 +1475,7 @@ mod tests {
             cfg.clone(),
             storage.clone(),
             idx,
+            crate::consistency::ConsistencyCoordinator::new(),
         ));
 
         let state = test_app_state(cfg, storage, Some(service));
@@ -2848,7 +2852,7 @@ async fn ensure_tag_fresh(
             state.config.max_request_body_bytes,
             true,
             if_none_match,
-            Some(&state.manifest_lifecycle),
+            &state.manifest_lifecycle,
         )
         .await;
 
@@ -2878,7 +2882,7 @@ async fn ensure_tag_fresh(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        Some(&state.manifest_lifecycle),
+                        &state.manifest_lifecycle,
                     )
                     .await
                     .map_err(|e| {
@@ -2930,7 +2934,7 @@ async fn ensure_tag_fresh(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        Some(&state.manifest_lifecycle),
+                        &state.manifest_lifecycle,
                     )
                     .await
                     .map_err(|e| {

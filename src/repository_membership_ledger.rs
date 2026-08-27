@@ -3,7 +3,6 @@ use crate::registry::digest::Digest;
 use crate::storage::repo_membership::RepoBlobMembershipRecord;
 use crate::storage::{Storage, StorageError};
 use std::sync::Arc;
-use tokio::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -32,38 +31,41 @@ pub enum LedgerIndexMode {
 pub struct RepositoryMembershipLedger {
     storage: Arc<dyn Storage>,
     mode: LedgerIndexMode,
-    consistency_gate: Arc<Mutex<()>>,
+    consistency: crate::consistency::ConsistencyCoordinator,
 }
 
 impl RepositoryMembershipLedger {
     pub fn new(
         storage: Arc<dyn Storage>,
         ref_index: Option<Arc<BlobRefIndex>>,
-        consistency_gate: Arc<Mutex<()>>,
+        consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         match ref_index {
-            Some(idx) => Self::indexed(storage, idx, consistency_gate),
-            None => Self::storage_only(storage, consistency_gate),
+            Some(idx) => Self::indexed(storage, idx, consistency),
+            None => Self::storage_only(storage, consistency),
         }
     }
 
     pub fn indexed(
         storage: Arc<dyn Storage>,
         ref_index: Arc<BlobRefIndex>,
-        consistency_gate: Arc<Mutex<()>>,
+        consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         Self {
             storage,
             mode: LedgerIndexMode::Indexed(ref_index),
-            consistency_gate,
+            consistency,
         }
     }
 
-    pub fn storage_only(storage: Arc<dyn Storage>, consistency_gate: Arc<Mutex<()>>) -> Self {
+    pub fn storage_only(
+        storage: Arc<dyn Storage>,
+        consistency: crate::consistency::ConsistencyCoordinator,
+    ) -> Self {
         Self {
             storage,
             mode: LedgerIndexMode::StorageOnly,
-            consistency_gate,
+            consistency,
         }
     }
 
@@ -86,24 +88,20 @@ impl RepositoryMembershipLedger {
         matches!(&self.mode, LedgerIndexMode::Indexed(_))
     }
 
-    pub fn consistency_gate(&self) -> &Arc<Mutex<()>> {
-        &self.consistency_gate
+    pub fn consistency(&self) -> &crate::consistency::ConsistencyCoordinator {
+        &self.consistency
     }
 
-    pub async fn lock_gate(&self) -> MutexGuard<'_, ()> {
-        self.consistency_gate.lock().await
-    }
-
-    /// Durable link with internal gate acquisition.
+    /// Durable link with internal coordinator acquisition.
     pub async fn link(&self, record: &RepoBlobMembershipRecord) -> Result<(), LedgerError> {
-        let guard = self.consistency_gate.lock().await;
+        let guard = self.consistency.acquire_mutation().await;
         self.link_with_guard(&guard, record).await
     }
 
     /// Durable link using an existing lock guard (avoids lock inversion / re-entrancy).
     pub async fn link_with_guard(
         &self,
-        _guard: &MutexGuard<'_, ()>,
+        _guard: &crate::consistency::MutationGuard,
         record: &RepoBlobMembershipRecord,
     ) -> Result<(), LedgerError> {
         // 1. Ensure reverse index is healthy (auto-rebuilding if corrupt)
@@ -128,16 +126,16 @@ impl RepositoryMembershipLedger {
         Ok(())
     }
 
-    /// Durable unlink with internal gate acquisition.
+    /// Durable unlink with internal coordinator acquisition.
     pub async fn unlink(&self, repo: &str, digest: &Digest) -> Result<bool, LedgerError> {
-        let guard = self.consistency_gate.lock().await;
+        let guard = self.consistency.acquire_mutation().await;
         self.unlink_with_guard(&guard, repo, digest).await
     }
 
     /// Durable unlink using an existing lock guard.
     pub async fn unlink_with_guard(
         &self,
-        _guard: &MutexGuard<'_, ()>,
+        _guard: &crate::consistency::MutationGuard,
         repo: &str,
         digest: &Digest,
     ) -> Result<bool, LedgerError> {
@@ -165,14 +163,14 @@ impl RepositoryMembershipLedger {
         Ok(removed)
     }
 
-    /// Set candidate state with internal gate acquisition.
+    /// Set candidate state with internal coordinator acquisition.
     pub async fn set_candidate(
         &self,
         repo: &str,
         digest: &Digest,
         since_unix_secs: u64,
     ) -> Result<bool, LedgerError> {
-        let guard = self.consistency_gate.lock().await;
+        let guard = self.consistency.acquire_mutation().await;
         self.set_candidate_with_guard(&guard, repo, digest, since_unix_secs)
             .await
     }
@@ -180,7 +178,7 @@ impl RepositoryMembershipLedger {
     /// Set candidate state using an existing lock guard.
     pub async fn set_candidate_with_guard(
         &self,
-        _guard: &MutexGuard<'_, ()>,
+        _guard: &crate::consistency::MutationGuard,
         repo: &str,
         digest: &Digest,
         since_unix_secs: u64,
@@ -193,16 +191,16 @@ impl RepositoryMembershipLedger {
         Ok(changed)
     }
 
-    /// Reactivate candidate to Active with internal gate acquisition.
+    /// Reactivate candidate to Active with internal coordinator acquisition.
     pub async fn reactivate(&self, repo: &str, digest: &Digest) -> Result<bool, LedgerError> {
-        let guard = self.consistency_gate.lock().await;
+        let guard = self.consistency.acquire_mutation().await;
         self.reactivate_with_guard(&guard, repo, digest).await
     }
 
     /// Reactivate candidate to Active using an existing lock guard.
     pub async fn reactivate_with_guard(
         &self,
-        _guard: &MutexGuard<'_, ()>,
+        _guard: &crate::consistency::MutationGuard,
         repo: &str,
         digest: &Digest,
     ) -> Result<bool, LedgerError> {
@@ -244,7 +242,7 @@ impl RepositoryMembershipLedger {
 
     /// Explicitly rebuild and reconcile reverse index against authoritative storage markers.
     pub async fn reconcile_reverse_index(&self) -> Result<(), LedgerError> {
-        let _guard = self.consistency_gate.lock().await;
+        let _guard = self.consistency.acquire_mutation().await;
         if let LedgerIndexMode::Indexed(ref idx) = self.mode {
             idx.rebuild(&self.storage).await?;
         }
@@ -272,9 +270,12 @@ mod tests {
         let idx = Arc::new(BlobRefIndex::open(index_dir).expect("open index"));
         idx.mark_ready().expect("mark ready");
 
-        let gate = Arc::new(Mutex::new(()));
-        let ledger =
-            RepositoryMembershipLedger::indexed(Arc::clone(&storage), Arc::clone(&idx), gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let ledger = RepositoryMembershipLedger::indexed(
+            Arc::clone(&storage),
+            Arc::clone(&idx),
+            coordinator,
+        );
 
         (dir, ledger, idx, storage)
     }
@@ -358,8 +359,8 @@ mod tests {
         std::fs::create_dir_all(&fs_root).expect("mkdir data");
 
         let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
-        let gate = Arc::new(Mutex::new(()));
-        let ledger = RepositoryMembershipLedger::storage_only(Arc::clone(&storage), gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let ledger = RepositoryMembershipLedger::storage_only(Arc::clone(&storage), coordinator);
 
         assert!(!ledger.is_indexed());
         assert!(ledger.ref_index().is_none());

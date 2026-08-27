@@ -63,7 +63,7 @@ pub struct ProxyPublicationEvidence {
 }
 
 impl ProxyPublicationEvidence {
-    pub(crate) fn new(
+    pub fn new(
         repo: impl Into<String>,
         reference: impl Into<String>,
         payload: Bytes,
@@ -270,8 +270,8 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-pub struct RepoCoordinationGuard<'a> {
-    _gate: tokio::sync::MutexGuard<'a, ()>,
+pub struct RepoCoordinationGuard {
+    _guard: crate::consistency::MutationGuard,
     storage: Arc<dyn Storage>,
     repo: String,
     owner_id: String,
@@ -281,7 +281,7 @@ pub struct RepoCoordinationGuard<'a> {
     released: bool,
 }
 
-impl<'a> RepoCoordinationGuard<'a> {
+impl RepoCoordinationGuard {
     pub async fn check_lease(&mut self) -> Result<(), ManifestLifecycleError> {
         if let Ok(err) = self.failure_rx.try_recv() {
             return Err(ManifestLifecycleError::Internal(format!(
@@ -308,7 +308,7 @@ impl<'a> RepoCoordinationGuard<'a> {
     }
 }
 
-impl<'a> Drop for RepoCoordinationGuard<'a> {
+impl Drop for RepoCoordinationGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.renew_handle.take() {
             handle.abort();
@@ -332,19 +332,19 @@ impl<'a> Drop for RepoCoordinationGuard<'a> {
 pub struct ManifestLifecycleService {
     storage: Arc<dyn Storage>,
     ref_index: Option<Arc<BlobRefIndex>>,
-    consistency_gate: Arc<tokio::sync::Mutex<()>>,
+    consistency: crate::consistency::ConsistencyCoordinator,
 }
 
 impl ManifestLifecycleService {
     pub fn new(
         storage: Arc<dyn Storage>,
         ref_index: Option<Arc<BlobRefIndex>>,
-        consistency_gate: Arc<tokio::sync::Mutex<()>>,
+        consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         Self {
             storage,
             ref_index,
-            consistency_gate,
+            consistency,
         }
     }
 
@@ -355,11 +355,11 @@ impl ManifestLifecycleService {
         self.publish_manifest(req).await
     }
 
-    async fn acquire_coordination<'a>(
-        &'a self,
+    async fn acquire_coordination(
+        &self,
         repo: &str,
-    ) -> Result<RepoCoordinationGuard<'a>, ManifestLifecycleError> {
-        let gate = self.consistency_gate.lock().await;
+    ) -> Result<RepoCoordinationGuard, ManifestLifecycleError> {
+        let guard = self.consistency.acquire_mutation().await;
 
         let owner_id = uuid::Uuid::new_v4().to_string();
         let lease_id = uuid::Uuid::new_v4().to_string();
@@ -424,7 +424,7 @@ impl ManifestLifecycleService {
         });
 
         Ok(RepoCoordinationGuard {
-            _gate: gate,
+            _guard: guard,
             storage: Arc::clone(&self.storage),
             repo: repo.to_string(),
             owner_id,

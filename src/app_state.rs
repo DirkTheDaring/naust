@@ -63,9 +63,6 @@ pub struct AppState {
     pub ip_limiter: Arc<ip_concurrency::IpConcurrencyLimiter>,
     pub is_high_pressure: Arc<std::sync::atomic::AtomicBool>,
 
-    // Shared Consistency Coordinator:
-    pub consistency_gate: Arc<tokio::sync::Mutex<()>>,
-
     // Authoritative Repository Membership Ledger:
     pub membership_ledger: Arc<repository_membership_ledger::RepositoryMembershipLedger>,
 

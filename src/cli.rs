@@ -454,6 +454,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
             let mut gc_cfg = cfg.clone();
             gc_cfg.blob_gc_enabled = true;
             gc_cfg.blob_gc_enable_delete = true;
+            let consistency = crate::consistency::ConsistencyCoordinator::new();
 
             match command {
                 BlobGcCommand::Plan {
@@ -465,6 +466,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                         std::sync::Arc::new(gc_cfg),
                         storage.clone(),
                         std::sync::Arc::new(idx),
+                        consistency,
                     );
                     let budgets = crate::gc_service::GcBudgets {
                         max_blobs: max_per_run,
@@ -521,6 +523,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                         std::sync::Arc::new(gc_cfg),
                         storage.clone(),
                         std::sync::Arc::new(idx),
+                        consistency,
                         authority,
                     );
 
@@ -581,6 +584,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                         std::sync::Arc::new(gc_cfg),
                         storage.clone(),
                         std::sync::Arc::new(idx),
+                        consistency,
                         authority,
                     );
 

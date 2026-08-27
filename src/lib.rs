@@ -10,6 +10,8 @@ pub mod blob_gc;
 pub mod blob_ref_index;
 pub mod cli;
 pub mod config;
+pub mod consistency;
+pub use consistency::{ConsistencyCoordinator, GcRevalidationGuard, MutationGuard};
 pub mod fs_root_lock;
 pub mod gc_service;
 pub mod glob;

@@ -3,11 +3,14 @@ pub mod traverser;
 pub mod validation;
 
 pub use policy::{
-    AgeEligibility, BlobGcPolicy, PolicyContext, build_manifest_protected_set,
+    AgeEligibility, BlobGcPolicy, GcPolicyError, PolicyContext, build_manifest_protected_set,
     build_manifest_protected_set_fs, check_candidate_age,
 };
 pub use traverser::{CasBlobTraverser, GcPaginationError};
-pub(crate) use validation::{PreDeleteValidation, revalidate_candidate_before_delete};
+pub(crate) use validation::execute_guarded_gc_deletion;
+pub use validation::{
+    GcCandidateDeletionError, GcCandidateDeletionOutcome, GcProtectionReason, PreDeleteValidation,
+};
 
 use crate::blob_ref_index::BlobRefIndex;
 use crate::registry::digest::Digest;
@@ -18,6 +21,79 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlobGcError {
+    #[error("policy evaluation error: {0}")]
+    Policy(#[from] policy::GcPolicyError),
+
+    #[error("pagination error: {0}")]
+    Pagination(#[from] traverser::GcPaginationError),
+
+    #[error("reference index error: {0}")]
+    RefIndex(#[from] crate::blob_ref_index::RefIndexError),
+
+    #[error("mutation authority unavailable or inactive")]
+    AuthorityUnavailable,
+
+    #[error("mutation authority released")]
+    AuthorityReleased,
+
+    #[error("guarded deletion failed: {0}")]
+    CandidateDeletion(#[from] validation::GcCandidateDeletionError),
+
+    #[error("quarantine storage mutation failed for candidate {digest}: {source}")]
+    QuarantineStorage {
+        digest: Digest,
+        #[source]
+        source: crate::storage::StorageError,
+    },
+
+    #[error("restore storage mutation failed for candidate {digest}: {source}")]
+    RestoreStorage {
+        digest: Digest,
+        #[source]
+        source: crate::storage::StorageError,
+    },
+
+    #[error("storage version query failed for candidate {digest}: {source}")]
+    QuarantineVersionQuery {
+        digest: Digest,
+        #[source]
+        source: crate::storage::StorageError,
+    },
+
+    #[error("membership count query failed for candidate {digest}: {source}")]
+    MembershipCountQuery {
+        digest: Digest,
+        #[source]
+        source: crate::storage::StorageError,
+    },
+
+    #[error("bucket versioning check failed for GC: {0}")]
+    BucketVersioning(#[source] crate::storage::StorageError),
+
+    #[error("filesystem traversal failed at '{path}': {source}")]
+    FsReadDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("filesystem metadata write failed at '{path}': {source}")]
+    FsWriteMeta {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("filesystem metadata read failed at '{path}': {source}")]
+    FsReadMeta {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct BlobGcStats {
@@ -57,7 +133,7 @@ pub async fn blob_gc_plan(
     policy: BlobGcPolicy,
     min_age: Duration,
     limits: BlobGcLimits,
-) -> Result<BlobGcStats, String> {
+) -> Result<BlobGcStats, BlobGcError> {
     let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
     let mut stats = BlobGcStats::default();
 
@@ -66,7 +142,7 @@ pub async fn blob_gc_plan(
 
     let mut traverser = CasBlobTraverser::new(storage, 100);
 
-    while let Some(items) = traverser.next_batch().await.map_err(|e| e.to_string())? {
+    while let Some(items) = traverser.next_batch().await? {
         for candidate in items {
             if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
                 return Ok(stats);
@@ -94,7 +170,10 @@ pub async fn blob_gc_plan(
             let mem_count = storage
                 .count_repo_blob_memberships(&candidate.digest)
                 .await
-                .map_err(|e| format!("count memberships: {e}"))?;
+                .map_err(|source| BlobGcError::MembershipCountQuery {
+                    digest: candidate.digest.clone(),
+                    source,
+                })?;
             if mem_count > 0 {
                 continue;
             }
@@ -118,12 +197,12 @@ pub(crate) async fn blob_gc_quarantine(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
     idx: &BlobRefIndex,
-    consistency_gate: &Arc<Mutex<()>>,
+    consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     policy: BlobGcPolicy,
     min_age: Duration,
     limits: BlobGcLimits,
-) -> Result<BlobGcStats, String> {
+) -> Result<BlobGcStats, BlobGcError> {
     if storage.gc_strategy() == storage::GcStorageStrategy::S3DirectConditional {
         return Ok(BlobGcStats::default());
     }
@@ -135,7 +214,7 @@ pub(crate) async fn blob_gc_quarantine(
 
     let mut traverser = CasBlobTraverser::new(storage, 100);
 
-    while let Some(items) = traverser.next_batch().await.map_err(|e| e.to_string())? {
+    while let Some(items) = traverser.next_batch().await? {
         for candidate in items {
             if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
                 return Ok(stats);
@@ -157,25 +236,25 @@ pub(crate) async fn blob_gc_quarantine(
 
             let auth_guard = mutation_authority.lock().await;
             let Some(ref auth) = *auth_guard else {
-                return Err("mutation authority unavailable or inactive".to_string());
+                return Err(BlobGcError::AuthorityUnavailable);
             };
             if !auth.is_active() {
-                return Err("mutation authority released".to_string());
+                return Err(BlobGcError::AuthorityReleased);
             }
             let permit = auth.gc_mutation_permit();
 
-            let _gate = consistency_gate.lock().await;
+            let _reval_guard = consistency.acquire_gc_revalidation().await;
 
             let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
 
             if policy_ctx.is_pinned(&candidate.digest, now)? {
-                drop(_gate);
+                drop(_reval_guard);
                 drop(auth_guard);
                 continue;
             }
 
             if policy_ctx.is_referenced(&candidate.digest).await? {
-                drop(_gate);
+                drop(_reval_guard);
                 drop(auth_guard);
                 continue;
             }
@@ -184,7 +263,7 @@ pub(crate) async fn blob_gc_quarantine(
                 .quarantine_blob(&permit, &candidate.digest, &candidate.version)
                 .await;
 
-            drop(_gate);
+            drop(_reval_guard);
             drop(auth_guard);
 
             match q_res {
@@ -193,8 +272,11 @@ pub(crate) async fn blob_gc_quarantine(
                     stats.quarantined_bytes = stats.quarantined_bytes.saturating_add(size);
                 }
                 Ok(storage::GcQuarantineResult::Skipped) => {}
-                Err(e) => {
-                    return Err(format!("quarantine blob {}: {e}", candidate.digest));
+                Err(source) => {
+                    return Err(BlobGcError::QuarantineStorage {
+                        digest: candidate.digest,
+                        source,
+                    });
                 }
             }
         }
@@ -214,19 +296,19 @@ pub(crate) async fn blob_gc_delete(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
     idx: &BlobRefIndex,
-    consistency_gate: &Arc<Mutex<()>>,
+    consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     policy: BlobGcPolicy,
     quarantine_delay: Duration,
     limits: BlobGcLimits,
-) -> Result<BlobGcStats, String> {
+) -> Result<BlobGcStats, BlobGcError> {
     match storage.gc_strategy() {
         storage::GcStorageStrategy::FilesystemQuarantine => {
             blob_gc_delete_fs(
                 cfg,
                 storage,
                 idx,
-                consistency_gate,
+                consistency,
                 mutation_authority,
                 policy,
                 quarantine_delay,
@@ -239,7 +321,7 @@ pub(crate) async fn blob_gc_delete(
                 cfg,
                 storage,
                 idx,
-                consistency_gate,
+                consistency,
                 mutation_authority,
                 policy,
                 quarantine_delay,
@@ -254,12 +336,12 @@ async fn blob_gc_delete_fs(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
     idx: &BlobRefIndex,
-    consistency_gate: &Arc<Mutex<()>>,
+    consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     policy: BlobGcPolicy,
     quarantine_delay: Duration,
     limits: BlobGcLimits,
-) -> Result<BlobGcStats, String> {
+) -> Result<BlobGcStats, BlobGcError> {
     let mut stats = BlobGcStats::default();
 
     let t0 = Instant::now();
@@ -270,7 +352,7 @@ async fn blob_gc_delete_fs(
     let mut prefixes = match tokio::fs::read_dir(&root).await {
         Ok(d) => d,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stats),
-        Err(e) => return Err(format!("read_dir {}: {e}", root.display())),
+        Err(source) => return Err(BlobGcError::FsReadDir { path: root, source }),
     };
 
     while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
@@ -292,9 +374,15 @@ async fn blob_gc_delete_fs(
             continue;
         }
 
-        let mut dir = match tokio::fs::read_dir(prefix_ent.path()).await {
+        let prefix_path = prefix_ent.path();
+        let mut dir = match tokio::fs::read_dir(&prefix_path).await {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(source) => {
+                return Err(BlobGcError::FsReadDir {
+                    path: prefix_path,
+                    source,
+                });
+            }
         };
 
         while let Ok(Some(ent)) = dir.next_entry().await {
@@ -354,26 +442,26 @@ async fn blob_gc_delete_fs(
 
             let auth_guard = mutation_authority.lock().await;
             let Some(ref auth) = *auth_guard else {
-                return Err("mutation authority unavailable or inactive".to_string());
+                return Err(BlobGcError::AuthorityUnavailable);
             };
             if !auth.is_active() {
-                return Err("mutation authority released".to_string());
+                return Err(BlobGcError::AuthorityReleased);
             }
             let permit = auth.gc_mutation_permit();
 
-            let _gate = consistency_gate.lock().await;
+            let reval_guard = consistency.acquire_gc_revalidation().await;
 
             let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
 
             if policy_ctx.is_pinned(&digest, now)? {
-                drop(_gate);
+                drop(reval_guard);
                 drop(auth_guard);
                 continue;
             }
 
             if policy_ctx.is_referenced(&digest).await? {
                 let rest_res = storage.restore_quarantined_blob(&permit, &digest).await;
-                drop(_gate);
+                drop(reval_guard);
                 drop(auth_guard);
                 match rest_res {
                     Ok(Some(size)) => {
@@ -381,7 +469,9 @@ async fn blob_gc_delete_fs(
                         stats.restored_bytes = stats.restored_bytes.saturating_add(size);
                     }
                     Ok(None) => {}
-                    Err(e) => return Err(e.to_string()),
+                    Err(source) => {
+                        return Err(BlobGcError::RestoreStorage { digest, source });
+                    }
                 }
                 continue;
             }
@@ -389,14 +479,14 @@ async fn blob_gc_delete_fs(
             let version = match storage.quarantined_blob_version(&digest).await {
                 Ok(Some(v)) => v,
                 Ok(None) => {
-                    drop(_gate);
+                    drop(reval_guard);
                     drop(auth_guard);
                     continue;
                 }
-                Err(e) => {
-                    drop(_gate);
+                Err(source) => {
+                    drop(reval_guard);
                     drop(auth_guard);
-                    return Err(e.to_string());
+                    return Err(BlobGcError::QuarantineVersionQuery { digest, source });
                 }
             };
 
@@ -407,42 +497,36 @@ async fn blob_gc_delete_fs(
                 version,
             };
 
-            match revalidate_candidate_before_delete(storage, idx, &candidate, now, &mut policy_ctx)
-                .await
-            {
-                Ok(PreDeleteValidation::Eligible) => {}
-                Ok(PreDeleteValidation::Protected(_)) => {
-                    drop(_gate);
-                    drop(auth_guard);
-                    continue;
-                }
-                Err(e) => {
-                    drop(_gate);
-                    drop(auth_guard);
-                    return Err(e);
-                }
-            }
+            let del_outcome = execute_guarded_gc_deletion(
+                storage,
+                idx,
+                &candidate,
+                now,
+                &mut policy_ctx,
+                &permit,
+                &reval_guard,
+            )
+            .await;
 
-            let del_res = storage
-                .delete_blob_conditional(&permit, &digest, Some(&candidate.version))
-                .await;
-
-            drop(_gate);
+            drop(reval_guard);
             drop(auth_guard);
 
-            match del_res {
-                Ok(storage::GcDeleteResult::Deleted) => {
+            match del_outcome {
+                Ok(GcCandidateDeletionOutcome::Deleted { size }) => {
                     stats.deleted_blobs += 1;
-                    stats.deleted_bytes = stats.deleted_bytes.saturating_add(meta.len());
+                    stats.deleted_bytes = stats.deleted_bytes.saturating_add(size);
                 }
-                Ok(storage::GcDeleteResult::PreconditionFailed { .. }) => {
+                Ok(GcCandidateDeletionOutcome::Protected(_)) => {
+                    continue;
+                }
+                Ok(GcCandidateDeletionOutcome::NotFound) => {}
+                Ok(GcCandidateDeletionOutcome::PreconditionFailed { .. }) => {
                     tracing::warn!(
                         "quarantined blob {} version changed concurrently, preserving object",
                         digest
                     );
                 }
-                Ok(_) => {}
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(BlobGcError::CandidateDeletion(e)),
             }
         }
     }
@@ -454,16 +538,16 @@ async fn blob_gc_delete_s3(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
     idx: &BlobRefIndex,
-    consistency_gate: &Arc<Mutex<()>>,
+    consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     policy: BlobGcPolicy,
     min_age: Duration,
     limits: BlobGcLimits,
-) -> Result<BlobGcStats, String> {
+) -> Result<BlobGcStats, BlobGcError> {
     storage
         .check_bucket_versioning_for_gc()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(BlobGcError::BucketVersioning)?;
 
     let mut stats = BlobGcStats::default();
 
@@ -472,7 +556,7 @@ async fn blob_gc_delete_s3(
 
     let mut traverser = CasBlobTraverser::new(storage, 100);
 
-    while let Some(items) = traverser.next_batch().await.map_err(|e| e.to_string())? {
+    while let Some(items) = traverser.next_batch().await? {
         for candidate in items {
             if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
                 return Ok(stats);
@@ -494,48 +578,47 @@ async fn blob_gc_delete_s3(
 
             let auth_guard = mutation_authority.lock().await;
             let Some(ref auth) = *auth_guard else {
-                return Err("mutation authority unavailable or inactive".to_string());
+                return Err(BlobGcError::AuthorityUnavailable);
             };
             if !auth.is_active() {
-                return Err("mutation authority released".to_string());
+                return Err(BlobGcError::AuthorityReleased);
             }
             let permit = auth.gc_mutation_permit();
 
-            let _gate = consistency_gate.lock().await;
+            let reval_guard = consistency.acquire_gc_revalidation().await;
 
             let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
 
-            match revalidate_candidate_before_delete(storage, idx, &candidate, now, &mut policy_ctx)
-                .await
-            {
-                Ok(PreDeleteValidation::Eligible) => {}
-                Ok(PreDeleteValidation::Protected(_reason)) => {
-                    drop(_gate);
-                    drop(auth_guard);
-                    continue;
-                }
-                Err(e) => {
-                    drop(_gate);
-                    drop(auth_guard);
-                    return Err(e);
-                }
-            }
+            let del_outcome = execute_guarded_gc_deletion(
+                storage,
+                idx,
+                &candidate,
+                now,
+                &mut policy_ctx,
+                &permit,
+                &reval_guard,
+            )
+            .await;
 
-            let del_res = storage
-                .delete_blob_conditional(&permit, &candidate.digest, Some(&candidate.version))
-                .await;
-
-            drop(_gate);
+            drop(reval_guard);
             drop(auth_guard);
 
-            match del_res {
-                Ok(storage::GcDeleteResult::Deleted) => {
+            match del_outcome {
+                Ok(GcCandidateDeletionOutcome::Deleted { size }) => {
                     stats.deleted_blobs += 1;
-                    stats.deleted_bytes = stats.deleted_bytes.saturating_add(candidate.size);
+                    stats.deleted_bytes = stats.deleted_bytes.saturating_add(size);
                 }
-                Ok(storage::GcDeleteResult::NotFound) => {}
-                Ok(storage::GcDeleteResult::PreconditionFailed { .. }) => {}
-                Err(e) => return Err(e.to_string()),
+                Ok(GcCandidateDeletionOutcome::Protected(_reason)) => {
+                    continue;
+                }
+                Ok(GcCandidateDeletionOutcome::NotFound) => {}
+                Ok(GcCandidateDeletionOutcome::PreconditionFailed { .. }) => {
+                    tracing::warn!(
+                        "s3 blob {} version changed concurrently, preserving object",
+                        candidate.digest
+                    );
+                }
+                Err(e) => return Err(BlobGcError::CandidateDeletion(e)),
             }
         }
 
@@ -554,19 +637,19 @@ pub async fn blob_gc_sweep(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
     idx: &BlobRefIndex,
-    consistency_gate: &Arc<Mutex<()>>,
+    consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     policy: BlobGcPolicy,
     min_age: Duration,
     limits: BlobGcLimits,
-) -> Result<BlobGcStats, String> {
+) -> Result<BlobGcStats, BlobGcError> {
     match storage.gc_strategy() {
         storage::GcStorageStrategy::FilesystemQuarantine => {
             let mut stats = blob_gc_quarantine(
                 cfg,
                 storage,
                 idx,
-                consistency_gate,
+                consistency,
                 mutation_authority,
                 policy,
                 min_age,
@@ -578,7 +661,7 @@ pub async fn blob_gc_sweep(
                 cfg,
                 storage,
                 idx,
-                consistency_gate,
+                consistency,
                 mutation_authority,
                 policy,
                 min_age,
@@ -596,7 +679,7 @@ pub async fn blob_gc_sweep(
                 cfg,
                 storage,
                 idx,
-                consistency_gate,
+                consistency,
                 mutation_authority,
                 policy,
                 min_age,
@@ -620,12 +703,15 @@ async fn write_quarantine_time(
     cfg: &crate::config::Config,
     digest: &Digest,
     at: SystemTime,
-) -> Result<(), String> {
+) -> Result<(), BlobGcError> {
     let path = quarantine_meta_path(cfg, digest);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            .map_err(|source| BlobGcError::FsWriteMeta {
+                path: parent.to_path_buf(),
+                source,
+            })?;
     }
 
     let secs = at
@@ -634,7 +720,7 @@ async fn write_quarantine_time(
         .as_secs();
     tokio::fs::write(&path, format!("{secs}\n"))
         .await
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
+        .map_err(|source| BlobGcError::FsWriteMeta { path, source })?;
 
     Ok(())
 }
@@ -642,7 +728,7 @@ async fn write_quarantine_time(
 async fn read_quarantine_time(
     cfg: &crate::config::Config,
     digest: &Digest,
-) -> Result<Option<SystemTime>, String> {
+) -> Result<Option<SystemTime>, BlobGcError> {
     let path = quarantine_meta_path(cfg, digest);
     if let Ok(s) = tokio::fs::read_to_string(&path).await {
         if let Ok(secs) = s.trim().parse::<u64>() {
@@ -655,6 +741,7 @@ async fn read_quarantine_time(
 
 #[cfg(test)]
 mod tests {
+    use super::validation::revalidate_candidate_before_delete;
     use super::*;
     use crate::storage::mutation_authority::RuntimeMutationAuthority;
     use sha2::Digest as Sha2Digest;
@@ -760,7 +847,7 @@ mod tests {
         .unwrap();
 
         let err = build_manifest_protected_set_fs(fs_root).await.unwrap_err();
-        assert!(err.contains("unparsable manifest"));
+        assert!(matches!(err, GcPolicyError::ParseManifest { .. }));
     }
 
     #[tokio::test]
@@ -811,16 +898,25 @@ mod tests {
             PolicyContext::build(&cfg, &storage, &idx, BlobGcPolicy::ManifestRooted)
                 .await
                 .unwrap();
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let guard = coordinator.acquire_gc_revalidation().await;
         let err = revalidate_candidate_before_delete(
             &storage,
             &idx,
             &candidate,
             SystemTime::now(),
             &mut policy_ctx,
+            &guard,
         )
         .await
         .unwrap_err();
-        assert!(err.contains("corrupt lifecycle journal record"));
+        assert!(matches!(
+            err,
+            GcCandidateDeletionError::LifecycleJournalCorrupt {
+                ref repository,
+                ..
+            } if repository == "journal-repo"
+        ));
     }
 
     #[tokio::test]
@@ -872,7 +968,7 @@ mod tests {
         )
         .unwrap();
 
-        let consistency_gate = Arc::new(Mutex::new(()));
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let authority_arc = Arc::new(Mutex::new(Some(authority)));
 
         let stats = blob_gc_plan(
@@ -892,7 +988,7 @@ mod tests {
             &cfg,
             &storage,
             &idx,
-            &consistency_gate,
+            &coordinator,
             &authority_arc,
             BlobGcPolicy::ManifestRooted,
             Duration::from_secs(0),

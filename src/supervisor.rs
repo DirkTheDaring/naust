@@ -602,7 +602,7 @@ pub async fn run_server_supervisor(
     ));
     let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
     let upload_request_sem = Arc::new(Semaphore::new(config.max_concurrent_upload_requests.max(1)));
-    let consistency_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let consistency = crate::consistency::ConsistencyCoordinator::new();
     let mutation_authority = Arc::new(tokio::sync::Mutex::new(Some(mutation_authority)));
 
     let gc_service = match &ref_index {
@@ -610,7 +610,7 @@ pub async fn run_server_supervisor(
             config.clone(),
             storage.clone(),
             idx.clone(),
-            consistency_gate.clone(),
+            consistency.clone(),
             mutation_authority.clone(),
         ))),
         None => None,
@@ -646,10 +646,10 @@ pub async fn run_server_supervisor(
         upload_chunk_min_bytes: config.upload_chunk_min_bytes.map(|v| v as u64),
         gc_pin_duration_secs: config.gc_pin_duration_secs,
     };
-    let upload_coordinator = Arc::new(BlobUploadCoordinator::with_gate(
+    let upload_coordinator = Arc::new(BlobUploadCoordinator::new(
         storage.clone(),
         ref_index.clone(),
-        consistency_gate.clone(),
+        consistency.clone(),
         upload_coord_config,
     ));
 
@@ -671,22 +671,21 @@ pub async fn run_server_supervisor(
         last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
         ip_limiter,
         is_high_pressure,
-        consistency_gate: consistency_gate.clone(),
         membership_ledger: Arc::new(RepositoryMembershipLedger::new(
             storage.clone(),
             ref_index.clone(),
-            consistency_gate.clone(),
+            consistency.clone(),
         )),
         upload_coordinator,
         delete_service: Arc::new(BlobDeleteService::new(
             storage.clone(),
             ref_index.clone(),
-            consistency_gate.clone(),
+            consistency.clone(),
         )),
         manifest_lifecycle: Arc::new(ManifestLifecycleService::new(
             storage.clone(),
             ref_index.clone(),
-            consistency_gate.clone(),
+            consistency.clone(),
         )),
     };
 

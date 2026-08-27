@@ -440,8 +440,8 @@ mod tests {
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage, None, gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage, None, coordinator);
 
         let req = PublishManifestRequest {
             repo: "test/repo".to_string(),
@@ -461,8 +461,8 @@ mod tests {
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), None, gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), None, coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let missing_blob_digest = Digest::parse(
@@ -522,8 +522,8 @@ mod tests {
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = Arc::new(ManifestPublisher::new(storage.clone(), None, gate));
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = Arc::new(ManifestPublisher::new(storage.clone(), None, coordinator));
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d1 = write_test_blob(&storage, b"payload_1").await;
@@ -583,8 +583,8 @@ mod tests {
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), None, gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), None, coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d = write_test_blob(&storage, b"layer_idempotent").await;
@@ -617,8 +617,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let fault_storage = Arc::new(FaultInjectableStorage::new(temp_dir.path().to_path_buf()));
         let storage: Arc<dyn Storage> = fault_storage.clone();
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), None, gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), None, coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d = write_test_blob(&storage, b"base_layer").await;
@@ -682,8 +682,8 @@ mod tests {
             .await
             .unwrap();
 
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), Some(idx.clone()), gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), Some(idx.clone()), coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d = write_test_blob(&storage, b"crash_test_blob").await;
@@ -730,11 +730,11 @@ mod tests {
             .await
             .unwrap();
 
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let publisher = Arc::new(ManifestPublisher::new(
             storage.clone(),
             Some(idx.clone()),
-            gate,
+            coordinator,
         ));
 
         let config_d = write_test_blob(&storage, b"{}").await;
@@ -796,8 +796,8 @@ mod tests {
             .await
             .unwrap();
 
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), Some(idx.clone()), gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), Some(idx.clone()), coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d = write_test_blob(&storage, b"mutate_fail_blob").await;
@@ -822,19 +822,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_exclusion_with_shared_coordinator() {
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
 
-        // When publication holds the gate, trying to acquire the gate from GC is blocked
-        let guard = gate.try_lock();
-        assert!(guard.is_ok());
+        // When publication holds the coordinator, GC revalidation is blocked
+        let guard = coordinator.acquire_mutation().await;
 
-        // A second attempt to lock while held fails immediately with would-block (TryLockError)
-        let second_attempt = gate.try_lock();
-        assert!(second_attempt.is_err());
+        let coord_clone = coordinator.clone();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _g = coord_clone.acquire_gc_revalidation().await;
+            let _ = acquired_tx.send(());
+        });
 
+        tokio::task::yield_now().await;
+
+        // After mutation completes and guard drops, GC lock can be acquired
         drop(guard);
-        // After publication completes, lock can be acquired
-        assert!(gate.try_lock().is_ok());
+        acquired_rx
+            .await
+            .expect("gc acquires after mutation release");
+        handle.await.expect("task completes");
     }
 
     #[tokio::test]
@@ -851,8 +858,8 @@ mod tests {
             .await
             .unwrap();
 
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), Some(idx.clone()), gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), Some(idx.clone()), coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d = write_test_blob(&storage, b"retry_blob").await;
@@ -889,8 +896,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let fs_root = temp_dir.path().join("data");
         let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let publisher = ManifestPublisher::new(storage.clone(), None, gate);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let publisher = ManifestPublisher::new(storage.clone(), None, coordinator);
 
         let config_d = write_test_blob(&storage, b"{}").await;
         let blob_d1 = write_test_blob(&storage, b"payload1").await;

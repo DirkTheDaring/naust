@@ -176,13 +176,13 @@ impl BlobDeleteService {
     pub fn new(
         storage: Arc<dyn Storage>,
         ref_index: Option<Arc<BlobRefIndex>>,
-        consistency_gate: Arc<tokio::sync::Mutex<()>>,
+        consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         Self {
             ledger: crate::repository_membership_ledger::RepositoryMembershipLedger::new(
                 storage,
                 ref_index,
-                consistency_gate,
+                consistency,
             ),
         }
     }
@@ -198,18 +198,18 @@ impl BlobDeleteService {
     }
 
     /// Safely handles a repository-scoped blob deletion request:
-    /// 1. Acquires consistency gate via ledger.
+    /// 1. Acquires mutation guard from coordinator.
     /// 2. Ensures ref-index is healthy / rebuilt if dirty.
     /// 3. Verifies membership in the requested repository (returns NotFound if absent).
     /// 4. Verifies whether any manifest in the requested repository still references the blob (returns InUse if so).
-    /// 5. Unlinks only the requested repository's membership record through the ledger.
+    /// 5. Unlinks only the requested repository's membership record through the ledger under guard.
     pub async fn delete_repo_blob(
         &self,
         repo: &str,
         digest: &Digest,
     ) -> Result<BlobDeleteResult, StorageError> {
-        // 1. Acquire consistency gate for atomic reference validation and unlinking
-        let guard = self.ledger.lock_gate().await;
+        // 1. Acquire mutation guard for atomic reference validation and unlinking
+        let guard = self.ledger.consistency().acquire_mutation().await;
 
         // 2. Verify membership exists in the requested repository
         let membership = self.ledger.get_membership(repo, digest).await?;

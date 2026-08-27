@@ -23,14 +23,36 @@ pub enum GcServiceError {
     #[error("gc delete disabled")]
     DeleteDisabled,
 
-    #[error("unsupported for storage strategy: {0}")]
-    StrategyUnsupported(String),
+    #[error("unsupported storage strategy: {message}")]
+    StrategyUnsupported {
+        message: &'static str,
+        #[source]
+        source: Option<crate::storage::StorageError>,
+    },
 
-    #[error("ref-index unhealthy: {0}")]
-    RefIndexUnhealthy(String),
+    #[error("reference index error: {0}")]
+    RefIndex(#[from] crate::blob_ref_index::RefIndexError),
 
-    #[error("gc failed: {0}")]
-    Failed(String),
+    #[error("mutation authority unavailable or inactive")]
+    AuthorityUnavailable,
+
+    #[error("mutation authority released")]
+    AuthorityReleased,
+
+    #[error("gc operation failed: {0}")]
+    GcOperation(#[from] crate::blob_gc::BlobGcError),
+
+    #[error("filesystem gc lock error: {0}")]
+    Lock(#[source] std::io::Error),
+
+    #[error("storage operation failed: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+
+    #[error("repository membership ledger operation failed: {0}")]
+    Ledger(#[from] crate::repository_membership_ledger::LedgerError),
+
+    #[error("background task join failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
 }
 
 #[derive(Clone, Debug)]
@@ -58,7 +80,7 @@ pub struct GcService {
     storage: Arc<dyn storage::Storage>,
     idx: Arc<BlobRefIndex>,
     run_lock: Arc<Mutex<()>>,
-    consistency_gate: Arc<Mutex<()>>,
+    consistency: crate::consistency::ConsistencyCoordinator,
     mutation_authority: Arc<Mutex<Option<RuntimeMutationAuthority>>>,
 }
 
@@ -87,12 +109,13 @@ impl GcService {
         config: Arc<crate::config::Config>,
         storage: Arc<dyn storage::Storage>,
         idx: Arc<BlobRefIndex>,
+        consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         Self::with_coordinator_and_authority(
             config,
             storage,
             idx,
-            Arc::new(Mutex::new(())),
+            consistency,
             Arc::new(Mutex::new(None)),
         )
     }
@@ -101,29 +124,15 @@ impl GcService {
         config: Arc<crate::config::Config>,
         storage: Arc<dyn storage::Storage>,
         idx: Arc<BlobRefIndex>,
+        consistency: crate::consistency::ConsistencyCoordinator,
         authority: RuntimeMutationAuthority,
     ) -> Self {
         Self::with_coordinator_and_authority(
             config,
             storage,
             idx,
-            Arc::new(Mutex::new(())),
+            consistency,
             Arc::new(Mutex::new(Some(authority))),
-        )
-    }
-
-    pub fn with_coordinator(
-        config: Arc<crate::config::Config>,
-        storage: Arc<dyn storage::Storage>,
-        idx: Arc<BlobRefIndex>,
-        consistency_gate: Arc<Mutex<()>>,
-    ) -> Self {
-        Self::with_coordinator_and_authority(
-            config,
-            storage,
-            idx,
-            consistency_gate,
-            Arc::new(Mutex::new(None)),
         )
     }
 
@@ -131,7 +140,7 @@ impl GcService {
         config: Arc<crate::config::Config>,
         storage: Arc<dyn storage::Storage>,
         idx: Arc<BlobRefIndex>,
-        consistency_gate: Arc<Mutex<()>>,
+        consistency: crate::consistency::ConsistencyCoordinator,
         mutation_authority: Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     ) -> Self {
         Self {
@@ -139,7 +148,7 @@ impl GcService {
             storage,
             idx,
             run_lock: Arc::new(Mutex::new(())),
-            consistency_gate,
+            consistency,
             mutation_authority,
         }
     }
@@ -153,14 +162,10 @@ impl GcService {
 
     async fn ensure_ref_index_ready(&self) -> Result<(), GcServiceError> {
         let auto = self.config.ref_index.auto_rebuild_on_corruption;
-        match self
-            .idx
+        self.idx
             .ensure_healthy_or_rebuild(&self.storage, auto, false)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(e) => Err(GcServiceError::RefIndexUnhealthy(e.to_string())),
-        }
+            .await?;
+        Ok(())
     }
 
     async fn refresh_tag_rooted_index_if_needed(
@@ -175,8 +180,7 @@ impl GcService {
         let stats = self
             .idx
             .refresh_tag_rooted_conservative(&self.storage)
-            .await
-            .map_err(|e| GcServiceError::RefIndexUnhealthy(e.to_string()))?;
+            .await?;
 
         tracing::info!(
             event = "blob_gc",
@@ -217,12 +221,12 @@ impl GcService {
             }
         })
         .await
-        .map_err(|e| GcServiceError::Failed(e.to_string()))?;
+        .map_err(GcServiceError::TaskJoin)?;
 
         match res {
             Ok(Some(lock)) => Ok(Some(lock)),
             Ok(None) => Err(GcServiceError::AlreadyRunning),
-            Err(e) => Err(GcServiceError::Failed(format!("gc lock: {e}"))),
+            Err(e) => Err(GcServiceError::Lock(e)),
         }
     }
 
@@ -253,7 +257,7 @@ impl GcService {
             budgets.to_limits(),
         )
         .await
-        .map_err(GcServiceError::Failed)
+        .map_err(GcServiceError::GcOperation)
         .inspect(|stats| {
             tracing::info!(
                 event = "blob_gc",
@@ -278,16 +282,17 @@ impl GcService {
         let t0 = Instant::now();
 
         if self.storage.gc_strategy() == storage::GcStorageStrategy::S3DirectConditional {
-            return Err(GcServiceError::StrategyUnsupported(
-                "quarantine is not supported for S3 storage backend; use delete or scheduled cleanup with S3DirectConditional".to_string(),
-            ));
+            return Err(GcServiceError::StrategyUnsupported {
+                message: "quarantine is not supported for S3 storage backend; use delete or scheduled cleanup with S3DirectConditional",
+                source: None,
+            });
         }
 
         // -----------------------------------------------------------------------------------------
         // LOCK ORDER (strictly preserved across all GC mutation paths):
         // 1. self.run_lock: In-process mutual exclusion between concurrent GC executions.
         // 2. _fs_gc_lock: Cross-process file lock on `quarantine/.lock` (for filesystem backend).
-        // 3. (auth_guard & consistency_gate): Acquired per bounded candidate transaction inside
+        // 3. (auth_guard & consistency_coordinator): Acquired per bounded candidate check inside
         //    blob_gc_quarantine / blob_gc_delete.
         // -----------------------------------------------------------------------------------------
         let _run_guard = self
@@ -305,14 +310,10 @@ impl GcService {
         {
             let auth_guard = self.mutation_authority.lock().await;
             let Some(ref auth) = *auth_guard else {
-                return Err(GcServiceError::Failed(
-                    "mutation authority unavailable or inactive".to_string(),
-                ));
+                return Err(GcServiceError::AuthorityUnavailable);
             };
             if !auth.is_active() {
-                return Err(GcServiceError::Failed(
-                    "mutation authority released".to_string(),
-                ));
+                return Err(GcServiceError::AuthorityReleased);
             }
         }
 
@@ -323,14 +324,14 @@ impl GcService {
             &self.config,
             &self.storage,
             &self.idx,
-            &self.consistency_gate,
+            &self.consistency,
             &self.mutation_authority,
             policy,
             min_age,
             budgets.to_limits(),
         )
         .await
-        .map_err(GcServiceError::Failed)
+        .map_err(GcServiceError::GcOperation)
         .inspect(|stats| {
             tracing::info!(
                 event = "blob_gc",
@@ -360,7 +361,7 @@ impl GcService {
         // LOCK ORDER (strictly preserved across all GC mutation paths):
         // 1. self.run_lock: In-process mutual exclusion between concurrent GC executions.
         // 2. _fs_gc_lock: Cross-process file lock on `quarantine/.lock` (for filesystem backend).
-        // 3. (auth_guard & consistency_gate): Acquired per bounded candidate transaction inside
+        // 3. (auth_guard & consistency_coordinator): Acquired per bounded candidate check inside
         //    blob_gc_delete.
         // -----------------------------------------------------------------------------------------
         let _run_guard = self
@@ -381,14 +382,10 @@ impl GcService {
         {
             let auth_guard = self.mutation_authority.lock().await;
             let Some(ref auth) = *auth_guard else {
-                return Err(GcServiceError::Failed(
-                    "mutation authority unavailable or inactive".to_string(),
-                ));
+                return Err(GcServiceError::AuthorityUnavailable);
             };
             if !auth.is_active() {
-                return Err(GcServiceError::Failed(
-                    "mutation authority released".to_string(),
-                ));
+                return Err(GcServiceError::AuthorityReleased);
             }
         }
 
@@ -399,21 +396,24 @@ impl GcService {
             self.storage
                 .check_bucket_versioning_for_gc()
                 .await
-                .map_err(|e| GcServiceError::StrategyUnsupported(e.to_string()))?;
+                .map_err(|e| GcServiceError::StrategyUnsupported {
+                    message: "S3 bucket versioning check failed",
+                    source: Some(e),
+                })?;
         }
 
         blob_gc_delete(
             &self.config,
             &self.storage,
             &self.idx,
-            &self.consistency_gate,
+            &self.consistency,
             &self.mutation_authority,
             policy,
             quarantine_delay,
             budgets.to_limits(),
         )
         .await
-        .map_err(GcServiceError::Failed)
+        .map_err(GcServiceError::GcOperation)
         .inspect(|stats| {
             tracing::info!(
                 event = "blob_gc",
@@ -444,7 +444,7 @@ impl GcService {
 
     pub async fn sweep_repository_memberships_with_guard(
         &self,
-        guard: &tokio::sync::MutexGuard<'_, ()>,
+        _run_guard: &tokio::sync::MutexGuard<'_, ()>,
         grace_period: Duration,
         page_limit: usize,
     ) -> Result<MembershipSweepStats, GcServiceError> {
@@ -460,58 +460,34 @@ impl GcService {
         let ledger = crate::repository_membership_ledger::RepositoryMembershipLedger::new(
             Arc::clone(&self.storage),
             Some(Arc::clone(&self.idx)),
-            Arc::clone(&self.run_lock),
+            self.consistency.clone(),
         );
 
         let mut continuation: Option<String> = None;
         loop {
-            let (records, next_tok) = match self
+            let (records, next_tok) = self
                 .storage
                 .list_all_repo_blob_memberships_page(continuation.as_deref(), page_limit)
-                .await
-            {
-                Ok(res) => res,
-                Err(e) => {
-                    return Err(GcServiceError::Failed(format!(
-                        "list global blob memberships: {e}"
-                    )));
-                }
-            };
+                .await?;
 
             for rec in records {
                 stats.scanned += 1;
-                let is_referenced = match crate::blob_delete_safety::find_repo_blob_reference(
+                let is_referenced = crate::blob_delete_safety::find_repo_blob_reference(
                     &self.storage,
                     rec.repo.as_str(),
                     &rec.digest,
                 )
-                .await
-                {
-                    Ok(r) => r.is_some(),
-                    Err(e) => {
-                        return Err(GcServiceError::Failed(format!(
-                            "check ref for blob {} in repo {}: {e}",
-                            rec.digest, rec.repo
-                        )));
-                    }
-                };
+                .await?
+                .is_some();
 
                 if is_referenced {
                     if rec.state == MembershipState::Candidate
                         || rec.unreferenced_since_unix_secs.is_some()
                     {
-                        match ledger
-                            .reactivate_with_guard(guard, rec.repo.as_str(), &rec.digest)
-                            .await
-                        {
-                            Ok(true) => stats.activated += 1,
-                            Ok(false) => stats.skipped += 1,
-                            Err(e) => {
-                                return Err(GcServiceError::Failed(format!(
-                                    "reactivate {} in {}: {e}",
-                                    rec.digest, rec.repo
-                                )));
-                            }
+                        if ledger.reactivate(rec.repo.as_str(), &rec.digest).await? {
+                            stats.activated += 1;
+                        } else {
+                            stats.skipped += 1;
                         }
                     } else {
                         stats.skipped += 1;
@@ -521,18 +497,13 @@ impl GcService {
                     if rec.state == MembershipState::Active
                         || rec.unreferenced_since_unix_secs.is_none()
                     {
-                        match ledger
-                            .set_candidate_with_guard(guard, rec.repo.as_str(), &rec.digest, now)
-                            .await
+                        if ledger
+                            .set_candidate(rec.repo.as_str(), &rec.digest, now)
+                            .await?
                         {
-                            Ok(true) => stats.candidated += 1,
-                            Ok(false) => stats.skipped += 1,
-                            Err(e) => {
-                                return Err(GcServiceError::Failed(format!(
-                                    "set candidate for {} in {}: {e}",
-                                    rec.digest, rec.repo
-                                )));
-                            }
+                            stats.candidated += 1;
+                        } else {
+                            stats.skipped += 1;
                         }
                     } else if rec.state == MembershipState::Candidate {
                         let unref_time = rec
@@ -553,20 +524,10 @@ impl GcService {
                                 };
 
                             if !still_referenced {
-                                match ledger
-                                    .unlink_with_guard(guard, rec.repo.as_str(), &rec.digest)
-                                    .await
-                                {
-                                    Ok(true) => {
-                                        stats.unlinked += 1;
-                                    }
-                                    Ok(false) => stats.skipped += 1,
-                                    Err(e) => {
-                                        return Err(GcServiceError::Failed(format!(
-                                            "unlink membership for {} in {}: {e}",
-                                            rec.digest, rec.repo
-                                        )));
-                                    }
+                                if ledger.unlink(rec.repo.as_str(), &rec.digest).await? {
+                                    stats.unlinked += 1;
+                                } else {
+                                    stats.skipped += 1;
                                 }
                             } else {
                                 stats.skipped += 1;
@@ -613,14 +574,10 @@ impl GcService {
         {
             let auth_guard = self.mutation_authority.lock().await;
             let Some(ref auth) = *auth_guard else {
-                return Err(GcServiceError::Failed(
-                    "mutation authority unavailable or inactive".to_string(),
-                ));
+                return Err(GcServiceError::AuthorityUnavailable);
             };
             if !auth.is_active() {
-                return Err(GcServiceError::Failed(
-                    "mutation authority released".to_string(),
-                ));
+                return Err(GcServiceError::AuthorityReleased);
             }
         }
 
@@ -651,19 +608,22 @@ impl GcService {
                 self.storage
                     .check_bucket_versioning_for_gc()
                     .await
-                    .map_err(|e| GcServiceError::StrategyUnsupported(e.to_string()))?;
+                    .map_err(|e| GcServiceError::StrategyUnsupported {
+                        message: "S3 bucket versioning check failed",
+                        source: Some(e),
+                    })?;
                 let delete = blob_gc_delete(
                     &self.config,
                     &self.storage,
                     &self.idx,
-                    &self.consistency_gate,
+                    &self.consistency,
                     &self.mutation_authority,
                     policy,
                     min_age,
                     budgets.to_limits(),
                 )
                 .await
-                .map_err(GcServiceError::Failed)?;
+                .map_err(GcServiceError::GcOperation)?;
 
                 Ok(ScheduledCleanupStats {
                     quarantine: Default::default(),
@@ -675,48 +635,48 @@ impl GcService {
                     &self.config,
                     &self.storage,
                     &self.idx,
-                    &self.consistency_gate,
+                    &self.consistency,
                     &self.mutation_authority,
                     policy,
                     min_age,
                     budgets.to_limits(),
                 )
                 .await
-                .map_err(GcServiceError::Failed)?;
+                .map_err(GcServiceError::GcOperation)?;
 
-                if !self.config.blob_gc_enable_delete {
-                    return Ok(ScheduledCleanupStats {
-                        quarantine,
-                        delete: None,
-                    });
-                }
+                let delete = if self.config.blob_gc_enable_delete {
+                    let quarantine_delay =
+                        Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
+                    Some(
+                        blob_gc_delete(
+                            &self.config,
+                            &self.storage,
+                            &self.idx,
+                            &self.consistency,
+                            &self.mutation_authority,
+                            policy,
+                            quarantine_delay,
+                            budgets.to_limits(),
+                        )
+                        .await
+                        .map_err(GcServiceError::GcOperation)?,
+                    )
+                } else {
+                    None
+                };
 
-                let quarantine_delay =
-                    Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
-                let delete = blob_gc_delete(
-                    &self.config,
-                    &self.storage,
-                    &self.idx,
-                    &self.consistency_gate,
-                    &self.mutation_authority,
-                    policy,
-                    quarantine_delay,
-                    budgets.to_limits(),
-                )
-                .await
-                .map_err(GcServiceError::Failed)?;
-
-                Ok(ScheduledCleanupStats {
-                    quarantine,
-                    delete: Some(delete),
-                })
+                Ok(ScheduledCleanupStats { quarantine, delete })
             }
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    pub fn try_lock_run(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         self.run_lock.try_lock().ok()
+    }
+
+    #[doc(hidden)]
+    pub fn test_try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.try_lock_run()
     }
 }
 
@@ -891,8 +851,14 @@ mod tests {
         std::fs::create_dir_all(live.parent().unwrap()).expect("mkdir");
         std::fs::write(&live, data).expect("write");
 
-        let service =
-            GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let service = GcService::with_authority(
+            cfg.clone(),
+            storage.clone(),
+            idx.clone(),
+            coordinator,
+            authority,
+        );
 
         let stats = service
             .scheduled_cleanup_once()
@@ -965,8 +931,14 @@ mod tests {
         .await
         .expect("authority");
 
-        let service =
-            GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let service = GcService::with_authority(
+            cfg.clone(),
+            storage.clone(),
+            idx.clone(),
+            coordinator,
+            authority,
+        );
 
         let blob = Digest::parse(&format!("sha256:{}", "a".repeat(64))).expect("digest");
         write_blob(&fs_root, &blob, b"blobdata").await;
@@ -1037,8 +1009,14 @@ mod tests {
         .await
         .expect("authority");
 
-        let service =
-            GcService::with_authority(cfg.clone(), storage.clone(), idx.clone(), authority);
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let service = GcService::with_authority(
+            cfg.clone(),
+            storage.clone(),
+            idx.clone(),
+            coordinator,
+            authority,
+        );
 
         let blob = Digest::parse(&format!("sha256:{}", "d".repeat(64))).expect("digest");
         write_blob(&fs_root, &blob, b"blobdata").await;
@@ -1077,7 +1055,12 @@ mod tests {
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild");
 
-        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+        let service = GcService::new(
+            cfg.clone(),
+            storage.clone(),
+            idx.clone(),
+            crate::consistency::ConsistencyCoordinator::new(),
+        );
 
         // Hold the lock manually, then ensure plan refuses.
         let _held = service.run_lock.try_lock().expect("lock");
@@ -1109,7 +1092,12 @@ mod tests {
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(&storage).await.expect("rebuild");
 
-        let service = GcService::new(cfg.clone(), storage.clone(), idx.clone());
+        let service = GcService::new(
+            cfg.clone(),
+            storage.clone(),
+            idx.clone(),
+            crate::consistency::ConsistencyCoordinator::new(),
+        );
 
         let repo = "aging-repo";
         let blob = Digest::parse(&format!("sha256:{}", "e".repeat(64))).expect("digest");

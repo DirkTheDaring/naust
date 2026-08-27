@@ -651,11 +651,11 @@ impl Proxy {
         &self,
         decision: &RepoDecision,
         reference: &str,
-        storage: &Arc<dyn crate::storage::Storage>,
+        _storage: &Arc<dyn crate::storage::Storage>,
         max_bytes: usize,
         revalidate_only: bool,
         if_none_match: Option<String>,
-        lifecycle: Option<&crate::manifest_lifecycle::ManifestLifecycleService>,
+        lifecycle: &crate::manifest_lifecycle::ManifestLifecycleService,
     ) -> Result<FetchManifestResult, ProxyError> {
         // Singleflight per repo+reference.
         let key = format!("manifest:{}:{}", decision.local_repo.as_str(), reference);
@@ -773,19 +773,6 @@ impl Proxy {
                 )));
             }
 
-            let default_lifecycle;
-            let lc = match lifecycle {
-                Some(lc) => lc,
-                None => {
-                    default_lifecycle = crate::manifest_lifecycle::ManifestLifecycleService::new(
-                        storage.clone(),
-                        None,
-                        Arc::new(tokio::sync::Mutex::new(())),
-                    );
-                    &default_lifecycle
-                }
-            };
-
             let evidence = crate::manifest_lifecycle::ProxyPublicationEvidence::new(
                 decision.local_repo.as_str(),
                 reference,
@@ -795,7 +782,7 @@ impl Proxy {
                 computed.clone(),
             );
 
-            let published = lc
+            let published = lifecycle
                 .publish_proxy_cached_manifest(evidence)
                 .await
                 .map_err(|e| ProxyError::Internal(format!("lifecycle publication failed: {e}")))?;

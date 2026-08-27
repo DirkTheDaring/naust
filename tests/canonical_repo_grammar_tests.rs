@@ -837,11 +837,11 @@ async fn test_10_lifecycle_journal_recovery() {
     let storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
 
-    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
     let svc = ManifestLifecycleService::new(
         storage.clone() as Arc<dyn Storage>,
         Some(ref_index.clone()),
-        gate,
+        coordinator,
     );
 
     let repo = "team/image__cache--production";

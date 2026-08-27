@@ -249,7 +249,7 @@ impl Drop for PinLeaseGuard {
 pub struct BlobUploadCoordinator {
     storage: Arc<dyn Storage>,
     ref_index: Option<Arc<BlobRefIndex>>,
-    consistency_gate: Arc<tokio::sync::Mutex<()>>,
+    consistency: crate::consistency::ConsistencyCoordinator,
     config: BlobUploadCoordinatorConfig,
 }
 
@@ -257,26 +257,13 @@ impl BlobUploadCoordinator {
     pub fn new(
         storage: Arc<dyn Storage>,
         ref_index: Option<Arc<BlobRefIndex>>,
-        config: BlobUploadCoordinatorConfig,
-    ) -> Self {
-        Self::with_gate(
-            storage,
-            ref_index,
-            Arc::new(tokio::sync::Mutex::new(())),
-            config,
-        )
-    }
-
-    pub fn with_gate(
-        storage: Arc<dyn Storage>,
-        ref_index: Option<Arc<BlobRefIndex>>,
-        consistency_gate: Arc<tokio::sync::Mutex<()>>,
+        consistency: crate::consistency::ConsistencyCoordinator,
         config: BlobUploadCoordinatorConfig,
     ) -> Self {
         Self {
             storage,
             ref_index,
-            consistency_gate,
+            consistency,
             config,
         }
     }
@@ -556,15 +543,15 @@ impl BlobUploadCoordinator {
                 .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
         }
 
-        // STEP 4: Commit finalize in storage backend under the consistency gate
-        let _gate = self.consistency_gate.lock().await;
+        // STEP 4: Commit finalize in storage backend under the consistency coordinator
+        let _guard = self.consistency.acquire_mutation().await;
         let outcome = if let Some(ref mut guard) = pin_guard {
             tokio::select! {
                 outcome_res = self.storage.commit_finalize(&prepared) => {
                     outcome_res?
                 }
                 failure_msg = guard.wait_for_failure() => {
-                    drop(_gate);
+                    drop(_guard);
                     guard.stop().await;
                     return Err(CoordinatorError::Storage(StorageError::Internal(
                         failure_msg.unwrap_or_else(|| "pin renewal heartbeat failed during commit".to_string())
@@ -584,7 +571,7 @@ impl BlobUploadCoordinator {
             idx.mark_ready()
                 .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
         }
-        drop(_gate);
+        drop(_guard);
 
         // STEP 6: Stop renewal and release pin
         if let Some(ref mut guard) = pin_guard {
@@ -737,14 +724,14 @@ impl BlobUploadCoordinator {
                 .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
         }
 
-        // 5. Durably create target repository membership under the consistency gate
+        // 5. Durably create target repository membership under the consistency coordinator
         let target_record =
             crate::storage::repo_membership::RepoBlobMembershipRecord::new_cross_mount(
                 canonical_target,
                 digest.clone(),
                 canonical_from,
             );
-        let _gate = self.consistency_gate.lock().await;
+        let _guard = self.consistency.acquire_mutation().await;
         let link_res = self.storage.link_repo_blob(&target_record).await;
 
         if let Ok(()) = link_res
@@ -754,7 +741,7 @@ impl BlobUploadCoordinator {
             let _ = idx.flush();
             let _ = idx.mark_ready();
         }
-        drop(_gate);
+        drop(_guard);
 
         if let Some(ref mut guard) = pin_guard {
             guard.stop().await;
@@ -818,6 +805,19 @@ mod tests {
         hex::encode(hasher.finalize())
     }
 
+    fn test_coordinator(
+        storage: Arc<dyn Storage>,
+        ref_index: Option<Arc<BlobRefIndex>>,
+        config: BlobUploadCoordinatorConfig,
+    ) -> BlobUploadCoordinator {
+        BlobUploadCoordinator::new(
+            storage,
+            ref_index,
+            crate::consistency::ConsistencyCoordinator::new(),
+            config,
+        )
+    }
+
     #[tokio::test]
     async fn test_coordinator_s3_monolithic_upload() {
         let driver = Arc::new(MockS3Driver::new(1000));
@@ -835,7 +835,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
         };
-        let coordinator = BlobUploadCoordinator::new(storage.clone(), None, config);
+        let coordinator = test_coordinator(storage.clone(), None, config);
 
         let repo = "s3-test/repo";
         let data = b"payload for s3 monolithic upload test";
@@ -875,7 +875,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
         };
-        let coordinator = BlobUploadCoordinator::new(storage.clone(), None, config);
+        let coordinator = test_coordinator(storage.clone(), None, config);
 
         let repo = "fs-test/repo";
         let chunk1 = b"chunk one of the file;";
@@ -968,8 +968,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
         };
-        let coordinator =
-            BlobUploadCoordinator::new(storage.clone(), Some(ref_index.clone()), config);
+        let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
         let repo = "gc-test/repo";
         let data = b"payload to test GC pin protection";
@@ -1028,7 +1027,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
         };
-        let coordinator = BlobUploadCoordinator::new(storage, None, config);
+        let coordinator = test_coordinator(storage, None, config);
 
         let repo = "disallow/repo";
         let data = b"some data";
@@ -1078,7 +1077,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
         };
-        let coordinator = BlobUploadCoordinator::new(storage, None, config);
+        let coordinator = test_coordinator(storage, None, config);
 
         let repo = "instrumented/repo";
         let start = coordinator.start_upload(repo).await.unwrap();
@@ -1193,8 +1192,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 2,
         };
-        let coordinator =
-            BlobUploadCoordinator::new(storage.clone(), Some(ref_index.clone()), config);
+        let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
         let repo = "pin-lifecycle/repo";
         let data = b"DATA_FOR_PIN_LIFECYCLE_TEST";
@@ -1314,8 +1312,7 @@ mod tests {
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 2,
         };
-        let coordinator =
-            BlobUploadCoordinator::new(storage.clone(), Some(ref_index.clone()), config);
+        let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
         (storage, ref_index, coordinator, temp_dir)
     }

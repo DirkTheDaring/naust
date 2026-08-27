@@ -205,15 +205,13 @@ pub async fn admin_gc_plan(
         | Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
             (StatusCode::FORBIDDEN, "gc disabled").into_response()
         }
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported(e)) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e).into_response()
+        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
         }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -261,21 +259,17 @@ pub async fn admin_gc_quarantine(
         Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
             (StatusCode::CONFLICT, "gc already running").into_response()
         }
-        Err(crate::gc_service::GcServiceError::Disabled) => {
+        Err(crate::gc_service::GcServiceError::Disabled)
+        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
             (StatusCode::FORBIDDEN, "gc disabled").into_response()
         }
-        Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
+        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
         }
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported(e)) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -329,15 +323,13 @@ pub async fn admin_gc_delete(
         Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
             (StatusCode::FORBIDDEN, "gc delete disabled").into_response()
         }
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported(e)) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e).into_response()
+        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
         }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -353,19 +345,17 @@ pub async fn admin_gc_health(State(state): State<AppState>, headers: HeaderMap) 
 
     match service.health().await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(crate::gc_service::GcServiceError::RefIndexUnhealthy(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e).into_response()
+        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
         Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
             (StatusCode::OK, "gc running").into_response()
         }
         Err(crate::gc_service::GcServiceError::Disabled)
         | Err(crate::gc_service::GcServiceError::DeleteDisabled) => StatusCode::OK.into_response(),
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported(e)) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, e).into_response()
+        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
         }
-        Err(crate::gc_service::GcServiceError::Failed(e)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

@@ -56,11 +56,11 @@ async fn setup_test_service(
         .await
         .unwrap();
 
-    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
     let service = ManifestLifecycleService::new(
         storage.clone() as Arc<dyn Storage>,
         Some(ref_index.clone()),
-        gate,
+        coordinator,
     );
 
     (storage, ref_index, service)

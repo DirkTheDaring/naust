@@ -1,5 +1,5 @@
 use crate::blob_ref_index::BlobRefIndex;
-use crate::manifest_refs::parse_manifest_refs;
+use crate::manifest_refs::{ManifestParseError, parse_manifest_refs};
 use crate::registry::digest::Digest;
 use crate::storage;
 use std::collections::HashSet;
@@ -57,6 +57,55 @@ pub fn check_candidate_age(
     }
 }
 
+/// Typed error model for policy evaluation, reachability traversal, and root set construction.
+#[derive(Debug, thiserror::Error)]
+pub enum GcPolicyError {
+    #[error("reference index health check failed: {0}")]
+    IndexHealth(#[from] crate::blob_ref_index::RefIndexError),
+
+    #[error("repository enumeration failed: {0}")]
+    ListRepositories(#[source] crate::storage::StorageError),
+
+    #[error("manifest listing failed for repository '{repository}': {source}")]
+    ListManifests {
+        repository: String,
+        #[source]
+        source: crate::storage::StorageError,
+    },
+
+    #[error("failed to read manifest '{digest}' in repository '{repository}': {source}")]
+    ReadManifest {
+        repository: String,
+        digest: String,
+        #[source]
+        source: crate::storage::StorageError,
+    },
+
+    #[error(
+        "failed to parse manifest references for '{digest}' in repository '{repository}': {source}"
+    )]
+    ParseManifest {
+        repository: String,
+        digest: String,
+        #[source]
+        source: ManifestParseError,
+    },
+
+    #[error("filesystem traversal failed for '{path}': {source}")]
+    FsReadDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read manifest file '{path}': {source}")]
+    FsReadManifest {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 pub struct PolicyContext {
     pub(crate) policy: BlobGcPolicy,
     pub(crate) idx: Arc<BlobRefIndex>,
@@ -69,8 +118,8 @@ impl PolicyContext {
         storage: &Arc<dyn storage::Storage>,
         idx: &BlobRefIndex,
         policy: BlobGcPolicy,
-    ) -> Result<Self, String> {
-        idx.check_health().map_err(|e| format!("ref-index: {e}"))?;
+    ) -> Result<Self, GcPolicyError> {
+        idx.check_health()?;
 
         let idx = Arc::new(idx.clone());
 
@@ -86,11 +135,11 @@ impl PolicyContext {
         })
     }
 
-    pub async fn is_referenced(&mut self, digest: &Digest) -> Result<bool, String> {
-        let tag_reachable = self
-            .idx
-            .is_blob_referenced(digest)
-            .map_err(|e| format!("ref-index: {e}"))?;
+    pub async fn is_referenced(
+        &mut self,
+        digest: &Digest,
+    ) -> Result<bool, crate::blob_ref_index::RefIndexError> {
+        let tag_reachable = self.idx.is_blob_referenced(digest)?;
         if tag_reachable {
             return Ok(true);
         }
@@ -105,17 +154,19 @@ impl PolicyContext {
         Ok(false)
     }
 
-    pub fn is_pinned(&self, digest: &Digest, now: SystemTime) -> Result<bool, String> {
-        self.idx
-            .is_blob_pinned(digest, now)
-            .map_err(|e| format!("ref-index: {e}"))
+    pub fn is_pinned(
+        &self,
+        digest: &Digest,
+        now: SystemTime,
+    ) -> Result<bool, crate::blob_ref_index::RefIndexError> {
+        self.idx.is_blob_pinned(digest, now)
     }
 }
 
 pub async fn build_manifest_protected_set(
     cfg: &crate::config::Config,
     storage: &Arc<dyn storage::Storage>,
-) -> Result<HashSet<String>, String> {
+) -> Result<HashSet<String>, GcPolicyError> {
     if storage.kind() == "fs"
         && tokio::fs::metadata(&cfg.fs_root.join("repos"))
             .await
@@ -127,7 +178,7 @@ pub async fn build_manifest_protected_set(
     let repos = storage
         .list_repositories()
         .await
-        .map_err(|e| format!("list repositories: {e}"))?;
+        .map_err(GcPolicyError::ListRepositories)?;
 
     let mut protected = HashSet::new();
     for repo in repos {
@@ -136,16 +187,28 @@ pub async fn build_manifest_protected_set(
             let (digests, next_cursor) = storage
                 .list_manifest_digests_page(&repo, cursor.as_deref(), 100)
                 .await
-                .map_err(|e| format!("list manifest digests in {repo}: {e}"))?;
+                .map_err(|source| GcPolicyError::ListManifests {
+                    repository: repo.clone(),
+                    source,
+                })?;
 
             for digest in digests {
                 protected.insert(digest.as_str().to_string());
-                let (_meta, bytes) = storage
-                    .get_manifest(&repo, &digest)
-                    .await
-                    .map_err(|e| format!("get manifest {digest} in {repo}: {e}"))?;
-                let refs = parse_manifest_refs(&bytes)
-                    .map_err(|e| format!("unparsable manifest {digest} in {repo}: {e}"))?;
+                let (_meta, bytes) =
+                    storage
+                        .get_manifest(&repo, &digest)
+                        .await
+                        .map_err(|source| GcPolicyError::ReadManifest {
+                            repository: repo.clone(),
+                            digest: digest.to_string(),
+                            source,
+                        })?;
+                let refs =
+                    parse_manifest_refs(&bytes).map_err(|source| GcPolicyError::ParseManifest {
+                        repository: repo.clone(),
+                        digest: digest.to_string(),
+                        source,
+                    })?;
                 for r in refs.all_references() {
                     protected.insert(r.as_str().to_string());
                 }
@@ -161,7 +224,9 @@ pub async fn build_manifest_protected_set(
     Ok(protected)
 }
 
-pub async fn build_manifest_protected_set_fs(fs_root: &Path) -> Result<HashSet<String>, String> {
+pub async fn build_manifest_protected_set_fs(
+    fs_root: &Path,
+) -> Result<HashSet<String>, GcPolicyError> {
     let repos_root = fs_root.join("repos");
     let mut stack: Vec<PathBuf> = vec![repos_root];
     let mut protected: HashSet<String> = HashSet::new();
@@ -170,7 +235,7 @@ pub async fn build_manifest_protected_set_fs(fs_root: &Path) -> Result<HashSet<S
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("read_dir {}: {e}", dir.display())),
+            Err(source) => return Err(GcPolicyError::FsReadDir { path: dir, source }),
         };
 
         while let Ok(Some(ent)) = rd.next_entry().await {
@@ -185,7 +250,10 @@ pub async fn build_manifest_protected_set_fs(fs_root: &Path) -> Result<HashSet<S
                 if name == "manifests" {
                     let mut md = match tokio::fs::read_dir(&path).await {
                         Ok(d) => d,
-                        Err(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(source) => {
+                            return Err(GcPolicyError::FsReadDir { path, source });
+                        }
                     };
                     while let Ok(Some(m)) = md.next_entry().await {
                         let mft = match m.file_type().await {
@@ -208,12 +276,17 @@ pub async fn build_manifest_protected_set_fs(fs_root: &Path) -> Result<HashSet<S
 
                         let bytes = match tokio::fs::read(&mp).await {
                             Ok(b) => b,
-                            Err(e) => {
-                                return Err(format!("read manifest {}: {e}", mp.display()));
+                            Err(source) => {
+                                return Err(GcPolicyError::FsReadManifest { path: mp, source });
                             }
                         };
-                        let refs = parse_manifest_refs(&bytes)
-                            .map_err(|e| format!("unparsable manifest {}: {e}", mp.display()))?;
+                        let refs = parse_manifest_refs(&bytes).map_err(|source| {
+                            GcPolicyError::ParseManifest {
+                                repository: "fs".to_string(),
+                                digest: digest.clone(),
+                                source,
+                            }
+                        })?;
                         for r in refs.all_references() {
                             protected.insert(r.as_str().to_string());
                         }
