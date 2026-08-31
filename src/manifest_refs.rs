@@ -28,10 +28,10 @@ impl ManifestRefs {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum ManifestParseError {
     #[error("invalid json: {0}")]
-    InvalidJson(String),
+    InvalidJson(#[source] serde_json::Error),
 
     #[error("manifest structure is not a json object")]
     NotAnObject,
@@ -46,13 +46,20 @@ pub enum ManifestParseError {
     InvalidDigest {
         field: &'static str,
         raw: String,
+        #[source]
         error: DigestParseError,
     },
+
+    #[error("schema version 1 unsupported")]
+    SchemaV1Unsupported,
+
+    #[error("docker schema v1 manifest unsupported")]
+    DockerV1Unsupported,
 }
 
 pub fn parse_manifest_refs(bytes: &[u8]) -> Result<ManifestRefs, ManifestParseError> {
-    let v: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| ManifestParseError::InvalidJson(e.to_string()))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(ManifestParseError::InvalidJson)?;
 
     let obj = v.as_object().ok_or(ManifestParseError::NotAnObject)?;
     let mut refs = ManifestRefs::default();
@@ -168,8 +175,8 @@ pub fn parse_referrer_info(
         return Ok(None);
     };
 
-    let v: serde_json::Value = serde_json::from_slice(manifest_bytes)
-        .map_err(|e| ManifestParseError::InvalidJson(e.to_string()))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(manifest_bytes).map_err(ManifestParseError::InvalidJson)?;
 
     let artifact_type = v
         .get("artifactType")

@@ -126,24 +126,28 @@ pub async fn tag_delete(state: AppState, method: Method, name: &str, tag: &str) 
     if !is_valid_tag(tag) {
         return errors::tag_invalid().into_response();
     }
-    if !state.config.allow_tag_overwrite {
-        return errors::denied("tag is immutable and cannot be deleted").into_response();
-    }
 
-    match state.manifest_lifecycle.delete_tag(name, tag).await {
+    match state
+        .manifest_service
+        .delete_tag(name, tag, state.config.allow_tag_overwrite)
+        .await
+    {
         Ok(_) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
-        Err(crate::manifest_lifecycle::ManifestLifecycleError::TagNotFound) => {
+        Err(crate::application::ManifestMutationError::TagImmutable) => {
+            errors::denied("tag is immutable and cannot be deleted").into_response()
+        }
+        Err(crate::application::ManifestMutationError::TagNotFound) => {
             errors::tag_unknown().into_response()
         }
-        Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName) => {
+        Err(crate::application::ManifestMutationError::InvalidRepoName { .. }) => {
             errors::name_invalid().into_response()
         }
-        Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidTag) => {
+        Err(crate::application::ManifestMutationError::InvalidTag) => {
             errors::tag_invalid().into_response()
         }
-        Err(crate::manifest_lifecycle::ManifestLifecycleError::Storage(
-            StorageError::Unsupported,
-        )) => errors::method_not_allowed("DELETE"),
+        Err(crate::application::ManifestMutationError::Storage(StorageError::Unsupported)) => {
+            errors::method_not_allowed("DELETE")
+        }
         Err(_) => errors::internal_error().into_response(),
     }
 }

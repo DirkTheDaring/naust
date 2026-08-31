@@ -4,16 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use crate::blob_delete_safety;
+use crate::application::{BlobMutationService, ManifestMutationService};
 use crate::blob_ref_index;
 use crate::config::Config;
 use crate::gc_service;
 use crate::ip_concurrency;
-use crate::manifest_lifecycle;
 use crate::proxy;
-use crate::repository_membership_ledger;
 use crate::storage;
-use crate::upload_coordinator;
 
 #[derive(Debug, Default)]
 pub struct AuthMetrics {
@@ -63,17 +60,9 @@ pub struct AppState {
     pub ip_limiter: Arc<ip_concurrency::IpConcurrencyLimiter>,
     pub is_high_pressure: Arc<std::sync::atomic::AtomicBool>,
 
-    // Authoritative Repository Membership Ledger:
-    pub membership_ledger: Arc<repository_membership_ledger::RepositoryMembershipLedger>,
-
-    // Centralized Upload Session Lifecycle Coordinator:
-    pub upload_coordinator: Arc<upload_coordinator::BlobUploadCoordinator>,
-
-    // Isolated Blob Deletion Service:
-    pub delete_service: Arc<blob_delete_safety::BlobDeleteService>,
-
-    // Consolidated Manifest and Tag Lifecycle Service:
-    pub manifest_lifecycle: Arc<manifest_lifecycle::ManifestLifecycleService>,
+    // Focused Application Services:
+    pub blob_service: Arc<BlobMutationService>,
+    pub manifest_service: Arc<ManifestMutationService>,
 }
 
 #[derive(Clone)]

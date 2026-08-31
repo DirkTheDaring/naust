@@ -19,20 +19,17 @@ use tower_http::trace::TraceLayer;
 
 use crate::app_state::{AppState, AuthMetrics, ProxyContext};
 use crate::auth;
-use crate::blob_delete_safety::BlobDeleteService;
 use crate::blob_ref_index::BlobRefIndex;
 use crate::config::{Config, StorageBackend};
 use crate::gc_service::GcService;
 use crate::http_api::handlers;
 use crate::ip_concurrency::IpConcurrencyLimiter;
-use crate::manifest_lifecycle::ManifestLifecycleService;
 use crate::registry::digest::Digest;
-use crate::repository_membership_ledger::RepositoryMembershipLedger;
 use crate::storage::mutation_authority::RuntimeMutationAuthority;
 use crate::storage::{self, Storage};
 use crate::task_supervisor::{TaskClassification, TaskSupervisor};
 use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
-use crate::upload_coordinator::{BlobUploadCoordinator, BlobUploadCoordinatorConfig};
+use crate::upload_coordinator::BlobUploadCoordinatorConfig;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StartupPhase {
@@ -646,11 +643,16 @@ pub async fn run_server_supervisor(
         upload_chunk_min_bytes: config.upload_chunk_min_bytes.map(|v| v as u64),
         gc_pin_duration_secs: config.gc_pin_duration_secs,
     };
-    let upload_coordinator = Arc::new(BlobUploadCoordinator::new(
+    let blob_service = Arc::new(crate::application::BlobMutationService::new(
         storage.clone(),
         ref_index.clone(),
         consistency.clone(),
         upload_coord_config,
+    ));
+    let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
+        storage.clone(),
+        ref_index.clone(),
+        consistency.clone(),
     ));
 
     let state = AppState {
@@ -671,22 +673,8 @@ pub async fn run_server_supervisor(
         last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
         ip_limiter,
         is_high_pressure,
-        membership_ledger: Arc::new(RepositoryMembershipLedger::new(
-            storage.clone(),
-            ref_index.clone(),
-            consistency.clone(),
-        )),
-        upload_coordinator,
-        delete_service: Arc::new(BlobDeleteService::new(
-            storage.clone(),
-            ref_index.clone(),
-            consistency.clone(),
-        )),
-        manifest_lifecycle: Arc::new(ManifestLifecycleService::new(
-            storage.clone(),
-            ref_index.clone(),
-            consistency.clone(),
-        )),
+        blob_service,
+        manifest_service,
     };
 
     injector.record_event("app_state_constructed").await;
@@ -1596,7 +1584,7 @@ pub async fn spawn_upload_reaper(supervisor: &TaskSupervisor, state: AppState) {
     let interval = Duration::from_secs(state.config.upload_gc_interval_secs.max(1));
     let max_age_secs = state.config.upload_gc_max_age_secs;
     let receipt_ttl_secs = 3600;
-    let coordinator = state.upload_coordinator.clone();
+    let blob_service = state.blob_service.clone();
 
     supervisor
         .spawn_loop(
@@ -1605,9 +1593,9 @@ pub async fn spawn_upload_reaper(supervisor: &TaskSupervisor, state: AppState) {
             interval,
             None,
             move || {
-                let coord = coordinator.clone();
+                let svc = blob_service.clone();
                 async move {
-                    match coord
+                    match svc
                         .reap_expired_uploads(max_age_secs, receipt_ttl_secs)
                         .await
                     {

@@ -7,6 +7,22 @@
 
 ---
 
+## Post-Slice-2 Implementation Status (ADR-002 Accepted)
+
+> **Implementation Note (Post-Slice-2 Verification State):**
+> Following Slice 1, **Slice 2 (ADR-002: Application Service Layer & HTTP Transport Thinning)** was implemented and verified.
+>
+> * **ADR-002 Status:** Accepted.
+> * **Cohesive Application Layer (`src/application/`):** Pure application service module created with `BlobMutationService` (`src/application/blob.rs`) and `ManifestMutationService` (`src/application/manifest.rs`).
+> * **Zero HTTP Coupling in Application:** `src/application/` contains zero references to HTTP types (`axum`, `http`, `StatusCode`, `HeaderMap`, `Response`).
+> * **Thinned Transport Layer:** HTTP handlers in `src/http_api/handlers.rs` and `src/http_api/tags.rs` now exclusively parse transport parameters, check authentication challenges, and delegate directly to application services with centralized error mappers (`blob_mutation_error_to_response`, `manifest_mutation_error_to_response`).
+> * **Encapsulated AppState:** Raw coordinator handles (`BlobUploadCoordinator`, `BlobDeleteService`, `ManifestLifecycleService`, `RepositoryMembershipLedger`, `ConsistencyCoordinator`) have been removed from `AppState` and are accessed exclusively through `blob_service` and `manifest_service`.
+> * **Remaining Direct Storage Access (Read-Only):** Transport handlers retain direct access only for read-only catalog/tag/referrer listing and content streaming; full storage-port segregation remains explicitly deferred to **Slice 3**.
+> * **Deterministic Unit & Integration Tests:** 9 comprehensive application service integration tests added in `tests/application_service_tests.rs` (including 2 typed error source chain verification tests).
+> * **Verified Test Inventory:** 611 total listed tests across 16 test binaries (602 Slice 1 baseline + 9 new application tests). **611 passed, 0 failed, 0 ignored** with local MinIO backend healthy.
+
+---
+
 ## Post-Slice-1 Implementation Status (ADR-001 Accepted)
 
 > **Implementation Note (Post-Slice-1 Verification State):**
@@ -18,9 +34,8 @@
 > * **Typed Serialization:** Typed `MutationGuard` and `GcRevalidationGuard` tokens serialize current application mutation paths (`BlobUploadCoordinator`, `ManifestLifecycleService`, `RepositoryMembershipLedger`, `BlobDeleteService`, `Proxy`) and GC reachability revalidation paths.
 > * **Application-Level Guarded Deletion:** Authoritative GC candidate deletion (`execute_guarded_gc_deletion`) strictly requires dual independent proofs: `&GcMutationPermit` (proving active deployment mutation authority) and `&GcRevalidationGuard` (proving reachability mutation exclusion).
 > * **Storage Trait Scope / Limitation:** The low-level `Storage` trait (`src/storage/mod.rs`) and storage adapters (`FsStorage`, `S3Storage`) still require only mutation authority (`&GcMutationPermit`); full storage trait segregation and port decoupling remain deferred to subsequent architectural slices.
-> * **Verified Test Inventory:** The verified test suite has expanded from the 583 baseline tests to **602 passed, 0 failed, 0 ignored across 15 test binaries**.
-> 
-> *Note:* Later application-service facade and storage-port segregation slices remain planned and are not yet implemented.
+> * **Verified Test Inventory:** The verified test suite expanded to **602 passed, 0 failed, 0 ignored across 15 test binaries**.
+
 
 ---
 

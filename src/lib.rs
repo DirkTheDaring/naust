@@ -3,6 +3,7 @@
 pub mod app_state;
 pub use app_state::{AppState, AuthMetrics, ProxyContext};
 
+pub mod application;
 pub mod audit;
 pub mod auth;
 pub mod blob_delete_safety;

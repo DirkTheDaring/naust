@@ -355,10 +355,9 @@ async fn blob_by_digest(
     route_mode: V2RouteMode,
     proxy_ctx: Option<ProxyContext>,
 ) -> Response {
-    let canonical_repo = match crate::registry::canonical_name::CanonicalRepoName::parse(name) {
-        Ok(r) => r,
-        Err(_) => return errors::name_invalid().into_response(),
-    };
+    if crate::registry::canonical_name::CanonicalRepoName::parse(name).is_err() {
+        return errors::name_invalid().into_response();
+    }
 
     let digest = match Digest::parse(digest_str) {
         Ok(d) => d,
@@ -380,7 +379,7 @@ async fn blob_by_digest(
     };
 
     match method {
-        Method::DELETE => match state.delete_service.delete_repo_blob(name, &digest).await {
+        Method::DELETE => match state.blob_service.delete_repo_blob(name, &digest).await {
             Ok(crate::blob_delete_safety::BlobDeleteResult::Success) => {
                 (StatusCode::ACCEPTED, registry_headers()).into_response()
             }
@@ -412,13 +411,8 @@ async fn blob_by_digest(
                 if let Ok(meta) = ctx.cache.head_blob(&digest).await {
                     ctx.proxy.note_blob_access(&digest);
                     if let Err(e) = state
-                        .membership_ledger
-                        .link(
-                            &crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                                canonical_repo.clone(),
-                                digest.clone(),
-                            ),
-                        )
+                        .blob_service
+                        .link_proxy_blob_membership(name, &digest)
                         .await
                     {
                         tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
@@ -466,13 +460,8 @@ async fn blob_by_digest(
                 if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
                     ctx.proxy.note_blob_access(&digest);
                     if let Err(e) = state
-                        .membership_ledger
-                        .link(
-                            &crate::storage::repo_membership::RepoBlobMembershipRecord::new_proxy(
-                                canonical_repo.clone(),
-                                digest.clone(),
-                            ),
-                        )
+                        .blob_service
+                        .link_proxy_blob_membership(name, &digest)
                         .await
                     {
                         tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
@@ -490,7 +479,11 @@ async fn blob_by_digest(
                 if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
                     if ctx
                         .proxy
-                        .fetch_blob_into_storage(&decision, &digest, &state.upload_coordinator)
+                        .fetch_blob_into_storage(
+                            &decision,
+                            &digest,
+                            state.blob_service.coordinator(),
+                        )
                         .await
                         .is_ok()
                     {
@@ -547,7 +540,7 @@ async fn blob_by_digest_proxy_only(
             if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
                 match ctx
                     .proxy
-                    .fetch_blob_into_storage(&decision, &digest, &state.upload_coordinator)
+                    .fetch_blob_into_storage(&decision, &digest, state.blob_service.coordinator())
                     .await
                 {
                     Ok(()) => {
@@ -678,7 +671,7 @@ async fn manifest_by_reference(
                                     state.config.max_request_body_bytes,
                                     false,
                                     None,
-                                    &state.manifest_lifecycle,
+                                    state.manifest_service.lifecycle(),
                                 )
                                 .await
                             {
@@ -764,36 +757,39 @@ async fn manifest_by_reference(
         Method::DELETE => {
             let is_digest = Digest::parse(reference).is_ok();
             if is_digest {
-                match state
-                    .manifest_lifecycle
-                    .delete_manifest(name, &digest)
-                    .await
-                {
+                match state.manifest_service.delete_manifest(name, &digest).await {
                     Ok(_) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::ManifestNotFound) => {
+                    Err(crate::application::ManifestMutationError::ManifestNotFound) => {
                         errors::manifest_unknown().into_response()
                     }
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName) => {
+                    Err(crate::application::ManifestMutationError::InvalidRepoName { .. }) => {
                         errors::name_invalid().into_response()
                     }
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::Storage(
+                    Err(crate::application::ManifestMutationError::Storage(
                         StorageError::Unsupported,
                     )) => errors::not_implemented().into_response(),
                     Err(_) => errors::internal_error().into_response(),
                 }
             } else {
-                match state.manifest_lifecycle.delete_tag(name, reference).await {
+                match state
+                    .manifest_service
+                    .delete_tag(name, reference, state.config.allow_tag_overwrite)
+                    .await
+                {
                     Ok(_) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::TagNotFound) => {
+                    Err(crate::application::ManifestMutationError::TagNotFound) => {
                         errors::manifest_unknown().into_response()
                     }
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName) => {
+                    Err(crate::application::ManifestMutationError::InvalidRepoName { .. }) => {
                         errors::name_invalid().into_response()
                     }
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::InvalidTag) => {
+                    Err(crate::application::ManifestMutationError::InvalidTag) => {
                         errors::tag_invalid().into_response()
                     }
-                    Err(crate::manifest_lifecycle::ManifestLifecycleError::Storage(
+                    Err(crate::application::ManifestMutationError::TagImmutable) => {
+                        errors::denied("tag is immutable and cannot be deleted").into_response()
+                    }
+                    Err(crate::application::ManifestMutationError::Storage(
                         StorageError::Unsupported,
                     )) => errors::not_implemented().into_response(),
                     Err(_) => errors::internal_error().into_response(),
@@ -854,7 +850,7 @@ async fn manifest_by_reference(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
-                                &state.manifest_lifecycle,
+                                state.manifest_service.lifecycle(),
                             )
                             .await
                         {
@@ -954,7 +950,7 @@ async fn manifest_by_reference(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
-                                &state.manifest_lifecycle,
+                                state.manifest_service.lifecycle(),
                             )
                             .await
                         {
@@ -1047,7 +1043,7 @@ async fn manifest_by_reference_proxy_only(
                                 state.config.max_request_body_bytes,
                                 false,
                                 None,
-                                &state.manifest_lifecycle,
+                                state.manifest_service.lifecycle(),
                             )
                             .await
                         {
@@ -1150,7 +1146,7 @@ async fn manifest_by_reference_proxy_only(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        &state.manifest_lifecycle,
+                        state.manifest_service.lifecycle(),
                     )
                     .await
                 {
@@ -1212,7 +1208,7 @@ async fn manifest_by_reference_proxy_only(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        &state.manifest_lifecycle,
+                        state.manifest_service.lifecycle(),
                     )
                     .await
                 {
@@ -1294,11 +1290,11 @@ mod tests {
             .map(|k| k.key.as_bytes().to_vec())
             .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
         let consistency = crate::consistency::ConsistencyCoordinator::new();
-        let upload_coordinator = Arc::new(crate::upload_coordinator::BlobUploadCoordinator::new(
+        let blob_service = Arc::new(crate::application::BlobMutationService::new(
             storage.clone(),
             None,
             consistency.clone(),
-            crate::upload_coordinator::BlobUploadCoordinatorConfig {
+            crate::application::BlobUploadCoordinatorConfig {
                 signing_key,
                 max_upload_bytes: cfg.max_upload_bytes,
                 abort_on_digest_mismatch: cfg.upload_policy.abort_on_digest_mismatch,
@@ -1306,6 +1302,11 @@ mod tests {
                 upload_chunk_min_bytes: cfg.upload_chunk_min_bytes.map(|v| v as u64),
                 gc_pin_duration_secs: cfg.gc_pin_duration_secs,
             },
+        ));
+        let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
+            storage.clone(),
+            None,
+            consistency,
         ));
         AppState {
             config: cfg,
@@ -1325,24 +1326,8 @@ mod tests {
             gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            membership_ledger: Arc::new(
-                crate::repository_membership_ledger::RepositoryMembershipLedger::new(
-                    storage.clone(),
-                    None,
-                    consistency.clone(),
-                ),
-            ),
-            upload_coordinator,
-            delete_service: Arc::new(crate::blob_delete_safety::BlobDeleteService::new(
-                storage.clone(),
-                None,
-                consistency.clone(),
-            )),
-            manifest_lifecycle: Arc::new(crate::manifest_lifecycle::ManifestLifecycleService::new(
-                storage.clone(),
-                None,
-                consistency,
-            )),
+            blob_service,
+            manifest_service,
         }
     }
 
@@ -2852,7 +2837,7 @@ async fn ensure_tag_fresh(
             state.config.max_request_body_bytes,
             true,
             if_none_match,
-            &state.manifest_lifecycle,
+            state.manifest_service.lifecycle(),
         )
         .await;
 
@@ -2882,7 +2867,7 @@ async fn ensure_tag_fresh(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        &state.manifest_lifecycle,
+                        state.manifest_service.lifecycle(),
                     )
                     .await
                     .map_err(|e| {
@@ -2934,7 +2919,7 @@ async fn ensure_tag_fresh(
                         state.config.max_request_body_bytes,
                         false,
                         None,
-                        &state.manifest_lifecycle,
+                        state.manifest_service.lifecycle(),
                     )
                     .await
                     .map_err(|e| {
@@ -3036,7 +3021,7 @@ async fn manifest_put(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let req = crate::manifest_lifecycle::PublishManifestRequest::new(
+    let req = crate::application::PublishManifestRequest::new(
         name,
         reference,
         bytes,
@@ -3044,7 +3029,7 @@ async fn manifest_put(
         state.config.allow_tag_overwrite,
     );
 
-    match state.manifest_lifecycle.publish_manifest(req).await {
+    match state.manifest_service.publish_manifest(req).await {
         Ok(published) => {
             let mut headers = registry_headers();
             headers.insert(
@@ -3063,47 +3048,51 @@ async fn manifest_put(
             }
             (StatusCode::CREATED, headers).into_response()
         }
-        Err(err) => match err {
-            crate::manifest_lifecycle::ManifestLifecycleError::InvalidRepoName => {
-                errors::name_invalid().into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::EmptyPayload
-            | crate::manifest_lifecycle::ManifestLifecycleError::PayloadTooLarge
-            | crate::manifest_lifecycle::ManifestLifecycleError::InvalidManifest(_) => {
-                errors::manifest_invalid().into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::Unverified(msg) => {
-                errors::manifest_unverified(&msg)
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::UnsupportedMediaType(_) => {
-                errors::not_implemented().into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::MissingBlob(blob_d) => {
-                errors::manifest_blob_unknown(&blob_d).into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::MissingManifest(manifest_d) => {
-                errors::manifest_blob_unknown(&manifest_d).into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::InvalidTag => {
-                errors::tag_invalid().into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::TagAlreadyExists => {
-                (StatusCode::CONFLICT, registry_headers(), Body::empty()).into_response()
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::DigestMismatch { .. } => {
-                errors::manifest_unverified("manifest digest mismatch")
-            }
-            crate::manifest_lifecycle::ManifestLifecycleError::Storage(
-                StorageError::InsufficientStorage,
-            ) => errors::insufficient_storage().into_response(),
-            crate::manifest_lifecycle::ManifestLifecycleError::Storage(
-                StorageError::Unsupported,
-            ) => errors::not_implemented().into_response(),
-            crate::manifest_lifecycle::ManifestLifecycleError::Storage(
-                StorageError::DigestMismatch,
-            ) => errors::digest_invalid().into_response(),
-            _ => errors::internal_error().into_response(),
-        },
+        Err(err) => manifest_mutation_error_to_response(err),
+    }
+}
+
+fn manifest_mutation_error_to_response(err: crate::application::ManifestMutationError) -> Response {
+    use crate::application::ManifestMutationError;
+    use crate::storage::StorageError;
+    match err {
+        ManifestMutationError::InvalidRepoName { .. } => errors::name_invalid().into_response(),
+        ManifestMutationError::EmptyPayload
+        | ManifestMutationError::PayloadTooLarge
+        | ManifestMutationError::InvalidManifest(_) => errors::manifest_invalid().into_response(),
+        ManifestMutationError::Unverified(reason) => {
+            errors::manifest_unverified(&reason.to_string())
+        }
+        ManifestMutationError::UnsupportedMediaType(_) => errors::not_implemented().into_response(),
+        ManifestMutationError::MissingBlob(blob_d) => {
+            errors::manifest_blob_unknown(&blob_d).into_response()
+        }
+        ManifestMutationError::MissingManifest(manifest_d) => {
+            errors::manifest_blob_unknown(&manifest_d).into_response()
+        }
+        ManifestMutationError::InvalidTag => errors::tag_invalid().into_response(),
+        ManifestMutationError::TagAlreadyExists => {
+            (StatusCode::CONFLICT, registry_headers(), Body::empty()).into_response()
+        }
+        ManifestMutationError::TagImmutable => {
+            errors::denied("tag is immutable and cannot be deleted").into_response()
+        }
+        ManifestMutationError::TagNotFound | ManifestMutationError::ManifestNotFound => {
+            errors::manifest_unknown().into_response()
+        }
+        ManifestMutationError::DigestMismatch { .. } => {
+            errors::manifest_unverified("manifest digest mismatch")
+        }
+        ManifestMutationError::Storage(StorageError::InsufficientStorage) => {
+            errors::insufficient_storage().into_response()
+        }
+        ManifestMutationError::Storage(StorageError::Unsupported) => {
+            errors::not_implemented().into_response()
+        }
+        ManifestMutationError::Storage(StorageError::DigestMismatch) => {
+            errors::digest_invalid().into_response()
+        }
+        _ => errors::internal_error().into_response(),
     }
 }
 
@@ -3358,11 +3347,11 @@ async fn upload_create(
         }
 
         match state
-            .upload_coordinator
-            .cross_mount_blob(name, from_repo, &digest)
+            .blob_service
+            .cross_mount(name, from_repo, &digest)
             .await
         {
-            Ok(crate::upload_coordinator::CrossMountResult::Mounted(fin)) => {
+            Ok(crate::application::CrossMountResult::Mounted(fin)) => {
                 let mut resp_headers = registry_headers();
                 resp_headers.insert(
                     "Location",
@@ -3377,7 +3366,7 @@ async fn upload_create(
                 resp_headers.insert("Content-Length", "0".parse().unwrap());
                 return (StatusCode::CREATED, resp_headers).into_response();
             }
-            Ok(crate::upload_coordinator::CrossMountResult::Fallback(start)) => {
+            Ok(crate::application::CrossMountResult::Fallback(start)) => {
                 let mut resp_headers = registry_headers();
                 let location = format!(
                     "/v2/{name}/blobs/uploads/{}?_state={}",
@@ -3391,7 +3380,7 @@ async fn upload_create(
                 }
                 return (StatusCode::ACCEPTED, resp_headers).into_response();
             }
-            Err(err) => return coordinator_error_to_response(err),
+            Err(err) => return blob_mutation_error_to_response(err),
         }
     }
 
@@ -3403,19 +3392,6 @@ async fn upload_create(
             Ok(d) => d,
             Err(_) => return errors::digest_invalid().into_response(),
         };
-
-        if let Ok(Some(_)) = state.storage.get_repo_blob_membership(name, &digest).await {
-            let mut headers = registry_headers();
-            headers.insert(
-                "Location",
-                format!("/v2/{name}/blobs/{}", digest.as_str())
-                    .parse()
-                    .unwrap(),
-            );
-            headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-            headers.insert("Content-Length", "0".parse().unwrap());
-            return (StatusCode::CREATED, headers).into_response();
-        }
 
         // Stream monolithic upload (no buffering of multi-GB body).
         let (idle_timeout, min_rate) = state.current_stream_guard_params();
@@ -3432,7 +3408,7 @@ async fn upload_create(
         let first = stream.next().await;
         let Some(first) = first else {
             // No body -> behave like normal upload creation.
-            return match state.upload_coordinator.start_upload(name).await {
+            return match state.blob_service.start_upload(name).await {
                 Ok(start) => {
                     let mut headers = registry_headers();
                     let location = format!(
@@ -3447,7 +3423,7 @@ async fn upload_create(
                     }
                     (StatusCode::ACCEPTED, headers).into_response()
                 }
-                Err(err) => coordinator_error_to_response(err),
+                Err(err) => blob_mutation_error_to_response(err),
             };
         };
 
@@ -3479,12 +3455,12 @@ async fn upload_create(
             Box::pin(first_stream.chain(rest));
 
         match state
-            .upload_coordinator
+            .blob_service
             .monolithic_upload(name, &digest, Some(body_stream))
             .await
         {
-            Ok(crate::upload_coordinator::MonolithicUploadResult::AlreadyFinalized(res))
-            | Ok(crate::upload_coordinator::MonolithicUploadResult::Created(res)) => {
+            Ok(crate::application::MonolithicUploadResult::AlreadyFinalized(res))
+            | Ok(crate::application::MonolithicUploadResult::Created(res)) => {
                 let mut headers = registry_headers();
                 headers.insert(
                     "Location",
@@ -3499,7 +3475,7 @@ async fn upload_create(
                 headers.insert("Content-Length", res.size.to_string().parse().unwrap());
                 (StatusCode::CREATED, headers).into_response()
             }
-            Ok(crate::upload_coordinator::MonolithicUploadResult::SessionStarted(start)) => {
+            Ok(crate::application::MonolithicUploadResult::SessionStarted(start)) => {
                 let mut headers = registry_headers();
                 let location = format!(
                     "/v2/{name}/blobs/uploads/{}?_state={}",
@@ -3509,10 +3485,10 @@ async fn upload_create(
                 headers.insert("Docker-Upload-UUID", start.session.uuid.parse().unwrap());
                 (StatusCode::ACCEPTED, headers).into_response()
             }
-            Err(err) => coordinator_error_to_response(err),
+            Err(err) => blob_mutation_error_to_response(err),
         }
     } else {
-        match state.upload_coordinator.start_upload(name).await {
+        match state.blob_service.start_upload(name).await {
             Ok(start) => {
                 let mut headers = registry_headers();
                 let location = format!(
@@ -3526,22 +3502,24 @@ async fn upload_create(
                 }
                 (StatusCode::ACCEPTED, headers).into_response()
             }
-            Err(err) => coordinator_error_to_response(err),
+            Err(err) => blob_mutation_error_to_response(err),
         }
     }
 }
 
-fn coordinator_error_to_response(err: crate::upload_coordinator::CoordinatorError) -> Response {
+fn blob_mutation_error_to_response(err: crate::application::BlobMutationError) -> Response {
+    use crate::application::BlobMutationError;
     use crate::http_api::upload_state::StateTokenError;
     use crate::storage::StorageError;
-    use crate::upload_coordinator::CoordinatorError;
     match err {
-        CoordinatorError::InvalidRepoName(_) => errors::name_invalid().into_response(),
-        CoordinatorError::SessionNotFound => errors::blob_upload_unknown().into_response(),
-        CoordinatorError::StateToken(StateTokenError::Missing) => {
+        BlobMutationError::InvalidRepoName { .. } => errors::name_invalid().into_response(),
+        BlobMutationError::SessionNotFound => errors::blob_upload_unknown().into_response(),
+        BlobMutationError::BlobNotFound => errors::blob_unknown().into_response(),
+        BlobMutationError::BlobInUse(msg) => errors::blob_in_use(&msg).into_response(),
+        BlobMutationError::StateToken(StateTokenError::Missing) => {
             errors::blob_upload_invalid("missing _state parameter").into_response()
         }
-        CoordinatorError::StateToken(StateTokenError::OffsetMismatch { expected, .. }) => {
+        BlobMutationError::StateToken(StateTokenError::OffsetMismatch { expected, .. }) => {
             let mut resp = errors::range_invalid("storage size does not match state offset");
             if expected > 0 {
                 resp.headers_mut()
@@ -3549,10 +3527,10 @@ fn coordinator_error_to_response(err: crate::upload_coordinator::CoordinatorErro
             }
             resp.into_response()
         }
-        CoordinatorError::StateToken(_) => {
+        BlobMutationError::StateToken(_) => {
             errors::blob_upload_invalid("invalid _state parameter").into_response()
         }
-        CoordinatorError::OffsetMismatch { current, .. } => {
+        BlobMutationError::OffsetMismatch { current, .. } => {
             let mut resp = errors::range_invalid("storage size does not match state offset");
             if current > 0 {
                 resp.headers_mut()
@@ -3560,45 +3538,58 @@ fn coordinator_error_to_response(err: crate::upload_coordinator::CoordinatorErro
             }
             resp.into_response()
         }
-        CoordinatorError::RangeInvalid(msg) => errors::range_invalid(&msg).into_response(),
-        CoordinatorError::DigestMismatch { .. } => errors::digest_invalid().into_response(),
-        CoordinatorError::SizeInvalid(msg) => errors::size_invalid(&msg).into_response(),
-        CoordinatorError::TooLarge => {
+        BlobMutationError::RangeInvalid(msg) => errors::range_invalid(&msg).into_response(),
+        BlobMutationError::DigestMismatch { .. } => errors::digest_invalid().into_response(),
+        BlobMutationError::SizeInvalid(msg) => errors::size_invalid(&msg).into_response(),
+        BlobMutationError::TooLarge => {
             errors::blob_upload_invalid("upload too large").into_response()
         }
-        CoordinatorError::Conflict => {
+        BlobMutationError::Conflict => {
             (StatusCode::CONFLICT, "concurrent operation conflict").into_response()
         }
-        CoordinatorError::MonolithicDisallowed => errors::blob_upload_invalid(
+        BlobMutationError::MonolithicDisallowed => errors::blob_upload_invalid(
             "monolithic uploads are disabled; use PATCH-based chunked upload",
         )
         .into_response(),
-        CoordinatorError::InvalidPreparedHandle => errors::internal_error().into_response(),
-        CoordinatorError::Storage(StorageError::NotFound) => {
+        BlobMutationError::InvalidPreparedHandle => errors::internal_error().into_response(),
+        BlobMutationError::Storage(StorageError::NotFound) => {
             errors::blob_upload_unknown().into_response()
         }
-        CoordinatorError::Storage(StorageError::DigestMismatch) => {
+        BlobMutationError::Storage(StorageError::DigestMismatch) => {
             errors::digest_invalid().into_response()
         }
-        CoordinatorError::Storage(StorageError::TooLarge) => {
+        BlobMutationError::Storage(StorageError::TooLarge) => {
             errors::blob_upload_invalid("upload too large").into_response()
         }
-        CoordinatorError::Storage(StorageError::InsufficientStorage) => {
+        BlobMutationError::Storage(StorageError::InsufficientStorage) => {
             errors::insufficient_storage().into_response()
         }
-        CoordinatorError::Storage(StorageError::Unsupported) => {
+        BlobMutationError::Storage(StorageError::Unsupported) => {
             errors::not_implemented().into_response()
         }
-        CoordinatorError::Storage(_) => errors::internal_error().into_response(),
-        CoordinatorError::Stream(
+        BlobMutationError::Storage(_) => errors::internal_error().into_response(),
+        BlobMutationError::Ledger(crate::application::LedgerError::Storage(
+            StorageError::NotFound,
+        )) => errors::blob_unknown().into_response(),
+        BlobMutationError::Ledger(crate::application::LedgerError::Storage(
+            StorageError::InsufficientStorage,
+        )) => errors::insufficient_storage().into_response(),
+        BlobMutationError::Ledger(crate::application::LedgerError::Storage(
+            StorageError::Unsupported,
+        )) => errors::not_implemented().into_response(),
+        BlobMutationError::Ledger(crate::application::LedgerError::Storage(
+            StorageError::InvalidRepoName(_),
+        )) => errors::name_invalid().into_response(),
+        BlobMutationError::Ledger(_) => errors::internal_error().into_response(),
+        BlobMutationError::Stream(
             crate::storage::upload_session::UploadStreamError::IdleTimeout,
         ) => errors::request_timeout("upload aborted while reading request body").into_response(),
-        CoordinatorError::Stream(crate::storage::upload_session::UploadStreamError::RateTooLow) => {
-            errors::request_timeout("upload aborted due to low transfer rate").into_response()
-        }
-        CoordinatorError::Stream(crate::storage::upload_session::UploadStreamError::Io(io_err)) => {
-            errors::request_timeout(&format!("stream io error: {io_err}")).into_response()
-        }
+        BlobMutationError::Stream(
+            crate::storage::upload_session::UploadStreamError::RateTooLow,
+        ) => errors::request_timeout("upload aborted due to low transfer rate").into_response(),
+        BlobMutationError::Stream(crate::storage::upload_session::UploadStreamError::Io(
+            io_err,
+        )) => errors::request_timeout(&format!("stream io error: {io_err}")).into_response(),
     }
 }
 
@@ -3703,7 +3694,7 @@ async fn upload_session(
         Method::GET | Method::HEAD => {
             let _ = axum::body::to_bytes(body, usize::MAX).await;
             match state
-                .upload_coordinator
+                .blob_service
                 .get_upload_status(name, uuid, query.get("_state").map(|s| s.as_str()))
                 .await
             {
@@ -3718,13 +3709,13 @@ async fn upload_session(
                     }
                     (StatusCode::NO_CONTENT, headers).into_response()
                 }
-                Err(err) => coordinator_error_to_response(err),
+                Err(err) => blob_mutation_error_to_response(err),
             }
         }
         Method::DELETE => {
             let _ = axum::body::to_bytes(body, usize::MAX).await;
             match state
-                .upload_coordinator
+                .blob_service
                 .abort_upload(name, uuid, query.get("_state").map(|s| s.as_str()))
                 .await
             {
@@ -3733,7 +3724,7 @@ async fn upload_session(
                     headers.insert("Docker-Upload-UUID", uuid.parse().unwrap());
                     (StatusCode::NO_CONTENT, headers).into_response()
                 }
-                Err(err) => coordinator_error_to_response(err),
+                Err(err) => blob_mutation_error_to_response(err),
             }
         }
         Method::PATCH => {
@@ -3776,8 +3767,8 @@ async fn upload_session(
             });
 
             match state
-                .upload_coordinator
-                .append_upload(
+                .blob_service
+                .append_chunk(
                     name,
                     uuid,
                     state_param,
@@ -3807,7 +3798,7 @@ async fn upload_session(
                     }
                     (StatusCode::ACCEPTED, headers).into_response()
                 }
-                Err(err) => coordinator_error_to_response(err),
+                Err(err) => blob_mutation_error_to_response(err),
             }
         }
         Method::PUT => {
@@ -3873,7 +3864,7 @@ async fn upload_session(
                 };
 
             match state
-                .upload_coordinator
+                .blob_service
                 .finalize_upload(
                     name,
                     uuid,
@@ -3899,7 +3890,7 @@ async fn upload_session(
                     headers.insert("Content-Length", fin.size.to_string().parse().unwrap());
                     (StatusCode::CREATED, headers).into_response()
                 }
-                Err(err) => coordinator_error_to_response(err),
+                Err(err) => blob_mutation_error_to_response(err),
             }
         }
         _ => errors::method_not_allowed("GET, HEAD, PATCH, PUT, DELETE"),

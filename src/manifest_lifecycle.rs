@@ -198,6 +198,14 @@ pub struct LifecycleJournalRecord {
     pub manifest_size: Option<u64>,
 }
 
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum UnverifiedReason {
+    #[error("manifest failed signature verification")]
+    SignatureVerificationFailed,
+    #[error("manifest signatures unverified")]
+    SignaturesUnverified,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestLifecycleError {
     #[error("invalid repository name")]
@@ -210,10 +218,10 @@ pub enum ManifestLifecycleError {
     PayloadTooLarge,
 
     #[error("manifest JSON is malformed or invalid: {0}")]
-    InvalidManifest(String),
+    InvalidManifest(#[from] crate::manifest_refs::ManifestParseError),
 
     #[error("manifest signature is unverified: {0}")]
-    Unverified(String),
+    Unverified(#[from] UnverifiedReason),
 
     #[error("unsupported manifest media type: {0}")]
     UnsupportedMediaType(String),
@@ -248,8 +256,17 @@ pub enum ManifestLifecycleError {
     #[error("reference index error: {0}")]
     RefIndex(#[from] crate::blob_ref_index::RefIndexError),
 
-    #[error("internal lifecycle error: {0}")]
-    Internal(String),
+    #[error("repository coordination lease held by concurrent writer")]
+    CoordinationLeaseHeld,
+
+    #[error("repository lease lost: {0}")]
+    LeaseLost(String),
+
+    #[error("lifecycle journal corrupt: {0}")]
+    CorruptJournal(#[source] serde_json::Error),
+
+    #[error("lifecycle journal serialization failed: {0}")]
+    JournalSerialization(#[source] serde_json::Error),
 }
 
 pub fn is_supported_manifest_media_type(media_type: &str) -> bool {
@@ -284,9 +301,7 @@ pub struct RepoCoordinationGuard {
 impl RepoCoordinationGuard {
     pub async fn check_lease(&mut self) -> Result<(), ManifestLifecycleError> {
         if let Ok(err) = self.failure_rx.try_recv() {
-            return Err(ManifestLifecycleError::Internal(format!(
-                "repository lease lost: {err}"
-            )));
+            return Err(ManifestLifecycleError::LeaseLost(err));
         }
         Ok(())
     }
@@ -355,7 +370,16 @@ impl ManifestLifecycleService {
         self.publish_manifest(req).await
     }
 
-    async fn acquire_coordination(
+    /// Tests whether an unexpired active lifecycle journal exists for this repo.
+    pub async fn is_lifecycle_active(&self, repo: &str) -> bool {
+        let Some(journal) = self.read_journal(repo).await.ok().flatten() else {
+            return false;
+        };
+        journal.lease_expiry_unix_secs > now_unix_secs()
+    }
+
+    /// Acquires bounded mutual exclusion for a repository lifecycle mutation.
+    pub async fn acquire_coordination(
         &self,
         repo: &str,
     ) -> Result<RepoCoordinationGuard, ManifestLifecycleError> {
@@ -383,9 +407,7 @@ impl ManifestLifecycleService {
         }
 
         if !acquired {
-            return Err(ManifestLifecycleError::Internal(
-                "repository coordination lease held by concurrent writer".to_string(),
-            ));
+            return Err(ManifestLifecycleError::CoordinationLeaseHeld);
         }
 
         let (failure_tx, failure_rx) = tokio::sync::mpsc::channel(1);
@@ -443,8 +465,8 @@ impl ManifestLifecycleService {
             Some(b) => b,
             None => return Ok(None),
         };
-        let record: LifecycleJournalRecord = serde_json::from_slice(&bytes)
-            .map_err(|e| ManifestLifecycleError::Internal(format!("corrupt journal: {e}")))?;
+        let record: LifecycleJournalRecord =
+            serde_json::from_slice(&bytes).map_err(ManifestLifecycleError::CorruptJournal)?;
         Ok(Some(record))
     }
 
@@ -453,9 +475,9 @@ impl ManifestLifecycleService {
         repo: &str,
         record: &LifecycleJournalRecord,
     ) -> Result<(), ManifestLifecycleError> {
-        let bytes = Bytes::from(serde_json::to_vec(record).map_err(|e| {
-            ManifestLifecycleError::Internal(format!("serialize journal failed: {e}"))
-        })?);
+        let bytes = Bytes::from(
+            serde_json::to_vec(record).map_err(ManifestLifecycleError::JournalSerialization)?,
+        );
         self.storage
             .write_lifecycle_journal(repo, bytes)
             .await
@@ -857,7 +879,7 @@ impl ManifestLifecycleService {
         }
 
         let manifest_json: serde_json::Value = serde_json::from_slice(&payload)
-            .map_err(|e| ManifestLifecycleError::InvalidManifest(e.to_string()))?;
+            .map_err(crate::manifest_refs::ManifestParseError::InvalidJson)?;
 
         // Schema version 1 / legacy signatures rejection
         if let Some(schema_version) = manifest_json.get("schemaVersion").and_then(|v| v.as_i64()) {
@@ -866,18 +888,18 @@ impl ManifestLifecycleService {
                     || manifest_json.get("signature").is_some()
                 {
                     return Err(ManifestLifecycleError::Unverified(
-                        "manifest failed signature verification".to_string(),
+                        UnverifiedReason::SignatureVerificationFailed,
                     ));
                 }
                 return Err(ManifestLifecycleError::InvalidManifest(
-                    "schemaVersion 1 unsupported".to_string(),
+                    crate::manifest_refs::ManifestParseError::SchemaV1Unsupported,
                 ));
             }
         }
 
         if manifest_json.get("signatures").is_some() || manifest_json.get("signature").is_some() {
             return Err(ManifestLifecycleError::Unverified(
-                "manifest failed signature verification".to_string(),
+                UnverifiedReason::SignatureVerificationFailed,
             ));
         }
 
@@ -891,11 +913,11 @@ impl ManifestLifecycleService {
         if media_type.starts_with("application/vnd.docker.distribution.manifest.v1") {
             if media_type.contains("prettyjws") || manifest_json.get("signatures").is_some() {
                 return Err(ManifestLifecycleError::Unverified(
-                    "manifest signatures unverified".to_string(),
+                    UnverifiedReason::SignaturesUnverified,
                 ));
             }
             return Err(ManifestLifecycleError::InvalidManifest(
-                "docker schema v1 manifest unsupported".to_string(),
+                crate::manifest_refs::ManifestParseError::DockerV1Unsupported,
             ));
         }
 
@@ -904,12 +926,10 @@ impl ManifestLifecycleService {
         }
 
         // Parse and validate descriptor references
-        let refs = parse_manifest_refs(&payload)
-            .map_err(|e| ManifestLifecycleError::InvalidManifest(e.to_string()))?;
+        let refs = parse_manifest_refs(&payload)?;
 
         // Pre-parse referrer info
-        let referrer_info = crate::manifest_refs::parse_referrer_info(&payload)
-            .map_err(|e| ManifestLifecycleError::InvalidManifest(e.to_string()))?;
+        let referrer_info = crate::manifest_refs::parse_referrer_info(&payload)?;
         let subject_digest = referrer_info.as_ref().map(|(s, _, _)| s.clone());
 
         // Compute manifest digest over raw bytes
