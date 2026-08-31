@@ -163,3 +163,99 @@ impl From<ManifestLifecycleError> for ManifestMutationError {
         }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlobReadError {
+    #[error("repository name '{name}' is invalid: {source}")]
+    InvalidRepoName {
+        name: String,
+        #[source]
+        source: RepoNameError,
+    },
+    #[error("invalid digest: {0}")]
+    InvalidDigest(String),
+    #[error("blob not found")]
+    NotFound,
+    #[error("upstream error: {0}")]
+    Upstream(String),
+    #[error("proxy error: {0}")]
+    Proxy(#[source] crate::proxy::ProxyError),
+    #[error("mutation error: {0}")]
+    Mutation(#[source] BlobMutationError),
+    #[error("storage error: {0}")]
+    Storage(#[source] StorageError),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestReadError {
+    #[error("repository name '{name}' is invalid: {source}")]
+    InvalidRepoName {
+        name: String,
+        #[source]
+        source: RepoNameError,
+    },
+    #[error("invalid tag '{0}'")]
+    InvalidTag(String),
+    #[error("invalid digest: {0}")]
+    InvalidDigest(String),
+    #[error("manifest not found")]
+    NotFound,
+    #[error("tag not found")]
+    TagNotFound,
+    #[error("manifest payload too large")]
+    TooLarge,
+    #[error("manifest digest mismatch: expected {expected}, computed {computed}")]
+    DigestMismatch { expected: String, computed: String },
+    #[error("upstream error: {0}")]
+    Upstream(String),
+    #[error("proxy error: {0}")]
+    Proxy(#[source] crate::proxy::ProxyError),
+    #[error("mutation error: {0}")]
+    Mutation(#[source] ManifestMutationError),
+    #[error("storage error: {0}")]
+    Storage(#[source] StorageError),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogQueryError {
+    #[error("storage error: {0}")]
+    Storage(#[source] StorageError),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TagQueryError {
+    #[error("repository name '{name}' is invalid: {source}")]
+    InvalidRepoName {
+        name: String,
+        #[source]
+        source: RepoNameError,
+    },
+    #[error("repository not found")]
+    NotFound,
+    #[error("storage error: {0}")]
+    Storage(#[source] StorageError),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReferrersQueryError {
+    #[error("repository name '{name}' is invalid: {source}")]
+    InvalidRepoName {
+        name: String,
+        #[source]
+        source: RepoNameError,
+    },
+    #[error("invalid subject digest: {0}")]
+    InvalidDigest(String),
+    #[error("storage error: {0}")]
+    Storage(#[source] StorageError),
+    #[error("internal error: {0}")]
+    Internal(String),
+}

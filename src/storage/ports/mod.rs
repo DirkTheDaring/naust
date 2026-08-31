@@ -275,6 +275,42 @@ impl<T: ?Sized> BlobUploadCoordinatorStoragePort for T where
 {
 }
 
+/// Minimum cohesive storage capability required by `ProxyTarget`.
+pub trait ProxyStoragePort:
+    BlobUploadCoordinatorStoragePort + BlobIndexStoragePort + ReferrersReader + Send + Sync
+{
+    fn as_blob_upload_coordinator_storage_port(&self) -> &dyn BlobUploadCoordinatorStoragePort;
+    fn as_catalog_reader(&self) -> &dyn RepositoryCatalogReader;
+    fn as_tag_reader(&self) -> &dyn TagReader;
+    fn as_referrers_reader(&self) -> &dyn ReferrersReader;
+    fn as_manifest_reader(&self) -> &dyn ManifestReader;
+    fn as_blob_reader(&self) -> &dyn BlobCasReader;
+}
+
+impl<T> ProxyStoragePort for T
+where
+    T: BlobUploadCoordinatorStoragePort + BlobIndexStoragePort + ReferrersReader + Send + Sync,
+{
+    fn as_blob_upload_coordinator_storage_port(&self) -> &dyn BlobUploadCoordinatorStoragePort {
+        self
+    }
+    fn as_catalog_reader(&self) -> &dyn RepositoryCatalogReader {
+        self
+    }
+    fn as_tag_reader(&self) -> &dyn TagReader {
+        self
+    }
+    fn as_referrers_reader(&self) -> &dyn ReferrersReader {
+        self
+    }
+    fn as_manifest_reader(&self) -> &dyn ManifestReader {
+        self
+    }
+    fn as_blob_reader(&self) -> &dyn BlobCasReader {
+        self
+    }
+}
+
 /// Minimum cohesive storage capability required by `ManifestLifecycleService`.
 pub trait ManifestLifecycleStoragePort:
     ManifestStore
@@ -982,6 +1018,7 @@ pub struct StorageWiring {
     tag_reader: Arc<dyn TagReader>,
     catalog_reader: Arc<dyn RepositoryCatalogReader>,
     referrers_reader: Arc<dyn ReferrersReader>,
+    proxy_storage: Arc<dyn ProxyStoragePort>,
     gc_port: Arc<dyn GcStoragePort>,
     gc_service_port: Arc<dyn GcServiceStoragePort>,
     cluster_lock: Arc<dyn ClusterLockStore>,
@@ -1011,6 +1048,7 @@ impl StorageWiring {
             tag_reader: backend.clone(),
             catalog_reader: backend.clone(),
             referrers_reader: backend.clone(),
+            proxy_storage: backend.clone(),
             gc_port: backend.clone(),
             gc_service_port: backend.clone(),
             cluster_lock: backend.clone(),
@@ -1053,6 +1091,10 @@ impl StorageWiring {
 
     pub fn referrers_reader(&self) -> Arc<dyn ReferrersReader> {
         Arc::clone(&self.referrers_reader)
+    }
+
+    pub fn proxy_storage(&self) -> Arc<dyn ProxyStoragePort> {
+        Arc::clone(&self.proxy_storage)
     }
 
     pub fn gc_port(&self) -> Arc<dyn GcStoragePort> {

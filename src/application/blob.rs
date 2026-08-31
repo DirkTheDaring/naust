@@ -64,10 +64,6 @@ impl BlobMutationService {
         }
     }
 
-    pub fn coordinator(&self) -> &Arc<BlobUploadCoordinator> {
-        &self.coordinator
-    }
-
     pub fn membership_ledger(&self) -> &Arc<RepositoryMembershipLedger> {
         &self.membership_ledger
     }
@@ -217,7 +213,7 @@ impl BlobMutationService {
             .map_err(BlobMutationError::from)
     }
 
-    pub async fn publish_proxy_blob(
+    pub async fn publish_verified_proxy_blob(
         &self,
         repo: &CanonicalRepoName,
         digest: &Digest,
@@ -227,6 +223,15 @@ impl BlobMutationService {
             .publish_proxy_blob(repo, digest, stream)
             .await
             .map_err(BlobMutationError::from)
+    }
+
+    pub async fn publish_proxy_blob(
+        &self,
+        repo: &CanonicalRepoName,
+        digest: &Digest,
+        stream: UploadByteStream,
+    ) -> Result<(), BlobMutationError> {
+        self.publish_verified_proxy_blob(repo, digest, stream).await
     }
 
     pub async fn link_proxy_blob_membership(

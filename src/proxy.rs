@@ -574,16 +574,20 @@ impl Proxy {
         &self,
         decision: &RepoDecision,
         digest: &Digest,
-        coordinator: &crate::upload_coordinator::BlobUploadCoordinator,
+        cache_storage: &(
+             impl crate::storage::ports::BlobCasReader
+             + crate::storage::repo_membership::RepositoryBlobMembershipStorage
+             + ?Sized
+         ),
+        mutation_service: &crate::application::BlobMutationService,
     ) -> Result<(), ProxyError> {
         // Singleflight per digest to avoid thundering herd.
         let key = format!("blob:{}", digest.as_str());
         let (sf_key, sf_arc, sf_guard) = self.singleflight.lock_key(&key).await;
 
         let result = async {
-            if coordinator.storage().head_blob(digest).await.is_ok()
-                && coordinator
-                    .storage()
+            if cache_storage.head_blob(digest).await.is_ok()
+                && cache_storage
                     .get_repo_blob_membership(decision.local_repo.as_str(), digest)
                     .await
                     .ok()
@@ -632,8 +636,8 @@ impl Proxy {
 
             let pinned_stream: crate::storage::upload_session::UploadByteStream = Box::pin(stream);
 
-            coordinator
-                .publish_proxy_blob(&decision.local_repo, digest, pinned_stream)
+            mutation_service
+                .publish_verified_proxy_blob(&decision.local_repo, digest, pinned_stream)
                 .await
                 .map_err(|e| ProxyError::Internal(e.to_string()))?;
 
@@ -655,7 +659,7 @@ impl Proxy {
         max_bytes: usize,
         revalidate_only: bool,
         if_none_match: Option<String>,
-        lifecycle: &crate::manifest_lifecycle::ManifestLifecycleService,
+        manifest_service: &crate::application::ManifestMutationService,
     ) -> Result<FetchManifestResult, ProxyError> {
         // Singleflight per repo+reference.
         let key = format!("manifest:{}:{}", decision.local_repo.as_str(), reference);
@@ -782,13 +786,32 @@ impl Proxy {
                 computed.clone(),
             );
 
-            let published = lifecycle
-                .publish_proxy_cached_manifest(evidence)
+            let published = manifest_service
+                .publish_verified_proxy_manifest(evidence)
                 .await
-                .map_err(|e| ProxyError::Internal(format!("lifecycle publication failed: {e}")))?;
+                .map_err(|e| {
+                    ProxyError::Internal(format!("manifest service publication failed: {e}"))
+                })?;
 
             self.index_manifest(decision.local_repo.as_str(), &published.digest, &bytes);
             self.note_manifest_access(decision.local_repo.as_str(), &published.digest);
+            if Digest::parse(reference).is_err() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let expires_at_unix = match decision.tag_policy {
+                    crate::config::TagPolicy::TtlSeconds(ttl) => now.saturating_add(ttl),
+                    crate::config::TagPolicy::DigestOnly => 0,
+                    crate::config::TagPolicy::AlwaysRevalidate => 0,
+                };
+                let tag_meta = TagMeta {
+                    digest: published.digest.to_string(),
+                    expires_at_unix,
+                    etag: etag.clone(),
+                };
+                self.put_tag_meta(decision.local_repo.as_str(), reference, &tag_meta);
+            }
 
             Ok(FetchManifestResult::Fetched {
                 digest: published.digest,

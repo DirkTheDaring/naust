@@ -612,15 +612,47 @@ root = "{}"
             cfg.trusted_bypass_cidrs.clone(),
         ));
         let wiring = crate::storage::StorageWiring::from_backend(storage);
+        let blob_service = std::sync::Arc::new(crate::application::BlobMutationService::new(
+            wiring.blob_mutation(),
+            None,
+            crate::consistency::ConsistencyCoordinator::new(),
+            crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
+        ));
+        let manifest_service =
+            std::sync::Arc::new(crate::application::ManifestMutationService::new(
+                wiring.manifest_lifecycle(),
+                None,
+                crate::consistency::ConsistencyCoordinator::new(),
+            ));
+        let blob_read_service = std::sync::Arc::new(crate::application::BlobReadService::new(
+            wiring.blob_reader(),
+            wiring.membership_reader(),
+            blob_service.clone(),
+        ));
+        let manifest_read_service =
+            std::sync::Arc::new(crate::application::ManifestReadService::new(
+                wiring.manifest_reader(),
+                wiring.tag_reader(),
+                manifest_service.clone(),
+                cfg.max_request_body_bytes,
+                Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
+            ));
+        let catalog_query_service =
+            std::sync::Arc::new(crate::application::CatalogQueryService::new(
+                wiring.catalog_reader(),
+                wiring.tag_reader(),
+                wiring.manifest_reader(),
+                wiring.blob_reader(),
+            ));
+        let tag_query_service = std::sync::Arc::new(crate::application::TagQueryService::new(
+            wiring.tag_reader(),
+        ));
+        let referrers_query_service = std::sync::Arc::new(
+            crate::application::ReferrersQueryService::new(wiring.referrers_reader()),
+        );
         let state = crate::AppState {
             config: cfg,
             auth_metrics: std::sync::Arc::new(crate::AuthMetrics::default()),
-            blob_reader: wiring.blob_reader(),
-            membership_reader: wiring.membership_reader(),
-            manifest_reader: wiring.manifest_reader(),
-            tag_reader: wiring.tag_reader(),
-            catalog_reader: wiring.catalog_reader(),
-            referrers_reader: wiring.referrers_reader(),
             ref_index: None,
             gc_service: None,
             proxy: None,
@@ -637,19 +669,13 @@ root = "{}"
             gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            blob_service: std::sync::Arc::new(crate::application::BlobMutationService::new(
-                wiring.blob_mutation(),
-                None,
-                crate::consistency::ConsistencyCoordinator::new(),
-                crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
-            )),
-            manifest_service: std::sync::Arc::new(
-                crate::application::ManifestMutationService::new(
-                    wiring.manifest_lifecycle(),
-                    None,
-                    crate::consistency::ConsistencyCoordinator::new(),
-                ),
-            ),
+            blob_service,
+            manifest_service,
+            blob_read_service,
+            manifest_read_service,
+            catalog_query_service,
+            tag_query_service,
+            referrers_query_service,
         };
 
         let app = axum::Router::new()
@@ -782,15 +808,47 @@ root = "{}"
             cfg.trusted_bypass_cidrs.clone(),
         ));
         let wiring = crate::storage::StorageWiring::from_backend(storage);
+        let blob_service = std::sync::Arc::new(crate::application::BlobMutationService::new(
+            wiring.blob_mutation(),
+            None,
+            crate::consistency::ConsistencyCoordinator::new(),
+            crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
+        ));
+        let manifest_service =
+            std::sync::Arc::new(crate::application::ManifestMutationService::new(
+                wiring.manifest_lifecycle(),
+                None,
+                crate::consistency::ConsistencyCoordinator::new(),
+            ));
+        let blob_read_service = std::sync::Arc::new(crate::application::BlobReadService::new(
+            wiring.blob_reader(),
+            wiring.membership_reader(),
+            blob_service.clone(),
+        ));
+        let manifest_read_service =
+            std::sync::Arc::new(crate::application::ManifestReadService::new(
+                wiring.manifest_reader(),
+                wiring.tag_reader(),
+                manifest_service.clone(),
+                cfg.max_request_body_bytes,
+                Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
+            ));
+        let catalog_query_service =
+            std::sync::Arc::new(crate::application::CatalogQueryService::new(
+                wiring.catalog_reader(),
+                wiring.tag_reader(),
+                wiring.manifest_reader(),
+                wiring.blob_reader(),
+            ));
+        let tag_query_service = std::sync::Arc::new(crate::application::TagQueryService::new(
+            wiring.tag_reader(),
+        ));
+        let referrers_query_service = std::sync::Arc::new(
+            crate::application::ReferrersQueryService::new(wiring.referrers_reader()),
+        );
         let state = crate::AppState {
             config: cfg.clone(),
             auth_metrics: std::sync::Arc::new(crate::AuthMetrics::default()),
-            blob_reader: wiring.blob_reader(),
-            membership_reader: wiring.membership_reader(),
-            manifest_reader: wiring.manifest_reader(),
-            tag_reader: wiring.tag_reader(),
-            catalog_reader: wiring.catalog_reader(),
-            referrers_reader: wiring.referrers_reader(),
             ref_index: None,
             gc_service: None,
             proxy: None,
@@ -807,19 +865,13 @@ root = "{}"
             gc_run_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            blob_service: std::sync::Arc::new(crate::application::BlobMutationService::new(
-                wiring.blob_mutation(),
-                None,
-                crate::consistency::ConsistencyCoordinator::new(),
-                crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
-            )),
-            manifest_service: std::sync::Arc::new(
-                crate::application::ManifestMutationService::new(
-                    wiring.manifest_lifecycle(),
-                    None,
-                    crate::consistency::ConsistencyCoordinator::new(),
-                ),
-            ),
+            blob_service,
+            manifest_service,
+            blob_read_service,
+            manifest_read_service,
+            catalog_query_service,
+            tag_query_service,
+            referrers_query_service,
         };
 
         let app = axum::Router::new()

@@ -32,86 +32,74 @@ pub async fn tags_list(
         }
     }
 
-    let tag_reader: std::sync::Arc<dyn crate::storage::TagReader> = match route_mode {
-        V2RouteMode::Default => state.tag_reader.clone(),
+    let n = query.get("n").and_then(|s| s.parse::<usize>().ok());
+    let last = query.get("last").cloned();
+    let params = crate::application::TagQueryParams { n, last };
+
+    let proxy_target = match route_mode {
+        V2RouteMode::Default => None,
         V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
-            Some(ctx) => ctx.cache.clone(),
+            Some(ctx) => Some(ctx),
             None => return errors::internal_error().into_response(),
         },
     };
 
     match method {
-        Method::GET | Method::HEAD => match tag_reader.list_tags(name).await {
-            Ok(mut all_tags) => {
-                all_tags.sort();
-                // Pagination per OCI/Docker distribution spec:
-                // - `n` limits the number of tags
-                // - `last` starts listing after the provided tag
-                let total = all_tags.len();
-                let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-                let n = n_opt.unwrap_or(usize::MAX);
+        Method::GET | Method::HEAD => {
+            match state
+                .tag_query_service
+                .query_tags(name, params, proxy_target)
+                .await
+            {
+                Ok(page) => {
+                    let payload = serde_json::json!({
+                        "name": page.repo,
+                        "tags": page.tags,
+                    });
+                    let bytes = match serde_json::to_vec(&payload) {
+                        Ok(b) => b,
+                        Err(_) => return errors::internal_error().into_response(),
+                    };
 
-                let start_idx = match query.get("last") {
-                    Some(last) => all_tags
-                        .iter()
-                        .position(|t| t > last)
-                        .unwrap_or(all_tags.len()),
-                    None => 0,
-                };
+                    let mut headers = registry_headers();
+                    headers.insert("Content-Type", "application/json".parse().unwrap());
+                    headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
-                let end_idx = start_idx.saturating_add(n).min(total);
-                let tags: Vec<String> = all_tags
-                    .into_iter()
-                    .skip(start_idx)
-                    .take(end_idx.saturating_sub(start_idx))
-                    .collect();
-
-                let has_more =
-                    n_opt.is_some() && !tags.is_empty() && tags.len() == n && end_idx < total;
-
-                let payload = serde_json::json!({
-                    "name": name,
-                    "tags": tags,
-                });
-                let bytes = match serde_json::to_vec(&payload) {
-                    Ok(b) => b,
-                    Err(_) => return errors::internal_error().into_response(),
-                };
-
-                let mut headers = registry_headers();
-                headers.insert("Content-Type", "application/json".parse().unwrap());
-                headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-
-                if has_more {
-                    if let (Some(n_val), Some(last_tag)) = (n_opt, tags.last()) {
-                        let last_tag = url_encode_component(last_tag);
-                        let link = format!(
-                            "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
-                        );
-                        if let Ok(v) = http::HeaderValue::from_str(&link) {
-                            headers.insert(http::header::LINK, v);
+                    if page.has_more {
+                        if let (Some(n_val), Some(last_tag)) = (n, page.next_last.as_deref()) {
+                            let last_tag = url_encode_component(last_tag);
+                            let link = format!(
+                                "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
+                            );
+                            if let Ok(v) = http::HeaderValue::from_str(&link) {
+                                headers.insert(http::header::LINK, v);
+                            }
                         }
                     }
-                }
 
-                if method == Method::HEAD {
-                    return (StatusCode::OK, headers).into_response();
+                    if method == Method::HEAD {
+                        return (StatusCode::OK, headers).into_response();
+                    }
+                    (StatusCode::OK, headers, Body::from(bytes)).into_response()
                 }
-                (StatusCode::OK, headers, Body::from(bytes)).into_response()
+                Err(crate::application::TagQueryError::InvalidRepoName { .. }) => {
+                    errors::name_invalid().into_response()
+                }
+                Err(crate::application::TagQueryError::NotFound) => {
+                    errors::name_unknown().into_response()
+                }
+                Err(crate::application::TagQueryError::Storage(StorageError::NotFound)) => {
+                    errors::name_unknown().into_response()
+                }
+                Err(crate::application::TagQueryError::Storage(StorageError::Unsupported)) => {
+                    errors::not_implemented().into_response()
+                }
+                Err(crate::application::TagQueryError::Storage(
+                    StorageError::InsufficientStorage,
+                )) => errors::insufficient_storage().into_response(),
+                Err(_) => errors::internal_error().into_response(),
             }
-            Err(StorageError::NotFound) => errors::name_unknown().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::InvalidRepoName(_)) => errors::name_invalid().into_response(),
-            Err(StorageError::ExclusiveWriterLocked(_)) => errors::internal_error().into_response(),
-            Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
-            Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
+        }
         _ => errors::method_not_allowed("GET, HEAD"),
     }
 }

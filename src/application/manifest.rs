@@ -33,10 +33,6 @@ impl ManifestMutationService {
         Self { lifecycle }
     }
 
-    pub fn lifecycle(&self) -> &Arc<ManifestLifecycleService> {
-        &self.lifecycle
-    }
-
     pub async fn publish_manifest(
         &self,
         req: PublishManifestRequest,
@@ -89,6 +85,13 @@ impl ManifestMutationService {
             .delete_tag(canonical_repo.as_str(), tag)
             .await
             .map_err(ManifestMutationError::from)
+    }
+
+    pub async fn publish_verified_proxy_manifest(
+        &self,
+        evidence: ProxyPublicationEvidence,
+    ) -> Result<PublishedManifest, ManifestMutationError> {
+        self.publish_manifest_from_proxy(evidence).await
     }
 
     pub async fn publish_manifest_from_proxy(

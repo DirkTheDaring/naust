@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity, clippy::collapsible_if)]
+
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use registry_rust::config::*;
@@ -30,6 +32,21 @@ pub struct StorageHooks {
     pub after_mutate_tag: Option<AsyncHook<(String, String, Digest)>>,
     pub before_delete_blob_conditional: Option<AsyncHook<Digest>>,
     pub after_delete_blob_conditional: Option<AsyncHook<Digest>>,
+    pub fail_link_repo_blob:
+        Option<Arc<dyn Fn(&RepoBlobMembershipRecord) -> Option<StorageError> + Send + Sync>>,
+    pub fail_commit_finalize:
+        Option<Arc<dyn Fn(&PreparedFinalize) -> Option<UploadTransitionError> + Send + Sync>>,
+    pub custom_commit_finalize: Option<
+        Arc<
+            dyn Fn(
+                    Arc<dyn Storage>,
+                    &PreparedFinalize,
+                )
+                    -> BoxFuture<'static, Result<FinalizeOutcome, UploadTransitionError>>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 #[derive(Clone)]
@@ -58,9 +75,16 @@ impl RepositoryBlobMembershipStorage for HookedStorage {
         if let Some(hook) = &self.hooks.before_link_repo_blob {
             hook(record.clone()).await;
         }
+        if let Some(fail_fn) = &self.hooks.fail_link_repo_blob {
+            if let Some(err) = fail_fn(record) {
+                return Err(err);
+            }
+        }
         let res = self.inner.link_repo_blob(record).await;
-        if let Some(hook) = &self.hooks.after_link_repo_blob {
-            hook(record.clone()).await;
+        if res.is_ok() {
+            if let Some(hook) = &self.hooks.after_link_repo_blob {
+                hook(record.clone()).await;
+            }
         }
         res
     }
@@ -171,6 +195,14 @@ impl UploadSessionStorage for HookedStorage {
         &self,
         prepared: &PreparedFinalize,
     ) -> Result<FinalizeOutcome, UploadTransitionError> {
+        if let Some(custom) = &self.hooks.custom_commit_finalize {
+            return custom(self.inner.clone(), prepared).await;
+        }
+        if let Some(fail_fn) = &self.hooks.fail_commit_finalize {
+            if let Some(err) = fail_fn(prepared) {
+                return Err(err);
+            }
+        }
         if let Some(hook) = &self.hooks.before_commit_blob {
             hook(prepared.expected_digest.clone()).await;
         }
@@ -497,6 +529,7 @@ impl Storage for HookedStorage {
 registry_rust::impl_storage_ports!(HookedStorage);
 registry_rust::impl_gc_storage_port!(HookedStorage);
 
+#[allow(dead_code)]
 pub fn tmp_dir(prefix: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&p).expect("create temp dir");
@@ -616,6 +649,7 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
     }
 }
 
+#[allow(dead_code)]
 pub async fn write_live_blob(fs_root: &std::path::Path, digest: &Digest, bytes: &[u8]) {
     let dir = fs_root.join("blobs").join("sha256").join(digest.prefix2());
     tokio::fs::create_dir_all(&dir).await.expect("mkdir");

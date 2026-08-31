@@ -4,13 +4,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use crate::application::{BlobMutationService, ManifestMutationService};
+use crate::application::{
+    BlobMutationService, BlobReadService, CatalogQueryService, ManifestMutationService,
+    ManifestReadService, ProxyTarget, ReferrersQueryService, TagQueryService,
+};
 use crate::blob_ref_index;
 use crate::config::Config;
 use crate::gc_service;
 use crate::ip_concurrency;
 use crate::proxy;
-use crate::storage;
 
 #[derive(Debug, Default)]
 pub struct AuthMetrics {
@@ -35,23 +37,19 @@ impl AuthMetrics {
     }
 }
 
+pub type ProxyContext = ProxyTarget;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub auth_metrics: Arc<AuthMetrics>,
-    pub blob_reader: Arc<dyn storage::BlobCasReader>,
-    pub membership_reader: Arc<dyn storage::RepositoryBlobMembershipStorage>,
-    pub manifest_reader: Arc<dyn storage::ManifestReader>,
-    pub tag_reader: Arc<dyn storage::TagReader>,
-    pub catalog_reader: Arc<dyn storage::RepositoryCatalogReader>,
-    pub referrers_reader: Arc<dyn storage::ReferrersReader>,
     pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
     pub gc_service: Option<Arc<gc_service::GcService>>,
     pub gc_run_seq: Arc<AtomicU64>,
     pub proxy: Option<Arc<proxy::Proxy>>,
-    pub proxy_cache: Option<Arc<dyn storage::BlobUploadCoordinatorStoragePort>>,
+    pub proxy_cache: Option<Arc<dyn crate::storage::ports::ProxyStoragePort>>,
     // Multi-upstream: proxy/cache selected per request host.
-    pub proxy_upstreams: Vec<ProxyContext>,
+    pub proxy_upstreams: Vec<ProxyTarget>,
     pub buffered_body_sem: Arc<Semaphore>,
     pub request_sem: Arc<Semaphore>,
     pub upload_request_sem: Arc<Semaphore>,
@@ -68,16 +66,15 @@ pub struct AppState {
     // Focused Application Services:
     pub blob_service: Arc<BlobMutationService>,
     pub manifest_service: Arc<ManifestMutationService>,
-}
-
-#[derive(Clone)]
-pub struct ProxyContext {
-    pub proxy: Arc<proxy::Proxy>,
-    pub cache: Arc<dyn storage::BlobUploadCoordinatorStoragePort>,
+    pub blob_read_service: Arc<BlobReadService>,
+    pub manifest_read_service: Arc<ManifestReadService>,
+    pub catalog_query_service: Arc<CatalogQueryService>,
+    pub tag_query_service: Arc<TagQueryService>,
+    pub referrers_query_service: Arc<ReferrersQueryService>,
 }
 
 impl AppState {
-    pub fn proxy_context_for_request(&self, headers: &HeaderMap) -> Option<ProxyContext> {
+    pub fn proxy_context_for_request(&self, headers: &HeaderMap) -> Option<ProxyTarget> {
         // Multi-upstream mode: choose the upstream by request host.
         if !self.config.proxy.upstreams.is_empty() {
             let idx = crate::request_routing::proxy_upstream_index_for_request(
@@ -89,9 +86,9 @@ impl AppState {
 
         // Single-upstream mode.
         match (self.proxy.as_ref(), self.proxy_cache.as_ref()) {
-            (Some(proxy), Some(cache)) => Some(ProxyContext {
+            (Some(proxy), Some(cache)) => Some(ProxyTarget {
                 proxy: proxy.clone(),
-                cache: cache.clone(),
+                cache_storage: cache.clone(),
             }),
             _ => None,
         }
@@ -128,6 +125,180 @@ impl AppState {
                 Duration::from_secs(self.config.upload_chunk_idle_timeout_secs),
                 self.config.min_upload_bytes_per_sec,
             )
+        }
+    }
+
+    pub fn new_test(
+        cfg: Arc<Config>,
+        storage: Arc<crate::storage::fs::FsStorage>,
+        gc_service: Option<Arc<crate::gc_service::GcService>>,
+    ) -> Self {
+        let ip_limiter = Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
+            cfg.max_connections_per_ip,
+            cfg.trusted_bypass_cidrs.clone(),
+        ));
+        let signing_key = cfg
+            .token_signing_keys
+            .first()
+            .map(|k| k.key.as_bytes().to_vec())
+            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
+        let consistency = crate::consistency::ConsistencyCoordinator::new();
+        let wiring = crate::storage::ports::StorageWiring::from_backend(storage);
+        let blob_service = Arc::new(crate::application::BlobMutationService::new(
+            wiring.blob_mutation(),
+            None,
+            consistency.clone(),
+            crate::application::BlobUploadCoordinatorConfig {
+                signing_key,
+                max_upload_bytes: cfg.max_upload_bytes,
+                abort_on_digest_mismatch: cfg.upload_policy.abort_on_digest_mismatch,
+                disallow_monolithic_uploads: cfg.disallow_monolithic_uploads,
+                upload_chunk_min_bytes: cfg.upload_chunk_min_bytes.map(|v| v as u64),
+                gc_pin_duration_secs: cfg.gc_pin_duration_secs,
+            },
+        ));
+        let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
+            wiring.manifest_lifecycle(),
+            None,
+            consistency,
+        ));
+        let blob_read_service = Arc::new(crate::application::BlobReadService::new(
+            wiring.blob_reader(),
+            wiring.membership_reader(),
+            blob_service.clone(),
+        ));
+        let manifest_read_service = Arc::new(crate::application::ManifestReadService::new(
+            wiring.manifest_reader(),
+            wiring.tag_reader(),
+            manifest_service.clone(),
+            cfg.max_request_body_bytes,
+            Some(Arc::new(tokio::sync::Semaphore::new(1))),
+        ));
+        let catalog_query_service = Arc::new(crate::application::CatalogQueryService::new(
+            wiring.catalog_reader(),
+            wiring.tag_reader(),
+            wiring.manifest_reader(),
+            wiring.blob_reader(),
+        ));
+        let tag_query_service = Arc::new(crate::application::TagQueryService::new(
+            wiring.tag_reader(),
+        ));
+        let referrers_query_service = Arc::new(crate::application::ReferrersQueryService::new(
+            wiring.referrers_reader(),
+        ));
+
+        Self {
+            config: cfg,
+            auth_metrics: Arc::new(AuthMetrics::default()),
+            ref_index: None,
+            gc_service,
+            gc_run_seq: Arc::new(AtomicU64::new(0)),
+            proxy: None,
+            proxy_cache: None,
+            proxy_upstreams: Vec::new(),
+            buffered_body_sem: Arc::new(Semaphore::new(1)),
+            request_sem: Arc::new(Semaphore::new(1)),
+            upload_request_sem: Arc::new(Semaphore::new(1)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
+            ip_limiter,
+            is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blob_service,
+            manifest_service,
+            blob_read_service,
+            manifest_read_service,
+            catalog_query_service,
+            tag_query_service,
+            referrers_query_service,
+        }
+    }
+
+    pub fn new_test_with_proxy(
+        cfg: Arc<Config>,
+        storage: Arc<crate::storage::fs::FsStorage>,
+        ref_index: Option<Arc<crate::blob_ref_index::BlobRefIndex>>,
+        proxy: Option<Arc<crate::proxy::Proxy>>,
+        proxy_cache: Option<Arc<dyn crate::storage::ports::ProxyStoragePort>>,
+    ) -> Self {
+        let ip_limiter = Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
+            cfg.max_connections_per_ip,
+            cfg.trusted_bypass_cidrs.clone(),
+        ));
+        let signing_key = cfg
+            .token_signing_keys
+            .first()
+            .map(|k| k.key.as_bytes().to_vec())
+            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
+        let consistency = crate::consistency::ConsistencyCoordinator::new();
+        let wiring = crate::storage::ports::StorageWiring::from_backend(storage);
+        let blob_service = Arc::new(crate::application::BlobMutationService::new(
+            wiring.blob_mutation(),
+            ref_index.clone(),
+            consistency.clone(),
+            crate::application::BlobUploadCoordinatorConfig {
+                signing_key,
+                max_upload_bytes: cfg.max_upload_bytes,
+                abort_on_digest_mismatch: cfg.upload_policy.abort_on_digest_mismatch,
+                disallow_monolithic_uploads: cfg.disallow_monolithic_uploads,
+                upload_chunk_min_bytes: cfg.upload_chunk_min_bytes.map(|v| v as u64),
+                gc_pin_duration_secs: cfg.gc_pin_duration_secs,
+            },
+        ));
+        let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
+            wiring.manifest_lifecycle(),
+            ref_index.clone(),
+            consistency,
+        ));
+        let blob_read_service = Arc::new(crate::application::BlobReadService::new(
+            wiring.blob_reader(),
+            wiring.membership_reader(),
+            blob_service.clone(),
+        ));
+        let manifest_read_service = Arc::new(crate::application::ManifestReadService::new(
+            wiring.manifest_reader(),
+            wiring.tag_reader(),
+            manifest_service.clone(),
+            cfg.max_request_body_bytes,
+            Some(Arc::new(tokio::sync::Semaphore::new(10))),
+        ));
+        let catalog_query_service = Arc::new(crate::application::CatalogQueryService::new(
+            wiring.catalog_reader(),
+            wiring.tag_reader(),
+            wiring.manifest_reader(),
+            wiring.blob_reader(),
+        ));
+        let tag_query_service = Arc::new(crate::application::TagQueryService::new(
+            wiring.tag_reader(),
+        ));
+        let referrers_query_service = Arc::new(crate::application::ReferrersQueryService::new(
+            wiring.referrers_reader(),
+        ));
+
+        Self {
+            config: cfg,
+            auth_metrics: Arc::new(AuthMetrics::default()),
+            ref_index,
+            gc_service: None,
+            gc_run_seq: Arc::new(AtomicU64::new(0)),
+            proxy,
+            proxy_cache,
+            proxy_upstreams: Vec::new(),
+            buffered_body_sem: Arc::new(Semaphore::new(10)),
+            request_sem: Arc::new(Semaphore::new(50)),
+            upload_request_sem: Arc::new(Semaphore::new(20)),
+            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
+            active_upload_requests: Arc::new(AtomicU64::new(0)),
+            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
+            ip_limiter,
+            is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blob_service,
+            manifest_service,
+            blob_read_service,
+            manifest_read_service,
+            catalog_query_service,
+            tag_query_service,
+            referrers_query_service,
         }
     }
 }

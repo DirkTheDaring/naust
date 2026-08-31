@@ -1,3 +1,4 @@
+use crate::registry::validation::is_valid_tag;
 use crate::{AppState, ProxyContext, registry::digest::Digest, storage::StorageError};
 use axum::{
     body::Body,
@@ -10,13 +11,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::io::AsyncReadExt;
-use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 
 use super::errors;
@@ -115,111 +112,6 @@ pub(crate) fn query_bool(map: &HashMap<String, String>, key: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn platform_triplet(os: &str, arch: &str, variant: Option<&str>) -> String {
-    let os = os.trim();
-    let arch = arch.trim();
-    let variant = variant.map(|v| v.trim()).filter(|v| !v.is_empty());
-    match variant {
-        Some(v) => format!("{os}/{arch}/{v}"),
-        None => format!("{os}/{arch}"),
-    }
-}
-
-async fn read_storage_blob_limited_json(
-    blob_reader: &Arc<dyn crate::storage::BlobCasReader>,
-    digest: &Digest,
-    max_bytes: usize,
-) -> Result<serde_json::Value, ()> {
-    let (meta, mut reader) = blob_reader.open_blob(digest).await.map_err(|_| ())?;
-    // Defensive: config blobs are expected to be small. Refuse to read very large blobs.
-    if meta.size as usize > max_bytes {
-        return Err(());
-    }
-
-    let mut buf = Vec::with_capacity(meta.size as usize);
-    let mut chunk = [0u8; 8192];
-    while buf.len() <= max_bytes {
-        let n = reader.read(&mut chunk).await.map_err(|_| ())?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > max_bytes {
-            return Err(());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-
-    serde_json::from_slice(&buf).map_err(|_| ())
-}
-
-pub(crate) async fn tag_platforms_for_repo(
-    blob_reader: &Arc<dyn crate::storage::BlobCasReader>,
-    tag_reader: &Arc<dyn crate::storage::TagReader>,
-    manifest_reader: &Arc<dyn crate::storage::ManifestReader>,
-    repo: &str,
-    tag: &str,
-) -> Result<serde_json::Value, StorageError> {
-    let digest = tag_reader.resolve_tag(repo, tag).await?;
-    let (meta, bytes) = manifest_reader.get_manifest(repo, &digest).await?;
-
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-
-    let mut platforms: HashSet<String> = HashSet::new();
-    let kind: &str;
-
-    // Index/list: manifests[].platform.{os,architecture,variant}
-    if let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) {
-        kind = "index";
-        for m in manifests {
-            let p = m.get("platform");
-            let Some(os) = p.and_then(|p| p.get("os")).and_then(|x| x.as_str()) else {
-                continue;
-            };
-            let Some(arch) = p
-                .and_then(|p| p.get("architecture"))
-                .and_then(|x| x.as_str())
-            else {
-                continue;
-            };
-            let variant = p.and_then(|p| p.get("variant")).and_then(|x| x.as_str());
-            platforms.insert(platform_triplet(os, arch, variant));
-        }
-    } else {
-        // Single manifest: try to infer platform from config blob.
-        kind = "manifest";
-        if let Some(cfg_digest) = v
-            .get("config")
-            .and_then(|c| c.get("digest"))
-            .and_then(|d| d.as_str())
-        {
-            if let Ok(cfg_d) = Digest::parse(cfg_digest) {
-                if let Ok(cfg) =
-                    read_storage_blob_limited_json(blob_reader, &cfg_d, 1024 * 1024).await
-                {
-                    if let (Some(os), Some(arch)) = (
-                        cfg.get("os").and_then(|x| x.as_str()),
-                        cfg.get("architecture").and_then(|x| x.as_str()),
-                    ) {
-                        let variant = cfg.get("variant").and_then(|x| x.as_str());
-                        platforms.insert(platform_triplet(os, arch, variant));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut platforms: Vec<String> = platforms.into_iter().collect();
-    platforms.sort();
-
-    Ok(serde_json::json!({
-        "tag": tag,
-        "digest": digest.as_str(),
-        "media_type": meta.media_type,
-        "kind": kind,
-        "platforms": platforms,
-    }))
 }
 
 pub async fn v2_dispatch(
@@ -323,6 +215,7 @@ pub async fn v2_dispatch(
             }
             manifest_by_reference(
                 state,
+                &headers,
                 method,
                 repo.as_str(),
                 &reference,
@@ -338,6 +231,7 @@ pub async fn v2_dispatch(
             }
             blob_by_digest(
                 state,
+                &headers,
                 method,
                 repo.as_str(),
                 &digest,
@@ -350,270 +244,184 @@ pub async fn v2_dispatch(
     }
 }
 
-async fn blob_by_digest(
+pub async fn blob_by_digest(
     state: AppState,
+    headers: &HeaderMap,
     method: Method,
     name: &str,
     digest_str: &str,
     route_mode: V2RouteMode,
     proxy_ctx: Option<ProxyContext>,
 ) -> Response {
-    if crate::registry::canonical_name::CanonicalRepoName::parse(name).is_err() {
-        return errors::name_invalid().into_response();
-    }
-
     let digest = match Digest::parse(digest_str) {
         Ok(d) => d,
         Err(_) => return errors::digest_invalid().into_response(),
     };
 
-    if route_mode == V2RouteMode::ProxyOnly {
-        return blob_by_digest_proxy_only(state, method, name, digest, proxy_ctx).await;
-    }
-
-    // Check repository-scoped blob membership
-    let membership_opt = match state
-        .membership_reader
-        .get_repo_blob_membership(name, &digest)
-        .await
-    {
-        Ok(m) => m,
-        Err(StorageError::InvalidRepoName(_)) => return errors::name_invalid().into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to read blob membership");
-            return errors::internal_error().into_response();
-        }
-    };
+    let proxy_only = route_mode == V2RouteMode::ProxyOnly;
 
     match method {
-        Method::DELETE => match state.blob_service.delete_repo_blob(name, &digest).await {
-            Ok(crate::blob_delete_safety::BlobDeleteResult::Success) => {
-                (StatusCode::ACCEPTED, registry_headers()).into_response()
+        Method::DELETE => {
+            if proxy_only {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response();
             }
-            Ok(crate::blob_delete_safety::BlobDeleteResult::NotFound) => {
-                errors::blob_unknown().into_response()
+            match state.blob_service.delete_repo_blob(name, &digest).await {
+                Ok(crate::blob_delete_safety::BlobDeleteResult::Success) => {
+                    (StatusCode::ACCEPTED, registry_headers()).into_response()
+                }
+                Ok(crate::blob_delete_safety::BlobDeleteResult::NotFound) => {
+                    errors::blob_unknown().into_response()
+                }
+                Ok(crate::blob_delete_safety::BlobDeleteResult::InUse { message }) => {
+                    errors::blob_in_use(&message).into_response()
+                }
+                Err(crate::application::BlobMutationError::InvalidRepoName { .. }) => {
+                    errors::name_invalid().into_response()
+                }
+                Err(_) => errors::internal_error().into_response(),
             }
-            Ok(crate::blob_delete_safety::BlobDeleteResult::InUse { message }) => {
-                errors::blob_in_use(&message).into_response()
-            }
-            Err(_) => errors::internal_error().into_response(),
-        },
+        }
         Method::HEAD => {
-            if membership_opt.is_some() {
-                match state.blob_reader.head_blob(&digest).await {
-                    Ok(meta) => {
-                        let mut headers = registry_headers();
-                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                        return (StatusCode::OK, headers).into_response();
-                    }
-                    Err(StorageError::NotFound) => return errors::blob_unknown().into_response(),
-                    Err(_) => return errors::internal_error().into_response(),
-                }
-            }
-
-            // Proxy fallback if configured
-            if let Some(ctx) = proxy_ctx.as_ref() {
-                if let Ok(meta) = ctx.cache.head_blob(&digest).await {
-                    ctx.proxy.note_blob_access(&digest);
-                    if let Err(e) = state
-                        .blob_service
-                        .link_proxy_blob_membership(name, &digest)
-                        .await
-                    {
-                        tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
-                        return errors::internal_error().into_response();
-                    }
+            match state
+                .blob_read_service
+                .head_blob(name, &digest, proxy_ctx.as_ref(), proxy_only)
+                .await
+            {
+                Ok(meta) => {
                     let mut headers = registry_headers();
-                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+                    headers.insert(
+                        "Docker-Content-Digest",
+                        meta.digest.as_str().parse().unwrap(),
+                    );
+                    headers.insert("Content-Type", meta.media_type.parse().unwrap());
                     headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                    return (StatusCode::OK, headers).into_response();
+                    (StatusCode::OK, headers).into_response()
                 }
-
-                if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                    if let Ok(size) = ctx.proxy.head_blob_upstream(&decision, &digest).await {
-                        let mut headers = registry_headers();
-                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                        headers.insert("Content-Length", size.to_string().parse().unwrap());
-                        return (StatusCode::OK, headers).into_response();
-                    }
+                Err(crate::application::BlobReadError::NotFound) => {
+                    errors::blob_unknown().into_response()
                 }
+                Err(crate::application::BlobReadError::InvalidRepoName { .. }) => {
+                    errors::name_invalid().into_response()
+                }
+                Err(crate::application::BlobReadError::InvalidDigest(_)) => {
+                    errors::digest_invalid().into_response()
+                }
+                Err(_) => errors::internal_error().into_response(),
             }
-
-            errors::blob_unknown().into_response()
         }
         Method::GET => {
-            if membership_opt.is_some() {
-                match state.blob_reader.open_blob(&digest).await {
-                    Ok((meta, reader)) => {
-                        let stream = ReaderStream::new(reader);
-                        let body = Body::from_stream(stream);
-                        let mut headers = registry_headers();
-                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                        return (StatusCode::OK, headers, body).into_response();
-                    }
-                    Err(StorageError::NotFound) => return errors::blob_unknown().into_response(),
-                    Err(_) => return errors::internal_error().into_response(),
-                }
-            }
-
-            // Proxy fallback if configured
-            if let Some(ctx) = proxy_ctx.as_ref() {
-                if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
-                    ctx.proxy.note_blob_access(&digest);
-                    if let Err(e) = state
-                        .blob_service
-                        .link_proxy_blob_membership(name, &digest)
-                        .await
+            match state
+                .blob_read_service
+                .get_blob(name, &digest, proxy_ctx.as_ref(), proxy_only)
+                .await
+            {
+                Ok(out) => {
+                    if let Some(range_header) = headers
+                        .get(axum::http::header::RANGE)
+                        .and_then(|v| v.to_str().ok())
                     {
-                        tracing::error!(error = %e, repo = name, digest = digest.as_str(), "failed to link proxy blob membership");
-                        return errors::internal_error().into_response();
-                    }
-                    let stream = ReaderStream::new(reader);
-                    let body = Body::from_stream(stream);
-                    let mut headers = registry_headers();
-                    headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                    return (StatusCode::OK, headers, body).into_response();
-                }
-
-                if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                    if ctx
-                        .proxy
-                        .fetch_blob_into_storage(
-                            &decision,
-                            &digest,
-                            state.blob_service.coordinator(),
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
-                            ctx.proxy.note_blob_access(&digest);
-                            let stream = ReaderStream::new(reader);
-                            let body = Body::from_stream(stream);
-                            let mut headers = registry_headers();
-                            headers
-                                .insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                            headers.insert(
-                                "Content-Type",
-                                "application/octet-stream".parse().unwrap(),
-                            );
-                            headers
-                                .insert("Content-Length", meta.size.to_string().parse().unwrap());
-                            return (StatusCode::OK, headers, body).into_response();
+                        if let Some(spec) = range_header.strip_prefix("bytes=") {
+                            let parts: Vec<&str> = spec.split('-').collect();
+                            if parts.len() == 2 {
+                                let start = parts[0].parse::<u64>();
+                                let end = parts[1].parse::<u64>();
+                                match (start, end) {
+                                    (Ok(s), Ok(e)) if s <= e && e < out.size => {
+                                        let mut collected =
+                                            Vec::with_capacity((e - s + 1) as usize);
+                                        let mut stream = out.stream;
+                                        let mut curr = 0u64;
+                                        while let Some(chunk) = stream.next().await {
+                                            if let Ok(c) = chunk {
+                                                let c_len = c.len() as u64;
+                                                let c_start = curr;
+                                                let c_end = curr + c_len;
+                                                if c_end > s && c_start <= e {
+                                                    let slice_s = if s > c_start {
+                                                        (s - c_start) as usize
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let slice_e = if e + 1 < c_end {
+                                                        (e + 1 - c_start) as usize
+                                                    } else {
+                                                        c.len()
+                                                    };
+                                                    collected
+                                                        .extend_from_slice(&c[slice_s..slice_e]);
+                                                }
+                                                curr += c_len;
+                                                if curr > e {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        let mut resp_headers = registry_headers();
+                                        resp_headers.insert(
+                                            "Content-Range",
+                                            format!("bytes {s}-{e}/{}", out.size).parse().unwrap(),
+                                        );
+                                        resp_headers.insert(
+                                            "Content-Length",
+                                            collected.len().to_string().parse().unwrap(),
+                                        );
+                                        resp_headers.insert(
+                                            "Content-Type",
+                                            out.media_type.parse().unwrap(),
+                                        );
+                                        resp_headers.insert(
+                                            "Docker-Content-Digest",
+                                            out.digest.as_str().parse().unwrap(),
+                                        );
+                                        return (
+                                            StatusCode::PARTIAL_CONTENT,
+                                            resp_headers,
+                                            Body::from(collected),
+                                        )
+                                            .into_response();
+                                    }
+                                    _ => {
+                                        let mut resp_headers = registry_headers();
+                                        resp_headers.insert(
+                                            "Content-Range",
+                                            format!("bytes */{}", out.size).parse().unwrap(),
+                                        );
+                                        return (StatusCode::RANGE_NOT_SATISFIABLE, resp_headers)
+                                            .into_response();
+                                    }
+                                }
+                            }
                         }
                     }
+                    let body = Body::from_stream(out.stream);
+                    let mut headers = registry_headers();
+                    headers.insert(
+                        "Docker-Content-Digest",
+                        out.digest.as_str().parse().unwrap(),
+                    );
+                    headers.insert("Content-Type", out.media_type.parse().unwrap());
+                    headers.insert("Content-Length", out.size.to_string().parse().unwrap());
+                    (StatusCode::OK, headers, body).into_response()
                 }
+                Err(crate::application::BlobReadError::NotFound) => {
+                    errors::blob_unknown().into_response()
+                }
+                Err(crate::application::BlobReadError::InvalidRepoName { .. }) => {
+                    errors::name_invalid().into_response()
+                }
+                Err(crate::application::BlobReadError::InvalidDigest(_)) => {
+                    errors::digest_invalid().into_response()
+                }
+                Err(_) => errors::internal_error().into_response(),
             }
-
-            errors::blob_unknown().into_response()
         }
         _ => errors::method_not_allowed("GET, HEAD, DELETE").into_response(),
     }
 }
 
-async fn blob_by_digest_proxy_only(
+pub async fn manifest_by_reference(
     state: AppState,
-    method: Method,
-    name: &str,
-    digest: Digest,
-    proxy_ctx: Option<ProxyContext>,
-) -> Response {
-    let Some(ctx) = proxy_ctx.as_ref() else {
-        return errors::internal_error().into_response();
-    };
-
-    match method {
-        Method::GET => {
-            if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
-                ctx.proxy.note_blob_access(&digest);
-                let stream = ReaderStream::new(reader);
-                let body = Body::from_stream(stream);
-
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                return (StatusCode::OK, headers, body).into_response();
-            }
-
-            if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                match ctx
-                    .proxy
-                    .fetch_blob_into_storage(&decision, &digest, state.blob_service.coordinator())
-                    .await
-                {
-                    Ok(()) => {
-                        if let Ok((meta, reader)) = ctx.cache.open_blob(&digest).await {
-                            ctx.proxy.note_blob_access(&digest);
-                            let stream = ReaderStream::new(reader);
-                            let body = Body::from_stream(stream);
-
-                            let mut headers = registry_headers();
-                            headers
-                                .insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                            headers.insert(
-                                "Content-Type",
-                                "application/octet-stream".parse().unwrap(),
-                            );
-                            headers
-                                .insert("Content-Length", meta.size.to_string().parse().unwrap());
-                            return (StatusCode::OK, headers, body).into_response();
-                        }
-                    }
-                    Err(crate::proxy::ProxyError::NotFound) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: fetch blob failed");
-                        return errors::internal_error().into_response();
-                    }
-                }
-            }
-
-            errors::blob_unknown().into_response()
-        }
-        Method::HEAD => {
-            if let Ok(meta) = ctx.cache.head_blob(&digest).await {
-                ctx.proxy.note_blob_access(&digest);
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                return (StatusCode::OK, headers).into_response();
-            }
-
-            if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                match ctx.proxy.head_blob_upstream(&decision, &digest).await {
-                    Ok(size) => {
-                        let mut headers = registry_headers();
-                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                        headers.insert("Content-Length", size.to_string().parse().unwrap());
-                        return (StatusCode::OK, headers).into_response();
-                    }
-                    Err(crate::proxy::ProxyError::NotFound) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, repo = name, digest = digest.as_str(), "proxy: head blob failed");
-                        return errors::internal_error().into_response();
-                    }
-                }
-            }
-
-            errors::blob_unknown().into_response()
-        }
-        // Proxy-only host: never mutate local storage.
-        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-    }
-}
-
-async fn manifest_by_reference(
-    state: AppState,
+    headers: &HeaderMap,
     method: Method,
     name: &str,
     reference: &str,
@@ -625,145 +433,23 @@ async fn manifest_by_reference(
         return errors::name_invalid().into_response();
     }
 
-    // Reference can be a digest or a tag.
-    let is_digest_ref = Digest::parse(reference).is_ok();
-
-    if route_mode == V2RouteMode::ProxyOnly {
-        return manifest_by_reference_proxy_only(
-            state,
-            method,
-            name,
-            reference,
-            is_digest_ref,
-            proxy_ctx,
-            request_host,
-        )
-        .await;
+    let is_digest = Digest::parse(reference).is_ok();
+    if !is_digest && !is_valid_tag(reference) {
+        return errors::tag_invalid().into_response();
     }
 
-    // Resolve tag references to a digest (with optional proxying).
-    let digest = if let Ok(d) = Digest::parse(reference) {
-        d
-    } else {
-        match state.tag_reader.resolve_tag(name, reference).await {
-            Ok(d) => d,
-            Err(StorageError::NotFound) => {
-                // Check cache storage for an existing cached tag.
-                let Some(ctx) = proxy_ctx.as_ref() else {
-                    // Tag not known locally and no cache store.
-                    return errors::manifest_unknown().into_response();
-                };
-
-                if let Ok(d) = ctx.cache.resolve_tag(name, reference).await {
-                    d
-                } else {
-                    // Tag not known locally. If proxying is enabled and repo is allowed, resolve from upstream.
-                    let Ok(decision) = ctx.proxy.decision_for_repo(name) else {
-                        return errors::manifest_unknown().into_response();
-                    };
-
-                    match decision.tag_policy.clone() {
-                        crate::config::TagPolicy::DigestOnly => {
-                            let _permit =
-                                match state.buffered_body_sem.clone().acquire_owned().await {
-                                    Ok(p) => p,
-                                    Err(_) => return errors::internal_error().into_response(),
-                                };
-                            match ctx
-                                .proxy
-                                .fetch_manifest_and_cache(
-                                    &decision,
-                                    reference,
-                                    &ctx.cache,
-                                    state.config.max_request_body_bytes,
-                                    false,
-                                    None,
-                                    state.manifest_service.lifecycle(),
-                                )
-                                .await
-                            {
-                                Ok(crate::proxy::FetchManifestResult::Fetched {
-                                    digest, ..
-                                }) => digest,
-                                Ok(_) => return errors::internal_error().into_response(),
-                                Err(crate::proxy::ProxyError::NotFound) => {
-                                    return errors::manifest_unknown().into_response();
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        request_host = request_host.unwrap_or("<missing>"),
-                                        proxy_upstream = ctx.proxy.upstream_base_url_for_log().unwrap_or("<unset>"),
-                                        repo = name,
-                                        tag = reference,
-                                        "proxy: resolve tag failed"
-                                    );
-                                    return errors::internal_error().into_response();
-                                }
-                            }
-                        }
-                        crate::config::TagPolicy::TtlSeconds(ttl) => {
-                            if let Err(resp) = ensure_tag_fresh(
-                                &state, &ctx.proxy, &decision, &ctx.cache, reference, ttl, false,
-                            )
-                            .await
-                            {
-                                return resp;
-                            }
-                            match ctx.cache.resolve_tag(name, reference).await {
-                                Ok(d) => d,
-                                Err(StorageError::NotFound) => {
-                                    return errors::manifest_unknown().into_response();
-                                }
-                                Err(_) => return errors::internal_error().into_response(),
-                            }
-                        }
-                        crate::config::TagPolicy::AlwaysRevalidate => {
-                            if let Err(resp) = ensure_tag_fresh(
-                                &state, &ctx.proxy, &decision, &ctx.cache, reference, 0, true,
-                            )
-                            .await
-                            {
-                                return resp;
-                            }
-                            match ctx.cache.resolve_tag(name, reference).await {
-                                Ok(d) => d,
-                                Err(StorageError::NotFound) => {
-                                    return errors::manifest_unknown().into_response();
-                                }
-                                Err(_) => return errors::internal_error().into_response(),
-                            }
-                        }
-                    }
-                }
-            }
-            Err(StorageError::DigestMismatch) => return errors::internal_error().into_response(),
-            Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
-            Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                return errors::insufficient_storage().into_response();
-            }
-            Err(StorageError::InvalidRepoName(_)) => return errors::name_invalid().into_response(),
-            Err(StorageError::ExclusiveWriterLocked(_))
-            | Err(StorageError::TagAlreadyExists)
-            | Err(StorageError::Internal(_))
-            | Err(StorageError::MigrationRequired(_)) => {
-                return errors::internal_error().into_response();
-            }
-        }
-    };
-
-    // Record tag access for eviction/observability (best-effort).
-    if Digest::parse(reference).is_err() {
-        if let Some(ctx) = proxy_ctx.as_ref() {
-            ctx.proxy.note_tag_access(name, reference);
-        }
-    }
+    let proxy_only = route_mode == V2RouteMode::ProxyOnly;
 
     match method {
         Method::DELETE => {
-            let is_digest = Digest::parse(reference).is_ok();
+            if proxy_only {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response();
+            }
             if is_digest {
+                let digest = match Digest::parse(reference) {
+                    Ok(d) => d,
+                    Err(_) => return errors::digest_invalid().into_response(),
+                };
                 match state.manifest_service.delete_manifest(name, &digest).await {
                     Ok(_) => (StatusCode::ACCEPTED, registry_headers()).into_response(),
                     Err(crate::application::ManifestMutationError::ManifestNotFound) => {
@@ -803,444 +489,105 @@ async fn manifest_by_reference(
                 }
             }
         }
-        Method::HEAD => match state.manifest_reader.get_manifest(name, &digest).await {
-            Ok((meta, bytes)) => {
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
-                    headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
-                }
-                (StatusCode::OK, headers).into_response()
-            }
-            Err(StorageError::NotFound) => {
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
-                        ctx.proxy.note_manifest_access(name, &digest);
-                        if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                            for blob in refs.blob_references() {
-                                ctx.proxy.note_blob_access(blob);
-                            }
-                        }
-                        let mut headers = registry_headers();
-                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                        headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                        if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
-                            headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
-                        }
-                        return (StatusCode::OK, headers).into_response();
-                    }
-                }
-
-                // For manifests, on miss we fetch+cache on HEAD too (small), to avoid extra upstream roundtrips.
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return errors::internal_error().into_response(),
-                        };
-                        let digest_ref;
-                        let upstream_ref: &str = if is_digest_ref {
-                            digest_ref = digest.as_str();
-                            digest_ref.as_str()
-                        } else {
-                            reference
-                        };
-                        match ctx
-                            .proxy
-                            .fetch_manifest_and_cache(
-                                &decision,
-                                upstream_ref,
-                                &ctx.cache,
-                                state.config.max_request_body_bytes,
-                                false,
-                                None,
-                                state.manifest_service.lifecycle(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                if let Ok((meta, bytes)) =
-                                    ctx.cache.get_manifest(name, &digest).await
-                                {
-                                    let mut headers = registry_headers();
-                                    headers.insert(
-                                        "Docker-Content-Digest",
-                                        digest.as_str().parse().unwrap(),
-                                    );
-                                    headers
-                                        .insert("Content-Type", meta.media_type.parse().unwrap());
-                                    headers.insert(
-                                        "Content-Length",
-                                        meta.size.to_string().parse().unwrap(),
-                                    );
-                                    if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
-                                        headers.insert(
-                                            "OCI-Subject",
-                                            subject.as_str().parse().unwrap(),
-                                        );
-                                    }
-                                    return (StatusCode::OK, headers).into_response();
-                                }
-                            }
-                            Err(crate::proxy::ProxyError::NotFound) => {}
-                            Err(err) => {
-                                tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
-                                return errors::internal_error().into_response();
-                            }
-                        }
-                    }
-                }
-                errors::manifest_unknown().into_response()
-            }
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::InvalidRepoName(_)) => errors::name_invalid().into_response(),
-            Err(StorageError::ExclusiveWriterLocked(_)) => errors::internal_error().into_response(),
-            Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
-            Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
-        Method::GET => match state.manifest_reader.get_manifest(name, &digest).await {
-            Ok((meta, bytes)) => {
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                if let Ok(Some(subject)) = extract_subject_digest(&bytes) {
-                    headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
-                }
-                (StatusCode::OK, headers, Body::from(bytes)).into_response()
-            }
-            Err(StorageError::NotFound) => {
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
-                        ctx.proxy.note_manifest_access(name, &digest);
-                        if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                            for blob in refs.blob_references() {
-                                ctx.proxy.note_blob_access(blob);
-                            }
-                        }
-                        let mut headers = registry_headers();
-                        headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                        headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                        headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                        return (StatusCode::OK, headers, Body::from(bytes)).into_response();
-                    }
-                }
-
-                if let Some(ctx) = proxy_ctx.as_ref() {
-                    if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return errors::internal_error().into_response(),
-                        };
-                        let digest_ref;
-                        let upstream_ref: &str = if is_digest_ref {
-                            digest_ref = digest.as_str();
-                            digest_ref.as_str()
-                        } else {
-                            reference
-                        };
-                        match ctx
-                            .proxy
-                            .fetch_manifest_and_cache(
-                                &decision,
-                                upstream_ref,
-                                &ctx.cache,
-                                state.config.max_request_body_bytes,
-                                false,
-                                None,
-                                state.manifest_service.lifecycle(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                if let Ok((meta, bytes)) =
-                                    ctx.cache.get_manifest(name, &digest).await
-                                {
-                                    let mut headers = registry_headers();
-                                    headers.insert(
-                                        "Docker-Content-Digest",
-                                        digest.as_str().parse().unwrap(),
-                                    );
-                                    headers
-                                        .insert("Content-Type", meta.media_type.parse().unwrap());
-                                    headers.insert(
-                                        "Content-Length",
-                                        meta.size.to_string().parse().unwrap(),
-                                    );
-                                    return (StatusCode::OK, headers, Body::from(bytes))
-                                        .into_response();
-                                }
-                            }
-                            Err(crate::proxy::ProxyError::NotFound) => {}
-                            Err(err) => {
-                                tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
-                                return errors::internal_error().into_response();
-                            }
-                        }
-                    }
-                }
-                errors::manifest_unknown().into_response()
-            }
-            Err(StorageError::DigestMismatch) => errors::internal_error().into_response(),
-            Err(StorageError::TooLarge) => errors::internal_error().into_response(),
-            Err(StorageError::Unsupported) => errors::not_implemented().into_response(),
-            Err(StorageError::InsufficientStorage) => {
-                errors::insufficient_storage().into_response()
-            }
-            Err(StorageError::InvalidRepoName(_)) => errors::name_invalid().into_response(),
-            Err(StorageError::ExclusiveWriterLocked(_)) => errors::internal_error().into_response(),
-            Err(StorageError::TagAlreadyExists) => errors::internal_error().into_response(),
-            Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
-            Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
-        },
-        _ => errors::method_not_allowed("GET, HEAD, DELETE"),
-    }
-}
-
-async fn manifest_by_reference_proxy_only(
-    state: AppState,
-    method: Method,
-    name: &str,
-    reference: &str,
-    is_digest_ref: bool,
-    proxy_ctx: Option<ProxyContext>,
-    request_host: Option<&str>,
-) -> Response {
-    match method {
-        Method::GET | Method::HEAD => {}
-        _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
-    }
-
-    let Some(ctx) = proxy_ctx.as_ref() else {
-        return errors::internal_error().into_response();
-    };
-
-    // Resolve tag references to a digest using cache/upstream only.
-    let digest = if let Ok(d) = Digest::parse(reference) {
-        d
-    } else {
-        match ctx.cache.resolve_tag(name, reference).await {
-            Ok(d) => d,
-            Err(StorageError::NotFound) => {
-                let Ok(decision) = ctx.proxy.decision_for_repo(name) else {
-                    return errors::manifest_unknown().into_response();
-                };
-
-                match decision.tag_policy.clone() {
-                    crate::config::TagPolicy::DigestOnly => {
-                        let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return errors::internal_error().into_response(),
-                        };
-                        match ctx
-                            .proxy
-                            .fetch_manifest_and_cache(
-                                &decision,
-                                reference,
-                                &ctx.cache,
-                                state.config.max_request_body_bytes,
-                                false,
-                                None,
-                                state.manifest_service.lifecycle(),
-                            )
-                            .await
-                        {
-                            Ok(crate::proxy::FetchManifestResult::Fetched { digest, .. }) => digest,
-                            Ok(_) => return errors::internal_error().into_response(),
-                            Err(crate::proxy::ProxyError::NotFound) => {
-                                return errors::manifest_unknown().into_response();
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    request_host = request_host.unwrap_or("<missing>"),
-                                    proxy_upstream = ctx.proxy.upstream_base_url_for_log().unwrap_or("<unset>"),
-                                    repo = name,
-                                    tag = reference,
-                                    "proxy: resolve tag failed"
-                                );
-                                return errors::internal_error().into_response();
-                            }
-                        }
-                    }
-                    crate::config::TagPolicy::TtlSeconds(ttl) => {
-                        if let Err(resp) = ensure_tag_fresh(
-                            &state, &ctx.proxy, &decision, &ctx.cache, reference, ttl, false,
-                        )
-                        .await
-                        {
-                            return resp;
-                        }
-                        match ctx.cache.resolve_tag(name, reference).await {
-                            Ok(d) => d,
-                            Err(StorageError::NotFound) => {
-                                return errors::manifest_unknown().into_response();
-                            }
-                            Err(_) => return errors::internal_error().into_response(),
-                        }
-                    }
-                    crate::config::TagPolicy::AlwaysRevalidate => {
-                        if let Err(resp) = ensure_tag_fresh(
-                            &state, &ctx.proxy, &decision, &ctx.cache, reference, 0, true,
-                        )
-                        .await
-                        {
-                            return resp;
-                        }
-                        match ctx.cache.resolve_tag(name, reference).await {
-                            Ok(d) => d,
-                            Err(StorageError::NotFound) => {
-                                return errors::manifest_unknown().into_response();
-                            }
-                            Err(_) => return errors::internal_error().into_response(),
-                        }
-                    }
-                }
-            }
-            Err(_) => return errors::internal_error().into_response(),
-        }
-    };
-
-    // Record tag access for eviction/observability (best-effort).
-    if Digest::parse(reference).is_err() {
-        ctx.proxy.note_tag_access(name, reference);
-    }
-
-    match method {
         Method::HEAD => {
-            if let Ok(meta) = ctx.cache.head_manifest(name, &digest).await {
-                ctx.proxy.note_manifest_access(name, &digest);
-                if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                    for blob in refs.blob_references() {
-                        ctx.proxy.note_blob_access(blob);
+            match state
+                .manifest_read_service
+                .head_manifest(
+                    name,
+                    reference,
+                    proxy_ctx.as_ref(),
+                    proxy_only,
+                    request_host,
+                )
+                .await
+            {
+                Ok(meta) => {
+                    let mut headers = registry_headers();
+                    headers.insert(
+                        "Docker-Content-Digest",
+                        meta.digest.as_str().parse().unwrap(),
+                    );
+                    headers.insert("Content-Type", meta.media_type.parse().unwrap());
+                    headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
+                    if let Some(subject) = meta.subject {
+                        headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
                     }
+                    (StatusCode::OK, headers).into_response()
                 }
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                return (StatusCode::OK, headers).into_response();
-            }
-
-            if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return errors::internal_error().into_response(),
-                };
-                let digest_ref;
-                let upstream_ref: &str = if is_digest_ref {
-                    digest_ref = digest.as_str();
-                    digest_ref.as_str()
-                } else {
-                    reference
-                };
-
-                match ctx
-                    .proxy
-                    .fetch_manifest_and_cache(
-                        &decision,
-                        upstream_ref,
-                        &ctx.cache,
-                        state.config.max_request_body_bytes,
-                        false,
-                        None,
-                        state.manifest_service.lifecycle(),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        if let Ok(meta) = ctx.cache.head_manifest(name, &digest).await {
-                            let mut headers = registry_headers();
-                            headers
-                                .insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                            headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                            headers
-                                .insert("Content-Length", meta.size.to_string().parse().unwrap());
-                            return (StatusCode::OK, headers).into_response();
-                        }
-                    }
-                    Err(crate::proxy::ProxyError::NotFound) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
-                        return errors::internal_error().into_response();
-                    }
+                Err(
+                    crate::application::ManifestReadError::NotFound
+                    | crate::application::ManifestReadError::TagNotFound,
+                ) => errors::manifest_unknown().into_response(),
+                Err(crate::application::ManifestReadError::InvalidRepoName { .. }) => {
+                    errors::name_invalid().into_response()
                 }
+                Err(crate::application::ManifestReadError::InvalidTag(_)) => {
+                    errors::tag_invalid().into_response()
+                }
+                Err(crate::application::ManifestReadError::Storage(StorageError::Unsupported)) => {
+                    errors::not_implemented().into_response()
+                }
+                Err(crate::application::ManifestReadError::Storage(
+                    StorageError::InsufficientStorage,
+                )) => errors::insufficient_storage().into_response(),
+                Err(_) => errors::internal_error().into_response(),
             }
-
-            errors::manifest_unknown().into_response()
         }
         Method::GET => {
-            if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
-                ctx.proxy.note_manifest_access(name, &digest);
-                if let Some(refs) = ctx.proxy.get_manifest_refs(name, &digest) {
-                    for blob in refs.blob_references() {
-                        ctx.proxy.note_blob_access(blob);
+            match state
+                .manifest_read_service
+                .get_manifest(
+                    name,
+                    reference,
+                    proxy_ctx.as_ref(),
+                    proxy_only,
+                    request_host,
+                )
+                .await
+            {
+                Ok(out) => {
+                    let mut resp_headers = registry_headers();
+                    resp_headers.insert(
+                        "Docker-Content-Digest",
+                        out.digest.as_str().parse().unwrap(),
+                    );
+                    resp_headers.insert("ETag", format!("\"{}\"", out.digest).parse().unwrap());
+                    resp_headers.insert("Content-Type", out.media_type.parse().unwrap());
+                    resp_headers.insert("Content-Length", out.size.to_string().parse().unwrap());
+                    if let Some(subject) = out.subject {
+                        resp_headers.insert("OCI-Subject", subject.as_str().parse().unwrap());
                     }
-                }
-                let mut headers = registry_headers();
-                headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                headers.insert("Content-Length", meta.size.to_string().parse().unwrap());
-                return (StatusCode::OK, headers, Body::from(bytes)).into_response();
-            }
-
-            if let Ok(decision) = ctx.proxy.decision_for_repo(name) {
-                let _permit = match state.buffered_body_sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return errors::internal_error().into_response(),
-                };
-                let digest_ref;
-                let upstream_ref: &str = if is_digest_ref {
-                    digest_ref = digest.as_str();
-                    digest_ref.as_str()
-                } else {
-                    reference
-                };
-
-                match ctx
-                    .proxy
-                    .fetch_manifest_and_cache(
-                        &decision,
-                        upstream_ref,
-                        &ctx.cache,
-                        state.config.max_request_body_bytes,
-                        false,
-                        None,
-                        state.manifest_service.lifecycle(),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        if let Ok((meta, bytes)) = ctx.cache.get_manifest(name, &digest).await {
-                            let mut headers = registry_headers();
-                            headers
-                                .insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
-                            headers.insert("Content-Type", meta.media_type.parse().unwrap());
-                            headers
-                                .insert("Content-Length", meta.size.to_string().parse().unwrap());
-                            return (StatusCode::OK, headers, Body::from(bytes)).into_response();
+                    if let Some(inm) = headers
+                        .get(axum::http::header::IF_NONE_MATCH)
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        let trimmed = inm.trim().trim_matches('"');
+                        if trimmed == out.digest.as_str() || inm.trim() == "*" {
+                            return (StatusCode::NOT_MODIFIED, resp_headers).into_response();
                         }
                     }
-                    Err(crate::proxy::ProxyError::NotFound) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, repo = name, reference, "proxy: fetch manifest failed");
-                        return errors::internal_error().into_response();
-                    }
+                    (StatusCode::OK, resp_headers, Body::from(out.payload)).into_response()
                 }
+                Err(
+                    crate::application::ManifestReadError::NotFound
+                    | crate::application::ManifestReadError::TagNotFound,
+                ) => errors::manifest_unknown().into_response(),
+                Err(crate::application::ManifestReadError::InvalidRepoName { .. }) => {
+                    errors::name_invalid().into_response()
+                }
+                Err(crate::application::ManifestReadError::InvalidTag(_)) => {
+                    errors::tag_invalid().into_response()
+                }
+                Err(crate::application::ManifestReadError::Storage(StorageError::Unsupported)) => {
+                    errors::not_implemented().into_response()
+                }
+                Err(crate::application::ManifestReadError::Storage(
+                    StorageError::InsufficientStorage,
+                )) => errors::insufficient_storage().into_response(),
+                Err(_) => errors::internal_error().into_response(),
             }
-
-            errors::manifest_unknown().into_response()
         }
-        _ => errors::method_not_allowed("GET, HEAD, DELETE"),
+        _ => errors::method_not_allowed("GET, HEAD, DELETE").into_response(),
     }
 }
 
@@ -1265,7 +612,6 @@ mod tests {
     use headers::{Authorization, HeaderMapExt};
     use http_body_util::BodyExt;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
 
     fn with_admin_creds(mut cfg: Config) -> Config {
         cfg.admin_api = crate::config::AdminApiConfig {
@@ -1283,76 +629,12 @@ mod tests {
         headers
     }
 
-    fn test_app_state<S>(
+    fn test_app_state(
         cfg: Arc<crate::config::Config>,
-        storage: Arc<S>,
+        storage: Arc<crate::storage::fs::FsStorage>,
         gc_service: Option<Arc<crate::gc_service::GcService>>,
-    ) -> AppState
-    where
-        S: crate::storage::Storage
-            + crate::storage::BlobUploadCoordinatorStoragePort
-            + crate::storage::ManifestLifecycleStoragePort
-            + crate::storage::BlobIndexStoragePort
-            + crate::storage::BlobRefIndexStoragePort
-            + crate::storage::GcServiceStoragePort
-            + crate::storage::ClusterLockStore
-            + 'static,
-    {
-        let ip_limiter = Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
-            cfg.max_connections_per_ip,
-            cfg.trusted_bypass_cidrs.clone(),
-        ));
-        let signing_key = cfg
-            .token_signing_keys
-            .first()
-            .map(|k| k.key.as_bytes().to_vec())
-            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
-        let consistency = crate::consistency::ConsistencyCoordinator::new();
-        let wiring = crate::storage::StorageWiring::from_backend(storage);
-        let blob_service = Arc::new(crate::application::BlobMutationService::new(
-            wiring.blob_mutation(),
-            None,
-            consistency.clone(),
-            crate::application::BlobUploadCoordinatorConfig {
-                signing_key,
-                max_upload_bytes: cfg.max_upload_bytes,
-                abort_on_digest_mismatch: cfg.upload_policy.abort_on_digest_mismatch,
-                disallow_monolithic_uploads: cfg.disallow_monolithic_uploads,
-                upload_chunk_min_bytes: cfg.upload_chunk_min_bytes.map(|v| v as u64),
-                gc_pin_duration_secs: cfg.gc_pin_duration_secs,
-            },
-        ));
-        let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
-            wiring.manifest_lifecycle(),
-            None,
-            consistency,
-        ));
-        AppState {
-            config: cfg,
-            auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            blob_reader: wiring.blob_reader(),
-            membership_reader: wiring.membership_reader(),
-            manifest_reader: wiring.manifest_reader(),
-            tag_reader: wiring.tag_reader(),
-            catalog_reader: wiring.catalog_reader(),
-            referrers_reader: wiring.referrers_reader(),
-            ref_index: None,
-            gc_service,
-            proxy: None,
-            proxy_cache: None,
-            proxy_upstreams: vec![],
-            buffered_body_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            upload_request_sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-            active_upload_requests: Arc::new(AtomicU64::new(0)),
-            last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-            gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            ip_limiter,
-            is_high_pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            blob_service,
-            manifest_service,
-        }
+    ) -> AppState {
+        AppState::new_test(cfg, storage, gc_service)
     }
 
     #[tokio::test]
@@ -2836,181 +2118,6 @@ fn detect_media_type_from_manifest(bytes: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn ensure_tag_fresh(
-    state: &AppState,
-    proxy: &crate::proxy::Proxy,
-    decision: &crate::proxy::RepoDecision,
-    cache: &Arc<dyn crate::storage::BlobUploadCoordinatorStoragePort>,
-    tag: &str,
-    ttl_secs: u64,
-    always_revalidate: bool,
-) -> Result<(), Response> {
-    let now = crate::proxy::Proxy::now_unix();
-    let current_digest = state
-        .tag_reader
-        .resolve_tag(decision.local_repo.as_str(), tag)
-        .await
-        .ok();
-    let meta = proxy.get_tag_meta(decision.local_repo.as_str(), tag);
-
-    if !always_revalidate {
-        if let (Some(d), Some(m)) = (&current_digest, &meta) {
-            if m.expires_at_unix > now && m.digest == d.as_str() {
-                return Ok(());
-            }
-        }
-    }
-
-    // Revalidate via HEAD (conditional if we have an ETag).
-    let if_none_match = meta.as_ref().and_then(|m| m.etag.clone());
-    let head = proxy
-        .fetch_manifest_and_cache(
-            decision,
-            tag,
-            cache,
-            state.config.max_request_body_bytes,
-            true,
-            if_none_match,
-            state.manifest_service.lifecycle(),
-        )
-        .await;
-
-    match head {
-        Ok(crate::proxy::FetchManifestResult::NotModified { etag, digest }) => {
-            // If we don't have the manifest locally (or no tag pointer), fetch the body.
-            if current_digest.is_none()
-                || state
-                    .manifest_reader
-                    .head_manifest(
-                        decision.local_repo.as_str(),
-                        current_digest.as_ref().unwrap(),
-                    )
-                    .await
-                    .is_err()
-            {
-                let _permit = state
-                    .buffered_body_sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| errors::internal_error().into_response())?;
-                let _ = proxy
-                    .fetch_manifest_and_cache(
-                        decision,
-                        tag,
-                        cache,
-                        state.config.max_request_body_bytes,
-                        false,
-                        None,
-                        state.manifest_service.lifecycle(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, repo = %decision.local_repo, tag, "proxy: fetch manifest after 304 failed");
-                        errors::internal_error().into_response()
-                    })?;
-            }
-
-            if let Some(d) = state
-                .tag_reader
-                .resolve_tag(decision.local_repo.as_str(), tag)
-                .await
-                .ok()
-                .or(digest)
-            {
-                let m = crate::proxy::TagMeta {
-                    digest: d.as_str(),
-                    expires_at_unix: if always_revalidate {
-                        now
-                    } else {
-                        crate::proxy::Proxy::ttl_expires_at(ttl_secs)
-                    },
-                    etag,
-                };
-                proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
-            }
-            Ok(())
-        }
-        Ok(crate::proxy::FetchManifestResult::HeadOk { etag, digest, .. }) => {
-            let needs_get = match (&current_digest, &digest) {
-                (Some(local), Some(up)) if local.hex() == up.hex() => state
-                    .manifest_reader
-                    .head_manifest(decision.local_repo.as_str(), local)
-                    .await
-                    .is_err(),
-                _ => true,
-            };
-
-            if needs_get {
-                let _permit = state
-                    .buffered_body_sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| errors::internal_error().into_response())?;
-                let fetched = proxy
-                    .fetch_manifest_and_cache(
-                        decision,
-                        tag,
-                        cache,
-                        state.config.max_request_body_bytes,
-                        false,
-                        None,
-                        state.manifest_service.lifecycle(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, repo = %decision.local_repo, tag, "proxy: fetch manifest failed");
-                        errors::internal_error().into_response()
-                    })?;
-                if let crate::proxy::FetchManifestResult::Fetched { digest, etag, .. } = fetched {
-                    let m = crate::proxy::TagMeta {
-                        digest: digest.as_str(),
-                        expires_at_unix: if always_revalidate {
-                            now
-                        } else {
-                            crate::proxy::Proxy::ttl_expires_at(ttl_secs)
-                        },
-                        etag,
-                    };
-                    proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
-                }
-            } else if let Some(d) = current_digest {
-                let m = crate::proxy::TagMeta {
-                    digest: d.as_str(),
-                    expires_at_unix: if always_revalidate {
-                        now
-                    } else {
-                        crate::proxy::Proxy::ttl_expires_at(ttl_secs)
-                    },
-                    etag,
-                };
-                proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
-            }
-            Ok(())
-        }
-        Ok(crate::proxy::FetchManifestResult::Fetched { digest, etag, .. }) => {
-            let m = crate::proxy::TagMeta {
-                digest: digest.as_str(),
-                expires_at_unix: if always_revalidate {
-                    now
-                } else {
-                    crate::proxy::Proxy::ttl_expires_at(ttl_secs)
-                },
-                etag,
-            };
-            proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
-            Ok(())
-        }
-        Err(crate::proxy::ProxyError::NotFound) => Err(errors::manifest_unknown().into_response()),
-        Err(crate::proxy::ProxyError::TooLarge) => Err(errors::payload_too_large().into_response()),
-        Err(err) => {
-            tracing::warn!(error = %err, repo = %decision.local_repo, tag, "proxy: revalidate failed");
-            Err(errors::internal_error().into_response())
-        }
-    }
-}
-
 async fn manifest_put(
     state: AppState,
     headers: &HeaderMap,
@@ -3131,12 +2238,6 @@ fn manifest_mutation_error_to_response(err: crate::application::ManifestMutation
         }
         _ => errors::internal_error().into_response(),
     }
-}
-
-fn extract_subject_digest(
-    manifest_bytes: &[u8],
-) -> Result<Option<Digest>, crate::manifest_refs::ManifestParseError> {
-    crate::manifest_refs::extract_subject_digest(manifest_bytes)
 }
 
 async fn oci_extension_discover(method: Method) -> Response {

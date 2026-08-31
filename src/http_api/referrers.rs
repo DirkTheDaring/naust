@@ -30,70 +30,55 @@ pub async fn referrers_list(
 
     match method {
         Method::GET | Method::HEAD => {
-            let referrers_reader: std::sync::Arc<dyn crate::storage::ReferrersReader> =
-                match route_mode {
-                    V2RouteMode::Default => state.referrers_reader.clone(),
-                    V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
-                        Some(_) => state.referrers_reader.clone(),
-                        None => return errors::internal_error().into_response(),
-                    },
-                };
+            let artifact_type = query.get("artifactType").cloned();
+            let last = query.get("last").cloned();
+            let n = query.get("n").and_then(|s| s.parse::<usize>().ok());
+            let params = crate::application::ReferrersQueryParams {
+                artifact_type: artifact_type.clone(),
+                last,
+                n,
+            };
 
-            let mut entries = match referrers_reader.list_referrers(name, &subject).await {
-                Ok(v) => v,
-                Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
-                Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),
-                Err(StorageError::TooLarge) => return errors::internal_error().into_response(),
-                Err(StorageError::DigestMismatch) => {
-                    return errors::internal_error().into_response();
-                }
-                Err(StorageError::NotFound) => Vec::new(),
-                Err(StorageError::InsufficientStorage) => {
-                    return errors::insufficient_storage().into_response();
-                }
-                Err(StorageError::TagAlreadyExists) => {
-                    return errors::internal_error().into_response();
-                }
-                Err(StorageError::InvalidRepoName(_)) => {
+            let proxy_target = match route_mode {
+                V2RouteMode::Default => None,
+                V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
+                    Some(ctx) => Some(ctx),
+                    None => return errors::internal_error().into_response(),
+                },
+            };
+
+            let page = match state
+                .referrers_query_service
+                .query_referrers(name, &subject, params, proxy_target)
+                .await
+            {
+                Ok(p) => p,
+                Err(crate::application::ReferrersQueryError::InvalidRepoName { .. }) => {
                     return errors::name_invalid().into_response();
                 }
-                Err(StorageError::ExclusiveWriterLocked(_)) => {
-                    return errors::internal_error().into_response();
+                Err(crate::application::ReferrersQueryError::InvalidDigest(_)) => {
+                    return errors::digest_invalid().into_response();
                 }
-                Err(StorageError::MigrationRequired(_)) => {
-                    return errors::internal_error().into_response();
+                Err(crate::application::ReferrersQueryError::Storage(
+                    StorageError::Unsupported,
+                )) => {
+                    return errors::not_implemented().into_response();
                 }
-            };
-
-            let artifact_type_filter = query.get("artifactType").map(|s| s.as_str());
-            if let Some(filter) = artifact_type_filter {
-                entries.retain(|d| d.artifact_type.as_deref() == Some(filter));
-            }
-
-            // Sort deterministically by digest for stable pagination.
-            entries.sort_by(|a, b| a.digest.cmp(&b.digest));
-
-            // Apply pagination if `last` is provided.
-            let start_idx = if let Some(last) = query.get("last") {
-                match entries.iter().position(|d| d.digest == *last) {
-                    Some(pos) => pos + 1,
-                    None => 0,
+                Err(crate::application::ReferrersQueryError::Storage(
+                    StorageError::InsufficientStorage,
+                )) => {
+                    return errors::insufficient_storage().into_response();
                 }
-            } else {
-                0
+                Err(crate::application::ReferrersQueryError::Storage(
+                    StorageError::InvalidRepoName(_),
+                )) => {
+                    return errors::name_invalid().into_response();
+                }
+                Err(_) => return errors::internal_error().into_response(),
             };
 
-            let remaining = if start_idx < entries.len() {
-                &entries[start_idx..]
-            } else {
-                &[]
-            };
-
-            let n_opt = query.get("n").and_then(|s| s.parse::<usize>().ok());
-            let (page_entries, next_last) = match n_opt {
-                Some(n) if n < remaining.len() => (&remaining[..n], Some(&remaining[n - 1].digest)),
-                _ => (remaining, None),
-            };
+            let page_entries = page.descriptors;
+            let next_last = page.next_last;
 
             // Return OCI index.
             let manifests = page_entries
@@ -131,13 +116,13 @@ pub async fn referrers_list(
                 "application/vnd.oci.image.index.v1+json".parse().unwrap(),
             );
             headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-            if artifact_type_filter.is_some() {
+            if artifact_type.is_some() {
                 headers.insert("OCI-Filters-Applied", "artifactType".parse().unwrap());
             }
 
-            if let (Some(n), Some(last_digest)) = (n_opt, next_last) {
-                let mut link_params = vec![format!("n={}", n)];
-                if let Some(filter) = artifact_type_filter {
+            if let (Some(n_val), Some(last_digest)) = (n, next_last) {
+                let mut link_params = vec![format!("n={}", n_val)];
+                if let Some(ref filter) = artifact_type {
                     let encoded_filter: String =
                         url::form_urlencoded::byte_serialize(filter.as_bytes()).collect();
                     link_params.push(format!("artifactType={}", encoded_filter));

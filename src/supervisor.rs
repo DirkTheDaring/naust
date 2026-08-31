@@ -512,43 +512,45 @@ pub async fn run_server_supervisor(
                 }
             };
 
-            let cache: Arc<dyn storage::BlobUploadCoordinatorStoragePort> =
-                match config.storage_backend {
-                    StorageBackend::Filesystem => {
-                        let root = up
-                            .cache_fs_root
-                            .clone()
-                            .expect("validated: filesystem cache fs_root");
-                        Arc::new(storage::fs::FsStorage::new(root, config.max_upload_bytes))
-                    }
-                    StorageBackend::S3 => {
-                        let endpoint = config
-                            .s3_endpoint
-                            .clone()
-                            .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
-                        let region = config
-                            .s3_region
-                            .clone()
-                            .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
-                        let bucket = config
-                            .s3_bucket
-                            .clone()
-                            .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
-                        let prefix = up
-                            .cache_s3_prefix
-                            .clone()
-                            .expect("validated: S3 cache s3_prefix");
-                        Arc::new(storage::s3::S3Storage::new(
-                            Some(endpoint),
-                            Some(region),
-                            Some(bucket),
-                            prefix,
-                            config.max_upload_bytes,
-                        ))
-                    }
-                };
+            let cache: Arc<dyn storage::ports::ProxyStoragePort> = match config.storage_backend {
+                StorageBackend::Filesystem => {
+                    let root = up
+                        .cache_fs_root
+                        .clone()
+                        .expect("validated: filesystem cache fs_root");
+                    Arc::new(storage::fs::FsStorage::new(root, config.max_upload_bytes))
+                }
+                StorageBackend::S3 => {
+                    let endpoint = config
+                        .s3_endpoint
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
+                    let region = config
+                        .s3_region
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
+                    let bucket = config
+                        .s3_bucket
+                        .clone()
+                        .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
+                    let prefix = up
+                        .cache_s3_prefix
+                        .clone()
+                        .expect("validated: S3 cache s3_prefix");
+                    Arc::new(storage::s3::S3Storage::new(
+                        Some(endpoint),
+                        Some(region),
+                        Some(bucket),
+                        prefix,
+                        config.max_upload_bytes,
+                    ))
+                }
+            };
 
-            proxy_upstreams.push(ProxyContext { proxy, cache });
+            proxy_upstreams.push(ProxyContext {
+                proxy,
+                cache_storage: cache,
+            });
         }
     }
 
@@ -564,7 +566,7 @@ pub async fn run_server_supervisor(
         None
     };
 
-    let proxy_cache: Option<Arc<dyn storage::BlobUploadCoordinatorStoragePort>> =
+    let proxy_cache: Option<Arc<dyn storage::ports::ProxyStoragePort>> =
         if config.proxy.enabled && config.proxy.upstreams.is_empty() {
             match config.storage_backend {
                 StorageBackend::Filesystem => {
@@ -671,16 +673,34 @@ pub async fn run_server_supervisor(
         ref_index.clone(),
         consistency.clone(),
     ));
+    let blob_read_service = Arc::new(crate::application::BlobReadService::new(
+        storage_wiring.blob_reader(),
+        storage_wiring.membership_reader(),
+        blob_service.clone(),
+    ));
+    let manifest_read_service = Arc::new(crate::application::ManifestReadService::new(
+        storage_wiring.manifest_reader(),
+        storage_wiring.tag_reader(),
+        manifest_service.clone(),
+        config.max_request_body_bytes,
+        Some(buffered_body_sem.clone()),
+    ));
+    let catalog_query_service = Arc::new(crate::application::CatalogQueryService::new(
+        storage_wiring.catalog_reader(),
+        storage_wiring.tag_reader(),
+        storage_wiring.manifest_reader(),
+        storage_wiring.blob_reader(),
+    ));
+    let tag_query_service = Arc::new(crate::application::TagQueryService::new(
+        storage_wiring.tag_reader(),
+    ));
+    let referrers_query_service = Arc::new(crate::application::ReferrersQueryService::new(
+        storage_wiring.referrers_reader(),
+    ));
 
     let state = AppState {
         config: config.clone(),
         auth_metrics: Arc::new(AuthMetrics::default()),
-        blob_reader: storage_wiring.blob_reader(),
-        membership_reader: storage_wiring.membership_reader(),
-        manifest_reader: storage_wiring.manifest_reader(),
-        tag_reader: storage_wiring.tag_reader(),
-        catalog_reader: storage_wiring.catalog_reader(),
-        referrers_reader: storage_wiring.referrers_reader(),
         ref_index: ref_index.clone(),
         gc_service,
         gc_run_seq: Arc::new(AtomicU64::new(0)),
@@ -697,6 +717,11 @@ pub async fn run_server_supervisor(
         is_high_pressure,
         blob_service,
         manifest_service,
+        blob_read_service,
+        manifest_read_service,
+        catalog_query_service,
+        tag_query_service,
+        referrers_query_service,
     };
 
     injector.record_event("app_state_constructed").await;
@@ -926,7 +951,7 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
                 .clone()
                 .unwrap_or_else(|| state.config.fs_root.join(format!("cache-upstream-{i}")));
             let max_cache_bytes = up.max_cache_bytes;
-            let storage = ctx.cache;
+            let storage = ctx.cache_storage;
             let proxy_for_gc = ctx.proxy;
             let repo_rules_for_gc = repo_rules.clone();
 
@@ -1200,7 +1225,7 @@ async fn proxy_scrub_once(
 }
 
 async fn proxy_gc_once(
-    storage: &Arc<dyn storage::BlobUploadCoordinatorStoragePort>,
+    storage: &Arc<dyn storage::ports::ProxyStoragePort>,
     fs_root: &std::path::Path,
     max_cache_bytes: u64,
     repo_rules: &[crate::config::ProxyRepoRule],

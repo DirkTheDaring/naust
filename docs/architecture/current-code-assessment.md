@@ -7,6 +7,22 @@
 
 ---
 
+## Post-Slice-4 Implementation Status (ADR-004 Accepted)
+
+> **Implementation Note (Post-Slice-4 Verification State):**
+> Following Slices 1 through 3, **Slice 4 (ADR-004: Complete Application Read Services, Query Services, and Proxy Encapsulation)** was implemented and verified.
+>
+> * **ADR-004 Status:** Accepted.
+> * **Application Read & Query Services (`src/application/`):** Established `BlobReadService`, `ManifestReadService`, `CatalogQueryService`, `TagQueryService`, and `ReferrersQueryService`.
+> * **Deterministic Query Policy in Application Layer:** Application query services own deterministic sorting, bounds checking, `last` cursor navigation, and `has_more` calculation. HTTP handlers retain purely transport concerns (query string parsing, RFC 5988 Link header creation, JSON formatting).
+> * **Proxy Encapsulation & Boundary Isolation:** Replaced transport-coupled proxy references with transport-neutral `ProxyTarget` (`src/application/proxy.rs`). Removed `.coordinator()` and `.lifecycle()` engine leakage from mutation services. Upstream proxy fetching now delegates publication exclusively through accepted application mutation services.
+> * **Completely Thinned Handlers & Clean `AppState`:** Removed all raw reader fields from `AppState`. HTTP handlers perform only authentication, parameter parsing, application service calls, and response mapping.
+> * **Zero HTTP Coupling in Application:** Zero Axum/HTTP types (`StatusCode`, `HeaderMap`, `Response`, `IntoResponse`) or `StorageWiring` / `dyn Storage` in `src/application/`.
+> * **Deterministic Unit & Integration Tests:** Added `tests/application_read_tests.rs` verifying read services, deterministic query pagination, tenant isolation, and live S3 MinIO backend operations.
+> * **Verified Test Inventory:** 620 total listed tests across 18 test binaries (614 Slice 3 baseline + 6 new application read tests). **620 passed, 0 failed, 0 ignored** with local MinIO backend healthy.
+
+---
+
 ## Post-Slice-3 Implementation Status (ADR-003 Accepted)
 
 > **Implementation Note (Post-Slice-3 Verification State):**
