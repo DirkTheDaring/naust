@@ -1,7 +1,6 @@
 use crate::blob_ref_index::{BlobRefIndex, RefIndexError};
 use crate::registry::digest::Digest;
-use crate::storage::repo_membership::RepoBlobMembershipRecord;
-use crate::storage::{Storage, StorageError};
+use crate::storage::{RepoBlobMembershipRecord, StorageError};
 use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
@@ -25,18 +24,20 @@ pub enum LedgerIndexMode {
     StorageOnly,
 }
 
+use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+
 /// Dedicated, narrowly scoped application service that coordinates mutations between
 /// authoritative storage membership markers and the rebuildable reverse index.
 #[derive(Clone)]
 pub struct RepositoryMembershipLedger {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn RepositoryBlobMembershipStorage>,
     mode: LedgerIndexMode,
     consistency: crate::consistency::ConsistencyCoordinator,
 }
 
 impl RepositoryMembershipLedger {
     pub fn new(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn RepositoryBlobMembershipStorage>,
         ref_index: Option<Arc<BlobRefIndex>>,
         consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
@@ -47,7 +48,7 @@ impl RepositoryMembershipLedger {
     }
 
     pub fn indexed(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn RepositoryBlobMembershipStorage>,
         ref_index: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
@@ -59,7 +60,7 @@ impl RepositoryMembershipLedger {
     }
 
     pub fn storage_only(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn RepositoryBlobMembershipStorage>,
         consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         Self {
@@ -69,7 +70,7 @@ impl RepositoryMembershipLedger {
         }
     }
 
-    pub fn storage(&self) -> &Arc<dyn Storage> {
+    pub fn storage(&self) -> &Arc<dyn RepositoryBlobMembershipStorage> {
         &self.storage
     }
 
@@ -104,10 +105,9 @@ impl RepositoryMembershipLedger {
         _guard: &crate::consistency::MutationGuard,
         record: &RepoBlobMembershipRecord,
     ) -> Result<(), LedgerError> {
-        // 1. Ensure reverse index is healthy (auto-rebuilding if corrupt)
+        // 1. Ensure reverse index is healthy
         if let LedgerIndexMode::Indexed(ref idx) = self.mode {
-            idx.ensure_healthy_or_rebuild(&self.storage, true, false)
-                .await?;
+            idx.check_health()?;
             // 2. Durably mark index dirty before mutating storage
             idx.mark_dirty()?;
         }
@@ -141,8 +141,7 @@ impl RepositoryMembershipLedger {
     ) -> Result<bool, LedgerError> {
         // 1. Ensure reverse index is healthy
         if let LedgerIndexMode::Indexed(ref idx) = self.mode {
-            idx.ensure_healthy_or_rebuild(&self.storage, true, false)
-                .await?;
+            idx.check_health()?;
             // 2. Durably mark dirty before removal
             idx.mark_dirty()?;
         }
@@ -228,8 +227,7 @@ impl RepositoryMembershipLedger {
     pub async fn has_any_membership(&self, digest: &Digest) -> Result<bool, LedgerError> {
         match &self.mode {
             LedgerIndexMode::Indexed(idx) => {
-                idx.ensure_healthy_or_rebuild(&self.storage, true, false)
-                    .await?;
+                idx.check_health()?;
                 let has = idx.has_any_repo_membership(digest)?;
                 Ok(has)
             }
@@ -240,11 +238,26 @@ impl RepositoryMembershipLedger {
         }
     }
 
-    /// Explicitly rebuild and reconcile reverse index against authoritative storage markers.
-    pub async fn reconcile_reverse_index(&self) -> Result<(), LedgerError> {
+    /// Explicitly reconcile reverse index memberships against authoritative storage markers.
+    pub async fn reconcile_memberships(&self) -> Result<(), LedgerError> {
         let _guard = self.consistency.acquire_mutation().await;
         if let LedgerIndexMode::Indexed(ref idx) = self.mode {
-            idx.rebuild(&self.storage).await?;
+            let mut cursor: Option<String> = None;
+            loop {
+                let (records, next) = self
+                    .storage
+                    .list_all_repo_blob_memberships_page(cursor.as_deref(), 256)
+                    .await?;
+                for rec in records {
+                    idx.record_membership(&rec.digest, rec.repo.as_str())?;
+                }
+                cursor = next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            idx.flush()?;
+            idx.mark_ready()?;
         }
         Ok(())
     }
@@ -254,21 +267,26 @@ impl RepositoryMembershipLedger {
 mod tests {
     use super::*;
     use crate::storage::fs::FsStorage;
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
 
-    fn setup_test_ledger() -> (
+    async fn setup_test_ledger() -> (
         tempfile::TempDir,
         RepositoryMembershipLedger,
         Arc<BlobRefIndex>,
-        Arc<dyn Storage>,
+        Arc<dyn RepositoryBlobMembershipStorage>,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let fs_root = dir.path().join("data");
         std::fs::create_dir_all(&fs_root).expect("mkdir data");
 
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+        let storage: Arc<dyn RepositoryBlobMembershipStorage> =
+            Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
         let index_dir = dir.path().join("index");
         let idx = Arc::new(BlobRefIndex::open(index_dir).expect("open index"));
-        idx.mark_ready().expect("mark ready");
+        let concrete_storage = FsStorage::new(fs_root.clone(), 10 * 1024 * 1024);
+        idx.ensure_healthy_or_rebuild(&concrete_storage, true, true)
+            .await
+            .expect("rebuild index");
 
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let ledger = RepositoryMembershipLedger::indexed(
@@ -282,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ledger_link_and_unlink_transitions() {
-        let (_dir, ledger, idx, storage) = setup_test_ledger();
+        let (_dir, ledger, idx, storage) = setup_test_ledger().await;
         let digest = Digest::parse(
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         )
@@ -325,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ledger_dirty_index_rebuilds_from_storage() {
-        let (_dir, ledger, idx, storage) = setup_test_ledger();
+        let (_dir, ledger, idx, storage) = setup_test_ledger().await;
         let digest = Digest::parse(
             "sha256:2222222222222222222222222222222222222222222222222222222222222222",
         )
@@ -341,14 +359,19 @@ mod tests {
         // Mark index dirty
         idx.mark_dirty().unwrap();
 
-        // has_any_membership detects dirty and auto-rebuilds!
+        // Reconcile memberships from authoritative storage markers
+        ledger
+            .reconcile_memberships()
+            .await
+            .expect("reconcile memberships");
+
         let has = ledger
             .has_any_membership(&digest)
             .await
             .expect("has membership");
         assert!(
             has,
-            "Auto-rebuild must populate membership from authoritative storage markers"
+            "Reconcile must populate membership from authoritative storage markers"
         );
     }
 
@@ -358,7 +381,8 @@ mod tests {
         let fs_root = dir.path().join("data");
         std::fs::create_dir_all(&fs_root).expect("mkdir data");
 
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+        let storage: Arc<dyn RepositoryBlobMembershipStorage> =
+            Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let ledger = RepositoryMembershipLedger::storage_only(Arc::clone(&storage), coordinator);
 

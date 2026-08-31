@@ -33,7 +33,7 @@ fn sha256_digest(bytes: &[u8]) -> Digest {
     Digest::parse(&format!("sha256:{hex}")).expect("valid sha256 digest")
 }
 
-async fn read_blob_bytes(storage: &Arc<dyn Storage>, digest: &Digest) -> Bytes {
+async fn read_blob_bytes(storage: &(impl Storage + ?Sized), digest: &Digest) -> Bytes {
     use tokio::io::AsyncReadExt;
     let (_meta, mut reader) = storage.open_blob(digest).await.unwrap();
     let mut buf = Vec::new();
@@ -51,22 +51,16 @@ async fn setup_test_service(
 
     let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
-    ref_index
-        .rebuild(&(storage.clone() as Arc<dyn Storage>))
-        .await
-        .unwrap();
+    ref_index.rebuild(&storage).await.unwrap();
 
     let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
-    let service = ManifestLifecycleService::new(
-        storage.clone() as Arc<dyn Storage>,
-        Some(ref_index.clone()),
-        coordinator,
-    );
+    let service =
+        ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
 
     (storage, ref_index, service)
 }
 
-async fn write_test_blob(storage: &Arc<dyn Storage>, repo: &str, content: &[u8]) -> Digest {
+async fn write_test_blob(storage: &(impl Storage + ?Sized), repo: &str, content: &[u8]) -> Digest {
     let digest = sha256_digest(content);
     let upload = storage.create_upload().await.unwrap();
     storage
@@ -147,8 +141,8 @@ async fn test_mark_dirty_failure_zero_storage_writes() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "fail-dirty-repo";
 
-    let cfg_d = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer_d = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"data").await;
+    let cfg_d = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer_d = write_test_blob(storage.as_ref(), repo, b"data").await;
     let (m_bytes, m_digest) = create_manifest_json(&cfg_d, &layer_d);
 
     // Inject mark_dirty failure
@@ -185,8 +179,8 @@ async fn test_interruption_after_manifest_storage_recovery() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "interrupted-manifest-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     // Step 1: Put manifest bytes into storage and write journal simulating crash before tag mutation
@@ -242,8 +236,8 @@ async fn test_interruption_after_referrer_registration_recovery() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "interrupted-referrer-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"base").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"base").await;
     let (base_bytes, base_d) = create_manifest_json(&cfg, &layer);
     service
         .publish_manifest(PublishManifestRequest {
@@ -256,7 +250,7 @@ async fn test_interruption_after_referrer_registration_recovery() {
         .await
         .unwrap();
 
-    let sig_blob = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"sig").await;
+    let sig_blob = write_test_blob(storage.as_ref(), repo, b"sig").await;
     let (art_bytes, art_d) = create_artifact_manifest_json(&base_d, &sig_blob);
 
     storage.put_manifest(repo, &art_d, art_bytes).await.unwrap();
@@ -305,8 +299,8 @@ async fn test_interruption_after_tag_mutation_recovery() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "interrupted-tag-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
@@ -354,8 +348,8 @@ async fn test_immutable_tag_collision_preserves_cas_manifest() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "immutable-collision-repo";
 
-    let cfg1 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"cfg1").await;
-    let layer1 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"l1").await;
+    let cfg1 = write_test_blob(storage.as_ref(), repo, b"cfg1").await;
+    let layer1 = write_test_blob(storage.as_ref(), repo, b"l1").await;
     let (m1_bytes, m1_d) = create_manifest_json(&cfg1, &layer1);
 
     service
@@ -369,8 +363,8 @@ async fn test_immutable_tag_collision_preserves_cas_manifest() {
         .await
         .unwrap();
 
-    let cfg2 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"cfg2").await;
-    let layer2 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"l2").await;
+    let cfg2 = write_test_blob(storage.as_ref(), repo, b"cfg2").await;
+    let layer2 = write_test_blob(storage.as_ref(), repo, b"l2").await;
     let (m2_bytes, m2_d) = create_manifest_json(&cfg2, &layer2);
 
     let res = service
@@ -401,8 +395,8 @@ async fn test_restart_recovery_all_journal_phases() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "recovery-phases-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     let phases = vec![
@@ -457,8 +451,8 @@ async fn test_manifest_delete_interrupted_after_partial_tags() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "partial-tags-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     // Create manifest and 5 tags
@@ -554,8 +548,8 @@ async fn test_manifest_delete_referrer_cleanup_failure_leaves_dirty() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "ref-clean-fail-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"base").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"base").await;
     let (base_bytes, base_d) = create_manifest_json(&cfg, &layer);
     service
         .publish_manifest(PublishManifestRequest {
@@ -568,7 +562,7 @@ async fn test_manifest_delete_referrer_cleanup_failure_leaves_dirty() {
         .await
         .unwrap();
 
-    let sig_blob = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"sig").await;
+    let sig_blob = write_test_blob(storage.as_ref(), repo, b"sig").await;
     let (art_bytes, art_d) = create_artifact_manifest_json(&base_d, &sig_blob);
     service
         .publish_manifest(PublishManifestRequest {
@@ -631,12 +625,12 @@ async fn test_concurrent_tag_replacement_during_manifest_delete() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "concurrent-replace-repo";
 
-    let cfg1 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"cfg1").await;
-    let layer1 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"l1").await;
+    let cfg1 = write_test_blob(storage.as_ref(), repo, b"cfg1").await;
+    let layer1 = write_test_blob(storage.as_ref(), repo, b"l1").await;
     let (m1_bytes, m1_d) = create_manifest_json(&cfg1, &layer1);
 
-    let cfg2 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"cfg2").await;
-    let layer2 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"l2").await;
+    let cfg2 = write_test_blob(storage.as_ref(), repo, b"cfg2").await;
+    let layer2 = write_test_blob(storage.as_ref(), repo, b"l2").await;
     let (m2_bytes, m2_d) = create_manifest_json(&cfg2, &layer2);
 
     service
@@ -689,8 +683,8 @@ async fn test_policy_b_multi_page_tags_deletion() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "multi-page-del-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"payload").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"payload").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     // Publish manifest and create 150 tags pointing to it
@@ -810,7 +804,7 @@ async fn test_s3_instances_lease_competition() {
 #[tokio::test]
 async fn test_s3_exclusive_writer_deployment_lock_and_stale_prevention() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -871,7 +865,7 @@ async fn test_s3_exclusive_writer_deployment_lock_and_stale_prevention() {
 #[tokio::test]
 async fn test_s3_lease_loss_during_operation() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -921,8 +915,8 @@ async fn test_tag_deletion_leaves_manifest_intact() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "tag-del-intact-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     service
@@ -957,8 +951,8 @@ async fn test_manifest_publication_by_digest() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "digest-publish-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     let pub_res = service
@@ -986,8 +980,8 @@ async fn test_storage_rebuild_after_ambiguous_failures() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "rebuild-after-crash-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"layer").await;
     let (m_bytes, _m_d) = create_manifest_json(&cfg, &layer);
 
     service
@@ -1002,10 +996,7 @@ async fn test_storage_rebuild_after_ambiguous_failures() {
         .unwrap();
 
     // Rebuild index from authoritative storage
-    ref_index
-        .rebuild(&(storage.clone() as Arc<dyn Storage>))
-        .await
-        .unwrap();
+    ref_index.rebuild(storage.as_ref()).await.unwrap();
 
     assert!(ref_index.check_health().is_ok());
     assert!(ref_index.is_blob_referenced(&layer).unwrap());
@@ -1037,18 +1028,8 @@ async fn test_bounded_pagination_manifests_tags_referrers() {
 
     let mut manifest_digests = Vec::new();
     for i in 0..5 {
-        let cfg = write_test_blob(
-            &(storage.clone() as Arc<dyn Storage>),
-            repo,
-            format!("cfg-{i}").as_bytes(),
-        )
-        .await;
-        let layer = write_test_blob(
-            &(storage.clone() as Arc<dyn Storage>),
-            repo,
-            format!("layer-{i}").as_bytes(),
-        )
-        .await;
+        let cfg = write_test_blob(storage.as_ref(), repo, format!("cfg-{i}").as_bytes()).await;
+        let layer = write_test_blob(storage.as_ref(), repo, format!("layer-{i}").as_bytes()).await;
         let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
         service
             .publish_manifest(PublishManifestRequest {
@@ -1094,13 +1075,8 @@ async fn test_cancellation_during_all_lifecycle_stages() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "cancellation-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(
-        &(storage.clone() as Arc<dyn Storage>),
-        repo,
-        b"cancel-layer",
-    )
-    .await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"cancel-layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     // Cancel future during validation/preflight by racing with immediate ready
@@ -1136,13 +1112,8 @@ async fn test_canonical_repo_name_security_matrix() {
     let dir = tempfile::tempdir().unwrap();
     let (storage, _ref_index, service) = setup_test_service(&dir).await;
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), "valid-repo", b"{}").await;
-    let layer = write_test_blob(
-        &(storage.clone() as Arc<dyn Storage>),
-        "valid-repo",
-        b"payload",
-    )
-    .await;
+    let cfg = write_test_blob(storage.as_ref(), "valid-repo", b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), "valid-repo", b"payload").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     let malicious_repos = vec![
@@ -1198,13 +1169,8 @@ async fn test_bounded_resumable_policy_b_deletion_with_interruption() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "resumable-b-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(
-        &(storage.clone() as Arc<dyn Storage>),
-        repo,
-        b"resumable-payload",
-    )
-    .await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"resumable-payload").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     service
@@ -1246,8 +1212,8 @@ async fn test_gc_fails_closed_when_journal_incomplete_or_index_dirty() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
     let repo = "gc-fail-closed-repo";
 
-    let cfg = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"{}").await;
-    let layer = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo, b"gc-layer").await;
+    let cfg = write_test_blob(storage.as_ref(), repo, b"{}").await;
+    let layer = write_test_blob(storage.as_ref(), repo, b"gc-layer").await;
     let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
 
     // Write incomplete lifecycle journal
@@ -1302,12 +1268,12 @@ async fn test_multi_repo_concurrent_mutations_no_cross_contention() {
     let repo1 = "repo-alpha";
     let repo2 = "repo-beta";
 
-    let cfg1 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo1, b"cfg1").await;
-    let layer1 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo1, b"l1").await;
+    let cfg1 = write_test_blob(storage.as_ref(), repo1, b"cfg1").await;
+    let layer1 = write_test_blob(storage.as_ref(), repo1, b"l1").await;
     let (m1_bytes, m1_d) = create_manifest_json(&cfg1, &layer1);
 
-    let cfg2 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo2, b"cfg2").await;
-    let layer2 = write_test_blob(&(storage.clone() as Arc<dyn Storage>), repo2, b"l2").await;
+    let cfg2 = write_test_blob(storage.as_ref(), repo2, b"cfg2").await;
+    let layer2 = write_test_blob(storage.as_ref(), repo2, b"l2").await;
     let (m2_bytes, m2_d) = create_manifest_json(&cfg2, &layer2);
 
     let s1 = service.clone();
@@ -1385,7 +1351,7 @@ async fn test_proxy_manifest_caching_lifecycle_lazy_blobs_and_gc_safety() {
     assert!(ref_index.is_blob_referenced(&blob2_d).unwrap());
 
     // 4. Later lazy blob fetch publishes CAS blob and repository membership atomically
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
     let _b1 = write_test_blob(&storage_trait, repo, b"lazy-blob-1").await;
     let _b2 = write_test_blob(&storage_trait, repo, b"lazy-blob-2").await;
 
@@ -1425,7 +1391,7 @@ async fn test_shared_content_proxy_eviction_and_physical_gc_safety() {
     let local_repo = "local-team/app";
     let proxy_repo = "upstream-cache/base";
 
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
 
     // Shared base layer
     let shared_layer = write_test_blob(&storage_trait, local_repo, b"shared-layer-bytes").await;
@@ -1493,7 +1459,7 @@ async fn test_shared_content_proxy_eviction_and_physical_gc_safety() {
 #[tokio::test]
 async fn test_runtime_mutation_authority_startup_and_modes_matrix() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1539,7 +1505,7 @@ async fn test_runtime_mutation_authority_startup_and_modes_matrix() {
 #[tokio::test]
 async fn test_authority_acquired_before_app_state_and_workers() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1565,13 +1531,13 @@ async fn test_authority_acquired_before_app_state_and_workers() {
 #[tokio::test]
 async fn test_second_writer_fails_closed_before_routes_active() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage1: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage1 = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
         mock.clone(),
     ));
-    let storage2: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage2 = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1595,7 +1561,7 @@ async fn test_second_writer_fails_closed_before_routes_active() {
 #[tokio::test]
 async fn test_partial_startup_failure_releases_lock_cleanly() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1630,7 +1596,7 @@ async fn test_partial_startup_failure_releases_lock_cleanly() {
 #[tokio::test]
 async fn test_storage_clone_and_drop_preserves_process_authority() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1662,7 +1628,7 @@ async fn test_storage_clone_and_drop_preserves_process_authority() {
 #[tokio::test]
 async fn test_graceful_shutdown_releases_with_matching_etag_and_token() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1691,7 +1657,7 @@ async fn test_graceful_shutdown_releases_with_matching_etag_and_token() {
 #[tokio::test]
 async fn test_wrong_owner_or_stale_etag_cannot_release_lock() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1725,7 +1691,7 @@ async fn test_wrong_owner_or_stale_etag_cannot_release_lock() {
 #[tokio::test]
 async fn test_process_crash_leaves_lock_blocking_restart_until_admin_recovery() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1777,7 +1743,7 @@ async fn test_process_crash_leaves_lock_blocking_restart_until_admin_recovery() 
 #[tokio::test]
 async fn test_admin_clear_lock_race_fails_closed_newer_lock_survives() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -1865,7 +1831,7 @@ async fn test_proxy_eviction_two_manifests_sharing_blob_preserves_live_manifest(
     let (storage, ref_index, service) = setup_test_service(&dir).await;
 
     let repo = "proxy-multi-cache";
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
 
     let shared_blob = write_test_blob(&storage_trait, repo, b"shared-content").await;
     let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, shared_blob.clone()).unwrap();
@@ -1913,7 +1879,7 @@ async fn test_proxy_tag_refresh_racing_with_eviction_preserves_refreshed_tag() {
     let (storage, _ref_index, service) = setup_test_service(&dir).await;
 
     let repo = "proxy-racing-refresh";
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
 
     let b1 = write_test_blob(&storage_trait, repo, b"b1").await;
     let (m1_bytes, m1_d) = create_manifest_json(&b1, &b1);
@@ -1952,7 +1918,7 @@ async fn test_proxy_eviction_multiple_tags_removes_only_target_tag_alias() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
 
     let repo = "proxy-multi-tags";
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
 
     let b = write_test_blob(&storage_trait, repo, b"b").await;
     let (m_bytes, m_d) = create_manifest_json(&b, &b);
@@ -2001,7 +1967,7 @@ async fn test_immediate_gc_after_proxy_publication_protects_blobs() {
     let (_storage, ref_index, service) = setup_test_service(&dir).await;
 
     let repo = "proxy-gc-protected";
-    let storage_trait = _storage.clone() as Arc<dyn Storage>;
+    let storage_trait = _storage.clone();
 
     let layer = write_test_blob(&storage_trait, repo, b"protected-layer").await;
     let (m_bytes, m_d) = create_manifest_json(&layer, &layer);
@@ -2020,7 +1986,7 @@ async fn test_immediate_gc_after_proxy_publication_protects_blobs() {
 #[tokio::test]
 async fn test_s3_storage_adapter_http_412_and_conditional_cas_parity() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -2056,7 +2022,7 @@ async fn test_proxy_eviction_restart_after_dirty_marker_and_initiated_journal() 
 
     let (m_d, layer_d) = {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"proxy-evict-crash-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2151,7 +2117,7 @@ async fn test_proxy_eviction_restart_after_tag_alias_deleted() {
 
     let (m_d, layer_d) = {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"proxy-tag-crash-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2241,7 +2207,7 @@ async fn test_shared_content_across_two_repositories_gc_safety() {
     let repo_a = "team-local/app";
     let repo_b = "upstream-cache/base";
 
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
     let shared_blob = write_test_blob(&storage_trait, repo_a, b"shared-cross-repo-blob").await;
     let proxy_record =
         RepoBlobMembershipRecord::try_new_proxy(repo_b, shared_blob.clone()).unwrap();
@@ -2307,7 +2273,7 @@ async fn test_shared_content_same_repo_client_and_proxy_gc_safety() {
     let (storage, ref_index, service) = setup_test_service(&dir).await;
 
     let repo = "mixed-origin-repo";
-    let storage_trait = storage.clone() as Arc<dyn Storage>;
+    let storage_trait = storage.clone();
 
     // Shared layer
     let shared_blob = write_test_blob(&storage_trait, repo, b"mixed-shared-layer").await;
@@ -2363,7 +2329,7 @@ async fn test_index_durability_ordering_crash_between_flush_and_mark_ready() {
 
     let (m_d, layer_d) = {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"durability-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2454,7 +2420,7 @@ async fn test_proxy_eviction_restart_manifest_deleted_before_phase_update() {
 
     let (m_d, layer_d) = {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"unrecorded-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2536,7 +2502,7 @@ async fn test_proxy_eviction_restart_proxy_manifest_deleted_persisted() {
 
     let (m_d, layer_d) = {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"persisted-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2617,7 +2583,7 @@ async fn test_proxy_eviction_restart_memberships_unlinked_before_phase_update() 
 
     let (m_d, layer_d) = {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"unlinked-before-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2700,7 +2666,7 @@ async fn test_proxy_eviction_restart_proxy_memberships_unlinked_persisted() {
 
     let (m_d, layer_d) = {
         let (storage, _ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"unlinked-persisted-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2782,7 +2748,7 @@ async fn test_proxy_eviction_restart_index_reconciled_not_flushed() {
 
     let (m_d, layer_d) = {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"unflushed-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2864,7 +2830,7 @@ async fn test_proxy_eviction_restart_index_flushed_not_ready() {
 
     let (m_d, layer_d) = {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"flushed-not-ready-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -2950,7 +2916,7 @@ async fn test_proxy_eviction_restart_ready_set_journal_present() {
 
     let (m_d, layer_d) = {
         let (storage, ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
+        let storage_trait = storage.clone();
         let layer = write_test_blob(&storage_trait, repo, b"ready-journal-present-layer").await;
         let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
         storage.link_repo_blob(&proxy_record).await.unwrap();
@@ -3034,53 +3000,56 @@ async fn test_proxy_eviction_restart_journal_deletion_lost_retry_is_idempotent()
     let dir = tempfile::tempdir().unwrap();
     let repo = "evict-restart-lost-delete-retry";
 
-    let (m_d, layer_d) = {
-        let (storage, _ref_index, service) = setup_test_service(&dir).await;
-        let storage_trait = storage.clone() as Arc<dyn Storage>;
-        let layer = write_test_blob(&storage_trait, repo, b"lost-delete-layer").await;
-        let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
-        storage.link_repo_blob(&proxy_record).await.unwrap();
-
-        let cfg = write_test_blob(&storage_trait, repo, b"lost-delete-cfg").await;
-        let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
-
-        let ev = ProxyPublicationEvidence::new_for_test(
-            repo,
-            "v1",
-            m_bytes.clone(),
-            None,
-            true,
-            m_d.clone(),
-        );
-        service.publish_proxy_cached_manifest(ev).await.unwrap();
-
-        let journal = LifecycleJournalRecord {
-            op_id: "evict-op-lost-delete".to_string(),
-            repo: CanonicalRepoName::parse(repo).unwrap(),
-            op_kind: LifecycleOpKind::ProxyEvict,
-            target_digest: m_d.clone(),
-            target_reference: Some("v1".to_string()),
-            phase: LifecyclePhase::ProxyMembershipsUnlinked,
-            owner_id: "test-owner".to_string(),
-            lease_expiry_unix_secs: 9999999999,
-            started_unix_secs: 100,
-            updated_unix_secs: 100,
-            relevant_tags: vec![],
-            subject_digest: None,
-            artifact_type: None,
-            annotations: None,
-            media_type: None,
-            manifest_size: None,
-        };
-        storage
-            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
-            .await
-            .unwrap();
-
-        (m_d, layer)
-    };
-
     let (storage, ref_index, service) = setup_test_service(&dir).await;
+    let storage_trait = storage.clone();
+    let layer = write_test_blob(&storage_trait, repo, b"lost-delete-layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let cfg = write_test_blob(&storage_trait, repo, b"lost-delete-cfg").await;
+    let (m_bytes, m_d) = create_manifest_json(&cfg, &layer);
+
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "evict-op-lost-delete".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: Some("v1".to_string()),
+        phase: LifecyclePhase::ProxyMembershipsUnlinked,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    let layer_d = layer;
+
+    // Create a new service instance sharing the existing storage and index (simulating process restart)
+    let service = ManifestLifecycleService::new(
+        storage.clone(),
+        Some(ref_index.clone()),
+        registry_rust::consistency::ConsistencyCoordinator::new(),
+    );
 
     // First recovery attempt
     service

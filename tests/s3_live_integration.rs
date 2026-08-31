@@ -21,14 +21,16 @@ use registry_rust::storage::mutation_authority::{
     RuntimeMutationAuthority, admin_clear_abandoned_deployment_writer_lock,
     inspect_deployment_writer_lock,
 };
-use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
+use registry_rust::storage::repo_membership::{
+    RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+};
 use registry_rust::storage::s3::S3Storage;
 use registry_rust::storage::upload_session::{
     FinalizeOutcome, UploadAppendResult, UploadOffsetPrecondition, UploadSessionState,
     UploadSessionStorage,
 };
 use registry_rust::storage::{
-    ConditionalDeleteResult, GcDeleteResult, ReferrerDescriptor, Storage, StorageError,
+    ConditionalDeleteResult, GcDeleteResult, GcStorage, ReferrerDescriptor, Storage, StorageError,
     TagMutation, TagMutationPolicy,
 };
 use registry_rust::supervisor::{SupervisorOptions, run_server_supervisor};
@@ -273,8 +275,28 @@ signing_key = "test-secret-key-12345678901234567890"
             self.prefix
         );
 
+        let url = Url::parse(&self.endpoint)
+            .unwrap_or_else(|_| Url::parse("http://127.0.0.1:9000").unwrap());
+        let host = url.host_str().unwrap_or("");
+        let is_local = host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::1"
+            || host == "0.0.0.0"
+            || host.ends_with(".localhost");
+
         let loader = aws_config::defaults(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_config::Region::new(self.region.clone()));
+        let loader = if is_local && std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+            loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "minioadmin",
+                "minioadmin",
+                None,
+                None,
+                "static",
+            ))
+        } else {
+            loader
+        };
         let shared = loader.load().await;
         let config = aws_sdk_s3::config::Builder::from(&shared)
             .endpoint_url(&self.endpoint)
@@ -294,7 +316,13 @@ signing_key = "test-secret-key-12345678901234567890"
             }
             let resp = match req.send().await {
                 Ok(r) => r,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!(
+                        "LIVE S3 CLEANUP ERROR listing objects under prefix '{}': {e}",
+                        self.prefix
+                    );
+                    break;
+                }
             };
 
             for obj in resp.contents() {
@@ -322,6 +350,25 @@ signing_key = "test-secret-key-12345678901234567890"
             "LIVE S3 CLEANUP: Purged {} objects under prefix '{}'",
             count, self.prefix
         );
+
+        // Assert post-cleanup absence
+        let post_check = client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&self.prefix)
+            .send()
+            .await
+            .expect("verify prefix is absent");
+        assert_eq!(
+            post_check.key_count().unwrap_or(0),
+            0,
+            "Expected 0 objects remaining under prefix {}",
+            self.prefix
+        );
+        println!(
+            "LIVE S3 CLEANUP PROOF: Verified 0 objects remaining under prefix '{}'",
+            self.prefix
+        );
     }
 }
 
@@ -332,7 +379,7 @@ fn sha256_digest(bytes: &[u8]) -> Digest {
     Digest::parse(&format!("sha256:{hex}")).expect("valid sha256 digest")
 }
 
-async fn read_blob_bytes(storage: &Arc<dyn Storage>, digest: &Digest) -> Bytes {
+async fn read_blob_bytes(storage: &(impl Storage + ?Sized), digest: &Digest) -> Bytes {
     use tokio::io::AsyncReadExt;
     let (_meta, mut reader) = storage.open_blob(digest).await.unwrap();
     let mut buf = Vec::new();
@@ -340,7 +387,7 @@ async fn read_blob_bytes(storage: &Arc<dyn Storage>, digest: &Digest) -> Bytes {
     Bytes::from(buf)
 }
 
-async fn write_test_blob(storage: &Arc<dyn Storage>, repo: &str, content: &[u8]) -> Digest {
+async fn write_test_blob(storage: &(impl Storage + ?Sized), repo: &str, content: &[u8]) -> Digest {
     let digest = sha256_digest(content);
     let upload = storage.create_upload().await.unwrap();
     storage
@@ -455,8 +502,8 @@ async fn test_production_s3_storage_adapter_construction() {
 #[tokio::test]
 async fn test_live_s3_writer_lock_1_to_6_full_lifecycle() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage1: Arc<dyn Storage> = harness.create_storage();
-    let storage2: Arc<dyn Storage> = harness.create_storage();
+    let storage1 = harness.create_storage();
+    let storage2 = harness.create_storage();
 
     // 1. Initial acquisition creates lock with If-None-Match: *
     let mut auth1 = RuntimeMutationAuthority::acquire(storage1.clone(), "server-1")
@@ -512,8 +559,8 @@ async fn test_live_s3_writer_lock_1_to_6_full_lifecycle() {
 #[tokio::test]
 async fn test_live_s3_writer_lock_7_to_10_admin_recovery_and_supervisor_competition() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage1: Arc<dyn Storage> = harness.create_storage();
-    let storage2: Arc<dyn Storage> = harness.create_storage();
+    let storage1 = harness.create_storage();
+    let storage2 = harness.create_storage();
 
     // 7. Abandoned lock from crashed server-1
     let auth1 = RuntimeMutationAuthority::acquire(storage1.clone(), "server-1")
@@ -596,7 +643,7 @@ async fn test_live_s3_writer_lock_7_to_10_admin_recovery_and_supervisor_competit
 #[tokio::test]
 async fn test_live_s3_tag_cas_full_matrix() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let repo = "library/cas-test";
 
     let d1 = sha256_digest(b"manifest 1");
@@ -697,7 +744,7 @@ async fn test_live_s3_tag_cas_full_matrix() {
 #[tokio::test]
 async fn test_live_s3_pagination_under_mutation() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let repo = "library/pagination-test";
 
     // 1. Populate 25 tags (exceeding page limits of 5)
@@ -888,7 +935,7 @@ async fn test_live_s3_upload_session_storage_api_contract() {
     assert_eq!(receipt.digest, digest.to_string());
 
     // 10. Verify blob readable in CAS
-    let read_back = read_blob_bytes(&(storage.clone() as Arc<dyn Storage>), &digest).await;
+    let read_back = read_blob_bytes(&storage, &digest).await;
     assert_eq!(read_back.as_ref(), full.as_slice());
 
     harness.cleanup().await;
@@ -897,7 +944,7 @@ async fn test_live_s3_upload_session_storage_api_contract() {
 #[tokio::test]
 async fn test_live_s3_upload_legacy_and_monolithic_helpers() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
 
     let upload = storage.create_upload().await.unwrap();
     let uuid = upload.uuid.clone();
@@ -921,7 +968,7 @@ async fn test_live_s3_upload_legacy_and_monolithic_helpers() {
         .unwrap();
     assert_eq!(meta.size, full_content.len() as u64);
 
-    let fresh_storage: Arc<dyn Storage> = harness.create_storage();
+    let fresh_storage = harness.create_storage();
     let read_back = read_blob_bytes(&fresh_storage, &expected_digest).await;
     assert_eq!(read_back.as_ref(), full_content.as_slice());
 
@@ -941,7 +988,7 @@ async fn test_live_s3_upload_legacy_and_monolithic_helpers() {
 #[tokio::test]
 async fn test_live_s3_lifecycle_service_and_recovery() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage1: Arc<dyn Storage> = harness.create_storage();
+    let storage1 = harness.create_storage();
     let temp = TempDir::new().unwrap();
     let ref_idx1 = Arc::new(BlobRefIndex::open(temp.path().join("ref_idx.db")).unwrap());
     ref_idx1.rebuild(&storage1).await.unwrap();
@@ -981,7 +1028,7 @@ async fn test_live_s3_lifecycle_service_and_recovery() {
     drop(service1);
     drop(ref_idx1);
 
-    let storage2: Arc<dyn Storage> = harness.create_storage();
+    let storage2 = harness.create_storage();
     let ref_idx2 = Arc::new(BlobRefIndex::open(temp.path().join("ref_idx2.db")).unwrap());
     ref_idx2.rebuild(&storage2).await.unwrap();
 
@@ -1006,7 +1053,7 @@ async fn test_live_s3_lifecycle_service_and_recovery() {
 #[tokio::test]
 async fn test_live_s3_membership_contract() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
 
     let repo1 = "tenant-a/app";
     let repo2 = "tenant-b/app";
@@ -1064,7 +1111,7 @@ async fn test_live_s3_membership_contract() {
 #[tokio::test]
 async fn test_live_s3_referrers_concurrent_additions() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let repo = "library/referrers-test";
     let target = sha256_digest(b"target image manifest");
 
@@ -1119,7 +1166,7 @@ async fn test_live_s3_referrers_concurrent_additions() {
 #[tokio::test]
 async fn test_live_s3_error_classification_contracts() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
 
     // 1. Missing object returns NotFound
     let missing_digest = sha256_digest(b"non-existent-blob-12345");
@@ -1181,7 +1228,7 @@ async fn test_live_s3_gc_service_construction_in_supervisor() {
 #[tokio::test]
 async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1224,7 +1271,7 @@ async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
 #[tokio::test]
 async fn test_live_s3_gc_admin_plan_succeeds() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let cfg = Arc::new(harness.create_server_config(&temp));
@@ -1268,7 +1315,7 @@ async fn test_live_s3_gc_admin_plan_succeeds() {
 #[tokio::test]
 async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1324,7 +1371,7 @@ async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
 #[tokio::test]
 async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1372,7 +1419,7 @@ async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
 #[tokio::test]
 async fn test_live_s3_gc_repository_membership_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1425,7 +1472,7 @@ async fn test_live_s3_gc_repository_membership_protects_blob() {
 #[tokio::test]
 async fn test_live_s3_gc_manifest_reachability_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1506,7 +1553,7 @@ async fn test_live_s3_gc_manifest_reachability_protects_blob() {
 #[tokio::test]
 async fn test_live_s3_gc_upload_pin_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1565,7 +1612,7 @@ async fn test_live_s3_gc_upload_pin_protects_blob() {
 #[tokio::test]
 async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1648,7 +1695,7 @@ async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
 #[tokio::test]
 async fn test_live_s3_gc_changed_etag_produces_precondition_failed_and_preserves() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
 
     let mut authority = RuntimeMutationAuthority::acquire(storage.clone(), "etag-test")
         .await
@@ -1695,7 +1742,7 @@ async fn test_live_s3_gc_changed_etag_produces_precondition_failed_and_preserves
 #[tokio::test]
 async fn test_live_s3_gc_empty_filtered_pages_traversed_with_continuation() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
 
     // Write a blob
     let _d = write_test_blob(&storage, "page-repo", b"page-traversal-content").await;
@@ -1717,7 +1764,7 @@ async fn test_live_s3_gc_empty_filtered_pages_traversed_with_continuation() {
 #[tokio::test]
 async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1775,7 +1822,7 @@ async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
 #[tokio::test]
 async fn test_live_s3_gc_repeated_continuation_token_fails_closed() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
 
     let mut traverser = CasBlobTraverser::new(&storage, 10);
     let _ = traverser.next_batch().await.unwrap();
@@ -1786,7 +1833,7 @@ async fn test_live_s3_gc_repeated_continuation_token_fails_closed() {
 #[tokio::test]
 async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bounded_transaction() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let temp = TempDir::new().unwrap();
 
     let mut cfg = harness.create_server_config(&temp);
@@ -1840,8 +1887,8 @@ async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bound
 #[tokio::test]
 async fn test_live_s3_gc_second_mutation_process_rejected_by_authority() {
     let harness = LiveS3Harness::new().await.unwrap();
-    let storage1: Arc<dyn Storage> = harness.create_storage();
-    let storage2: Arc<dyn Storage> = harness.create_storage();
+    let storage1 = harness.create_storage();
+    let storage2 = harness.create_storage();
 
     let mut auth1 = RuntimeMutationAuthority::acquire(storage1.clone(), "proc-1")
         .await
@@ -1876,7 +1923,7 @@ async fn test_live_s3_gc_graceful_shutdown_releases_authority_once() {
     let srv = tokio::spawn(async move { run_server_supervisor(cfg, Some(opts)).await });
     let _addr = bound_rx.await.unwrap();
 
-    let storage: Arc<dyn Storage> = harness.create_storage();
+    let storage = harness.create_storage();
     let (lock_doc, _) = inspect_deployment_writer_lock(&storage)
         .await
         .unwrap()

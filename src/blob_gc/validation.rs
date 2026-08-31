@@ -99,7 +99,7 @@ pub enum PreDeleteValidation {
 /// - Protects candidate if referenced in any repository lifecycle journal WAL.
 /// - Fails closed if any repository lifecycle journal is unreadable or malformed.
 pub(crate) async fn revalidate_candidate_before_delete(
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     candidate: &storage::GcBlobCandidate,
     now: SystemTime,
@@ -161,17 +161,17 @@ pub(crate) async fn revalidate_candidate_before_delete(
                 {
                     return Ok(PreDeleteValidation::Protected(
                         GcProtectionReason::ActiveLifecycleJournal {
-                            repository: repo,
+                            repository: repo.clone(),
                             op_id: rec.op_id,
                         },
                     ));
                 }
             }
             Ok(None) => {}
-            Err(source) => {
+            Err(e) => {
                 return Err(GcCandidateDeletionError::LifecycleJournalRead {
-                    repository: repo,
-                    source,
+                    repository: repo.clone(),
+                    source: e,
                 });
             }
         }
@@ -192,16 +192,14 @@ pub enum GcCandidateDeletionOutcome {
     },
 }
 
-/// Executes an application-level guarded GC deletion requiring both independent proofs:
-/// 1. `&GcMutationPermit`: Proves that active deployment mutation authority is held.
-/// 2. `&GcRevalidationGuard`: Proves that reachability-altering mutations are currently serialized.
+/// Centralized execution helper for safe, guarded candidate deletion.
 ///
-/// Invariants:
+/// Invariants enforced:
 /// - Fails closed if pre-delete candidate revalidation fails.
 /// - Performs conditional physical mutation only when candidate is validated as Eligible.
 /// - Classifies the final deletion outcome into structured types.
 pub(crate) async fn execute_guarded_gc_deletion(
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     candidate: &storage::GcBlobCandidate,
     now: SystemTime,

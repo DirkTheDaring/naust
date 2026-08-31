@@ -14,7 +14,9 @@ use crate::registry::digest::Digest;
 #[allow(unused_imports)]
 use crate::registry::validation::{is_valid_repo_name, is_valid_tag};
 #[allow(unused_imports)]
-use crate::storage::{ReferrerDescriptor, Storage, StorageError, TagMutationPolicy};
+use crate::storage::{
+    ManifestLifecycleStoragePort, ReferrerDescriptor, Storage, StorageError, TagMutationPolicy,
+};
 
 #[allow(unused_imports)]
 pub use crate::manifest_lifecycle::{
@@ -30,6 +32,7 @@ pub type ManifestPublisher = ManifestLifecycleService;
 mod tests {
     use super::*;
     use crate::storage::fs::FsStorage;
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -385,7 +388,14 @@ mod tests {
         }
     }
 
-    async fn write_test_blob(storage: &Arc<dyn Storage>, content: &[u8]) -> Digest {
+    crate::impl_storage_ports!(FaultInjectableStorage);
+    crate::impl_gc_storage_port!(FaultInjectableStorage);
+
+    async fn write_test_blob<T>(storage: &T, content: &[u8]) -> Digest
+    where
+        T: std::ops::Deref,
+        T::Target: Storage,
+    {
         let mut hasher = sha2::Sha256::new();
         hasher.update(content);
         let digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
@@ -436,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn test_stage_1_reference_parsing_fails() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(
+        let storage = Arc::new(FsStorage::new(
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
@@ -457,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn test_reference_kind_validation_blobs_vs_child_manifests() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(
+        let storage = Arc::new(FsStorage::new(
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
@@ -518,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn test_real_fs_concurrent_immutable_tag_creates() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(
+        let storage = Arc::new(FsStorage::new(
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
@@ -579,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn test_immutable_tag_idempotent_republish() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(
+        let storage = Arc::new(FsStorage::new(
             temp_dir.path().to_path_buf(),
             10 * 1024 * 1024,
         ));
@@ -616,7 +626,7 @@ mod tests {
     async fn test_synchronous_referrer_registration_failure() {
         let temp_dir = tempfile::tempdir().unwrap();
         let fault_storage = Arc::new(FaultInjectableStorage::new(temp_dir.path().to_path_buf()));
-        let storage: Arc<dyn Storage> = fault_storage.clone();
+        let storage = fault_storage.clone();
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let publisher = ManifestPublisher::new(storage.clone(), None, coordinator);
 
@@ -676,7 +686,7 @@ mod tests {
         std::fs::create_dir_all(&fs_root).unwrap();
         std::fs::create_dir_all(&ref_index_path).unwrap();
 
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).unwrap());
         idx.ensure_healthy_or_rebuild(&storage, true, true)
             .await
@@ -724,7 +734,7 @@ mod tests {
         std::fs::create_dir_all(&fs_root).unwrap();
         std::fs::create_dir_all(&ref_index_path).unwrap();
 
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
         let idx = Arc::new(BlobRefIndex::open(ref_index_path).unwrap());
         idx.ensure_healthy_or_rebuild(&storage, true, true)
             .await
@@ -790,7 +800,7 @@ mod tests {
         std::fs::create_dir_all(&ref_index_path).unwrap();
 
         let fault_storage = Arc::new(FaultInjectableStorage::new(fs_root));
-        let storage: Arc<dyn Storage> = fault_storage.clone();
+        let storage = fault_storage.clone();
         let idx = Arc::new(BlobRefIndex::open(ref_index_path).unwrap());
         idx.ensure_healthy_or_rebuild(&storage, true, true)
             .await
@@ -852,7 +862,7 @@ mod tests {
         std::fs::create_dir_all(&fs_root).unwrap();
         std::fs::create_dir_all(&ref_index_path).unwrap();
 
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
         let idx = Arc::new(BlobRefIndex::open(ref_index_path).unwrap());
         idx.ensure_healthy_or_rebuild(&storage, true, true)
             .await
@@ -895,7 +905,7 @@ mod tests {
     async fn test_immutable_conflict_retains_content_addressed_manifest_and_referrer() {
         let temp_dir = tempfile::tempdir().unwrap();
         let fs_root = temp_dir.path().join("data");
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let publisher = ManifestPublisher::new(storage.clone(), None, coordinator);
 

@@ -7,6 +7,22 @@
 
 ---
 
+## Post-Slice-3 Implementation Status (ADR-003 Accepted)
+
+> **Implementation Note (Post-Slice-3 Verification State):**
+> Following Slice 1 and Slice 2, **Slice 3 (ADR-003: Storage Capability Port Segregation & Production Migration)** was implemented and verified.
+>
+> * **ADR-003 Status:** Accepted.
+> * **Granular Capability Ports (`src/storage/ports/`):** Defined cohesive capability traits (`BlobCasReader`, `BlobCasWriter`, `RepositoryCatalogReader`, `ManifestReader`, `ManifestStore`, `TagReader`, `TagStore`, `ReferrersReader`, `ReferrersStore`, `LifecycleJournalStore`, `RepositoryLeaseStore`, `ClusterLockStore`, `GcStoragePort`).
+> * **Cohesive Composite Service Ports:** Defined composite trait bounds for domain engines (`BlobRefIndexStoragePort`, `BlobUploadCoordinatorStoragePort`, `ManifestLifecycleStoragePort`, `BlobIndexStoragePort`, `GcServiceStoragePort`).
+> * **Shared Backend Wiring (`StorageWiring`):** Implemented `StorageWiring::from_backend` ensuring that a single concrete storage instance (`Arc<FsStorage>` or `Arc<S3Storage>`) is shared across all segregated port views without split-brain risk or duplicate state.
+> * **Zero Production Consumers on Omnibus `Storage`:** Every production consumer (`BlobMutationService`, `ManifestMutationService`, `GcService`, `RuntimeMutationAuthority`, `BlobRefIndex`, `BlobDeleteService`, `RepositoryMembershipLedger`, `ProxyService`) was migrated to its minimum required capability interface.
+> * **Segregated `AppState`:** Removed `storage: Arc<dyn Storage>` from `AppState`, exposing only read-only capability views (`blob_reader`, `membership_reader`, `manifest_reader`, `tag_reader`, `catalog_reader`, `referrers_reader`).
+> * **Deterministic Unit & Integration Tests:** Added `tests/ports_wiring_tests.rs` verifying shared backend mutation visibility across port views and isolated capability fakes without omnibus storage.
+> * **Verified Test Inventory:** 614 total listed tests across 17 test binaries (611 Slice 2 baseline + 3 new port wiring tests). **614 passed, 0 failed, 0 ignored** with local MinIO backend healthy.
+
+---
+
 ## Post-Slice-2 Implementation Status (ADR-002 Accepted)
 
 > **Implementation Note (Post-Slice-2 Verification State):**

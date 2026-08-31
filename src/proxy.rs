@@ -651,7 +651,7 @@ impl Proxy {
         &self,
         decision: &RepoDecision,
         reference: &str,
-        _storage: &Arc<dyn crate::storage::Storage>,
+        _storage: &(impl crate::storage::BlobUploadCoordinatorStoragePort + ?Sized),
         max_bytes: usize,
         revalidate_only: bool,
         if_none_match: Option<String>,

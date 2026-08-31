@@ -77,7 +77,7 @@ use crate::storage::mutation_authority::RuntimeMutationAuthority;
 #[derive(Clone)]
 pub struct GcService {
     config: Arc<crate::config::Config>,
-    storage: Arc<dyn storage::Storage>,
+    storage: Arc<dyn storage::GcServiceStoragePort>,
     idx: Arc<BlobRefIndex>,
     run_lock: Arc<Mutex<()>>,
     consistency: crate::consistency::ConsistencyCoordinator,
@@ -107,7 +107,7 @@ pub struct ScheduledCleanupStats {
 impl GcService {
     pub fn new(
         config: Arc<crate::config::Config>,
-        storage: Arc<dyn storage::Storage>,
+        storage: Arc<dyn storage::GcServiceStoragePort>,
         idx: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
@@ -122,7 +122,7 @@ impl GcService {
 
     pub fn with_authority(
         config: Arc<crate::config::Config>,
-        storage: Arc<dyn storage::Storage>,
+        storage: Arc<dyn storage::GcServiceStoragePort>,
         idx: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
         authority: RuntimeMutationAuthority,
@@ -138,7 +138,7 @@ impl GcService {
 
     pub fn with_coordinator_and_authority(
         config: Arc<crate::config::Config>,
-        storage: Arc<dyn storage::Storage>,
+        storage: Arc<dyn storage::GcServiceStoragePort>,
         idx: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
         mutation_authority: Arc<Mutex<Option<RuntimeMutationAuthority>>>,
@@ -163,7 +163,7 @@ impl GcService {
     async fn ensure_ref_index_ready(&self) -> Result<(), GcServiceError> {
         let auto = self.config.ref_index.auto_rebuild_on_corruption;
         self.idx
-            .ensure_healthy_or_rebuild(&self.storage, auto, false)
+            .ensure_healthy_or_rebuild(self.storage.as_ref(), auto, false)
             .await?;
         Ok(())
     }
@@ -179,7 +179,7 @@ impl GcService {
         let t0 = Instant::now();
         let stats = self
             .idx
-            .refresh_tag_rooted_conservative(&self.storage)
+            .refresh_tag_rooted_conservative(self.storage.as_ref())
             .await?;
 
         tracing::info!(
@@ -458,7 +458,7 @@ impl GcService {
 
         let mut stats = MembershipSweepStats::default();
         let ledger = crate::repository_membership_ledger::RepositoryMembershipLedger::new(
-            Arc::clone(&self.storage),
+            Arc::new(self.storage.clone()),
             Some(Arc::clone(&self.idx)),
             self.consistency.clone(),
         );
@@ -473,7 +473,7 @@ impl GcService {
             for rec in records {
                 stats.scanned += 1;
                 let is_referenced = crate::blob_delete_safety::find_repo_blob_reference(
-                    &self.storage,
+                    self.storage.as_ref(),
                     rec.repo.as_str(),
                     &rec.digest,
                 )
@@ -513,7 +513,7 @@ impl GcService {
                             // Revalidate before unlinking
                             let still_referenced =
                                 match crate::blob_delete_safety::find_repo_blob_reference(
-                                    &self.storage,
+                                    self.storage.as_ref(),
                                     rec.repo.as_str(),
                                     &rec.digest,
                                 )
@@ -685,6 +685,7 @@ mod tests {
     use super::*;
     use crate::registry::digest::Digest;
     use crate::storage::fs::FsStorage;
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
     use sha2::Digest as _;
     use std::path::PathBuf;
     use std::time::SystemTime;
@@ -825,15 +826,15 @@ mod tests {
         cfg.blob_gc_default_max_blobs = 1000;
 
         let cfg = Arc::new(cfg);
-        let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes))
-            as Arc<dyn storage::Storage>;
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).expect("open idx"));
-        idx.ensure_healthy_or_rebuild(&storage, true, true)
+        idx.ensure_healthy_or_rebuild(wiring.blob_ref_index().as_ref(), true, true)
             .await
             .expect("ensure idx");
 
         let authority = crate::storage::mutation_authority::RuntimeMutationAuthority::acquire(
-            storage.clone(),
+            wiring.cluster_lock(),
             "test-sched-gc",
         )
         .await
@@ -854,7 +855,7 @@ mod tests {
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let service = GcService::with_authority(
             cfg.clone(),
-            storage.clone(),
+            wiring.gc_service_port(),
             idx.clone(),
             coordinator,
             authority,
@@ -918,14 +919,16 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> =
-            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let wiring = storage::StorageWiring::from_backend(backend.clone());
 
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
-        idx.rebuild(&storage).await.expect("rebuild empty");
+        idx.rebuild(wiring.blob_ref_index().as_ref())
+            .await
+            .expect("rebuild empty");
 
         let authority = crate::storage::mutation_authority::RuntimeMutationAuthority::acquire(
-            storage.clone(),
+            wiring.cluster_lock(),
             "test-quarantine-restore",
         )
         .await
@@ -934,7 +937,7 @@ mod tests {
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let service = GcService::with_authority(
             cfg.clone(),
-            storage.clone(),
+            wiring.gc_service_port(),
             idx.clone(),
             coordinator,
             authority,
@@ -969,7 +972,9 @@ mod tests {
         );
         write_tag_and_manifest(&fs_root, "org/repo", "latest", &root, manifest.as_bytes()).await;
 
-        idx.rebuild(&storage).await.expect("rebuild with tag");
+        idx.rebuild(wiring.blob_ref_index().as_ref())
+            .await
+            .expect("rebuild with tag");
 
         // With quarantine_delay=0, delete phase should restore instead of deleting.
         let d = service
@@ -997,13 +1002,15 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex2");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> =
-            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
-        idx.rebuild(&storage).await.expect("rebuild");
+        idx.rebuild(wiring.blob_ref_index().as_ref())
+            .await
+            .expect("rebuild");
 
         let authority = crate::storage::mutation_authority::RuntimeMutationAuthority::acquire(
-            storage.clone(),
+            wiring.cluster_lock(),
             "test-pinned",
         )
         .await
@@ -1012,7 +1019,7 @@ mod tests {
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let service = GcService::with_authority(
             cfg.clone(),
-            storage.clone(),
+            wiring.gc_service_port(),
             idx.clone(),
             coordinator,
             authority,
@@ -1050,14 +1057,16 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex3");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> =
-            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
-        idx.rebuild(&storage).await.expect("rebuild");
+        idx.rebuild(wiring.blob_ref_index().as_ref())
+            .await
+            .expect("rebuild");
 
         let service = GcService::new(
             cfg.clone(),
-            storage.clone(),
+            wiring.gc_service_port(),
             idx.clone(),
             crate::consistency::ConsistencyCoordinator::new(),
         );
@@ -1087,14 +1096,16 @@ mod tests {
         let ref_index_path = tmp_dir("gc-refindex-aging");
 
         let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let storage: Arc<dyn storage::Storage> =
-            Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
-        idx.rebuild(&storage).await.expect("rebuild");
+        idx.rebuild(wiring.blob_ref_index().as_ref())
+            .await
+            .expect("rebuild");
 
         let service = GcService::new(
             cfg.clone(),
-            storage.clone(),
+            wiring.gc_service_port(),
             idx.clone(),
             crate::consistency::ConsistencyCoordinator::new(),
         );
@@ -1106,7 +1117,7 @@ mod tests {
         let canonical_repo =
             crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
         let rec = RepoBlobMembershipRecord::new_upload(canonical_repo, blob.clone(), None);
-        storage.link_repo_blob(&rec).await.unwrap();
+        backend.link_repo_blob(&rec).await.unwrap();
         idx.record_membership(&blob, repo).unwrap();
 
         // 1. First scan: blob is unreferenced by any manifest, so Active -> Candidate with unreferenced_since
@@ -1117,7 +1128,7 @@ mod tests {
         assert_eq!(s1.candidated, 1);
         assert_eq!(s1.unlinked, 0);
 
-        let mem1 = storage
+        let mem1 = backend
             .get_repo_blob_membership(repo, &blob)
             .await
             .unwrap()
@@ -1140,7 +1151,7 @@ mod tests {
             .unwrap();
         assert_eq!(s3.unlinked, 1);
 
-        let mem_after = storage.get_repo_blob_membership(repo, &blob).await.unwrap();
+        let mem_after = backend.get_repo_blob_membership(repo, &blob).await.unwrap();
         assert!(mem_after.is_none());
         assert!(!idx.has_any_repo_membership(&blob).unwrap());
 

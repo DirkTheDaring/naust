@@ -355,3 +355,89 @@ pub trait RepositoryBlobMembershipStorage: Send + Sync {
         Ok(())
     }
 }
+
+#[async_trait]
+impl<T: ?Sized + RepositoryBlobMembershipStorage + Send + Sync> RepositoryBlobMembershipStorage
+    for std::sync::Arc<T>
+{
+    async fn get_repo_blob_membership(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<Option<RepoBlobMembershipRecord>, StorageError> {
+        (**self).get_repo_blob_membership(repo, digest).await
+    }
+
+    async fn link_repo_blob(&self, record: &RepoBlobMembershipRecord) -> Result<(), StorageError> {
+        (**self).link_repo_blob(record).await
+    }
+
+    async fn set_membership_candidate(
+        &self,
+        repo: &str,
+        digest: &Digest,
+        since_unix_secs: u64,
+    ) -> Result<bool, StorageError> {
+        (**self)
+            .set_membership_candidate(repo, digest, since_unix_secs)
+            .await
+    }
+
+    async fn clear_membership_candidate(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<bool, StorageError> {
+        (**self).clear_membership_candidate(repo, digest).await
+    }
+
+    async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
+        (**self).unlink_repo_blob(repo, digest).await
+    }
+
+    async fn list_repo_blob_memberships_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<RepoBlobMembershipRecord>, Option<String>), StorageError> {
+        (**self)
+            .list_repo_blob_memberships_page(repo, continuation_token, page_limit)
+            .await
+    }
+
+    async fn list_all_repo_blob_memberships_page(
+        &self,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<RepoBlobMembershipRecord>, Option<String>), StorageError> {
+        (**self)
+            .list_all_repo_blob_memberships_page(continuation_token, page_limit)
+            .await
+    }
+
+    async fn count_repo_blob_memberships(&self, digest: &Digest) -> Result<usize, StorageError> {
+        (**self).count_repo_blob_memberships(digest).await
+    }
+
+    async fn is_membership_ready(&self) -> Result<bool, StorageError> {
+        (**self).is_membership_ready().await
+    }
+
+    async fn mark_membership_ready(&self) -> Result<(), StorageError> {
+        (**self).mark_membership_ready().await
+    }
+
+    async fn get_migration_checkpoint(
+        &self,
+    ) -> Result<Option<MigrationCheckpointRecord>, StorageError> {
+        (**self).get_migration_checkpoint().await
+    }
+
+    async fn save_migration_checkpoint(
+        &self,
+        checkpoint: &MigrationCheckpointRecord,
+    ) -> Result<(), StorageError> {
+        (**self).save_migration_checkpoint(checkpoint).await
+    }
+}

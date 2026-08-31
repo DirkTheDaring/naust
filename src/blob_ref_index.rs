@@ -1,8 +1,4 @@
-use crate::{
-    manifest_refs::parse_manifest_refs,
-    registry::digest::Digest,
-    storage::{Storage, StorageError},
-};
+use crate::{manifest_refs::parse_manifest_refs, registry::digest::Digest, storage::StorageError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -339,7 +335,7 @@ impl BlobRefIndex {
 
     pub async fn ensure_healthy_or_rebuild(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         auto_rebuild_on_corruption: bool,
         rebuild_on_start: bool,
     ) -> Result<(), RefIndexError> {
@@ -398,7 +394,7 @@ impl BlobRefIndex {
 
     pub async fn on_tag_mutation(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
         tag: &str,
         new_root: &Digest,
@@ -433,7 +429,7 @@ impl BlobRefIndex {
 
     pub async fn on_tag_set(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
         tag: &str,
         new_root: &Digest,
@@ -448,25 +444,20 @@ impl BlobRefIndex {
 
         // If caller provided old_root, use it. Otherwise, derive from existing tag_to_root.
         let prev = match old_root {
-            Some(d) => Some(d.as_str().to_string()),
+            Some(r) => Some(r),
             None => self
                 .tag_to_root
                 .get(&key)?
-                .and_then(|v| String::from_utf8(v.to_vec()).ok()),
+                .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
+                .and_then(|s| Digest::parse(&s).ok()),
         };
 
         self.tag_to_root.insert(&key, new_val)?;
 
-        let changed = match prev.as_deref() {
-            Some(p) => p != new_root.as_str(),
-            None => true,
-        };
-        if changed {
-            if let Some(prev_root) = prev {
-                self.dec_root_count(prev_root.as_bytes())?;
-            }
-            self.inc_root_count(new_root.as_str().as_bytes())?;
+        if let Some(p) = prev {
+            self.dec_root_count(p.as_str().as_bytes())?;
         }
+        self.inc_root_count(new_root.as_str().as_bytes())?;
 
         self.db.flush()?;
         Ok(())
@@ -474,7 +465,7 @@ impl BlobRefIndex {
 
     pub async fn sync_repo_manifests_and_tags(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
     ) -> Result<(), RefIndexError> {
         // 1. Remove all existing tags for this repo from the index.
@@ -485,7 +476,6 @@ impl BlobRefIndex {
             .filter_map(|r| r.ok())
             .map(|(k, _v)| k.to_vec())
             .collect();
-
         for k in existing_tags {
             let _ = self.tag_to_root.remove(k);
         }
@@ -528,7 +518,7 @@ impl BlobRefIndex {
 
     pub async fn sync_repo_tags(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
     ) -> Result<(), RefIndexError> {
         self.sync_repo_manifests_and_tags(storage, repo).await
@@ -536,7 +526,7 @@ impl BlobRefIndex {
 
     pub async fn on_manifest_published(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
         digest: &Digest,
         tag: Option<&str>,
@@ -576,7 +566,10 @@ impl BlobRefIndex {
         Ok(())
     }
 
-    pub async fn rebuild(&self, storage: &Arc<dyn Storage>) -> Result<(), RefIndexError> {
+    pub async fn rebuild(
+        &self,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
+    ) -> Result<(), RefIndexError> {
         self.meta
             .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))?;
         self.meta.insert(META_STATE, META_STATE_BUILDING)?;
@@ -625,7 +618,7 @@ impl BlobRefIndex {
     /// - it never decrements counts or deletes old mappings (may over-retain, but is safe)
     pub async fn refresh_tag_rooted_conservative(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
     ) -> Result<TagRootedRefreshStats, RefIndexError> {
         self.check_health()?;
 
@@ -669,7 +662,7 @@ impl BlobRefIndex {
 
     async fn ingest_root(
         &self,
-        storage: &Arc<dyn Storage>,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
         root: &Digest,
     ) -> Result<(), RefIndexError> {
@@ -850,6 +843,7 @@ fn _path_exists(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::collections::{HashMap, HashSet};
@@ -874,14 +868,14 @@ mod tests {
             self.repos.lock().unwrap().insert(repo.to_string());
         }
 
-        fn set_tag(&self, repo: &str, tag: &str, digest: Digest) {
+        fn set_tag_sync(&self, repo: &str, tag: &str, digest: &Digest) {
             self.add_repo(repo);
             self.tags
                 .lock()
                 .unwrap()
                 .entry(repo.to_string())
                 .or_default()
-                .insert(tag.to_string(), digest);
+                .insert(tag.to_string(), digest.clone());
         }
 
         fn remove_tag(&self, repo: &str, tag: &str) {
@@ -1210,6 +1204,9 @@ mod tests {
         }
     }
 
+    crate::impl_storage_ports!(MockStorage);
+    crate::impl_gc_storage_port!(MockStorage);
+
     fn temp_index_path() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "registry-rust-ref-index-test-{}",
@@ -1325,14 +1322,14 @@ mod tests {
         let idx = BlobRefIndex::open(path.clone()).expect("open");
 
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         let repo = "org/repo";
         let root = d('a');
         let cfg = d('b');
         let layer = d('c');
 
-        mock.set_tag(repo, "latest", root.clone());
+        mock.set_tag_sync(repo, "latest", &root);
         mock.put_manifest_bytes(repo, &root, image_manifest(&cfg, &layer));
 
         idx.rebuild(&storage).await.expect("rebuild");
@@ -1351,14 +1348,14 @@ mod tests {
         let idx = BlobRefIndex::open(path.clone()).expect("open");
 
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         let repo = "org/repo";
         let root_index = d('a');
         let child = d('b');
         let layer = d('c');
 
-        mock.set_tag(repo, "v1", root_index.clone());
+        mock.set_tag_sync(repo, "v1", &root_index);
         mock.put_manifest_bytes(repo, &root_index, index_manifest(&child));
         mock.put_manifest_bytes(repo, &child, image_manifest(&d('d'), &layer));
 
@@ -1374,14 +1371,14 @@ mod tests {
         let path = temp_index_path();
         let idx = BlobRefIndex::open(path.clone()).expect("open");
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         let repo = "org/repo";
         let root = d('a');
         let subject = d('b');
         let blob = d('c');
 
-        mock.set_tag(repo, "artifact", root.clone());
+        mock.set_tag_sync(repo, "artifact", &root);
         mock.put_manifest_bytes(repo, &root, artifact_manifest(&subject, &blob));
 
         idx.rebuild(&storage).await.expect("rebuild");
@@ -1396,7 +1393,7 @@ mod tests {
         let path = temp_index_path();
         let idx = BlobRefIndex::open(path.clone()).expect("open");
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         // Bring index to a healthy state.
         idx.meta
@@ -1431,13 +1428,13 @@ mod tests {
         let path = temp_index_path();
         let idx = BlobRefIndex::open(path.clone()).expect("open");
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         let repo = "org/repo";
         let r1 = d('a');
         let r2 = d('b');
-        mock.set_tag(repo, "t1", r1.clone());
-        mock.set_tag(repo, "t2", r2.clone());
+        mock.set_tag_sync(repo, "t1", &r1);
+        mock.set_tag_sync(repo, "t2", &r2);
         mock.put_manifest_bytes(repo, &r1, image_manifest(&d('c'), &d('d')));
         mock.put_manifest_bytes(repo, &r2, image_manifest(&d('e'), &d('f')));
 
@@ -1487,11 +1484,11 @@ mod tests {
         let path = temp_index_path();
         let idx = BlobRefIndex::open(path.clone()).expect("open");
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         let repo = "org/repo";
         let root = d('a');
-        mock.set_tag(repo, "latest", root.clone());
+        mock.set_tag_sync(repo, "latest", &root);
         mock.put_manifest_bytes(repo, &root, image_manifest(&d('b'), &d('c')));
 
         // Simulate an incomplete prior rebuild.
@@ -1524,12 +1521,12 @@ mod tests {
         let path = temp_index_path();
         let idx = BlobRefIndex::open(path.clone()).expect("open");
         let mock = Arc::new(MockStorage::new());
-        let storage: Arc<dyn Storage> = mock.clone();
+        let storage = mock.clone();
 
         let repo = "org/repo";
         let root = d('a');
         let layer = d('b');
-        mock.set_tag(repo, "latest", root.clone());
+        mock.set_tag_sync(repo, "latest", &root);
         mock.put_manifest_bytes(repo, &root, image_manifest(&d('c'), &layer));
 
         idx.rebuild(&storage).await.expect("rebuild");

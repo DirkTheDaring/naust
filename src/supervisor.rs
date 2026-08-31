@@ -25,8 +25,8 @@ use crate::gc_service::GcService;
 use crate::http_api::handlers;
 use crate::ip_concurrency::IpConcurrencyLimiter;
 use crate::registry::digest::Digest;
+use crate::storage;
 use crate::storage::mutation_authority::RuntimeMutationAuthority;
-use crate::storage::{self, Storage};
 use crate::task_supervisor::{TaskClassification, TaskSupervisor};
 use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
 use crate::upload_coordinator::BlobUploadCoordinatorConfig;
@@ -226,7 +226,10 @@ async fn has_any_file_or_dir(path: &std::path::Path) -> bool {
     false
 }
 
-async fn is_store_completely_empty(storage: &Arc<dyn Storage>, config: &Config) -> bool {
+async fn is_store_completely_empty(
+    storage: &Arc<dyn storage::RepositoryCatalogReader>,
+    config: &Config,
+) -> bool {
     let repos = storage.list_repositories().await.unwrap_or_default();
     if !repos.is_empty() {
         return false;
@@ -384,12 +387,12 @@ pub async fn run_server_supervisor(
         None
     };
 
-    let storage = storage::from_config(config.as_ref());
+    let storage_wiring = storage::storage_wiring_from_config(config.as_ref());
     injector.record_event("storage_initialized").await;
     injector.on_phase(StartupPhase::StorageInitialized).await?;
 
     let mut mutation_authority =
-        match RuntimeMutationAuthority::acquire(storage.clone(), "server").await {
+        match RuntimeMutationAuthority::acquire(storage_wiring.cluster_lock(), "server").await {
             Ok(a) => a,
             Err(e) => {
                 return Err(format!(
@@ -404,12 +407,21 @@ pub async fn run_server_supervisor(
     }
 
     // Fail-closed repository blob membership startup check
-    match storage.is_membership_ready().await {
+    match storage_wiring
+        .membership_reader()
+        .is_membership_ready()
+        .await
+    {
         Ok(true) => {}
         Ok(false) => {
-            let is_empty = is_store_completely_empty(&storage, config.as_ref()).await;
+            let is_empty =
+                is_store_completely_empty(&storage_wiring.catalog_reader(), config.as_ref()).await;
             if is_empty {
-                if let Err(e) = storage.mark_membership_ready().await {
+                if let Err(e) = storage_wiring
+                    .membership_reader()
+                    .mark_membership_ready()
+                    .await
+                {
                     let _ = mutation_authority.release().await;
                     return Err(format!(
                         "server: failed to initialize membership marker on fresh storage: {e}"
@@ -442,7 +454,7 @@ pub async fn run_server_supervisor(
             Ok(idx) => {
                 if let Err(err) = idx
                     .ensure_healthy_or_rebuild(
-                        &storage,
+                        &storage_wiring.blob_ref_index(),
                         config.ref_index.auto_rebuild_on_corruption,
                         config.ref_index.rebuild_on_start,
                     )
@@ -500,40 +512,41 @@ pub async fn run_server_supervisor(
                 }
             };
 
-            let cache: Arc<dyn Storage> = match config.storage_backend {
-                StorageBackend::Filesystem => {
-                    let root = up
-                        .cache_fs_root
-                        .clone()
-                        .expect("validated: filesystem cache fs_root");
-                    Arc::new(storage::fs::FsStorage::new(root, config.max_upload_bytes))
-                }
-                StorageBackend::S3 => {
-                    let endpoint = config
-                        .s3_endpoint
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
-                    let region = config
-                        .s3_region
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
-                    let bucket = config
-                        .s3_bucket
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
-                    let prefix = up
-                        .cache_s3_prefix
-                        .clone()
-                        .expect("validated: S3 cache s3_prefix");
-                    Arc::new(storage::s3::S3Storage::new(
-                        Some(endpoint),
-                        Some(region),
-                        Some(bucket),
-                        prefix,
-                        config.max_upload_bytes,
-                    ))
-                }
-            };
+            let cache: Arc<dyn storage::BlobUploadCoordinatorStoragePort> =
+                match config.storage_backend {
+                    StorageBackend::Filesystem => {
+                        let root = up
+                            .cache_fs_root
+                            .clone()
+                            .expect("validated: filesystem cache fs_root");
+                        Arc::new(storage::fs::FsStorage::new(root, config.max_upload_bytes))
+                    }
+                    StorageBackend::S3 => {
+                        let endpoint = config
+                            .s3_endpoint
+                            .clone()
+                            .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
+                        let region = config
+                            .s3_region
+                            .clone()
+                            .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
+                        let bucket = config
+                            .s3_bucket
+                            .clone()
+                            .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
+                        let prefix = up
+                            .cache_s3_prefix
+                            .clone()
+                            .expect("validated: S3 cache s3_prefix");
+                        Arc::new(storage::s3::S3Storage::new(
+                            Some(endpoint),
+                            Some(region),
+                            Some(bucket),
+                            prefix,
+                            config.max_upload_bytes,
+                        ))
+                    }
+                };
 
             proxy_upstreams.push(ProxyContext { proxy, cache });
         }
@@ -551,7 +564,7 @@ pub async fn run_server_supervisor(
         None
     };
 
-    let proxy_cache: Option<Arc<dyn Storage>> =
+    let proxy_cache: Option<Arc<dyn storage::BlobUploadCoordinatorStoragePort>> =
         if config.proxy.enabled && config.proxy.upstreams.is_empty() {
             match config.storage_backend {
                 StorageBackend::Filesystem => {
@@ -605,7 +618,7 @@ pub async fn run_server_supervisor(
     let gc_service = match &ref_index {
         Some(idx) => Some(Arc::new(GcService::with_coordinator_and_authority(
             config.clone(),
-            storage.clone(),
+            storage_wiring.gc_service_port(),
             idx.clone(),
             consistency.clone(),
             mutation_authority.clone(),
@@ -617,7 +630,11 @@ pub async fn run_server_supervisor(
         && config.blob_gc_enabled
         && config.blob_gc_enable_delete
     {
-        if let Err(e) = storage.check_bucket_versioning_for_gc().await {
+        if let Err(e) = storage_wiring
+            .gc_port()
+            .check_bucket_versioning_for_gc()
+            .await
+        {
             tracing::warn!(
                 "S3 bucket versioning preflight check: {}; physical GC deletion will fail closed",
                 e
@@ -644,13 +661,13 @@ pub async fn run_server_supervisor(
         gc_pin_duration_secs: config.gc_pin_duration_secs,
     };
     let blob_service = Arc::new(crate::application::BlobMutationService::new(
-        storage.clone(),
+        storage_wiring.blob_mutation(),
         ref_index.clone(),
         consistency.clone(),
         upload_coord_config,
     ));
     let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
-        storage.clone(),
+        storage_wiring.manifest_lifecycle(),
         ref_index.clone(),
         consistency.clone(),
     ));
@@ -658,7 +675,12 @@ pub async fn run_server_supervisor(
     let state = AppState {
         config: config.clone(),
         auth_metrics: Arc::new(AuthMetrics::default()),
-        storage: storage.clone(),
+        blob_reader: storage_wiring.blob_reader(),
+        membership_reader: storage_wiring.membership_reader(),
+        manifest_reader: storage_wiring.manifest_reader(),
+        tag_reader: storage_wiring.tag_reader(),
+        catalog_reader: storage_wiring.catalog_reader(),
+        referrers_reader: storage_wiring.referrers_reader(),
         ref_index: ref_index.clone(),
         gc_service,
         gc_run_seq: Arc::new(AtomicU64::new(0)),
@@ -1178,7 +1200,7 @@ async fn proxy_scrub_once(
 }
 
 async fn proxy_gc_once(
-    storage: &Arc<dyn Storage>,
+    storage: &Arc<dyn storage::BlobUploadCoordinatorStoragePort>,
     fs_root: &std::path::Path,
     max_cache_bytes: u64,
     repo_rules: &[crate::config::ProxyRepoRule],
@@ -1264,7 +1286,7 @@ async fn proxy_gc_once(
 }
 
 pub async fn compute_protected_blobs(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl storage::BlobIndexStoragePort + ?Sized),
     repo_rules: &[crate::config::ProxyRepoRule],
     proxy: &crate::proxy::Proxy,
 ) -> Result<HashSet<String>, String> {
@@ -1325,7 +1347,7 @@ pub async fn compute_protected_blobs(
 }
 
 pub async fn collect_protected_blobs_for_manifest(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl storage::ManifestReader + ?Sized),
     repo: &str,
     digest: &Digest,
     protected_blobs: &mut HashSet<String>,
@@ -1722,13 +1744,13 @@ pub async fn spawn_blob_gc_scheduler(supervisor: &TaskSupervisor, state: AppStat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
     use tempfile::TempDir;
 
-    fn create_test_env() -> (Arc<dyn Storage>, crate::proxy::Proxy, TempDir) {
+    fn create_test_env() -> (Arc<storage::fs::FsStorage>, crate::proxy::Proxy, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let fs_root = temp_dir.path().join("registry");
-        let storage: Arc<dyn Storage> =
-            Arc::new(storage::fs::FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let storage = Arc::new(storage::fs::FsStorage::new(fs_root, 10 * 1024 * 1024));
         let proxy_db_path = temp_dir.path().join("proxy.db");
         let proxy_cfg = crate::config::ProxyConfig {
             enabled: true,

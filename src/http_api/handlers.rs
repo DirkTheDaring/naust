@@ -128,11 +128,11 @@ fn platform_triplet(os: &str, arch: &str, variant: Option<&str>) -> String {
 }
 
 async fn read_storage_blob_limited_json(
-    storage: &Arc<dyn crate::storage::Storage>,
+    blob_reader: &Arc<dyn crate::storage::BlobCasReader>,
     digest: &Digest,
     max_bytes: usize,
 ) -> Result<serde_json::Value, ()> {
-    let (meta, mut reader) = storage.open_blob(digest).await.map_err(|_| ())?;
+    let (meta, mut reader) = blob_reader.open_blob(digest).await.map_err(|_| ())?;
     // Defensive: config blobs are expected to be small. Refuse to read very large blobs.
     if meta.size as usize > max_bytes {
         return Err(());
@@ -155,12 +155,14 @@ async fn read_storage_blob_limited_json(
 }
 
 pub(crate) async fn tag_platforms_for_repo(
-    storage: &Arc<dyn crate::storage::Storage>,
+    blob_reader: &Arc<dyn crate::storage::BlobCasReader>,
+    tag_reader: &Arc<dyn crate::storage::TagReader>,
+    manifest_reader: &Arc<dyn crate::storage::ManifestReader>,
     repo: &str,
     tag: &str,
 ) -> Result<serde_json::Value, StorageError> {
-    let digest = storage.resolve_tag(repo, tag).await?;
-    let (meta, bytes) = storage.get_manifest(repo, &digest).await?;
+    let digest = tag_reader.resolve_tag(repo, tag).await?;
+    let (meta, bytes) = manifest_reader.get_manifest(repo, &digest).await?;
 
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
 
@@ -193,7 +195,8 @@ pub(crate) async fn tag_platforms_for_repo(
             .and_then(|d| d.as_str())
         {
             if let Ok(cfg_d) = Digest::parse(cfg_digest) {
-                if let Ok(cfg) = read_storage_blob_limited_json(storage, &cfg_d, 1024 * 1024).await
+                if let Ok(cfg) =
+                    read_storage_blob_limited_json(blob_reader, &cfg_d, 1024 * 1024).await
                 {
                     if let (Some(os), Some(arch)) = (
                         cfg.get("os").and_then(|x| x.as_str()),
@@ -369,7 +372,11 @@ async fn blob_by_digest(
     }
 
     // Check repository-scoped blob membership
-    let membership_opt = match state.storage.get_repo_blob_membership(name, &digest).await {
+    let membership_opt = match state
+        .membership_reader
+        .get_repo_blob_membership(name, &digest)
+        .await
+    {
         Ok(m) => m,
         Err(StorageError::InvalidRepoName(_)) => return errors::name_invalid().into_response(),
         Err(e) => {
@@ -393,7 +400,7 @@ async fn blob_by_digest(
         },
         Method::HEAD => {
             if membership_opt.is_some() {
-                match state.storage.head_blob(&digest).await {
+                match state.blob_reader.head_blob(&digest).await {
                     Ok(meta) => {
                         let mut headers = registry_headers();
                         headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
@@ -440,7 +447,7 @@ async fn blob_by_digest(
         }
         Method::GET => {
             if membership_opt.is_some() {
-                match state.storage.open_blob(&digest).await {
+                match state.blob_reader.open_blob(&digest).await {
                     Ok((meta, reader)) => {
                         let stream = ReaderStream::new(reader);
                         let body = Body::from_stream(stream);
@@ -638,7 +645,7 @@ async fn manifest_by_reference(
     let digest = if let Ok(d) = Digest::parse(reference) {
         d
     } else {
-        match state.storage.resolve_tag(name, reference).await {
+        match state.tag_reader.resolve_tag(name, reference).await {
             Ok(d) => d,
             Err(StorageError::NotFound) => {
                 // Check cache storage for an existing cached tag.
@@ -796,7 +803,7 @@ async fn manifest_by_reference(
                 }
             }
         }
-        Method::HEAD => match state.storage.get_manifest(name, &digest).await {
+        Method::HEAD => match state.manifest_reader.get_manifest(name, &digest).await {
             Ok((meta, bytes)) => {
                 let mut headers = registry_headers();
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
@@ -900,7 +907,7 @@ async fn manifest_by_reference(
             Err(StorageError::MigrationRequired(_)) => errors::internal_error().into_response(),
             Err(StorageError::Internal(_)) => errors::internal_error().into_response(),
         },
-        Method::GET => match state.storage.get_manifest(name, &digest).await {
+        Method::GET => match state.manifest_reader.get_manifest(name, &digest).await {
             Ok((meta, bytes)) => {
                 let mut headers = registry_headers();
                 headers.insert("Docker-Content-Digest", digest.as_str().parse().unwrap());
@@ -1252,6 +1259,7 @@ mod tests {
     };
     use crate::http_api::catalog::meta_catalog;
     use crate::registry::validation::{is_valid_repo_name, is_valid_tag};
+    use crate::storage::Storage;
     use axum::extract::{Json, State};
     use axum::http::{HeaderMap, StatusCode};
     use headers::{Authorization, HeaderMapExt};
@@ -1275,11 +1283,21 @@ mod tests {
         headers
     }
 
-    fn test_app_state(
+    fn test_app_state<S>(
         cfg: Arc<crate::config::Config>,
-        storage: Arc<dyn crate::storage::Storage>,
+        storage: Arc<S>,
         gc_service: Option<Arc<crate::gc_service::GcService>>,
-    ) -> AppState {
+    ) -> AppState
+    where
+        S: crate::storage::Storage
+            + crate::storage::BlobUploadCoordinatorStoragePort
+            + crate::storage::ManifestLifecycleStoragePort
+            + crate::storage::BlobIndexStoragePort
+            + crate::storage::BlobRefIndexStoragePort
+            + crate::storage::GcServiceStoragePort
+            + crate::storage::ClusterLockStore
+            + 'static,
+    {
         let ip_limiter = Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
             cfg.max_connections_per_ip,
             cfg.trusted_bypass_cidrs.clone(),
@@ -1290,8 +1308,9 @@ mod tests {
             .map(|k| k.key.as_bytes().to_vec())
             .unwrap_or_else(|| b"registry-rust-state-secret".to_vec());
         let consistency = crate::consistency::ConsistencyCoordinator::new();
+        let wiring = crate::storage::StorageWiring::from_backend(storage);
         let blob_service = Arc::new(crate::application::BlobMutationService::new(
-            storage.clone(),
+            wiring.blob_mutation(),
             None,
             consistency.clone(),
             crate::application::BlobUploadCoordinatorConfig {
@@ -1304,14 +1323,19 @@ mod tests {
             },
         ));
         let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
-            storage.clone(),
+            wiring.manifest_lifecycle(),
             None,
             consistency,
         ));
         AppState {
             config: cfg,
             auth_metrics: Arc::new(crate::AuthMetrics::default()),
-            storage: storage.clone(),
+            blob_reader: wiring.blob_reader(),
+            membership_reader: wiring.membership_reader(),
+            manifest_reader: wiring.manifest_reader(),
+            tag_reader: wiring.tag_reader(),
+            catalog_reader: wiring.catalog_reader(),
+            referrers_reader: wiring.referrers_reader(),
             ref_index: None,
             gc_service,
             proxy: None,
@@ -1334,9 +1358,10 @@ mod tests {
     #[tokio::test]
     async fn admin_gc_requires_auth() {
         let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let state = test_app_state(cfg, storage, None);
 
         let req = AdminGcPlanRequest::default();
@@ -1348,9 +1373,10 @@ mod tests {
     #[tokio::test]
     async fn admin_gc_returns_503_when_service_missing() {
         let cfg = Arc::new(with_admin_creds(minimal_config_for_token_tests()));
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let state = test_app_state(cfg, storage, None);
 
         let req = AdminGcPlanRequest::default();
@@ -1372,21 +1398,22 @@ mod tests {
         cfg.ref_index.path = ref_index_path.clone();
         let cfg = Arc::new(with_admin_creds(cfg));
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage_raw = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
-        idx.rebuild(&storage).await.expect("rebuild");
+        idx.rebuild(&storage_raw).await.expect("rebuild");
         let service = Arc::new(crate::gc_service::GcService::new(
             cfg.clone(),
-            storage.clone(),
+            storage_raw.clone(),
             idx,
             crate::consistency::ConsistencyCoordinator::new(),
         ));
         let service_for_state = service.clone();
         let held = service.test_try_lock().expect("lock");
 
-        let state = test_app_state(cfg, storage, Some(service_for_state));
+        let state = test_app_state(cfg, storage_raw, Some(service_for_state));
 
         let req = AdminGcPlanRequest::default();
 
@@ -1411,19 +1438,20 @@ mod tests {
         cfg.blob_gc_enabled = false;
         let cfg = Arc::new(with_admin_creds(cfg));
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage_raw = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
-        idx.rebuild(&storage).await.expect("rebuild");
+        idx.rebuild(&storage_raw).await.expect("rebuild");
         let service = Arc::new(crate::gc_service::GcService::new(
             cfg.clone(),
-            storage.clone(),
+            storage_raw.clone(),
             idx,
             crate::consistency::ConsistencyCoordinator::new(),
         ));
 
-        let state = test_app_state(cfg, storage, Some(service));
+        let state = test_app_state(cfg, storage_raw, Some(service));
 
         let resp = admin_gc_quarantine(
             State(state),
@@ -1451,19 +1479,20 @@ mod tests {
         cfg.blob_gc_enable_delete = false;
         let cfg = Arc::new(with_admin_creds(cfg));
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage_raw = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
-        idx.rebuild(&storage).await.expect("rebuild");
+        idx.rebuild(&storage_raw).await.expect("rebuild");
         let service = Arc::new(crate::gc_service::GcService::new(
             cfg.clone(),
-            storage.clone(),
+            storage_raw.clone(),
             idx,
             crate::consistency::ConsistencyCoordinator::new(),
         ));
 
-        let state = test_app_state(cfg, storage, Some(service));
+        let state = test_app_state(cfg, storage_raw, Some(service));
 
         let resp = admin_gc_delete(
             State(state),
@@ -1497,9 +1526,10 @@ mod tests {
         cfg.catalog_requires_auth = false;
         let cfg = Arc::new(cfg);
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
 
         let state = test_app_state(cfg, storage, None);
 
@@ -1624,9 +1654,10 @@ mod tests {
         cfg.catalog_requires_auth = false;
         let cfg = Arc::new(cfg);
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
 
         let state = test_app_state(cfg, storage, None);
 
@@ -2242,7 +2273,12 @@ mod tests {
 
     use sha2::Digest as _;
 
-    async fn setup_upload_test_env() -> (AppState, tempfile::TempDir, String) {
+    async fn setup_upload_test_env() -> (
+        AppState,
+        tempfile::TempDir,
+        String,
+        Arc<crate::storage::fs::FsStorage>,
+    ) {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut cfg = minimal_config_for_token_tests();
         cfg.fs_root = temp_dir.path().to_path_buf();
@@ -2251,21 +2287,21 @@ mod tests {
             key: "test-signing-key".to_string(),
         }];
         let cfg = Arc::new(cfg);
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
-        let state = test_app_state(cfg, storage, None);
-        let upload = state.storage.create_upload().await.unwrap();
-        (state, temp_dir, upload.uuid)
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
+        let upload = storage.create_upload().await.unwrap();
+        let state = test_app_state(cfg, storage.clone(), None);
+        (state, temp_dir, upload.uuid, storage)
     }
 
     #[tokio::test]
     async fn test_handler_put_finalize_with_valid_state_accepted() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk = b"chunk of 1000 bytes";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(chunk))
             .await
             .unwrap();
@@ -2299,11 +2335,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_put_finalize_with_stale_offset_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk = b"chunk of 1000 bytes";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(chunk))
             .await
             .unwrap();
@@ -2337,11 +2372,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_put_finalize_with_wrong_uuid_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk = b"chunk of 1000 bytes";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(chunk))
             .await
             .unwrap();
@@ -2378,11 +2412,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_put_finalize_with_wrong_repo_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk = b"chunk of 1000 bytes";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(chunk))
             .await
             .unwrap();
@@ -2419,11 +2452,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_put_finalize_with_tampered_sig_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk = b"chunk of 1000 bytes";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(chunk))
             .await
             .unwrap();
@@ -2452,7 +2484,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_put_finalize_missing_state_accepted_for_monolithic() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, _storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk = b"monolithic upload bytes";
 
@@ -2480,12 +2512,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_put_finalize_with_final_body_pre_append_offset_validated() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
         let chunk1 = b"chunk1-bytes-";
         let chunk2 = b"chunk2-bytes-final";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(chunk1))
             .await
             .unwrap();
@@ -2522,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_patch_missing_state_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, _storage) = setup_upload_test_env().await;
         let repo = "library/test";
 
         let resp = super::upload_session(
@@ -2541,10 +2572,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_patch_stale_offset_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, storage) = setup_upload_test_env().await;
         let repo = "library/test";
-        state
-            .storage
+        storage
             .append_upload(&uuid, bytes::Bytes::from_static(b"existing-1000"))
             .await
             .unwrap();
@@ -2572,7 +2602,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_get_session_with_invalid_state_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, _storage) = setup_upload_test_env().await;
         let repo = "library/test";
 
         let mut query = std::collections::HashMap::new();
@@ -2594,7 +2624,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_delete_session_with_invalid_state_rejected() {
-        let (state, _tmp, uuid) = setup_upload_test_env().await;
+        let (state, _tmp, uuid, _storage) = setup_upload_test_env().await;
         let repo = "library/test";
 
         let mut query = std::collections::HashMap::new();
@@ -2622,9 +2652,10 @@ mod tests {
         let mut cfg = minimal_config_for_token_tests();
         cfg.fs_root = fs_root.clone();
         let cfg = Arc::new(cfg);
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let state = test_app_state(cfg, storage, None);
         let repo = "library/malformed";
 
@@ -2684,9 +2715,10 @@ mod tests {
         let mut cfg = minimal_config_for_token_tests();
         cfg.fs_root = fs_root.clone();
         let cfg = Arc::new(cfg);
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let state = test_app_state(cfg, storage, None);
         let repo = "library/malformed-cfg";
 
@@ -2737,9 +2769,10 @@ mod tests {
         cfg.fs_root = fs_root.clone();
         cfg.max_upload_bytes = 10_000_000; // 10 MB limit
         let cfg = Arc::new(cfg);
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            cfg.fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let state = test_app_state(cfg, storage, None);
 
         // 1. Repo containing "quota" with 2.5 MB (> old 1 MB test-hook) succeeds (202 Accepted)
@@ -2807,13 +2840,14 @@ async fn ensure_tag_fresh(
     state: &AppState,
     proxy: &crate::proxy::Proxy,
     decision: &crate::proxy::RepoDecision,
-    storage: &Arc<dyn crate::storage::Storage>,
+    cache: &Arc<dyn crate::storage::BlobUploadCoordinatorStoragePort>,
     tag: &str,
     ttl_secs: u64,
     always_revalidate: bool,
 ) -> Result<(), Response> {
     let now = crate::proxy::Proxy::now_unix();
-    let current_digest = storage
+    let current_digest = state
+        .tag_reader
         .resolve_tag(decision.local_repo.as_str(), tag)
         .await
         .ok();
@@ -2833,7 +2867,7 @@ async fn ensure_tag_fresh(
         .fetch_manifest_and_cache(
             decision,
             tag,
-            storage,
+            cache,
             state.config.max_request_body_bytes,
             true,
             if_none_match,
@@ -2845,7 +2879,8 @@ async fn ensure_tag_fresh(
         Ok(crate::proxy::FetchManifestResult::NotModified { etag, digest }) => {
             // If we don't have the manifest locally (or no tag pointer), fetch the body.
             if current_digest.is_none()
-                || storage
+                || state
+                    .manifest_reader
                     .head_manifest(
                         decision.local_repo.as_str(),
                         current_digest.as_ref().unwrap(),
@@ -2863,7 +2898,7 @@ async fn ensure_tag_fresh(
                     .fetch_manifest_and_cache(
                         decision,
                         tag,
-                        storage,
+                        cache,
                         state.config.max_request_body_bytes,
                         false,
                         None,
@@ -2876,7 +2911,8 @@ async fn ensure_tag_fresh(
                     })?;
             }
 
-            if let Some(d) = storage
+            if let Some(d) = state
+                .tag_reader
                 .resolve_tag(decision.local_repo.as_str(), tag)
                 .await
                 .ok()
@@ -2897,7 +2933,8 @@ async fn ensure_tag_fresh(
         }
         Ok(crate::proxy::FetchManifestResult::HeadOk { etag, digest, .. }) => {
             let needs_get = match (&current_digest, &digest) {
-                (Some(local), Some(up)) if local.hex() == up.hex() => storage
+                (Some(local), Some(up)) if local.hex() == up.hex() => state
+                    .manifest_reader
                     .head_manifest(decision.local_repo.as_str(), local)
                     .await
                     .is_err(),
@@ -2915,7 +2952,7 @@ async fn ensure_tag_fresh(
                     .fetch_manifest_and_cache(
                         decision,
                         tag,
-                        storage,
+                        cache,
                         state.config.max_request_body_bytes,
                         false,
                         None,

@@ -203,11 +203,11 @@ impl UploadSessionStorage for HookedStorage {
 #[async_trait::async_trait]
 impl GcStorage for HookedStorage {
     fn gc_strategy(&self) -> GcStorageStrategy {
-        self.inner.gc_strategy()
+        GcStorage::gc_strategy(&self.inner)
     }
 
     async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
-        self.inner.check_bucket_versioning_for_gc().await
+        GcStorage::check_bucket_versioning_for_gc(&self.inner).await
     }
 
     async fn list_cas_blobs_page(
@@ -215,7 +215,7 @@ impl GcStorage for HookedStorage {
         cursor: Option<&GcCursor>,
         limit: usize,
     ) -> Result<GcBlobPage, StorageError> {
-        self.inner.list_cas_blobs_page(cursor, limit).await
+        GcStorage::list_cas_blobs_page(&self.inner, cursor, limit).await
     }
 
     async fn quarantine_blob(
@@ -224,7 +224,7 @@ impl GcStorage for HookedStorage {
         digest: &Digest,
         version: &BlobObjectVersion,
     ) -> Result<GcQuarantineResult, StorageError> {
-        self.inner.quarantine_blob(permit, digest, version).await
+        GcStorage::quarantine_blob(&self.inner, permit, digest, version).await
     }
 
     async fn restore_quarantined_blob(
@@ -232,14 +232,14 @@ impl GcStorage for HookedStorage {
         permit: &GcMutationPermit<'_>,
         digest: &Digest,
     ) -> Result<Option<u64>, StorageError> {
-        self.inner.restore_quarantined_blob(permit, digest).await
+        GcStorage::restore_quarantined_blob(&self.inner, permit, digest).await
     }
 
     async fn quarantined_blob_version(
         &self,
         digest: &Digest,
     ) -> Result<Option<BlobObjectVersion>, StorageError> {
-        self.inner.quarantined_blob_version(digest).await
+        GcStorage::quarantined_blob_version(&self.inner, digest).await
     }
 
     async fn delete_blob_conditional(
@@ -251,10 +251,7 @@ impl GcStorage for HookedStorage {
         if let Some(hook) = &self.hooks.before_delete_blob_conditional {
             hook(digest.clone()).await;
         }
-        let res = self
-            .inner
-            .delete_blob_conditional(permit, digest, version)
-            .await;
+        let res = GcStorage::delete_blob_conditional(&self.inner, permit, digest, version).await;
         if let Some(hook) = &self.hooks.after_delete_blob_conditional {
             hook(digest.clone()).await;
         }
@@ -269,30 +266,30 @@ impl Storage for HookedStorage {
     }
 
     async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
-        self.inner.list_repositories().await
+        Storage::list_repositories(&self.inner).await
     }
 
     async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
-        self.inner.repo_timestamps(name).await
+        Storage::repo_timestamps(&self.inner, name).await
     }
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
-        self.inner.head_blob(digest).await
+        Storage::head_blob(&self.inner, digest).await
     }
 
     async fn open_blob(
         &self,
         digest: &Digest,
     ) -> Result<(BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
-        self.inner.open_blob(digest).await
+        Storage::open_blob(&self.inner, digest).await
     }
 
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
-        self.inner.resolve_tag(name, tag).await
+        Storage::resolve_tag(&self.inner, name, tag).await
     }
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
-        self.inner.list_tags(name).await
+        Storage::list_tags(&self.inner, name).await
     }
 
     async fn head_manifest(
@@ -300,7 +297,7 @@ impl Storage for HookedStorage {
         name: &str,
         digest: &Digest,
     ) -> Result<ManifestMeta, StorageError> {
-        self.inner.head_manifest(name, digest).await
+        Storage::head_manifest(&self.inner, name, digest).await
     }
 
     async fn get_manifest(
@@ -308,7 +305,7 @@ impl Storage for HookedStorage {
         name: &str,
         digest: &Digest,
     ) -> Result<(ManifestMeta, Bytes), StorageError> {
-        self.inner.get_manifest(name, digest).await
+        Storage::get_manifest(&self.inner, name, digest).await
     }
 
     async fn put_manifest(
@@ -317,11 +314,11 @@ impl Storage for HookedStorage {
         digest: &Digest,
         bytes: Bytes,
     ) -> Result<ManifestMeta, StorageError> {
-        self.inner.put_manifest(name, digest, bytes).await
+        Storage::put_manifest(&self.inner, name, digest, bytes).await
     }
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
-        self.inner.set_tag(name, tag, digest).await
+        Storage::set_tag(&self.inner, name, tag, digest).await
     }
 
     async fn mutate_tag(
@@ -334,7 +331,7 @@ impl Storage for HookedStorage {
         if let Some(hook) = &self.hooks.before_mutate_tag {
             hook((name.to_string(), tag.to_string(), digest.clone())).await;
         }
-        let res = self.inner.mutate_tag(name, tag, digest, policy).await;
+        let res = Storage::mutate_tag(&self.inner, name, tag, digest, policy).await;
         if let Some(hook) = &self.hooks.after_mutate_tag {
             hook((name.to_string(), tag.to_string(), digest.clone())).await;
         }
@@ -342,7 +339,7 @@ impl Storage for HookedStorage {
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
-        self.inner.delete_tag(name, tag).await
+        Storage::delete_tag(&self.inner, name, tag).await
     }
 
     async fn list_manifest_digests_page(
@@ -351,9 +348,7 @@ impl Storage for HookedStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
-        self.inner
-            .list_manifest_digests_page(repo, continuation_token, page_limit)
-            .await
+        Storage::list_manifest_digests_page(&self.inner, repo, continuation_token, page_limit).await
     }
 
     async fn list_tags_page(
@@ -362,9 +357,7 @@ impl Storage for HookedStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
-        self.inner
-            .list_tags_page(repo, continuation_token, page_limit)
-            .await
+        Storage::list_tags_page(&self.inner, repo, continuation_token, page_limit).await
     }
 
     async fn list_referrers_page(
@@ -374,8 +367,7 @@ impl Storage for HookedStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError> {
-        self.inner
-            .list_referrers_page(repo, subject, continuation_token, page_limit)
+        Storage::list_referrers_page(&self.inner, repo, subject, continuation_token, page_limit)
             .await
     }
 
@@ -384,7 +376,7 @@ impl Storage for HookedStorage {
         repo: &str,
         tag: &str,
     ) -> Result<Option<(Digest, String)>, StorageError> {
-        self.inner.get_tag_with_version(repo, tag).await
+        Storage::get_tag_with_version(&self.inner, repo, tag).await
     }
 
     async fn delete_tag_conditional(
@@ -393,20 +385,18 @@ impl Storage for HookedStorage {
         tag: &str,
         expected_version: Option<&str>,
     ) -> Result<ConditionalDeleteResult, StorageError> {
-        self.inner
-            .delete_tag_conditional(repo, tag, expected_version)
-            .await
+        Storage::delete_tag_conditional(&self.inner, repo, tag, expected_version).await
     }
 
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
-        self.inner.read_lifecycle_journal(repo).await
+        Storage::read_lifecycle_journal(&self.inner, repo).await
     }
 
     async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
         if let Some(hook) = &self.hooks.before_write_lifecycle_journal {
             hook(repo.to_string()).await;
         }
-        let res = self.inner.write_lifecycle_journal(repo, data).await;
+        let res = Storage::write_lifecycle_journal(&self.inner, repo, data).await;
         if let Some(hook) = &self.hooks.after_write_lifecycle_journal {
             hook(repo.to_string()).await;
         }
@@ -417,7 +407,7 @@ impl Storage for HookedStorage {
         if let Some(hook) = &self.hooks.before_delete_lifecycle_journal {
             hook(repo.to_string()).await;
         }
-        let res = self.inner.delete_lifecycle_journal(repo).await;
+        let res = Storage::delete_lifecycle_journal(&self.inner, repo).await;
         if let Some(hook) = &self.hooks.after_delete_lifecycle_journal {
             hook(repo.to_string()).await;
         }
@@ -431,9 +421,7 @@ impl Storage for HookedStorage {
         lease_id: &str,
         ttl_secs: u64,
     ) -> Result<bool, StorageError> {
-        self.inner
-            .acquire_repo_lease(repo, owner_id, lease_id, ttl_secs)
-            .await
+        Storage::acquire_repo_lease(&self.inner, repo, owner_id, lease_id, ttl_secs).await
     }
 
     async fn renew_repo_lease(
@@ -443,9 +431,7 @@ impl Storage for HookedStorage {
         lease_id: &str,
         ttl_secs: u64,
     ) -> Result<bool, StorageError> {
-        self.inner
-            .renew_repo_lease(repo, owner_id, lease_id, ttl_secs)
-            .await
+        Storage::renew_repo_lease(&self.inner, repo, owner_id, lease_id, ttl_secs).await
     }
 
     async fn release_repo_lease(
@@ -454,29 +440,27 @@ impl Storage for HookedStorage {
         owner_id: &str,
         lease_id: &str,
     ) -> Result<(), StorageError> {
-        self.inner
-            .release_repo_lease(repo, owner_id, lease_id)
-            .await
+        Storage::release_repo_lease(&self.inner, repo, owner_id, lease_id).await
     }
 
     async fn create_upload(&self) -> Result<UploadMeta, StorageError> {
-        self.inner.create_upload().await
+        Storage::create_upload(&self.inner).await
     }
 
     async fn upload_status(&self, uuid: &str) -> Result<UploadMeta, StorageError> {
-        self.inner.upload_status(uuid).await
+        Storage::upload_status(&self.inner, uuid).await
     }
 
     async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<UploadMeta, StorageError> {
-        self.inner.append_upload(uuid, chunk).await
+        Storage::append_upload(&self.inner, uuid, chunk).await
     }
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError> {
-        self.inner.finalize_upload(uuid, digest).await
+        Storage::finalize_upload(&self.inner, uuid, digest).await
     }
 
     async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
-        self.inner.abort_upload(uuid).await
+        Storage::abort_upload(&self.inner, uuid).await
     }
 
     async fn list_referrers(
@@ -484,7 +468,7 @@ impl Storage for HookedStorage {
         name: &str,
         subject: &Digest,
     ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
-        self.inner.list_referrers(name, subject).await
+        Storage::list_referrers(&self.inner, name, subject).await
     }
 
     async fn add_referrer(
@@ -493,7 +477,7 @@ impl Storage for HookedStorage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
-        self.inner.add_referrer(name, subject, descriptor).await
+        Storage::add_referrer(&self.inner, name, subject, descriptor).await
     }
 
     async fn remove_referrer(
@@ -502,13 +486,16 @@ impl Storage for HookedStorage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
-        self.inner.remove_referrer(name, subject, referrer).await
+        Storage::remove_referrer(&self.inner, name, subject, referrer).await
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
-        self.inner.delete_manifest(name, digest).await
+        Storage::delete_manifest(&self.inner, name, digest).await
     }
 }
+
+registry_rust::impl_storage_ports!(HookedStorage);
+registry_rust::impl_gc_storage_port!(HookedStorage);
 
 pub fn tmp_dir(prefix: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));

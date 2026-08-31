@@ -319,10 +319,10 @@ pub async fn run_cli(cli: Cli) -> i32 {
                     }
                 },
                 RefIndexCommand::Rebuild => {
-                    let storage = storage::from_config(&cfg);
+                    let storage_wiring = storage::storage_wiring_from_config(&cfg);
                     let mut authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
-                            storage.clone(),
+                            storage_wiring.cluster_lock(),
                             "ref-index-rebuild",
                         )
                         .await
@@ -336,7 +336,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                             }
                         };
 
-                    if let Err(e) = idx.rebuild(&storage).await {
+                    if let Err(e) = idx.rebuild(&storage_wiring.blob_ref_index()).await {
                         eprintln!("ref-index: rebuild failed: {e}");
                         let _ = authority.release().await;
                         return 1;
@@ -346,10 +346,10 @@ pub async fn run_cli(cli: Cli) -> i32 {
                     0
                 }
                 RefIndexCommand::Ensure => {
-                    let storage = storage::from_config(&cfg);
+                    let storage_wiring = storage::storage_wiring_from_config(&cfg);
                     let mut authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
-                            storage.clone(),
+                            storage_wiring.cluster_lock(),
                             "ref-index-ensure",
                         )
                         .await
@@ -365,7 +365,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
 
                     if let Err(e) = idx
                         .ensure_healthy_or_rebuild(
-                            &storage,
+                            &storage_wiring.blob_ref_index(),
                             cfg.ref_index.auto_rebuild_on_corruption,
                             cfg.ref_index.rebuild_on_start,
                         )
@@ -438,10 +438,10 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 }
             };
 
-            let storage = storage::from_config(&cfg);
+            let storage_wiring = storage::storage_wiring_from_config(&cfg);
             if let Err(e) = idx
                 .ensure_healthy_or_rebuild(
-                    &storage,
+                    &storage_wiring.blob_ref_index(),
                     cfg.ref_index.auto_rebuild_on_corruption,
                     cfg.ref_index.rebuild_on_start,
                 )
@@ -464,7 +464,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 } => {
                     let service = crate::gc_service::GcService::new(
                         std::sync::Arc::new(gc_cfg),
-                        storage.clone(),
+                        storage_wiring.gc_service_port(),
                         std::sync::Arc::new(idx),
                         consistency,
                     );
@@ -505,7 +505,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 } => {
                     let authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
-                            storage.clone(),
+                            storage_wiring.cluster_lock(),
                             "blob-gc-quarantine",
                         )
                         .await
@@ -521,7 +521,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
 
                     let service = crate::gc_service::GcService::with_authority(
                         std::sync::Arc::new(gc_cfg),
-                        storage.clone(),
+                        storage_wiring.gc_service_port(),
                         std::sync::Arc::new(idx),
                         consistency,
                         authority,
@@ -566,7 +566,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 } => {
                     let authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
-                            storage.clone(),
+                            storage_wiring.cluster_lock(),
                             "blob-gc-delete",
                         )
                         .await
@@ -582,7 +582,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
 
                     let service = crate::gc_service::GcService::with_authority(
                         std::sync::Arc::new(gc_cfg),
-                        storage.clone(),
+                        storage_wiring.gc_service_port(),
                         std::sync::Arc::new(idx),
                         consistency,
                         authority,
@@ -624,11 +624,15 @@ pub async fn run_cli(cli: Cli) -> i32 {
         }
         CliCommand::MigrateMembership { command } => {
             let config = Arc::new(load_config_or_exit("migrate-membership", &config_paths));
-            let storage = storage::from_config(config.as_ref());
+            let storage_wiring = storage::storage_wiring_from_config(config.as_ref());
             match command {
                 MigrateMembershipCommand::Plan => {
                     println!("Planning repository blob membership migration (dry-run)...");
-                    match crate::membership_migration::plan_membership_migration(&storage).await {
+                    match crate::membership_migration::plan_membership_migration(
+                        &storage_wiring.blob_ref_index(),
+                    )
+                    .await
+                    {
                         Ok(stats) => {
                             println!("Migration Plan Summary:");
                             println!("  Repositories scanned: {}", stats.repositories_scanned);
@@ -649,7 +653,7 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 MigrateMembershipCommand::Apply => {
                     let mut authority =
                         match storage::mutation_authority::RuntimeMutationAuthority::acquire(
-                            storage.clone(),
+                            storage_wiring.cluster_lock(),
                             "migrate-membership-apply",
                         )
                         .await
@@ -664,7 +668,11 @@ pub async fn run_cli(cli: Cli) -> i32 {
                         };
 
                     println!("Applying repository blob membership migration...");
-                    match crate::membership_migration::apply_membership_migration(&storage).await {
+                    match crate::membership_migration::apply_membership_migration(
+                        &storage_wiring.blob_mutation(),
+                    )
+                    .await
+                    {
                         Ok(stats) => {
                             println!("Migration Applied Successfully:");
                             println!("  Repositories scanned: {}", stats.repositories_scanned);
@@ -687,7 +695,11 @@ pub async fn run_cli(cli: Cli) -> i32 {
                 }
                 MigrateMembershipCommand::Verify => {
                     println!("Verifying repository blob memberships...");
-                    match crate::membership_migration::verify_membership_migration(&storage).await {
+                    match crate::membership_migration::verify_membership_migration(
+                        &storage_wiring.blob_mutation(),
+                    )
+                    .await
+                    {
                         Ok(true) => {
                             println!(
                                 "Verification passed: all repository-referenced blobs have valid membership records."
@@ -710,8 +722,12 @@ pub async fn run_cli(cli: Cli) -> i32 {
         }
         CliCommand::InspectLock => {
             let config = Arc::new(load_config_or_exit("inspect-lock", &config_paths));
-            let storage = storage::from_config(config.as_ref());
-            match storage::mutation_authority::inspect_deployment_writer_lock(&storage).await {
+            let storage_wiring = storage::storage_wiring_from_config(config.as_ref());
+            match storage::mutation_authority::inspect_deployment_writer_lock(
+                &storage_wiring.cluster_lock(),
+            )
+            .await
+            {
                 Ok(Some((doc, etag))) => {
                     println!("Deployment Writer Lock Status: ACTIVE");
                     println!("  Format Version:    {}", doc.format_version);
@@ -741,18 +757,21 @@ pub async fn run_cli(cli: Cli) -> i32 {
             confirm,
         } => {
             let config = Arc::new(load_config_or_exit("admin-clear-lock", &config_paths));
-            let storage = storage::from_config(config.as_ref());
+            let storage_wiring = storage::storage_wiring_from_config(config.as_ref());
             let result = if confirm == "CONFIRM-CLEAR-ABANDONED-WRITER" {
                 storage::mutation_authority::admin_clear_abandoned_deployment_writer_lock(
-                    &storage,
+                    &storage_wiring.cluster_lock(),
                     &expected_owner,
                     &expected_etag,
                     &confirm,
                 )
                 .await
             } else {
-                storage::mutation_authority::force_unlock_deployment_writer(&storage, &confirm)
-                    .await
+                storage::mutation_authority::force_unlock_deployment_writer(
+                    &storage_wiring.cluster_lock(),
+                    &confirm,
+                )
+                .await
             };
 
             match result {

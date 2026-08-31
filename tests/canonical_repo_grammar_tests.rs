@@ -5,7 +5,6 @@ use registry_rust::blob_ref_index::BlobRefIndex;
 use registry_rust::manifest_lifecycle::{ManifestLifecycleService, PublishManifestRequest};
 use registry_rust::registry::canonical_name::CanonicalRepoName;
 use registry_rust::registry::digest::Digest;
-use registry_rust::storage::Storage;
 use registry_rust::storage::fs::FsStorage;
 use registry_rust::storage::repo_membership::{
     RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
@@ -838,11 +837,7 @@ async fn test_10_lifecycle_journal_recovery() {
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
 
     let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
-    let svc = ManifestLifecycleService::new(
-        storage.clone() as Arc<dyn Storage>,
-        Some(ref_index.clone()),
-        coordinator,
-    );
+    let svc = ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
 
     let repo = "team/image__cache--production";
     let cfg_bytes = b"cfg-payload";
@@ -925,10 +920,7 @@ async fn test_11_membership_migration_and_rebuild() {
 
     // Force dirty and rebuild
     ref_index.mark_dirty().unwrap();
-    ref_index
-        .rebuild(&(storage.clone() as Arc<dyn Storage>))
-        .await
-        .unwrap();
+    ref_index.rebuild(storage.as_ref()).await.unwrap();
 
     for name in &repo_names {
         let digest = sha256_digest(name.as_bytes());

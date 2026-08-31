@@ -30,15 +30,16 @@ pub async fn referrers_list(
 
     match method {
         Method::GET | Method::HEAD => {
-            let storage = match route_mode {
-                V2RouteMode::Default => state.storage.clone(),
-                V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
-                    Some(ctx) => ctx.cache.clone(),
-                    None => return errors::internal_error().into_response(),
-                },
-            };
+            let referrers_reader: std::sync::Arc<dyn crate::storage::ReferrersReader> =
+                match route_mode {
+                    V2RouteMode::Default => state.referrers_reader.clone(),
+                    V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
+                        Some(_) => state.referrers_reader.clone(),
+                        None => return errors::internal_error().into_response(),
+                    },
+                };
 
-            let mut entries = match storage.list_referrers(name, &subject).await {
+            let mut entries = match referrers_reader.list_referrers(name, &subject).await {
                 Ok(v) => v,
                 Err(StorageError::Unsupported) => return errors::not_implemented().into_response(),
                 Err(StorageError::Internal(_)) => return errors::internal_error().into_response(),

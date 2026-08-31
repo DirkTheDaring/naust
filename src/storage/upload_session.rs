@@ -190,3 +190,85 @@ pub trait UploadSessionStorage: Send + Sync {
         Err(StorageError::Unsupported)
     }
 }
+
+#[async_trait]
+impl<T: ?Sized + UploadSessionStorage + Send + Sync> UploadSessionStorage for std::sync::Arc<T> {
+    async fn create_session(&self, repo: &str) -> Result<UploadSessionId, StorageError> {
+        (**self).create_session(repo).await
+    }
+
+    async fn session_status(
+        &self,
+        session: &UploadSessionId,
+    ) -> Result<UploadSessionStatus, UploadTransitionError> {
+        (**self).session_status(session).await
+    }
+
+    async fn append_if_offset(
+        &self,
+        session: &UploadSessionId,
+        expected_offset: UploadOffsetPrecondition,
+        stream: UploadByteStream,
+        max_upload_bytes: u64,
+    ) -> Result<UploadAppendResult, UploadTransitionError> {
+        (**self)
+            .append_if_offset(session, expected_offset, stream, max_upload_bytes)
+            .await
+    }
+
+    async fn begin_finalize(
+        &self,
+        session: &UploadSessionId,
+        expected_offset: UploadOffsetPrecondition,
+        trailing_stream: Option<UploadByteStream>,
+        expected_digest: &Digest,
+        max_upload_bytes: u64,
+        abort_on_digest_mismatch: bool,
+    ) -> Result<PreparedFinalize, UploadTransitionError> {
+        (**self)
+            .begin_finalize(
+                session,
+                expected_offset,
+                trailing_stream,
+                expected_digest,
+                max_upload_bytes,
+                abort_on_digest_mismatch,
+            )
+            .await
+    }
+
+    async fn commit_finalize(
+        &self,
+        prepared: &PreparedFinalize,
+    ) -> Result<FinalizeOutcome, UploadTransitionError> {
+        (**self).commit_finalize(prepared).await
+    }
+
+    async fn abort_session(&self, session: &UploadSessionId) -> Result<(), StorageError> {
+        (**self).abort_session(session).await
+    }
+
+    async fn recover_session(
+        &self,
+        session: &UploadSessionId,
+    ) -> Result<UploadSessionStatus, UploadTransitionError> {
+        (**self).recover_session(session).await
+    }
+
+    async fn get_finalized_receipt(
+        &self,
+        session: &UploadSessionId,
+    ) -> Result<Option<FinalizedReceipt>, StorageError> {
+        (**self).get_finalized_receipt(session).await
+    }
+
+    async fn reap_expired_sessions(
+        &self,
+        max_age_secs: u64,
+        receipt_ttl_secs: u64,
+    ) -> Result<usize, StorageError> {
+        (**self)
+            .reap_expired_sessions(max_age_secs, receipt_ttl_secs)
+            .await
+    }
+}

@@ -670,7 +670,7 @@ mod tests {
         std::fs::create_dir_all(fs_root.join("uploads")).unwrap();
         std::fs::create_dir_all(&ref_dir).unwrap();
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
+        let storage: Arc<dyn crate::storage::BlobUploadCoordinatorStoragePort> = Arc::new(
             crate::storage::fs::FsStorage::new(fs_root.clone(), 10485760),
         );
         let ref_index = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_dir).unwrap());
@@ -729,12 +729,13 @@ mod tests {
         std::fs::create_dir_all(fs_root.join("blobs").join("sha256")).unwrap();
         std::fs::create_dir_all(&ref_dir).unwrap();
 
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(
-            crate::storage::fs::FsStorage::new(fs_root.clone(), 10485760),
-        );
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            fs_root.clone(),
+            10485760,
+        ));
         let ref_index = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_dir).unwrap());
         ref_index
-            .ensure_healthy_or_rebuild(&storage, true, false)
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
             .await
             .unwrap();
 

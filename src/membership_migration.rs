@@ -2,15 +2,14 @@ use crate::manifest_refs::parse_manifest_refs;
 pub use crate::storage::repo_membership::{
     MigrationCheckpointRecord, MigrationPhase, MigrationStats, RepoBlobMembershipRecord,
 };
-use crate::storage::{Storage, StorageError};
-use std::sync::Arc;
+use crate::storage::{BlobRefIndexStoragePort, BlobUploadCoordinatorStoragePort, StorageError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEASE_DURATION_SECS: u64 = 60;
 
 /// Plan repository blob membership migration (dry-run). Performs ZERO writes.
 pub async fn plan_membership_migration(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl BlobRefIndexStoragePort + ?Sized),
 ) -> Result<MigrationStats, StorageError> {
     let mut stats = MigrationStats::default();
     let repos = storage.list_repositories().await?;
@@ -43,7 +42,7 @@ pub async fn plan_membership_migration(
 /// Apply repository blob membership backfill from authoritative tagged manifests.
 /// Resumes from previous checkpoint if interrupted.
 pub async fn apply_membership_migration(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl BlobUploadCoordinatorStoragePort + ?Sized),
 ) -> Result<MigrationStats, StorageError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -209,7 +208,9 @@ pub async fn apply_membership_migration(
 }
 
 /// Verify that all repository-referenced blobs have durable membership records and exist in CAS.
-pub async fn verify_membership_migration(storage: &Arc<dyn Storage>) -> Result<bool, StorageError> {
+pub async fn verify_membership_migration(
+    storage: &(impl BlobUploadCoordinatorStoragePort + ?Sized),
+) -> Result<bool, StorageError> {
     let repos = storage.list_repositories().await?;
     for repo in &repos {
         let tags = storage.list_tags(repo).await.unwrap_or_default();

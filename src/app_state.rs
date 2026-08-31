@@ -39,12 +39,17 @@ impl AuthMetrics {
 pub struct AppState {
     pub config: Arc<Config>,
     pub auth_metrics: Arc<AuthMetrics>,
-    pub storage: Arc<dyn storage::Storage>,
+    pub blob_reader: Arc<dyn storage::BlobCasReader>,
+    pub membership_reader: Arc<dyn storage::RepositoryBlobMembershipStorage>,
+    pub manifest_reader: Arc<dyn storage::ManifestReader>,
+    pub tag_reader: Arc<dyn storage::TagReader>,
+    pub catalog_reader: Arc<dyn storage::RepositoryCatalogReader>,
+    pub referrers_reader: Arc<dyn storage::ReferrersReader>,
     pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
     pub gc_service: Option<Arc<gc_service::GcService>>,
     pub gc_run_seq: Arc<AtomicU64>,
     pub proxy: Option<Arc<proxy::Proxy>>,
-    pub proxy_cache: Option<Arc<dyn storage::Storage>>,
+    pub proxy_cache: Option<Arc<dyn storage::BlobUploadCoordinatorStoragePort>>,
     // Multi-upstream: proxy/cache selected per request host.
     pub proxy_upstreams: Vec<ProxyContext>,
     pub buffered_body_sem: Arc<Semaphore>,
@@ -68,7 +73,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct ProxyContext {
     pub proxy: Arc<proxy::Proxy>,
-    pub cache: Arc<dyn storage::Storage>,
+    pub cache: Arc<dyn storage::BlobUploadCoordinatorStoragePort>,
 }
 
 impl AppState {

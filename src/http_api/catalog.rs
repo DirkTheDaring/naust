@@ -16,6 +16,7 @@ use axum::{
 use futures_util::StreamExt as _;
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,15 +29,16 @@ pub async fn catalog_list(
 ) -> Response {
     match method {
         Method::GET | Method::HEAD => {
-            let storage = match route_mode {
-                V2RouteMode::Default => state.storage.clone(),
+            let catalog_reader: Arc<dyn crate::storage::RepositoryCatalogReader> = match route_mode
+            {
+                V2RouteMode::Default => state.catalog_reader.clone(),
                 V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
                     Some(ctx) => ctx.cache.clone(),
                     None => return errors::internal_error().into_response(),
                 },
             };
 
-            match storage.list_repositories().await {
+            match catalog_reader.list_repositories().await {
                 Ok(mut all) => {
                     all.sort();
                     let total = all.len();
@@ -121,13 +123,23 @@ pub fn repo_meta_from_timestamps(name: &str, ts: RepoTimestamps) -> serde_json::
     };
     let last_change = system_time_to_rfc3339_opt(last_change_time);
 
-    serde_json::json!({
-        "name": name,
-        "org": repo_org(name),
-        "last_push": last_push,
-        "last_manifest_change": last_manifest_change,
-        "last_change": last_change,
-    })
+    let org = repo_org(name);
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_string(), serde_json::json!(name));
+    if let Some(org) = org {
+        obj.insert("org".to_string(), serde_json::json!(org));
+    } else {
+        obj.insert("org".to_string(), serde_json::Value::Null);
+    }
+    obj.insert("last_change".to_string(), serde_json::json!(last_change));
+    obj.insert("last_push".to_string(), serde_json::json!(last_push));
+    obj.insert(
+        "last_manifest_change".to_string(),
+        serde_json::json!(last_manifest_change),
+    );
+
+    serde_json::Value::Object(obj)
 }
 
 pub async fn meta_orgs(
@@ -139,7 +151,7 @@ pub async fn meta_orgs(
         return crate::auth::unauthorized_catalog_challenge(&state).into_response();
     }
 
-    let repos = match state.storage.list_repositories().await {
+    let repos = match state.catalog_reader.list_repositories().await {
         Ok(r) => r,
         Err(_) => return errors::internal_error().into_response(),
     };
@@ -208,7 +220,7 @@ pub async fn meta_org_repos(
         return crate::auth::unauthorized_catalog_challenge(&state).into_response();
     }
 
-    let repos = match state.storage.list_repositories().await {
+    let repos = match state.catalog_reader.list_repositories().await {
         Ok(r) => r,
         Err(_) => return errors::internal_error().into_response(),
     };
@@ -238,11 +250,11 @@ pub async fn meta_org_repos(
     let mut repos_out: Vec<serde_json::Value> = Vec::new();
     let include_tags = query_bool(&query, "include_tags");
     for repo in &page {
-        match state.storage.repo_timestamps(repo).await {
+        match state.catalog_reader.repo_timestamps(repo).await {
             Ok(ts) => {
                 let mut meta = repo_meta_from_timestamps(repo, ts);
                 if include_tags {
-                    let tags = match state.storage.list_tags(repo).await {
+                    let tags = match state.tag_reader.list_tags(repo).await {
                         Ok(t) => t,
                         Err(StorageError::NotFound) => Vec::new(),
                         Err(_) => return errors::internal_error().into_response(),
@@ -276,8 +288,7 @@ pub async fn meta_org_repos(
     if has_more {
         if let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
             let last_repo = url_encode_component(last_repo);
-            let link =
-                format!("</_meta/orgs/{org}/repos?n={n_raw}&last={last_repo}>; rel=\"next\"");
+            let link = format!("</_meta/orgs/{org}?n={n_raw}&last={last_repo}>; rel=\"next\"");
             if let Ok(v) = http::HeaderValue::from_str(&link) {
                 resp_headers.insert(http::header::LINK, v);
             }
@@ -299,11 +310,11 @@ pub async fn meta_repo(
 
     let include_tags = query_bool(&query, "include_tags");
 
-    match state.storage.repo_timestamps(&name).await {
+    match state.catalog_reader.repo_timestamps(&name).await {
         Ok(ts) => {
             let mut payload = repo_meta_from_timestamps(&name, ts);
             if include_tags {
-                let tags = match state.storage.list_tags(&name).await {
+                let tags = match state.tag_reader.list_tags(&name).await {
                     Ok(t) => t,
                     Err(StorageError::NotFound) => Vec::new(),
                     Err(_) => return errors::internal_error().into_response(),
@@ -336,7 +347,7 @@ pub async fn meta_catalog(
         return crate::auth::unauthorized_catalog_challenge(&state).into_response();
     }
 
-    let mut repos = match state.storage.list_repositories().await {
+    let mut repos = match state.catalog_reader.list_repositories().await {
         Ok(r) => r,
         Err(_) => return errors::internal_error().into_response(),
     };
@@ -368,11 +379,11 @@ pub async fn meta_catalog(
     let include_platforms = query_bool(&query, "include_platforms");
     let include_tags = query_bool(&query, "include_tags") || include_platforms;
     for repo in &page {
-        match state.storage.repo_timestamps(repo).await {
+        match state.catalog_reader.repo_timestamps(repo).await {
             Ok(ts) => {
                 let mut meta = repo_meta_from_timestamps(repo, ts);
                 if include_tags {
-                    let tags = match state.storage.list_tags(repo).await {
+                    let tags = match state.tag_reader.list_tags(repo).await {
                         Ok(t) => t,
                         Err(StorageError::NotFound) => Vec::new(),
                         Err(_) => return errors::internal_error().into_response(),
@@ -382,7 +393,9 @@ pub async fn meta_catalog(
                         obj.insert("tags".to_string(), serde_json::json!(tags));
 
                         if include_platforms {
-                            let storage = state.storage.clone();
+                            let blob_reader = state.blob_reader.clone();
+                            let tag_reader = state.tag_reader.clone();
+                            let manifest_reader = state.manifest_reader.clone();
                             let repo = repo.to_string();
                             let tag_details = futures_util::stream::iter(
                                 obj.get("tags")
@@ -393,9 +406,20 @@ pub async fn meta_catalog(
                                     .collect::<Vec<_>>(),
                             )
                             .map(|tag| {
-                                let storage = storage.clone();
+                                let blob_reader = blob_reader.clone();
+                                let tag_reader = tag_reader.clone();
+                                let manifest_reader = manifest_reader.clone();
                                 let repo = repo.clone();
-                                async move { tag_platforms_for_repo(&storage, &repo, &tag).await }
+                                async move {
+                                    tag_platforms_for_repo(
+                                        &blob_reader,
+                                        &tag_reader,
+                                        &manifest_reader,
+                                        &repo,
+                                        &tag,
+                                    )
+                                    .await
+                                }
                             })
                             .buffer_unordered(16)
                             .collect::<Vec<_>>()

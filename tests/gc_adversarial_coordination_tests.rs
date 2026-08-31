@@ -11,7 +11,8 @@ use registry_rust::registry::digest::Digest;
 use registry_rust::storage::fs::FsStorage;
 use registry_rust::storage::mutation_authority::RuntimeMutationAuthority;
 use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
-use registry_rust::storage::{self, GcDeleteResult, GcQuarantineResult, Storage};
+use registry_rust::storage::repo_membership::RepositoryBlobMembershipStorage;
+use registry_rust::storage::{self, GcDeleteResult, GcQuarantineResult, GcStorage, Storage};
 use sha2::Digest as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use std::time::{Duration, SystemTime};
 use support::gc_coordination::*;
 use tokio::sync::{Barrier, Mutex};
 
+#[allow(dead_code)]
 async fn write_manifest(
     fs_root: &std::path::Path,
     repo: &str,
@@ -57,7 +59,7 @@ async fn test_manifest_publication_acquires_gate_first_gc_revalidates_and_preser
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -166,7 +168,7 @@ async fn test_gc_acquires_gate_first_publication_blocked_until_gc_finishes() {
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -258,7 +260,7 @@ async fn test_repo_membership_created_before_final_deletion_causes_candidate_ski
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -336,7 +338,7 @@ async fn test_pin_finalizing_upload_state_causes_candidate_skipped() {
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -414,7 +416,7 @@ async fn test_lifecycle_journal_appearing_before_validation_causes_candidate_ski
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -512,7 +514,7 @@ async fn test_fs_quarantined_object_version_mismatch_returns_precondition_failed
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "test-adv-6")
         .await
         .expect("authority");
@@ -579,7 +581,7 @@ async fn test_admin_and_scheduler_have_no_permit_access() {
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     let authority = RuntimeMutationAuthority::acquire(storage.clone(), "test-adv-7")
         .await
@@ -633,7 +635,7 @@ async fn test_cli_acquires_authority_once_and_routes_through_service() {
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -690,8 +692,7 @@ async fn test_concurrent_lifecycle_mutation_progresses_between_gc_candidates() {
     let ref_index_path = fs_root.join("ref-index");
     let cfg = Arc::new(test_config(fs_root.clone(), ref_index_path.clone()));
 
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
     idx.ensure_healthy_or_rebuild(&base_storage, true, true)
         .await
@@ -742,8 +743,7 @@ async fn test_concurrent_lifecycle_mutation_progresses_between_gc_candidates() {
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let service = GcService::with_coordinator_and_authority(
         cfg.clone(),
@@ -854,7 +854,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
     let ref_index_path = fs_root.join("index.sled");
     let cfg = test_config(fs_root.clone(), ref_index_path.clone());
 
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::try_new(fs_root.clone(), 0).unwrap());
+    let storage = Arc::new(FsStorage::try_new(fs_root.clone(), 0).unwrap());
     let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).unwrap());
     idx.ensure_healthy_or_rebuild(&storage, true, true)
         .await
@@ -969,7 +969,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
 #[tokio::test]
 async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     let (s3_storage, driver) = registry_rust::storage::s3::tests::create_mock_storage();
-    let storage: Arc<dyn Storage> = Arc::new(s3_storage);
+    let storage = Arc::new(s3_storage);
 
     let temp = tempfile::TempDir::new().unwrap();
     let idx = Arc::new(BlobRefIndex::open(temp.path().join("index.sled")).unwrap());
@@ -1128,8 +1128,7 @@ async fn test_s3_repository_enumeration_pagination_and_fail_closed_matrix() {
 async fn test_integration_manifest_publication_holds_mutation_guard_excluding_gc_revalidation() {
     let fs_root = tmp_dir("integ-manifest-excl-gc");
     let ref_idx_path = tmp_dir("integ-manifest-excl-gc-idx");
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -1159,8 +1158,7 @@ async fn test_integration_manifest_publication_holds_mutation_guard_excluding_gc
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let service = registry_rust::manifest_lifecycle::ManifestLifecycleService::new(
         hooked_storage.clone(),
@@ -1273,8 +1271,7 @@ async fn test_integration_manifest_publication_holds_mutation_guard_excluding_gc
 async fn test_integration_upload_finalization_holds_guard_through_membership_durability() {
     let fs_root = tmp_dir("integ-upload-fin-guard");
     let ref_idx_path = tmp_dir("integ-upload-fin-guard-idx");
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -1305,8 +1302,7 @@ async fn test_integration_upload_finalization_holds_guard_through_membership_dur
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let upload_coord = Arc::new(
         registry_rust::upload_coordinator::BlobUploadCoordinator::new(
@@ -1429,8 +1425,7 @@ async fn test_integration_upload_finalization_holds_guard_through_membership_dur
 async fn test_integration_proxy_blob_publication_holds_guard_through_membership_durability() {
     let fs_root = tmp_dir("integ-proxy-blob-pub");
     let ref_idx_path = tmp_dir("integ-proxy-blob-pub-idx");
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -1459,8 +1454,7 @@ async fn test_integration_proxy_blob_publication_holds_guard_through_membership_
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let upload_coord = Arc::new(
         registry_rust::upload_coordinator::BlobUploadCoordinator::new(
@@ -1582,8 +1576,7 @@ async fn test_integration_proxy_blob_publication_holds_guard_through_membership_
 async fn test_integration_cross_mount_cannot_race_gc_deletion() {
     let fs_root = tmp_dir("integ-cross-mount-gc");
     let ref_idx_path = tmp_dir("integ-cross-mount-gc-idx");
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -1613,8 +1606,7 @@ async fn test_integration_cross_mount_cannot_race_gc_deletion() {
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let upload_coord = Arc::new(
         registry_rust::upload_coordinator::BlobUploadCoordinator::new(
@@ -1717,8 +1709,7 @@ async fn test_integration_cross_mount_cannot_race_gc_deletion() {
 async fn test_integration_repository_unlink_and_gc_revalidation_serialize() {
     let fs_root = tmp_dir("integ-unlink-gc-serialize");
     let ref_idx_path = tmp_dir("integ-unlink-gc-serialize-idx");
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -1748,8 +1739,7 @@ async fn test_integration_repository_unlink_and_gc_revalidation_serialize() {
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let ledger = Arc::new(
         registry_rust::repository_membership_ledger::RepositoryMembershipLedger::new(
@@ -1851,7 +1841,7 @@ async fn test_integration_fs_deletion_requires_both_gc_proof_types() {
     let fs_root = tmp_dir("integ-fs-both-proofs");
     let ref_idx_path = tmp_dir("integ-fs-both-proofs-idx");
     let cfg = test_config(fs_root.clone(), ref_idx_path.clone());
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&storage, true, true)
@@ -1919,7 +1909,7 @@ async fn test_integration_fs_deletion_requires_both_gc_proof_types() {
 #[tokio::test]
 async fn test_integration_s3_deletion_requires_both_gc_proof_types() {
     let (s3_storage, driver) = registry_rust::storage::s3::tests::create_mock_storage();
-    let s3_storage_dyn: Arc<dyn Storage> = Arc::new(s3_storage);
+    let s3_storage_dyn = Arc::new(s3_storage);
     let ref_idx_path = tmp_dir("integ-s3-both-proofs-idx");
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
@@ -1978,8 +1968,7 @@ async fn test_integration_gc_candidate_releases_guard_between_items() {
     let fs_root = tmp_dir("integ-gc-release-between");
     let ref_idx_path = tmp_dir("integ-gc-release-between-idx");
     let cfg = test_config(fs_root.clone(), ref_idx_path.clone());
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -2032,8 +2021,7 @@ async fn test_integration_gc_candidate_releases_guard_between_items() {
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let gc_service = GcService::with_coordinator_and_authority(
         Arc::new(cfg),
@@ -2113,7 +2101,7 @@ async fn test_integration_gc_candidate_releases_guard_between_items() {
 async fn test_integration_nested_manifest_composition_no_reacquisition_deadlock() {
     let fs_root = tmp_dir("integ-nested-manifest");
     let ref_idx_path = tmp_dir("integ-nested-manifest-idx");
-    let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&storage, true, true)
@@ -2174,8 +2162,7 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
     let fs_root = tmp_dir("integ-cancel-prod-op");
     let ref_idx_path = tmp_dir("integ-cancel-prod-op-idx");
     let cfg = test_config(fs_root.clone(), ref_idx_path.clone());
-    let base_storage: Arc<dyn Storage> =
-        Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index
         .ensure_healthy_or_rebuild(&base_storage, true, true)
@@ -2206,8 +2193,7 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
         })
     }));
 
-    let hooked_storage: Arc<dyn Storage> =
-        Arc::new(HookedStorage::new(base_storage.clone(), hooks));
+    let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let upload_coord = Arc::new(
         registry_rust::upload_coordinator::BlobUploadCoordinator::new(

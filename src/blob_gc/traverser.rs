@@ -1,6 +1,5 @@
 use crate::storage;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GcPaginationError {
@@ -26,7 +25,7 @@ pub enum GcPaginationError {
 /// - If `next_cursor` was previously observed in this traversal, fails immediately with `CursorCycle`.
 /// - Failures fail closed and bubble up typed contextual errors.
 pub struct CasBlobTraverser<'a> {
-    storage: &'a Arc<dyn storage::Storage>,
+    storage: &'a dyn storage::GcStoragePort,
     page_limit: usize,
     cursor: Option<storage::GcCursor>,
     seen_cursors: HashSet<String>,
@@ -34,7 +33,7 @@ pub struct CasBlobTraverser<'a> {
 }
 
 impl<'a> CasBlobTraverser<'a> {
-    pub fn new(storage: &'a Arc<dyn storage::Storage>, page_limit: usize) -> Self {
+    pub fn new(storage: &'a (impl storage::GcStoragePort + 'a), page_limit: usize) -> Self {
         Self {
             storage,
             page_limit,

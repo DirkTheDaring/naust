@@ -603,17 +603,24 @@ root = "{}"
 
         let cfg = crate::config::Config::from_env_with_files(&[cfg_path]).unwrap();
         let cfg = std::sync::Arc::new(cfg);
-        let storage: std::sync::Arc<dyn crate::storage::Storage> = std::sync::Arc::new(
-            crate::storage::fs::FsStorage::new(fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = std::sync::Arc::new(crate::storage::fs::FsStorage::new(
+            fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let ip_limiter = std::sync::Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
             cfg.max_connections_per_ip,
             cfg.trusted_bypass_cidrs.clone(),
         ));
+        let wiring = crate::storage::StorageWiring::from_backend(storage);
         let state = crate::AppState {
             config: cfg,
             auth_metrics: std::sync::Arc::new(crate::AuthMetrics::default()),
-            storage: storage.clone(),
+            blob_reader: wiring.blob_reader(),
+            membership_reader: wiring.membership_reader(),
+            manifest_reader: wiring.manifest_reader(),
+            tag_reader: wiring.tag_reader(),
+            catalog_reader: wiring.catalog_reader(),
+            referrers_reader: wiring.referrers_reader(),
             ref_index: None,
             gc_service: None,
             proxy: None,
@@ -631,14 +638,14 @@ root = "{}"
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blob_service: std::sync::Arc::new(crate::application::BlobMutationService::new(
-                storage.clone(),
+                wiring.blob_mutation(),
                 None,
                 crate::consistency::ConsistencyCoordinator::new(),
                 crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
             )),
             manifest_service: std::sync::Arc::new(
                 crate::application::ManifestMutationService::new(
-                    storage.clone(),
+                    wiring.manifest_lifecycle(),
                     None,
                     crate::consistency::ConsistencyCoordinator::new(),
                 ),
@@ -766,17 +773,24 @@ root = "{}"
 
         let cfg = crate::config::Config::from_env_with_files(&[cfg_path]).unwrap();
         let cfg = std::sync::Arc::new(cfg);
-        let storage: std::sync::Arc<dyn crate::storage::Storage> = std::sync::Arc::new(
-            crate::storage::fs::FsStorage::new(fs_root.clone(), cfg.max_upload_bytes),
-        );
+        let storage = std::sync::Arc::new(crate::storage::fs::FsStorage::new(
+            fs_root.clone(),
+            cfg.max_upload_bytes,
+        ));
         let ip_limiter = std::sync::Arc::new(crate::ip_concurrency::IpConcurrencyLimiter::new(
             cfg.max_connections_per_ip,
             cfg.trusted_bypass_cidrs.clone(),
         ));
+        let wiring = crate::storage::StorageWiring::from_backend(storage);
         let state = crate::AppState {
             config: cfg.clone(),
             auth_metrics: std::sync::Arc::new(crate::AuthMetrics::default()),
-            storage: storage.clone(),
+            blob_reader: wiring.blob_reader(),
+            membership_reader: wiring.membership_reader(),
+            manifest_reader: wiring.manifest_reader(),
+            tag_reader: wiring.tag_reader(),
+            catalog_reader: wiring.catalog_reader(),
+            referrers_reader: wiring.referrers_reader(),
             ref_index: None,
             gc_service: None,
             proxy: None,
@@ -794,14 +808,14 @@ root = "{}"
             ip_limiter,
             is_high_pressure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blob_service: std::sync::Arc::new(crate::application::BlobMutationService::new(
-                storage.clone(),
+                wiring.blob_mutation(),
                 None,
                 crate::consistency::ConsistencyCoordinator::new(),
                 crate::upload_coordinator::BlobUploadCoordinatorConfig::default(),
             )),
             manifest_service: std::sync::Arc::new(
                 crate::application::ManifestMutationService::new(
-                    storage.clone(),
+                    wiring.manifest_lifecycle(),
                     None,
                     crate::consistency::ConsistencyCoordinator::new(),
                 ),

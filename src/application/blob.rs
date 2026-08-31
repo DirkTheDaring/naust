@@ -6,7 +6,7 @@ use crate::consistency::ConsistencyCoordinator;
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
 use crate::repository_membership_ledger::RepositoryMembershipLedger;
-use crate::storage::Storage;
+use crate::storage::BlobUploadCoordinatorStoragePort;
 use crate::storage::repo_membership::RepoBlobMembershipRecord;
 use crate::storage::upload_session::UploadByteStream;
 use crate::upload_coordinator::{
@@ -24,7 +24,7 @@ pub struct BlobMutationService {
 
 impl BlobMutationService {
     pub fn new(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn BlobUploadCoordinatorStoragePort>,
         ref_index: Option<Arc<BlobRefIndex>>,
         consistency: ConsistencyCoordinator,
         config: BlobUploadCoordinatorConfig,
@@ -40,7 +40,10 @@ impl BlobMutationService {
             ref_index.clone(),
             consistency.clone(),
         ));
-        let delete_service = Arc::new(BlobDeleteService::from_ledger((*membership_ledger).clone()));
+        let delete_service = Arc::new(BlobDeleteService::new(
+            Arc::new(storage.clone()),
+            (*membership_ledger).clone(),
+        ));
 
         Self {
             coordinator,

@@ -12,13 +12,14 @@ use registry_rust::cli::{
 use registry_rust::config::Config;
 use registry_rust::fs_root_lock::FsRootLock;
 use registry_rust::registry::digest::Digest;
+use registry_rust::storage::fs::FsStorage;
 use registry_rust::storage::mutation_authority::{
     RuntimeMutationAuthority, admin_clear_abandoned_deployment_writer_lock,
     inspect_deployment_writer_lock,
 };
 use registry_rust::storage::s3::S3Storage;
 use registry_rust::storage::s3::tests::MockS3Driver;
-use registry_rust::storage::{self, Storage};
+use registry_rust::storage::{self, RepositoryBlobMembershipStorage, Storage};
 use registry_rust::supervisor::{
     StartupPhase, SupervisorFaultInjector, SupervisorOptions, run_server_supervisor,
 };
@@ -186,12 +187,12 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let storage = storage::from_config(&cfg);
+    let wiring = storage::from_config(&cfg);
 
     {
         let idx =
             registry_rust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
-        idx.rebuild(&storage).await.unwrap();
+        idx.rebuild(wiring.blob_ref_index().as_ref()).await.unwrap();
     }
 
     let read_only_cmds = vec![
@@ -224,7 +225,9 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
         let exit = run_cli(cli).await;
         assert_eq!(exit, 0);
 
-        let lock = inspect_deployment_writer_lock(&storage).await.unwrap();
+        let lock = inspect_deployment_writer_lock(wiring.cluster_lock().as_ref())
+            .await
+            .unwrap();
         assert!(
             lock.is_none(),
             "read-only command must not create writer lock"
@@ -244,7 +247,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let storage = storage::from_config(&cfg);
+    let wiring = storage::from_config(&cfg);
 
     let maintenance_cmds = vec![
         CliCommand::RefIndex {
@@ -282,10 +285,12 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
         let exit = run_cli(cli).await;
         assert_eq!(exit, 0);
 
-        let lock = inspect_deployment_writer_lock(&storage).await.unwrap();
+        let lock = inspect_deployment_writer_lock(wiring.cluster_lock().as_ref())
+            .await
+            .unwrap();
         assert!(
             lock.is_none(),
-            "maintenance command must cleanly release lock on exit"
+            "maintenance command must release authority after completion"
         );
     }
 }
@@ -296,7 +301,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
 #[tokio::test]
 async fn test_destructive_admin_recovery_clears_matching_lock() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("admin-clear-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -337,7 +342,7 @@ async fn test_destructive_admin_recovery_clears_matching_lock() {
 #[tokio::test]
 async fn test_destructive_admin_recovery_fails_on_mismatched_owner_or_etag() {
     let mock = Arc::new(MockS3Driver::new(100));
-    let storage: Arc<dyn Storage> = Arc::new(S3Storage::new_with_driver(
+    let storage = Arc::new(S3Storage::new_with_driver(
         Some("admin-clear-bucket-mismatch".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
@@ -470,7 +475,7 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
     for phase in test_phases {
         let temp = TempDir::new().unwrap();
         let cfg = Arc::new(create_test_config(&temp));
-        let storage = storage::from_config(cfg.as_ref());
+        let wiring = storage::from_config(cfg.as_ref());
 
         let injector = Arc::new(FailingFaultInjector { fail_at: phase });
         let options = SupervisorOptions {
@@ -482,7 +487,9 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
         let res = run_server_supervisor(cfg, Some(options)).await;
         assert!(res.is_err(), "startup must fail at phase {:?}", phase);
 
-        let lock = inspect_deployment_writer_lock(&storage).await.unwrap();
+        let lock = inspect_deployment_writer_lock(wiring.cluster_lock().as_ref())
+            .await
+            .unwrap();
         assert!(
             lock.is_none(),
             "lock must be cleanly released on partial startup failure at {:?}",
@@ -498,7 +505,7 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
 async fn test_supervisor_graceful_shutdown_order() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let storage = storage::from_config(cfg.as_ref());
+    let wiring = storage::from_config(cfg.as_ref());
 
     let injector = Arc::new(RecordingFaultInjector::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -528,7 +535,9 @@ async fn test_supervisor_graceful_shutdown_order() {
         "authority must be released at end of shutdown"
     );
 
-    let lock = inspect_deployment_writer_lock(&storage).await.unwrap();
+    let lock = inspect_deployment_writer_lock(wiring.cluster_lock().as_ref())
+        .await
+        .unwrap();
     assert!(
         lock.is_none(),
         "lock must be clear after graceful server shutdown"
@@ -573,9 +582,9 @@ async fn test_supervisor_worker_panic_or_exit_triggers_global_shutdown() {
 async fn test_supervisor_mutation_authority_loss_stops_workers_and_fails_closed() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let storage = storage::from_config(cfg.as_ref());
+    let wiring = storage::storage_wiring_from_config(cfg.as_ref());
 
-    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "worker-test")
+    let authority = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "worker-test")
         .await
         .unwrap();
     assert!(authority.is_active());
@@ -611,7 +620,7 @@ async fn test_server_fails_closed_if_storage_lock_already_held() {
 async fn test_server_fails_closed_on_unmigrated_membership_with_existing_data() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let storage = storage::from_config(cfg.as_ref());
+    let storage = Arc::new(FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
 
     let repo = "unmigrated/app";
     let manifest_bytes = Bytes::from_static(b"{\"schemaVersion\":2}");
@@ -642,7 +651,7 @@ async fn test_server_fails_closed_on_unmigrated_membership_with_existing_data() 
 async fn test_server_auto_initializes_membership_on_fresh_empty_storage() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let storage = storage::from_config(cfg.as_ref());
+    let storage = Arc::new(FsStorage::new(cfg.fs_root.clone(), cfg.max_upload_bytes));
 
     assert!(!storage.is_membership_ready().await.unwrap());
 
@@ -673,7 +682,7 @@ async fn test_server_auto_initializes_membership_on_fresh_empty_storage() {
 async fn test_server_serves_http_requests_and_shuts_down_cleanly() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let storage = storage::from_config(cfg.as_ref());
+    let wiring = storage::from_config(cfg.as_ref());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (bound_tx, bound_rx) = oneshot::channel();
@@ -697,7 +706,9 @@ async fn test_server_serves_http_requests_and_shuts_down_cleanly() {
     let res = server_task.await.unwrap();
     assert!(res.is_ok());
 
-    let lock = inspect_deployment_writer_lock(&storage).await.unwrap();
+    let lock = inspect_deployment_writer_lock(wiring.cluster_lock().as_ref())
+        .await
+        .unwrap();
     assert!(lock.is_none());
 }
 
@@ -939,7 +950,7 @@ async fn test_supervisor_partial_startup_failure_unwinds_and_releases_authority(
     );
 
     // Verify storage lock is released and can be acquired immediately by a new process
-    let storage = storage::from_config(&cfg);
+    let storage = storage::storage_wiring_from_config(&cfg).cluster_lock();
     let mut auth2 = RuntimeMutationAuthority::acquire(storage, "recovery-after-failed-startup")
         .await
         .expect("must be able to acquire authority after failed startup unwind");
@@ -970,7 +981,7 @@ async fn test_supervisor_graceful_shutdown_releases_authority_exactly_once() {
     let srv_res = srv.await.expect("join");
     assert!(srv_res.is_ok());
 
-    let storage = storage::from_config(&create_test_config(&temp));
+    let storage = storage::storage_wiring_from_config(&create_test_config(&temp)).cluster_lock();
     let mut auth = RuntimeMutationAuthority::acquire(storage, "post-shutdown-check")
         .await
         .expect("must acquire authority after clean supervisor shutdown");

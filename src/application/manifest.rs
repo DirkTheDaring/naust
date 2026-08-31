@@ -7,7 +7,7 @@ use crate::manifest_lifecycle::{
 };
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
-use crate::storage::Storage;
+use crate::storage::ManifestLifecycleStoragePort;
 
 use super::errors::ManifestMutationError;
 
@@ -17,7 +17,7 @@ pub struct ManifestMutationService {
 
 impl ManifestMutationService {
     pub fn new(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn ManifestLifecycleStoragePort>,
         ref_index: Option<Arc<crate::blob_ref_index::BlobRefIndex>>,
         consistency: ConsistencyCoordinator,
     ) -> Self {

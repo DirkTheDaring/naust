@@ -2,11 +2,11 @@ use crate::blob_ref_index::BlobRefIndex;
 use crate::http_api::upload_state::{StateTokenError, UploadStateData};
 use crate::registry::digest::Digest;
 use crate::registry::validation::is_valid_repo_name;
+use crate::storage::StorageError;
 use crate::storage::upload_session::{
     FinalizeOutcome, UploadAppendResult, UploadByteStream, UploadOffsetPrecondition,
     UploadSessionId, UploadSessionState, UploadStreamError, UploadTransitionError,
 };
-use crate::storage::{Storage, StorageError};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -247,7 +247,7 @@ impl Drop for PinLeaseGuard {
 }
 
 pub struct BlobUploadCoordinator {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn crate::storage::BlobUploadCoordinatorStoragePort>,
     ref_index: Option<Arc<BlobRefIndex>>,
     consistency: crate::consistency::ConsistencyCoordinator,
     config: BlobUploadCoordinatorConfig,
@@ -255,7 +255,7 @@ pub struct BlobUploadCoordinator {
 
 impl BlobUploadCoordinator {
     pub fn new(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn crate::storage::BlobUploadCoordinatorStoragePort>,
         ref_index: Option<Arc<BlobRefIndex>>,
         consistency: crate::consistency::ConsistencyCoordinator,
         config: BlobUploadCoordinatorConfig,
@@ -268,7 +268,7 @@ impl BlobUploadCoordinator {
         }
     }
 
-    pub fn storage(&self) -> &Arc<dyn Storage> {
+    pub fn storage(&self) -> &Arc<dyn crate::storage::BlobUploadCoordinatorStoragePort> {
         &self.storage
     }
 
@@ -794,6 +794,8 @@ impl BlobUploadCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
+    use crate::storage::ports::BlobUploadCoordinatorStoragePort;
     use crate::storage::s3::tests::MockS3Driver;
     use crate::storage::upload_session::UploadSessionStorage;
     use sha2::Digest as _;
@@ -806,7 +808,7 @@ mod tests {
     }
 
     fn test_coordinator(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn BlobUploadCoordinatorStoragePort>,
         ref_index: Option<Arc<BlobRefIndex>>,
         config: BlobUploadCoordinatorConfig,
     ) -> BlobUploadCoordinator {
@@ -952,11 +954,11 @@ mod tests {
         let ref_path = temp_dir.path().join("ref_index");
         std::fs::create_dir_all(&ref_path).unwrap();
 
-        let storage: Arc<dyn Storage> =
+        let storage: Arc<dyn BlobUploadCoordinatorStoragePort> =
             Arc::new(crate::storage::fs::FsStorage::new(fs_root, 104857600));
         let ref_index = Arc::new(BlobRefIndex::open(ref_path).unwrap());
         ref_index
-            .ensure_healthy_or_rebuild(&storage, true, false)
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
             .await
             .unwrap();
 
@@ -1175,11 +1177,11 @@ mod tests {
         let ref_path = temp_dir.path().join("ref_index");
         std::fs::create_dir_all(&ref_path).unwrap();
 
-        let storage: Arc<dyn Storage> =
+        let storage: Arc<dyn BlobUploadCoordinatorStoragePort> =
             Arc::new(crate::storage::fs::FsStorage::new(fs_root, 104857600));
         let ref_index = Arc::new(BlobRefIndex::open(ref_path).unwrap());
         ref_index
-            .ensure_healthy_or_rebuild(&storage, true, false)
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
             .await
             .unwrap();
 
@@ -1265,7 +1267,7 @@ mod tests {
         // 7. Property 8: When referenced by a manifest/tag, blob remains protected even without pin
         ref_index
             .on_tag_mutation(
-                &storage,
+                storage.as_ref(),
                 repo,
                 "v1.0",
                 &digest,
@@ -1286,7 +1288,7 @@ mod tests {
 
     // Helper: Build mock coordinator with FsStorage and BlobRefIndex
     async fn setup_test_coordinator() -> (
-        Arc<dyn Storage>,
+        Arc<dyn BlobUploadCoordinatorStoragePort>,
         Arc<BlobRefIndex>,
         BlobUploadCoordinator,
         TempDir,
@@ -1296,11 +1298,11 @@ mod tests {
         let ref_path = temp_dir.path().join("ref_index");
         std::fs::create_dir_all(&ref_path).unwrap();
 
-        let storage: Arc<dyn Storage> =
+        let storage: Arc<dyn BlobUploadCoordinatorStoragePort> =
             Arc::new(crate::storage::fs::FsStorage::new(fs_root, 104857600));
         let ref_index = Arc::new(BlobRefIndex::open(ref_path).unwrap());
         ref_index
-            .ensure_healthy_or_rebuild(&storage, true, false)
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
             .await
             .unwrap();
 

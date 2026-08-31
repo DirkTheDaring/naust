@@ -128,7 +128,7 @@ impl BlobGcLimits {
 
 pub async fn blob_gc_plan(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     policy: BlobGcPolicy,
     min_age: Duration,
@@ -195,7 +195,7 @@ pub async fn blob_gc_plan(
 
 pub(crate) async fn blob_gc_quarantine(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
@@ -294,7 +294,7 @@ pub(crate) async fn blob_gc_quarantine(
 
 pub(crate) async fn blob_gc_delete(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
@@ -334,7 +334,7 @@ pub(crate) async fn blob_gc_delete(
 
 async fn blob_gc_delete_fs(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
@@ -536,7 +536,7 @@ async fn blob_gc_delete_fs(
 
 async fn blob_gc_delete_s3(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
@@ -635,7 +635,7 @@ async fn blob_gc_delete_s3(
 
 pub async fn blob_gc_sweep(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
     mutation_authority: &Arc<Mutex<Option<RuntimeMutationAuthority>>>,
@@ -853,11 +853,11 @@ mod tests {
     #[tokio::test]
     async fn test_revalidate_candidate_malformed_journal_fails_closed() {
         let (s3_storage, driver) = crate::storage::s3::tests::create_mock_storage();
-        let storage: Arc<dyn storage::Storage> = Arc::new(s3_storage);
+        let storage: Arc<dyn storage::GcServiceStoragePort> = Arc::new(s3_storage);
 
         let temp = tempfile::TempDir::new().unwrap();
         let idx = Arc::new(BlobRefIndex::open(temp.path().join("index.sled")).unwrap());
-        idx.ensure_healthy_or_rebuild(&storage, true, true)
+        idx.ensure_healthy_or_rebuild(storage.as_ref(), true, true)
             .await
             .unwrap();
 
@@ -922,18 +922,20 @@ mod tests {
     #[tokio::test]
     async fn test_blob_gc_plan_and_sweep_s3() {
         let (s3_storage, driver) = crate::storage::s3::tests::create_mock_storage();
-        let storage: Arc<dyn storage::Storage> = Arc::new(s3_storage);
+        let s3_arc = Arc::new(s3_storage);
+        let storage: Arc<dyn storage::GcServiceStoragePort> = s3_arc.clone();
 
         let temp = tempfile::TempDir::new().unwrap();
         let idx = Arc::new(BlobRefIndex::open(temp.path().join("index.sled")).unwrap());
-        idx.ensure_healthy_or_rebuild(&storage, true, true)
+        idx.ensure_healthy_or_rebuild(storage.as_ref(), true, true)
             .await
             .unwrap();
 
         let mut cfg = crate::config::Config::from_env().unwrap();
         cfg.fs_root = temp.path().to_path_buf();
 
-        let authority = RuntimeMutationAuthority::acquire(storage.clone(), "test-gc")
+        let cluster_lock: Arc<dyn storage::ClusterLockStore> = s3_arc.clone();
+        let authority = RuntimeMutationAuthority::acquire(cluster_lock, "test-gc")
             .await
             .unwrap();
 

@@ -115,7 +115,7 @@ pub struct PolicyContext {
 impl PolicyContext {
     pub async fn build(
         cfg: &crate::config::Config,
-        storage: &Arc<dyn storage::Storage>,
+        storage: &(impl storage::GcServiceStoragePort + ?Sized),
         idx: &BlobRefIndex,
         policy: BlobGcPolicy,
     ) -> Result<Self, GcPolicyError> {
@@ -165,7 +165,7 @@ impl PolicyContext {
 
 pub async fn build_manifest_protected_set(
     cfg: &crate::config::Config,
-    storage: &Arc<dyn storage::Storage>,
+    storage: &(impl storage::GcServiceStoragePort + ?Sized),
 ) -> Result<HashSet<String>, GcPolicyError> {
     if storage.kind() == "fs"
         && tokio::fs::metadata(&cfg.fs_root.join("repos"))

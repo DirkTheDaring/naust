@@ -1,9 +1,4 @@
-use crate::{
-    blob_ref_index::BlobRefIndex,
-    manifest_refs::parse_manifest_refs,
-    registry::digest::Digest,
-    storage::{Storage, StorageError},
-};
+use crate::{manifest_refs::parse_manifest_refs, registry::digest::Digest, storage::StorageError};
 use std::{
     collections::HashMap,
     collections::{HashSet, VecDeque},
@@ -18,9 +13,10 @@ pub struct BlobReference {
 }
 
 use crate::manifest_refs::ManifestRefs;
+use crate::storage::BlobIndexStoragePort;
 
 async fn scan_repo_for_blob(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl BlobIndexStoragePort + ?Sized),
     repo: &str,
     root_manifest: Digest,
     root_tag: Option<String>,
@@ -91,7 +87,7 @@ async fn scan_repo_for_blob(
 ///   as already inconsistent).
 #[allow(dead_code)]
 pub async fn find_blob_reference(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl BlobIndexStoragePort + ?Sized),
     target: &Digest,
 ) -> Result<Option<BlobReference>, StorageError> {
     let repos = storage.list_repositories().await?;
@@ -129,7 +125,7 @@ pub async fn find_blob_reference(
 
 /// Returns the first known reference to `target` in the specified repository `repo`.
 pub async fn find_repo_blob_reference(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl BlobIndexStoragePort + ?Sized),
     repo: &str,
     target: &Digest,
 ) -> Result<Option<BlobReference>, StorageError> {
@@ -170,27 +166,18 @@ pub enum BlobDeleteResult {
 
 pub struct BlobDeleteService {
     ledger: crate::repository_membership_ledger::RepositoryMembershipLedger,
+    index_storage: Arc<dyn BlobIndexStoragePort>,
 }
 
 impl BlobDeleteService {
     pub fn new(
-        storage: Arc<dyn Storage>,
-        ref_index: Option<Arc<BlobRefIndex>>,
-        consistency: crate::consistency::ConsistencyCoordinator,
-    ) -> Self {
-        Self {
-            ledger: crate::repository_membership_ledger::RepositoryMembershipLedger::new(
-                storage,
-                ref_index,
-                consistency,
-            ),
-        }
-    }
-
-    pub fn from_ledger(
+        index_storage: Arc<dyn BlobIndexStoragePort>,
         ledger: crate::repository_membership_ledger::RepositoryMembershipLedger,
     ) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            index_storage,
+        }
     }
 
     pub fn ledger(&self) -> &crate::repository_membership_ledger::RepositoryMembershipLedger {
@@ -218,7 +205,8 @@ impl BlobDeleteService {
         }
 
         // 3. Check if referenced by manifest in this repository
-        if let Some(r) = find_repo_blob_reference(self.ledger.storage(), repo, digest).await? {
+        if let Some(r) = find_repo_blob_reference(self.index_storage.as_ref(), repo, digest).await?
+        {
             let mut msg = format!("blob is still referenced by manifest {}", r.manifest);
             if let Some(tag) = r.tag {
                 msg = format!("{msg} (repo={}, tag={})", r.repo, tag);
@@ -239,6 +227,7 @@ impl BlobDeleteService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
     use crate::storage::fs::FsStorage;
     use sha2::{Digest as _, Sha256, Sha512};
     use std::path::PathBuf;
@@ -255,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_blob_reference_with_sha512_manifest_root() {
         let root = tmp_fs_root();
-        let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
 
         let repo = "testrepo";
         let blob_bytes = b"sample layer data for deletion safety";

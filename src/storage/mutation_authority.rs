@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::storage::{Storage, StorageError};
+use crate::storage::{ClusterLockStore, StorageError};
 
 pub const DEPLOYMENT_LOCK_FORMAT_VERSION: u32 = 1;
 
@@ -54,7 +54,7 @@ impl DeploymentWriterLockDoc {
 /// 4. Released conditionally on graceful shutdown with owner-token / ETag match.
 /// 5. Never released unconditionally.
 pub struct RuntimeMutationAuthority {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn ClusterLockStore>,
     doc: DeploymentWriterLockDoc,
     etag: Option<String>,
     released: bool,
@@ -73,7 +73,7 @@ impl std::fmt::Debug for RuntimeMutationAuthority {
 impl RuntimeMutationAuthority {
     /// Attempts to acquire the exclusive deployment mutation authority.
     pub async fn acquire(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn ClusterLockStore>,
         command_mode: &str,
     ) -> Result<Self, StorageError> {
         let doc = DeploymentWriterLockDoc::new(command_mode);
@@ -116,16 +116,15 @@ impl RuntimeMutationAuthority {
         GcMutationPermit { _authority: self }
     }
 
-    /// Conditionally releases the deployment lock upon clean shutdown.
+    /// Explicitly releases the deployment mutation lock upon clean shutdown.
     pub async fn release(&mut self) -> Result<(), StorageError> {
         if self.released {
             return Ok(());
         }
         self.released = true;
-        let _ = self
-            .storage
+        self.storage
             .release_deployment_writer_lock(&self.doc, self.etag.as_deref())
-            .await;
+            .await?;
         Ok(())
     }
 }
@@ -144,7 +143,7 @@ impl Drop for RuntimeMutationAuthority {
 
 /// Administrative function to inspect the stored deployment writer lock metadata without acquiring or mutating it.
 pub async fn inspect_deployment_writer_lock(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl ClusterLockStore + ?Sized),
 ) -> Result<Option<(DeploymentWriterLockDoc, Option<String>)>, StorageError> {
     storage.inspect_deployment_writer_lock().await
 }
@@ -160,7 +159,7 @@ pub async fn inspect_deployment_writer_lock(
 ///    modified, or acquired by a new writer concurrently, the operation fails closed with
 ///    `PreconditionFailed` and the newer lock survives intact.
 pub async fn admin_clear_abandoned_deployment_writer_lock(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl ClusterLockStore + ?Sized),
     expected_owner: &str,
     expected_etag: &str,
     confirmation: &str,
@@ -178,7 +177,7 @@ pub async fn admin_clear_abandoned_deployment_writer_lock(
 
 /// Deprecated / convenience alias forwarding to administrative clear with verification.
 pub async fn force_unlock_deployment_writer(
-    storage: &Arc<dyn Storage>,
+    storage: &(impl ClusterLockStore + ?Sized),
     confirmation_token: &str,
 ) -> Result<(), StorageError> {
     let inspect = storage.inspect_deployment_writer_lock().await?;

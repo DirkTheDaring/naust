@@ -7075,7 +7075,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_s3_migration_plan_performs_zero_writes() {
         let (storage, driver) = create_mock_storage();
-        let storage_arc: Arc<dyn Storage> = Arc::new(storage);
+        let storage_arc = Arc::new(storage);
 
         let stats = crate::membership_migration::plan_membership_migration(&storage_arc)
             .await
@@ -7093,7 +7093,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_s3_migration_conditional_state_acquisition_and_lease_renewal() {
         let (storage, _driver) = create_mock_storage();
-        let storage_arc: Arc<dyn Storage> = Arc::new(storage);
+        let storage_arc = Arc::new(storage);
 
         // First apply acquires lease and succeeds
         let stats = crate::membership_migration::apply_membership_migration(&storage_arc)
@@ -7109,7 +7109,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_s3_migration_concurrent_owner_rejection() {
         let (storage, _driver) = create_mock_storage();
-        let storage_arc: Arc<dyn Storage> = Arc::new(storage);
+        let storage_arc = Arc::new(storage);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7142,7 +7142,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_s3_migration_interrupted_apply_and_cursor_resume() {
         let (storage, _driver) = create_mock_storage();
-        let storage_arc: Arc<dyn Storage> = Arc::new(storage);
+        let storage_arc = Arc::new(storage);
 
         let now = 10000;
         // Pre-seed checkpoint with completed token "repo-a"

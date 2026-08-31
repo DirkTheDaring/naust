@@ -12,8 +12,7 @@ use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
 use crate::registry::validation::is_valid_tag;
 use crate::storage::{
-    ConditionalDeleteResult, ReferrerDescriptor, Storage, StorageError, TagMutation,
-    TagMutationPolicy,
+    ConditionalDeleteResult, ReferrerDescriptor, StorageError, TagMutation, TagMutationPolicy,
 };
 
 pub const MAX_MANIFEST_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
@@ -289,7 +288,7 @@ fn now_unix_secs() -> u64 {
 
 pub struct RepoCoordinationGuard {
     _guard: crate::consistency::MutationGuard,
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn crate::storage::ManifestLifecycleStoragePort>,
     repo: String,
     owner_id: String,
     lease_id: String,
@@ -345,14 +344,14 @@ impl Drop for RepoCoordinationGuard {
 
 #[derive(Clone)]
 pub struct ManifestLifecycleService {
-    storage: Arc<dyn Storage>,
+    storage: Arc<dyn crate::storage::ManifestLifecycleStoragePort>,
     ref_index: Option<Arc<BlobRefIndex>>,
     consistency: crate::consistency::ConsistencyCoordinator,
 }
 
 impl ManifestLifecycleService {
     pub fn new(
-        storage: Arc<dyn Storage>,
+        storage: Arc<dyn crate::storage::ManifestLifecycleStoragePort>,
         ref_index: Option<Arc<BlobRefIndex>>,
         consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {

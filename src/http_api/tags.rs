@@ -32,8 +32,8 @@ pub async fn tags_list(
         }
     }
 
-    let storage = match route_mode {
-        V2RouteMode::Default => state.storage.clone(),
+    let tag_reader: std::sync::Arc<dyn crate::storage::TagReader> = match route_mode {
+        V2RouteMode::Default => state.tag_reader.clone(),
         V2RouteMode::ProxyOnly => match proxy_ctx.as_ref() {
             Some(ctx) => ctx.cache.clone(),
             None => return errors::internal_error().into_response(),
@@ -41,7 +41,7 @@ pub async fn tags_list(
     };
 
     match method {
-        Method::GET | Method::HEAD => match storage.list_tags(name).await {
+        Method::GET | Method::HEAD => match tag_reader.list_tags(name).await {
             Ok(mut all_tags) => {
                 all_tags.sort();
                 // Pagination per OCI/Docker distribution spec:
