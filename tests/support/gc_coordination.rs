@@ -305,6 +305,10 @@ impl Storage for HookedStorage {
         Storage::repo_timestamps(&self.inner, name).await
     }
 
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        Storage::is_storage_empty(&self.inner).await
+    }
+
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
         Storage::head_blob(&self.inner, digest).await
     }

@@ -137,6 +137,10 @@ mod tests {
             self.inner.repo_timestamps(name).await
         }
 
+        async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+            self.inner.is_storage_empty().await
+        }
+
         async fn head_blob(
             &self,
             digest: &Digest,

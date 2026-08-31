@@ -10,26 +10,22 @@ use semver::Version;
 use sha2::Digest as _;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::app_state::{AppState, AuthMetrics, ProxyContext};
+use crate::app_state::AppState;
 use crate::auth;
-use crate::blob_ref_index::BlobRefIndex;
 use crate::config::{Config, StorageBackend};
 use crate::gc_service::GcService;
 use crate::http_api::handlers;
-use crate::ip_concurrency::IpConcurrencyLimiter;
 use crate::registry::digest::Digest;
 use crate::storage;
-use crate::storage::mutation_authority::RuntimeMutationAuthority;
 use crate::task_supervisor::{TaskClassification, TaskSupervisor};
 use crate::token_rate_limit::{TokenRateLimiter, limit_token_requests};
-use crate::upload_coordinator::BlobUploadCoordinatorConfig;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StartupPhase {
@@ -207,55 +203,6 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
     tracing::info!("acme: TLS certificate ready");
 }
 
-async fn has_any_file_or_dir(path: &std::path::Path) -> bool {
-    if let Ok(mut read_dir) = tokio::fs::read_dir(path).await {
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() {
-                if Box::pin(has_any_file_or_dir(&entry.path())).await {
-                    return true;
-                }
-            } else {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-async fn is_store_completely_empty(
-    storage: &Arc<dyn storage::RepositoryCatalogReader>,
-    config: &Config,
-) -> bool {
-    let repos = storage.list_repositories().await.unwrap_or_default();
-    if !repos.is_empty() {
-        return false;
-    }
-
-    if config.storage_backend == StorageBackend::Filesystem {
-        let root = &config.fs_root;
-        if has_any_file_or_dir(&root.join("blobs")).await {
-            return false;
-        }
-        if has_any_file_or_dir(&root.join("uploads")).await {
-            return false;
-        }
-        if has_any_file_or_dir(&root.join("quarantine")).await {
-            return false;
-        }
-        if has_any_file_or_dir(&root.join("repo-blobs")).await {
-            return false;
-        }
-        if has_any_file_or_dir(&root.join("repos")).await {
-            return false;
-        }
-    }
-    true
-}
-
 pub fn build_router(state: AppState) -> Router {
     let v2_body_limit = DefaultBodyLimit::disable();
 
@@ -387,371 +334,36 @@ pub async fn run_server_supervisor(
         None
     };
 
-    let storage_wiring = storage::storage_wiring_from_config(config.as_ref());
-    injector.record_event("storage_initialized").await;
-    injector.on_phase(StartupPhase::StorageInitialized).await?;
-
-    let mut mutation_authority =
-        match RuntimeMutationAuthority::acquire(storage_wiring.cluster_lock(), "server").await {
-            Ok(a) => a,
-            Err(e) => {
-                return Err(format!(
-                    "server: failed to acquire exclusive deployment writer authority: {e}"
-                ));
-            }
-        };
-    injector.record_event("authority_acquired").await;
-    if let Err(e) = injector.on_phase(StartupPhase::AuthorityAcquired).await {
-        let _ = mutation_authority.release().await;
-        return Err(e);
-    }
-
-    // Fail-closed repository blob membership startup check
-    match storage_wiring
-        .membership_reader()
-        .is_membership_ready()
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            let is_empty =
-                is_store_completely_empty(&storage_wiring.catalog_reader(), config.as_ref()).await;
-            if is_empty {
-                if let Err(e) = storage_wiring
-                    .membership_reader()
-                    .mark_membership_ready()
-                    .await
-                {
-                    let _ = mutation_authority.release().await;
-                    return Err(format!(
-                        "server: failed to initialize membership marker on fresh storage: {e}"
-                    ));
-                }
-            } else {
-                let _ = mutation_authority.release().await;
-                return Err(
-                    "FATAL: Storage contains existing data (repositories, blobs, uploads, or legacy markers) but repository-scoped blob membership is not initialized.\n\
-                     Silent fallback to global visibility is disabled for security and tenant isolation.\n\
-                     Please run: `registry-rust migrate-membership apply` to backfill membership records before starting the server.".to_string()
-                );
-            }
-        }
-        Err(e) => {
-            let _ = mutation_authority.release().await;
-            return Err(format!(
-                "server: failed to inspect membership readiness: {e}"
-            ));
-        }
-    }
-    injector.record_event("membership_verified").await;
-    if let Err(e) = injector.on_phase(StartupPhase::MembershipVerified).await {
-        let _ = mutation_authority.release().await;
-        return Err(e);
-    }
-
-    let ref_index: Option<Arc<BlobRefIndex>> = if config.ref_index.enabled {
-        match BlobRefIndex::open(config.ref_index.path.clone()) {
-            Ok(idx) => {
-                if let Err(err) = idx
-                    .ensure_healthy_or_rebuild(
-                        &storage_wiring.blob_ref_index(),
-                        config.ref_index.auto_rebuild_on_corruption,
-                        config.ref_index.rebuild_on_start,
-                    )
-                    .await
-                {
-                    let _ = mutation_authority.release().await;
-                    return Err(format!(
-                        "FATAL: ref-index init failed at {}: {err}",
-                        config.ref_index.path.display()
-                    ));
-                }
-                Some(Arc::new(idx))
-            }
-            Err(err) => {
-                let _ = mutation_authority.release().await;
-                return Err(format!(
-                    "FATAL: ref-index open failed at {}: {err}",
-                    config.ref_index.path.display()
-                ));
-            }
-        }
-    } else {
-        None
-    };
-    injector.record_event("index_initialized").await;
-    if let Err(e) = injector.on_phase(StartupPhase::IndexInitialized).await {
-        let _ = mutation_authority.release().await;
-        return Err(e);
-    }
-
-    let mut proxy_upstreams: Vec<ProxyContext> = Vec::new();
-
-    if config.proxy.enabled && !config.proxy.upstreams.is_empty() {
-        for (i, up) in config.proxy.upstreams.iter().enumerate() {
-            let mut per = config.proxy.clone();
-            per.upstreams = vec![];
-            per.upstream_base_url = Some(up.upstream_base_url.clone());
-            per.upstream_username = up.upstream_username.clone();
-            per.upstream_password = up.upstream_password.clone();
-            per.allowed_upstream_hosts = up.allowed_upstream_hosts.clone();
-            per.allowed_repo_prefixes = up.allowed_repo_prefixes.clone();
-            per.block_private_networks = up.block_private_networks;
-            per.redirect_policy = up.redirect_policy;
-            per.max_concurrent_upstream = up.max_concurrent_upstream;
-            per.index_path = up.index_path.clone();
-            per.cache_fs_root = up.cache_fs_root.clone();
-            per.cache_s3_prefix = up.cache_s3_prefix.clone();
-            per.max_cache_bytes = Some(up.max_cache_bytes);
-
-            let proxy = match crate::proxy::Proxy::new(&per) {
-                Ok(p) => p.map(Arc::new).expect("proxy enabled"),
-                Err(err) => {
-                    let _ = mutation_authority.release().await;
-                    return Err(format!("proxy upstream {i} init failed: {err}"));
-                }
-            };
-
-            let cache: Arc<dyn storage::ports::ProxyStoragePort> = match config.storage_backend {
-                StorageBackend::Filesystem => {
-                    let root = up
-                        .cache_fs_root
-                        .clone()
-                        .expect("validated: filesystem cache fs_root");
-                    Arc::new(storage::fs::FsStorage::new(root, config.max_upload_bytes))
-                }
-                StorageBackend::S3 => {
-                    let endpoint = config
-                        .s3_endpoint
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
-                    let region = config
-                        .s3_region
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
-                    let bucket = config
-                        .s3_bucket
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
-                    let prefix = up
-                        .cache_s3_prefix
-                        .clone()
-                        .expect("validated: S3 cache s3_prefix");
-                    Arc::new(storage::s3::S3Storage::new(
-                        Some(endpoint),
-                        Some(region),
-                        Some(bucket),
-                        prefix,
-                        config.max_upload_bytes,
-                    ))
-                }
-            };
-
-            proxy_upstreams.push(ProxyContext {
-                proxy,
-                cache_storage: cache,
-            });
-        }
-    }
-
-    let proxy = if config.proxy.enabled && config.proxy.upstreams.is_empty() {
-        match crate::proxy::Proxy::new(&config.proxy) {
-            Ok(p) => p.map(Arc::new),
-            Err(err) => {
-                let _ = mutation_authority.release().await;
-                return Err(format!("proxy init failed: {err}"));
-            }
-        }
-    } else {
-        None
-    };
-
-    let proxy_cache: Option<Arc<dyn storage::ports::ProxyStoragePort>> =
-        if config.proxy.enabled && config.proxy.upstreams.is_empty() {
-            match config.storage_backend {
-                StorageBackend::Filesystem => {
-                    let root = config
-                        .proxy
-                        .cache_fs_root
-                        .clone()
-                        .unwrap_or_else(|| config.fs_root.join("cache"));
-                    Some(Arc::new(storage::fs::FsStorage::new(
-                        root,
-                        config.max_upload_bytes,
-                    )))
-                }
-                StorageBackend::S3 => {
-                    let endpoint = config
-                        .s3_endpoint
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT");
-                    let region = config
-                        .s3_region
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_REGION");
-                    let bucket = config
-                        .s3_bucket
-                        .clone()
-                        .expect("proxy enabled: S3 cache requires STORAGE_S3_BUCKET");
-                    let prefix = config.proxy.cache_s3_prefix.clone().unwrap_or_else(|| {
-                        format!("{}/cache", config.s3_prefix.trim_end_matches('/'))
-                    });
-                    Some(Arc::new(storage::s3::S3Storage::new(
-                        Some(endpoint),
-                        Some(region),
-                        Some(bucket),
-                        prefix,
-                        config.max_upload_bytes,
-                    )))
-                }
-            }
-        } else {
-            None
+    let runtime =
+        match crate::runtime::build_server_runtime(config.clone(), Some(injector.clone())).await {
+            Ok(r) => r,
+            Err(e) => return Err(e.to_string()),
         };
 
-    let buffered_body_sem = Arc::new(Semaphore::new(
-        config.max_concurrent_buffered_requests.max(1),
-    ));
-    let request_sem = Arc::new(Semaphore::new(config.max_concurrent_requests.max(1)));
-    let upload_request_sem = Arc::new(Semaphore::new(config.max_concurrent_upload_requests.max(1)));
-    let consistency = crate::consistency::ConsistencyCoordinator::new();
-    let mutation_authority = Arc::new(tokio::sync::Mutex::new(Some(mutation_authority)));
-
-    let gc_service = match &ref_index {
-        Some(idx) => Some(Arc::new(GcService::with_coordinator_and_authority(
-            config.clone(),
-            storage_wiring.gc_service_port(),
-            idx.clone(),
-            consistency.clone(),
-            mutation_authority.clone(),
-        ))),
-        None => None,
-    };
-
-    if config.storage_backend == crate::config::StorageBackend::S3
-        && config.blob_gc_enabled
-        && config.blob_gc_enable_delete
-    {
-        if let Err(e) = storage_wiring
-            .gc_port()
-            .check_bucket_versioning_for_gc()
-            .await
-        {
-            tracing::warn!(
-                "S3 bucket versioning preflight check: {}; physical GC deletion will fail closed",
-                e
-            );
-        }
-    }
-
-    let ip_limiter = Arc::new(IpConcurrencyLimiter::new(
-        config.max_connections_per_ip,
-        config.trusted_bypass_cidrs.clone(),
-    ));
-    let is_high_pressure = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let upload_coord_config = BlobUploadCoordinatorConfig {
-        signing_key: config
-            .token_signing_keys
-            .first()
-            .map(|k| k.key.as_bytes().to_vec())
-            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec()),
-        max_upload_bytes: config.max_upload_bytes,
-        abort_on_digest_mismatch: config.upload_policy.abort_on_digest_mismatch,
-        disallow_monolithic_uploads: config.disallow_monolithic_uploads,
-        upload_chunk_min_bytes: config.upload_chunk_min_bytes.map(|v| v as u64),
-        gc_pin_duration_secs: config.gc_pin_duration_secs,
-    };
-    let blob_service = Arc::new(crate::application::BlobMutationService::new(
-        storage_wiring.blob_mutation(),
-        ref_index.clone(),
-        consistency.clone(),
-        upload_coord_config,
-    ));
-    let manifest_service = Arc::new(crate::application::ManifestMutationService::new(
-        storage_wiring.manifest_lifecycle(),
-        ref_index.clone(),
-        consistency.clone(),
-    ));
-    let blob_read_service = Arc::new(crate::application::BlobReadService::new(
-        storage_wiring.blob_reader(),
-        storage_wiring.membership_reader(),
-        blob_service.clone(),
-    ));
-    let manifest_read_service = Arc::new(crate::application::ManifestReadService::new(
-        storage_wiring.manifest_reader(),
-        storage_wiring.tag_reader(),
-        manifest_service.clone(),
-        config.max_request_body_bytes,
-        Some(buffered_body_sem.clone()),
-    ));
-    let catalog_query_service = Arc::new(crate::application::CatalogQueryService::new(
-        storage_wiring.catalog_reader(),
-        storage_wiring.tag_reader(),
-        storage_wiring.manifest_reader(),
-        storage_wiring.blob_reader(),
-    ));
-    let tag_query_service = Arc::new(crate::application::TagQueryService::new(
-        storage_wiring.tag_reader(),
-    ));
-    let referrers_query_service = Arc::new(crate::application::ReferrersQueryService::new(
-        storage_wiring.referrers_reader(),
-    ));
-
-    let state = AppState {
-        config: config.clone(),
-        auth_metrics: Arc::new(AuthMetrics::default()),
-        ref_index: ref_index.clone(),
-        gc_service,
-        gc_run_seq: Arc::new(AtomicU64::new(0)),
-        proxy,
-        proxy_cache,
-        proxy_upstreams,
-        buffered_body_sem,
-        request_sem,
-        upload_request_sem,
-        active_non_upload_requests: Arc::new(AtomicU64::new(0)),
-        active_upload_requests: Arc::new(AtomicU64::new(0)),
-        last_sem_saturation_log_unix_secs: Arc::new(AtomicU64::new(0)),
-        ip_limiter,
-        is_high_pressure,
-        blob_service,
-        manifest_service,
-        blob_read_service,
-        manifest_read_service,
-        catalog_query_service,
-        tag_query_service,
-        referrers_query_service,
-    };
-
-    injector.record_event("app_state_constructed").await;
-    if let Err(e) = injector.on_phase(StartupPhase::AppStateConstructed).await {
-        if let Some(mut a) = mutation_authority.lock().await.take() {
-            let _ = a.release().await;
-        }
-        return Err(e);
-    }
+    let state = runtime.app_state().clone();
 
     let app = build_router(state.clone());
     injector.record_event("routes_configured").await;
     if let Err(e) = injector.on_phase(StartupPhase::RoutesConfigured).await {
-        if let Some(mut a) = mutation_authority.lock().await.take() {
-            let _ = a.release().await;
-        }
+        let _ = runtime.release_mutation_authority().await;
         return Err(e);
     }
 
     let shutdown_timeout = Duration::from_secs(15);
     let supervisor = TaskSupervisor::new(shutdown_timeout);
 
-    if let Some(idx) = state.ref_index.clone() {
-        supervisor
-            .register_flush_hook(move || idx.flush().map_err(|e| e.to_string()))
-            .await;
-    }
+    let runtime_for_flush = runtime.clone();
+    supervisor
+        .register_flush_hook(move || runtime_for_flush.flush_for_shutdown())
+        .await;
 
-    spawn_upload_reaper(&supervisor, state.clone()).await;
-    spawn_blob_gc_scheduler(&supervisor, state.clone()).await;
+    spawn_upload_reaper(
+        &supervisor,
+        state.blob_service.clone(),
+        state.config.clone(),
+    )
+    .await;
+    spawn_blob_gc_scheduler(&supervisor, state.gc_service.clone(), state.config.clone()).await;
     spawn_proxy_gc(&supervisor, state.clone()).await;
     spawn_proxy_scrub(&supervisor, state.clone()).await;
     spawn_fd_diagnostics_logger(&supervisor, state.clone()).await;
@@ -759,9 +371,7 @@ pub async fn run_server_supervisor(
     injector.record_event("workers_spawned").await;
     if let Err(e) = injector.on_phase(StartupPhase::WorkersSpawned).await {
         let _ = supervisor.shutdown().await;
-        if let Some(mut a) = mutation_authority.lock().await.take() {
-            let _ = a.release().await;
-        }
+        let _ = runtime.release_mutation_authority().await;
         return Err(e);
     }
 
@@ -776,9 +386,7 @@ pub async fn run_server_supervisor(
             Ok(t) => t,
             Err(err) => {
                 let _ = supervisor.shutdown().await;
-                if let Some(mut a) = mutation_authority.lock().await.take() {
-                    let _ = a.release().await;
-                }
+                let _ = runtime.release_mutation_authority().await;
                 return Err(format!("load TLS cert/key: {err}"));
             }
         };
@@ -786,9 +394,7 @@ pub async fn run_server_supervisor(
         injector.record_event("listener_bound").await;
         if let Err(e) = injector.on_phase(StartupPhase::ListenerBound).await {
             let _ = supervisor.shutdown().await;
-            if let Some(mut a) = mutation_authority.lock().await.take() {
-                let _ = a.release().await;
-            }
+            let _ = runtime.release_mutation_authority().await;
             return Err(e);
         }
 
@@ -828,9 +434,7 @@ pub async fn run_server_supervisor(
             .await
         {
             let _ = supervisor.shutdown().await;
-            if let Some(mut a) = mutation_authority.lock().await.take() {
-                let _ = a.release().await;
-            }
+            let _ = runtime.release_mutation_authority().await;
             return Err(format!("serve https: {err}"));
         }
     } else {
@@ -838,9 +442,7 @@ pub async fn run_server_supervisor(
             Ok(l) => l,
             Err(err) => {
                 let _ = supervisor.shutdown().await;
-                if let Some(mut a) = mutation_authority.lock().await.take() {
-                    let _ = a.release().await;
-                }
+                let _ = runtime.release_mutation_authority().await;
                 return Err(format!("bind listen addr: {err}"));
             }
         };
@@ -853,9 +455,7 @@ pub async fn run_server_supervisor(
         injector.record_event("listener_bound").await;
         if let Err(e) = injector.on_phase(StartupPhase::ListenerBound).await {
             let _ = supervisor.shutdown().await;
-            if let Some(mut a) = mutation_authority.lock().await.take() {
-                let _ = a.release().await;
-            }
+            let _ = runtime.release_mutation_authority().await;
             return Err(e);
         }
 
@@ -883,9 +483,7 @@ pub async fn run_server_supervisor(
 
         if let Err(err) = server_res {
             let _ = supervisor.shutdown().await;
-            if let Some(mut a) = mutation_authority.lock().await.take() {
-                let _ = a.release().await;
-            }
+            let _ = runtime.release_mutation_authority().await;
             return Err(format!("serve http: {err}"));
         }
     }
@@ -899,9 +497,7 @@ pub async fn run_server_supervisor(
             "graceful shutdown completed with warnings"
         );
     }
-    if let Some(mut a) = mutation_authority.lock().await.take() {
-        let _ = a.release().await;
-    }
+    let _ = runtime.release_mutation_authority().await;
     injector.record_event("authority_released").await;
 
     Ok(())
@@ -1623,15 +1219,18 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-pub async fn spawn_upload_reaper(supervisor: &TaskSupervisor, state: AppState) {
-    if !state.config.upload_gc_enabled {
+pub async fn spawn_upload_reaper(
+    supervisor: &TaskSupervisor,
+    blob_service: Arc<crate::application::BlobMutationService>,
+    config: Arc<Config>,
+) {
+    if !config.upload_gc_enabled {
         return;
     }
 
-    let interval = Duration::from_secs(state.config.upload_gc_interval_secs.max(1));
-    let max_age_secs = state.config.upload_gc_max_age_secs;
+    let interval = Duration::from_secs(config.upload_gc_interval_secs.max(1));
+    let max_age_secs = config.upload_gc_max_age_secs;
     let receipt_ttl_secs = 3600;
-    let blob_service = state.blob_service.clone();
 
     supervisor
         .spawn_loop(
@@ -1698,17 +1297,21 @@ pub async fn spawn_fd_diagnostics_logger(supervisor: &TaskSupervisor, state: App
         .await;
 }
 
-pub async fn spawn_blob_gc_scheduler(supervisor: &TaskSupervisor, state: AppState) {
-    if !state.config.blob_gc_schedule_enabled {
+pub async fn spawn_blob_gc_scheduler(
+    supervisor: &TaskSupervisor,
+    gc_service: Option<Arc<GcService>>,
+    config: Arc<Config>,
+) {
+    if !config.blob_gc_schedule_enabled {
         return;
     }
 
-    let Some(service) = state.gc_service.clone() else {
+    let Some(service) = gc_service else {
         tracing::warn!("blob gc scheduler enabled but gc service unavailable");
         return;
     };
 
-    let interval = Duration::from_secs(state.config.blob_gc_schedule_interval_secs.max(1));
+    let interval = Duration::from_secs(config.blob_gc_schedule_interval_secs.max(1));
 
     supervisor
         .spawn_loop(
@@ -1769,13 +1372,15 @@ pub async fn spawn_blob_gc_scheduler(supervisor: &TaskSupervisor, state: AppStat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
     use tempfile::TempDir;
 
-    fn create_test_env() -> (Arc<storage::fs::FsStorage>, crate::proxy::Proxy, TempDir) {
+    fn create_test_env() -> (crate::storage::StorageWiring, crate::proxy::Proxy, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let fs_root = temp_dir.path().join("registry");
-        let storage = Arc::new(storage::fs::FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let mut cfg = crate::config::Config::from_env().unwrap();
+        cfg.fs_root = fs_root;
+        cfg.max_upload_bytes = 10 * 1024 * 1024;
+        let storage = crate::storage::storage_wiring_try_from_config(&cfg).unwrap();
         let proxy_db_path = temp_dir.path().join("proxy.db");
         let proxy_cfg = crate::config::ProxyConfig {
             enabled: true,
@@ -1838,6 +1443,7 @@ mod tests {
         ))
         .unwrap();
         storage
+            .manifest_lifecycle()
             .put_manifest(repo, &subject_digest, bytes::Bytes::from(subject_bytes))
             .await
             .unwrap();
@@ -1861,6 +1467,7 @@ mod tests {
         ))
         .unwrap();
         storage
+            .manifest_lifecycle()
             .put_manifest(repo, &artifact_digest, bytes::Bytes::from(artifact_bytes))
             .await
             .unwrap();
@@ -1868,8 +1475,9 @@ mod tests {
         let mut protected_blobs = HashSet::new();
         let mut seen_manifests = HashSet::new();
 
+        let proxy_cache = storage.proxy_storage();
         collect_protected_blobs_for_manifest(
-            &storage,
+            &proxy_cache,
             repo,
             &artifact_digest,
             &mut protected_blobs,
@@ -1905,6 +1513,7 @@ mod tests {
             "layers": []
         });
         storage
+            .manifest_lifecycle()
             .put_manifest(
                 repo,
                 &malformed_digest,
@@ -1913,6 +1522,7 @@ mod tests {
             .await
             .unwrap();
         storage
+            .manifest_lifecycle()
             .set_tag(repo, "v1", &malformed_digest)
             .await
             .unwrap();
@@ -1924,7 +1534,8 @@ mod tests {
             eviction_policy: crate::config::EvictionPolicy::KeepTags(vec!["v1".to_string()]),
         }];
 
-        let result = compute_protected_blobs(&storage, &rules, &proxy).await;
+        let proxy_cache = storage.proxy_storage();
+        let result = compute_protected_blobs(&proxy_cache, &rules, &proxy).await;
         assert!(
             result.is_err(),
             "compute_protected_blobs must fail when a pinned manifest is unparsable"

@@ -28,6 +28,7 @@ pub mod registry;
 pub mod repository_membership_ledger;
 pub mod request_routing;
 pub mod robot_secrets;
+pub(crate) mod runtime;
 pub mod security;
 pub mod storage;
 pub mod supervisor;

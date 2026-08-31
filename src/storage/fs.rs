@@ -638,6 +638,33 @@ async fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError
     Ok(())
 }
 
+async fn fs_dir_has_any_entry(path: &Path) -> Result<bool, StorageError> {
+    match tokio::fs::read_dir(path).await {
+        Ok(mut read_dir) => {
+            while let Some(entry) = read_dir
+                .next_entry()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+            {
+                let file_type = entry
+                    .file_type()
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if file_type.is_dir() {
+                    if Box::pin(fs_dir_has_any_entry(&entry.path())).await? {
+                        return Ok(true);
+                    }
+                } else {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(StorageError::Internal(err.to_string())),
+    }
+}
+
 #[async_trait]
 impl Storage for FsStorage {
     fn kind(&self) -> &'static str {
@@ -668,6 +695,29 @@ impl Storage for FsStorage {
             last_tag_update,
             last_manifest_update,
         })
+    }
+
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        let repos = self.list_repositories().await?;
+        if !repos.is_empty() {
+            return Ok(false);
+        }
+        let subdirs = [
+            "blobs",
+            "uploads",
+            "quarantine",
+            "repo-blobs",
+            "repo-memberships",
+            "repos",
+            "journals",
+        ];
+        for sub in &subdirs {
+            let p = self.root.join(sub);
+            if fs_dir_has_any_entry(&p).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {

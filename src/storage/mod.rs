@@ -226,6 +226,10 @@ pub trait Storage:
     // - last_manifest_update: latest modification in repo's manifest blobs
     async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError>;
 
+    /// Positively checks if the underlying storage contains any repository records,
+    /// blobs, manifests, uploads, or membership markers. Fails closed on any I/O or S3 error.
+    async fn is_storage_empty(&self) -> Result<bool, StorageError>;
+
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError>;
 
     async fn open_blob(
@@ -471,6 +475,9 @@ impl<T: ?Sized + Storage + Send + Sync> Storage for Arc<T> {
     }
     async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
         (**self).repo_timestamps(name).await
+    }
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        (**self).is_storage_empty().await
     }
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
         (**self).head_blob(digest).await
@@ -726,6 +733,67 @@ pub fn try_from_config(config: &Config) -> Result<StorageWiring, StorageError> {
 
 pub fn from_config(config: &Config) -> StorageWiring {
     storage_wiring_from_config(config)
+}
+
+pub fn proxy_cache_storage_try_from_config(
+    config: &Config,
+    upstream: Option<&crate::config::ProxyUpstreamRoute>,
+) -> Result<Arc<dyn ports::ProxyStoragePort>, StorageError> {
+    match config.storage_backend {
+        StorageBackend::Filesystem => {
+            let root = match upstream {
+                Some(up) => up.cache_fs_root.clone().ok_or_else(|| {
+                    StorageError::Internal(
+                        "proxy upstream enabled: filesystem cache requires cache_fs_root"
+                            .to_string(),
+                    )
+                })?,
+                None => config
+                    .proxy
+                    .cache_fs_root
+                    .clone()
+                    .unwrap_or_else(|| config.fs_root.join("cache")),
+            };
+            let fs_storage = fs::FsStorage::try_new(root, config.max_upload_bytes)?;
+            Ok(Arc::new(fs_storage))
+        }
+        StorageBackend::S3 => {
+            let endpoint = config.s3_endpoint.clone().ok_or_else(|| {
+                StorageError::Internal(
+                    "proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT".to_string(),
+                )
+            })?;
+            let region = config.s3_region.clone().ok_or_else(|| {
+                StorageError::Internal(
+                    "proxy enabled: S3 cache requires STORAGE_S3_REGION".to_string(),
+                )
+            })?;
+            let bucket = config.s3_bucket.clone().ok_or_else(|| {
+                StorageError::Internal(
+                    "proxy enabled: S3 cache requires STORAGE_S3_BUCKET".to_string(),
+                )
+            })?;
+            let prefix =
+                match upstream {
+                    Some(up) => up.cache_s3_prefix.clone().ok_or_else(|| {
+                        StorageError::Internal(
+                            "proxy upstream enabled: S3 cache requires cache_s3_prefix".to_string(),
+                        )
+                    })?,
+                    None => config.proxy.cache_s3_prefix.clone().unwrap_or_else(|| {
+                        format!("{}/cache", config.s3_prefix.trim_end_matches('/'))
+                    }),
+                };
+            let s3_storage = s3::S3Storage::new(
+                Some(endpoint),
+                Some(region),
+                Some(bucket),
+                prefix,
+                config.max_upload_bytes,
+            );
+            Ok(Arc::new(s3_storage))
+        }
+    }
 }
 
 pub(crate) fn ensure_dir(path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {

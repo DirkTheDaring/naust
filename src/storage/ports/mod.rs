@@ -234,6 +234,12 @@ pub trait GcStoragePort: Send + Sync {
     ) -> Result<GcDeleteResult, StorageError>;
 }
 
+/// Dedicated startup and readiness storage capability for whole-registry state inspection.
+#[async_trait]
+pub trait StorageReadinessInspector: Send + Sync {
+    async fn is_storage_empty(&self) -> Result<bool, StorageError>;
+}
+
 // -----------------------------------------------------------------------------
 // Focused Consumer Composite Ports
 // -----------------------------------------------------------------------------
@@ -413,6 +419,13 @@ macro_rules! impl_storage_ports {
             }
             async fn repo_timestamps(&self, name: &str) -> Result<$crate::storage::RepoTimestamps, $crate::storage::StorageError> {
                 $crate::storage::Storage::repo_timestamps(self, name).await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl $crate::storage::ports::StorageReadinessInspector for $target {
+            async fn is_storage_empty(&self) -> Result<bool, $crate::storage::StorageError> {
+                $crate::storage::Storage::is_storage_empty(self).await
             }
         }
 
@@ -730,6 +743,13 @@ impl<T: ?Sized + RepositoryCatalogReader + Send + Sync> RepositoryCatalogReader 
 }
 
 #[async_trait]
+impl<T: ?Sized + StorageReadinessInspector + Send + Sync> StorageReadinessInspector for Arc<T> {
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        (**self).is_storage_empty().await
+    }
+}
+
+#[async_trait]
 impl<T: ?Sized + ManifestReader + Send + Sync> ManifestReader for Arc<T> {
     async fn head_manifest(
         &self,
@@ -1024,6 +1044,7 @@ pub struct StorageWiring {
     cluster_lock: Arc<dyn ClusterLockStore>,
     blob_index: Arc<dyn BlobIndexStoragePort>,
     blob_ref_index: Arc<dyn BlobRefIndexStoragePort>,
+    readiness_inspector: Arc<dyn StorageReadinessInspector>,
 }
 
 impl StorageWiring {
@@ -1036,6 +1057,7 @@ impl StorageWiring {
             + GcServiceStoragePort
             + ClusterLockStore
             + GcStoragePort
+            + StorageReadinessInspector
             + 'static,
     {
         Self {
@@ -1053,7 +1075,8 @@ impl StorageWiring {
             gc_service_port: backend.clone(),
             cluster_lock: backend.clone(),
             blob_index: backend.clone(),
-            blob_ref_index: backend,
+            blob_ref_index: backend.clone(),
+            readiness_inspector: backend,
         }
     }
 
@@ -1115,5 +1138,9 @@ impl StorageWiring {
 
     pub fn blob_ref_index(&self) -> Arc<dyn BlobRefIndexStoragePort> {
         Arc::clone(&self.blob_ref_index)
+    }
+
+    pub fn readiness_inspector(&self) -> Arc<dyn StorageReadinessInspector> {
+        Arc::clone(&self.readiness_inspector)
     }
 }

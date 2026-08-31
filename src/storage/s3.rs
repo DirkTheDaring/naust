@@ -1407,6 +1407,50 @@ impl Storage for S3Storage {
         })
     }
 
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        let bucket = self.bucket()?;
+        let prefix = self.key("");
+        let lock_key = self.key("meta/exclusive_writer.lock");
+
+        let mut continuation_token: Option<String> = None;
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+
+        loop {
+            let page = self
+                .driver
+                .list_objects_v2_page(bucket, &prefix, continuation_token.as_deref(), 10)
+                .await?;
+
+            let has_data_objects = page.objects.iter().any(|obj| obj.key != lock_key);
+
+            if has_data_objects {
+                return Ok(false);
+            }
+
+            if let Some(next_token) = page.next_continuation_token {
+                if !seen_tokens.insert(next_token.clone()) {
+                    return Err(StorageError::Internal(
+                        "repeated S3 continuation token detected during storage readiness check"
+                            .to_string(),
+                    ));
+                }
+                continuation_token = Some(next_token);
+            } else {
+                break;
+            }
+        }
+
+        let mpu = self
+            .driver
+            .list_multipart_uploads(bucket, &prefix, None, None)
+            .await?;
+        if !mpu.uploads.is_empty() {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
         let bucket = self.bucket()?;
         let key = self.blob_key2(digest);

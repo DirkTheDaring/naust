@@ -928,6 +928,10 @@ mod tests {
             Err(StorageError::Unsupported)
         }
 
+        async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+            Ok(self.repos.lock().unwrap().is_empty())
+        }
+
         async fn head_blob(
             &self,
             _digest: &Digest,

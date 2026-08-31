@@ -7,6 +7,23 @@
 
 ---
 
+## Post-Slice-5 Implementation Status (ADR-005 Accepted)
+
+> **Implementation Note (Post-Slice-5 Verification State):**
+> Following Slices 1 through 4, **Slice 5 (ADR-005: Server Runtime Composition Root and Supervisor Boundary)** was implemented and verified.
+>
+> * **ADR-005 Status:** Accepted.
+> * **Server Runtime Composition Root (`src/runtime.rs`):** Introduced crate-private `ServerRuntime` encapsulating `AppState`, `StorageWiring`, `BlobRefIndex`, `ConsistencyCoordinator`, and `RuntimeMutationAuthority`. Exposes durability flush (`flush_for_shutdown()`), and clean authority release (`release_mutation_authority()`).
+> * **Centralized Application Graph Assembly:** Centralized all 7 pure application services (`BlobMutationService`, `ManifestMutationService`, `BlobReadService`, `ManifestReadService`, `CatalogQueryService`, `TagQueryService`, `ReferrersQueryService`) in `assemble_application_services` within `src/runtime.rs`. Test helpers (`AppState::new_test`, `AppState::new_test_with_proxy`) delegate directly to `crate::runtime::build_test_app_state`.
+> * **Strict Startup Pipeline, Storage Emptiness Capability & Failure Unwinding:** `build_server_runtime` orchestrates an 8-phase deterministic startup pipeline: storage initialization, mutation authority lease acquisition, fail-closed repository membership readiness preflight using dedicated narrow port `StorageReadinessInspector` (accessed via `StorageWiring::readiness_inspector()`), index opening and health recovery, proxy & proxy-cache storage initialization, consistency coordinator & GC service creation, application service graph assembly, and `AppState` construction. If any error occurs after acquiring mutation authority, the lease is cleanly released before returning `Err(RuntimeBuildError)`.
+> * **Storage Factory Placement:** Concrete storage constructors (`proxy_cache_storage_try_from_config`, `storage_wiring_try_from_config`, `storage_from_config`) are centralized in `src/storage/mod.rs`, preserving `src/storage/ports/mod.rs` as pure capability interfaces.
+> * **Supervisor Narrowing (`src/supervisor.rs`):** Removed all direct references to `FsStorage`, `S3Storage`, and low-level storage traversal helpers (`is_store_completely_empty`, `has_any_file_or_dir`). Supervisor focuses purely on process lifecycle orchestration, worker task supervision, flush hook execution, and graceful authority release.
+> * **Deterministic Unit & Integration Tests:** Added comprehensive unit tests in `src/runtime.rs` and lifecycle contract tests in `tests/supervisor_and_command_tests.rs` verifying filesystem graph assembly, coordinator identity sharing, phase ordering, fail-closed membership rejection, multi-phase failure unwinding, proxy configurations, required live S3 mode behavior, and live S3 MinIO backend graph construction and teardown.
+> * **Verified Test Inventory:** 691 total listed tests across 18 test binaries. **691 passed, 0 failed, 0 ignored** with local MinIO backend healthy.
+> * **Deferred Slice 6 Work:** Remaining CLI command composition duplication (`src/cli/`) deferred for unification in Slice 6.
+
+---
+
 ## Post-Slice-4 Implementation Status (ADR-004 Accepted)
 
 > **Implementation Note (Post-Slice-4 Verification State):**

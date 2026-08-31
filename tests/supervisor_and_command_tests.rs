@@ -987,3 +987,73 @@ async fn test_supervisor_graceful_shutdown_releases_authority_exactly_once() {
         .expect("must acquire authority after clean supervisor shutdown");
     auth.release().await.unwrap();
 }
+
+// ------------------------------------------------------------------------------------------------
+// 23. Supervisor runtime composition and full lifecycle contract
+// ------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_runtime_composition_and_full_lifecycle_contract() {
+    let temp = TempDir::new().unwrap();
+    let cfg = Arc::new(create_test_config(&temp));
+
+    let injector = Arc::new(RecordingFaultInjector::new());
+    let (bound_tx, bound_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let opts = SupervisorOptions {
+        fault_injector: Some(injector.clone()),
+        shutdown_rx: Some(shutdown_rx),
+        notify_bound_addr: Some(bound_tx),
+    };
+
+    let srv_handle = tokio::spawn(run_server_supervisor(cfg.clone(), Some(opts)));
+    let bound_addr = bound_rx.await.expect("listener must bind");
+
+    // 1. Verify HTTP endpoint serves requests using constructed runtime
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/v2/", bound_addr))
+        .send()
+        .await
+        .expect("send request to server");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 2. Trigger graceful shutdown
+    let _ = shutdown_tx.send(());
+    let srv_res = srv_handle.await.expect("supervisor task joined");
+    assert!(srv_res.is_ok(), "supervisor must exit cleanly");
+
+    // 3. Verify event ordering: startup pipeline executed in order, shutdown started before authority release
+    let events = injector.events.lock().await.clone();
+    assert_eq!(
+        events,
+        vec![
+            "config_loaded",
+            "storage_initialized",
+            "authority_acquired",
+            "membership_verified",
+            "index_initialized",
+            "app_state_constructed",
+            "routes_configured",
+            "workers_spawned",
+            "listener_bound",
+            "serving",
+            "shutdown_started",
+            "authority_released",
+        ]
+    );
+
+    // 4. Verify authority released cleanly and can be acquired by another process
+    let wiring = storage::storage_wiring_from_config(cfg.as_ref());
+    let mut auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "post-lifecycle-check")
+        .await
+        .expect("authority must be free after supervisor shutdown");
+    auth.release().await.unwrap();
+
+    // 5. Verify listener is closed (new connections fail)
+    let conn_res = tokio::net::TcpStream::connect(bound_addr).await;
+    assert!(
+        conn_res.is_err(),
+        "listener must be closed after supervisor shutdown"
+    );
+}
