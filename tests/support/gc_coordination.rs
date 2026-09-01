@@ -1,4 +1,4 @@
-#![allow(clippy::type_complexity, clippy::collapsible_if)]
+#![allow(dead_code, clippy::type_complexity, clippy::collapsible_if)]
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;

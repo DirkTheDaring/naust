@@ -7,6 +7,20 @@
 
 ---
 
+## Post-Slice-9 Implementation Status (Slice 9 Implemented)
+
+> **Implementation Note (Post-Slice-9 Verification State):**
+> Following Slices 1 through 8, **Slice 9 (S3 Storage Private Test Extraction and Production Test Isolation)** was implemented and verified under the governing policy established in ADR-008.
+>
+> * **Test Topology Standard (`src/storage/s3/tests.rs`):** Extracted 3,506 lines of inline unit test code (lines 3773–7278) from `src/storage/s3.rs` into the file-backed private unit test module `src/storage/s3/tests.rs` (3,492 lines) declared via `#[cfg(test)] #[path = "s3/tests.rs"] pub(crate) mod tests;`.
+> * **Production Test Isolation & Visibility Boundary:** Fully eliminated public production test bloat. The production module declaration is strictly gated behind `#[cfg(test)]`. Normal release compilation (`cargo build --release`) compiles zero test helpers, zero mock drivers (`MockS3Driver`), and zero test log entries (`S3CallLogEntry`).
+> * **Integration Test Support Migration (`tests/support/s3_mock.rs`):** Relocated reusable integration mock infrastructure (`MockS3Driver`, `S3CallLogEntry`, and `create_mock_storage()`) into `tests/support/s3_mock.rs`. Integration tests (`tests/supervisor_and_command_tests.rs`, `tests/manifest_lifecycle_tests.rs`, `tests/gc_adversarial_coordination_tests.rs`) import from `tests/support/s3_mock` using public crate interfaces, completely decoupling integration tests from crate internals.
+> * **Unchanged Test Identity & Coverage:** Exactly 61 compiled S3 unit tests verified identical via `diff -u` before and after. Total workspace test count remains exactly **708 tests across 18 binaries**.
+> * **Production File Size Reduction:** `src/storage/s3.rs` reduced from 7,278 to 3,776 lines (48.1% physical line count reduction), leaving purely production S3 backend driver logic.
+> * **Technical Debt Register:** Item **D-04** advanced (S3 storage test bloat extracted, isolated under `#[cfg(test)]`, integration mock infrastructure relocated to `tests/support/`, and production-visible test footprint eliminated; residual filesystem test bloat in `src/storage/fs.rs` deferred to Slice 10).
+
+---
+
 ## Post-Slice-8 Implementation Status (ADR-008 Accepted)
 
 > **Implementation Note (Post-Slice-8 Verification State):**

@@ -1,5 +1,7 @@
 #![allow(clippy::all)]
 
+mod support;
+
 use bytes::Bytes;
 use sha2::Digest as _;
 use std::sync::Arc;
@@ -21,10 +23,10 @@ use registry_rust::storage::mutation_authority::{
 use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
 use registry_rust::storage::s3::S3Driver;
 use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::s3::tests::MockS3Driver;
 use registry_rust::storage::{
     ConditionalDeleteResult, RepositoryBlobMembershipStorage, Storage, StorageError,
 };
+use support::s3_mock::MockS3Driver;
 
 fn sha256_digest(bytes: &[u8]) -> Digest {
     let mut hasher = sha2::Sha256::new();

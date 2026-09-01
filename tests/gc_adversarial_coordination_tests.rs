@@ -968,7 +968,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
-    let (s3_storage, driver) = registry_rust::storage::s3::tests::create_mock_storage();
+    let (s3_storage, driver) = support::s3_mock::create_mock_storage();
     let storage = Arc::new(s3_storage);
 
     let temp = tempfile::TempDir::new().unwrap();
@@ -1091,7 +1091,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn test_s3_repository_enumeration_pagination_and_fail_closed_matrix() {
-    let (s3_storage, driver) = registry_rust::storage::s3::tests::create_mock_storage();
+    let (s3_storage, driver) = support::s3_mock::create_mock_storage();
 
     // 1. Page 1 empty with continuation, Page 2 contains journal-only repo
     driver.objects.lock().unwrap().insert(
@@ -1908,7 +1908,7 @@ async fn test_integration_fs_deletion_requires_both_gc_proof_types() {
 // 7. S3 deletion requires both GC proof types.
 #[tokio::test]
 async fn test_integration_s3_deletion_requires_both_gc_proof_types() {
-    let (s3_storage, driver) = registry_rust::storage::s3::tests::create_mock_storage();
+    let (s3_storage, driver) = support::s3_mock::create_mock_storage();
     let s3_storage_dyn = Arc::new(s3_storage);
     let ref_idx_path = tmp_dir("integ-s3-both-proofs-idx");
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());

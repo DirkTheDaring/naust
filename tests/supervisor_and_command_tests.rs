@@ -1,3 +1,5 @@
+mod support;
+
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,11 +20,11 @@ use registry_rust::storage::mutation_authority::{
     inspect_deployment_writer_lock,
 };
 use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::s3::tests::MockS3Driver;
 use registry_rust::storage::{self, RepositoryBlobMembershipStorage, Storage};
 use registry_rust::supervisor::{
     StartupPhase, SupervisorFaultInjector, SupervisorOptions, run_server_supervisor,
 };
+use support::s3_mock::MockS3Driver;
 
 fn create_test_config_toml(temp_dir: &TempDir) -> String {
     let fs_root = temp_dir.path().join("registry");
