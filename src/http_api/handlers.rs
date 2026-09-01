@@ -2139,7 +2139,7 @@ async fn manifest_put(
     let limit = state
         .config
         .max_request_body_bytes
-        .min(crate::manifest_publication::MAX_MANIFEST_SIZE);
+        .min(crate::manifest_lifecycle::MAX_MANIFEST_SIZE);
 
     let (idle_timeout, min_rate) = state.current_stream_guard_params();
     let audit_only =

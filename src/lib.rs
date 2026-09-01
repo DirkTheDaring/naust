@@ -19,6 +19,7 @@ pub mod glob;
 pub mod http_api;
 pub mod ip_concurrency;
 pub mod manifest_lifecycle;
+#[deprecated(note = "use crate::manifest_lifecycle instead")]
 pub mod manifest_publication;
 pub mod manifest_refs;
 pub mod membership_migration;

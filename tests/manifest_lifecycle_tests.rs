@@ -3080,3 +3080,451 @@ async fn test_proxy_eviction_restart_journal_deletion_lost_retry_is_idempotent()
             .is_none()
     );
 }
+
+// ================================================================================================
+// Migrated Legacy Manifest Publication Scenarios (ADR-007)
+// ================================================================================================
+
+#[tokio::test]
+async fn test_migrated_stage_1_reference_parsing_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (_storage, _idx, service) = setup_test_service(&temp_dir).await;
+
+    let req = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "latest".to_string(),
+        payload: Bytes::from("not-valid-json"),
+        declared_media_type: None,
+        allow_tag_overwrite: true,
+    };
+    let err = service.publish_manifest(req).await.unwrap_err();
+    assert!(matches!(err, ManifestLifecycleError::InvalidManifest(_)));
+}
+
+#[tokio::test]
+async fn test_migrated_reference_kind_validation_blobs_vs_child_manifests() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (storage, _idx, service) = setup_test_service(&temp_dir).await;
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let missing_blob_digest =
+        Digest::parse("sha256:baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    let (payload, _) = create_manifest_json(&config_d, &missing_blob_digest);
+
+    // 1. Missing layer blob fails with MissingBlob
+    let req1 = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "latest".to_string(),
+        payload,
+        declared_media_type: None,
+        allow_tag_overwrite: true,
+    };
+    let err1 = service.publish_manifest(req1).await.unwrap_err();
+    assert!(matches!(err1, ManifestLifecycleError::MissingBlob(_)));
+
+    // 2. Missing child manifest in OCI index fails with MissingManifest
+    let missing_manifest_digest =
+        Digest::parse("sha256:caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    let index_json = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": missing_manifest_digest.as_str(),
+                "size": 100
+            }
+        ]
+    });
+    let index_bytes = Bytes::from(serde_json::to_vec(&index_json).unwrap());
+    let req2 = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "multiarch".to_string(),
+        payload: index_bytes,
+        declared_media_type: None,
+        allow_tag_overwrite: true,
+    };
+    let err2 = service.publish_manifest(req2).await.unwrap_err();
+    match err2 {
+        ManifestLifecycleError::MissingManifest(d) => {
+            assert_eq!(d, missing_manifest_digest.as_str())
+        }
+        other => panic!("expected MissingManifest, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_migrated_concurrent_immutable_tag_race_safety() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (storage, _idx, service) = setup_test_service(&temp_dir).await;
+    let service = Arc::new(service);
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let blob_d1 = write_test_blob(storage.as_ref(), "test/repo", b"payload_1").await;
+    let blob_d2 = write_test_blob(storage.as_ref(), "test/repo", b"payload_2").await;
+
+    let (m1_bytes, m1_digest) = create_manifest_json(&config_d, &blob_d1);
+    let (m2_bytes, m2_digest) = create_manifest_json(&config_d, &blob_d2);
+
+    let s1 = service.clone();
+    let handle1 = tokio::spawn(async move {
+        s1.publish_manifest(PublishManifestRequest {
+            repo: "test/repo".to_string(),
+            reference: "v1".to_string(),
+            payload: m1_bytes,
+            declared_media_type: None,
+            allow_tag_overwrite: false,
+        })
+        .await
+    });
+
+    let s2 = service.clone();
+    let handle2 = tokio::spawn(async move {
+        s2.publish_manifest(PublishManifestRequest {
+            repo: "test/repo".to_string(),
+            reference: "v1".to_string(),
+            payload: m2_bytes,
+            declared_media_type: None,
+            allow_tag_overwrite: false,
+        })
+        .await
+    });
+
+    let (res1, res2) = tokio::join!(handle1, handle2);
+    let r1 = res1.unwrap();
+    let r2 = res2.unwrap();
+
+    let (success_digest, failed_err) = match (r1, r2) {
+        (Ok(pub1), Err(err2)) => (pub1.digest, err2),
+        (Err(err1), Ok(pub2)) => (pub2.digest, err1),
+        (Ok(_), Ok(_)) => panic!("both concurrent immutable creates succeeded! Violation!"),
+        (Err(e1), Err(e2)) => panic!("both failed: {e1:?}, {e2:?}"),
+    };
+
+    assert!(matches!(
+        failed_err,
+        ManifestLifecycleError::TagAlreadyExists
+    ));
+
+    let resolved = storage.resolve_tag("test/repo", "v1").await.unwrap();
+    assert_eq!(resolved, success_digest);
+    assert!(resolved == m1_digest || resolved == m2_digest);
+}
+
+#[tokio::test]
+async fn test_migrated_immutable_tag_idempotent_republish() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (storage, _idx, service) = setup_test_service(&temp_dir).await;
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let blob_d = write_test_blob(storage.as_ref(), "test/repo", b"layer_idempotent").await;
+    let (m_bytes, m_digest) = create_manifest_json(&config_d, &blob_d);
+
+    let req1 = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "v1".to_string(),
+        payload: m_bytes.clone(),
+        declared_media_type: None,
+        allow_tag_overwrite: false,
+    };
+    let res1 = service.publish_manifest(req1).await.unwrap();
+    assert_eq!(res1.digest, m_digest);
+
+    // Republishing identical payload with allow_tag_overwrite=false succeeds as Unchanged
+    let req2 = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "v1".to_string(),
+        payload: m_bytes,
+        declared_media_type: None,
+        allow_tag_overwrite: false,
+    };
+    let res2 = service.publish_manifest(req2).await.unwrap();
+    assert_eq!(res2.digest, m_digest);
+}
+
+#[tokio::test]
+async fn test_migrated_dirty_index_state_rebuild_after_crash() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let fs_root = temp_dir.path().join("data");
+    let ref_index_path = temp_dir.path().join("ref-index");
+    std::fs::create_dir_all(&fs_root).unwrap();
+    std::fs::create_dir_all(&ref_index_path).unwrap();
+
+    let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+    let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let service = ManifestLifecycleService::new(storage.clone(), Some(idx.clone()), coordinator);
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let blob_d = write_test_blob(storage.as_ref(), "test/repo", b"crash_test_blob").await;
+    let (m_bytes, m_digest) = create_manifest_json(&config_d, &blob_d);
+
+    let req = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "v1".to_string(),
+        payload: m_bytes,
+        declared_media_type: None,
+        allow_tag_overwrite: true,
+    };
+    service.publish_manifest(req).await.unwrap();
+
+    // Simulate crash right after marking dirty
+    idx.mark_dirty().unwrap();
+    drop(service);
+    drop(idx);
+
+    // New process opens the index
+    let reopened_idx = BlobRefIndex::open(ref_index_path).unwrap();
+    assert!(reopened_idx.check_health().is_err());
+
+    // Calling ensure_healthy_or_rebuild with auto_rebuild_on_corruption rebuilds it
+    reopened_idx
+        .ensure_healthy_or_rebuild(&storage, true, false)
+        .await
+        .unwrap();
+    assert!(reopened_idx.check_health().is_ok());
+    assert!(reopened_idx.is_blob_referenced(&m_digest).unwrap());
+}
+
+#[tokio::test]
+async fn test_migrated_concurrent_overwrite_publications_converge() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let fs_root = temp_dir.path().join("data");
+    let ref_index_path = temp_dir.path().join("ref-index");
+    std::fs::create_dir_all(&fs_root).unwrap();
+    std::fs::create_dir_all(&ref_index_path).unwrap();
+
+    let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+    let idx = Arc::new(BlobRefIndex::open(ref_index_path).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let service = Arc::new(ManifestLifecycleService::new(
+        storage.clone(),
+        Some(idx.clone()),
+        coordinator,
+    ));
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let blob_d1 = write_test_blob(storage.as_ref(), "test/repo", b"concurrent_1").await;
+    let blob_d2 = write_test_blob(storage.as_ref(), "test/repo", b"concurrent_2").await;
+
+    let (m1_bytes, m1_digest) = create_manifest_json(&config_d, &blob_d1);
+    let (m2_bytes, m2_digest) = create_manifest_json(&config_d, &blob_d2);
+
+    let s1 = service.clone();
+    let handle1 = tokio::spawn(async move {
+        s1.publish_manifest(PublishManifestRequest {
+            repo: "test/repo".to_string(),
+            reference: "latest".to_string(),
+            payload: m1_bytes,
+            declared_media_type: None,
+            allow_tag_overwrite: true,
+        })
+        .await
+    });
+
+    let s2 = service.clone();
+    let handle2 = tokio::spawn(async move {
+        s2.publish_manifest(PublishManifestRequest {
+            repo: "test/repo".to_string(),
+            reference: "latest".to_string(),
+            payload: m2_bytes,
+            declared_media_type: None,
+            allow_tag_overwrite: true,
+        })
+        .await
+    });
+
+    let (r1, r2) = tokio::join!(handle1, handle2);
+    assert!(r1.unwrap().is_ok());
+    assert!(r2.unwrap().is_ok());
+
+    let final_tag = storage.resolve_tag("test/repo", "latest").await.unwrap();
+    assert!(final_tag == m1_digest || final_tag == m2_digest);
+
+    assert!(idx.check_health().is_ok());
+    assert!(idx.is_blob_referenced(&final_tag).unwrap());
+}
+
+#[tokio::test]
+async fn test_migrated_same_digest_retry_after_dirty_rebuilds_and_succeeds() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let fs_root = temp_dir.path().join("data");
+    let ref_index_path = temp_dir.path().join("ref-index");
+    std::fs::create_dir_all(&fs_root).unwrap();
+    std::fs::create_dir_all(&ref_index_path).unwrap();
+
+    let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+    let idx = Arc::new(BlobRefIndex::open(ref_index_path).unwrap());
+    idx.ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let service = ManifestLifecycleService::new(storage.clone(), Some(idx.clone()), coordinator);
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let blob_d = write_test_blob(storage.as_ref(), "test/repo", b"retry_blob").await;
+    let (m_bytes, m_digest) = create_manifest_json(&config_d, &blob_d);
+
+    let req = PublishManifestRequest {
+        repo: "test/repo".to_string(),
+        reference: "v1".to_string(),
+        payload: m_bytes.clone(),
+        declared_media_type: None,
+        allow_tag_overwrite: true,
+    };
+
+    // 1. Initial publish succeeds
+    service.publish_manifest(req.clone()).await.unwrap();
+    assert!(idx.check_health().is_ok());
+
+    // 2. Simulate partial failure leaving dirty marker
+    idx.mark_dirty().unwrap();
+    assert!(idx.check_health().is_err());
+
+    // 3. Retry same publication
+    let res = service.publish_manifest(req).await;
+    assert!(res.is_ok());
+
+    // 4. Index must now be healthy and report blob referenced
+    assert!(idx.check_health().is_ok());
+    assert!(idx.is_blob_referenced(&m_digest).unwrap());
+}
+
+#[tokio::test]
+async fn test_migrated_immutable_conflict_retains_content_addressed_manifest_and_referrer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_index, service) = setup_test_service(&dir).await;
+
+    let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
+    let blob_d1 = write_test_blob(storage.as_ref(), "test/repo", b"payload1").await;
+    let blob_d2 = write_test_blob(storage.as_ref(), "test/repo", b"payload2").await;
+
+    let (m1_bytes, m1_digest) = create_manifest_json(&config_d, &blob_d1);
+
+    // Subject blob
+    let subject_blob = write_test_blob(storage.as_ref(), "test/repo", b"artifact_subject").await;
+    let artifact_manifest_json = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_d.as_str(),
+            "size": 2
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": blob_d2.as_str(),
+                "size": 8
+            }
+        ],
+        "subject": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": subject_blob.as_str(),
+            "size": 16
+        }
+    });
+    let m2_bytes: Bytes = serde_json::to_vec(&artifact_manifest_json).unwrap().into();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&m2_bytes);
+    let m2_digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
+
+    // 1. Publish m1 to tag "v1"
+    service
+        .publish_manifest(PublishManifestRequest {
+            repo: "test/repo".to_string(),
+            reference: "v1".to_string(),
+            payload: m1_bytes,
+            declared_media_type: None,
+            allow_tag_overwrite: false,
+        })
+        .await
+        .unwrap();
+
+    // 2. Publish m2 (with subject) to immutable tag "v1" with allow_tag_overwrite = false
+    let err = service
+        .publish_manifest(PublishManifestRequest {
+            repo: "test/repo".to_string(),
+            reference: "v1".to_string(),
+            payload: m2_bytes,
+            declared_media_type: None,
+            allow_tag_overwrite: false,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ManifestLifecycleError::TagAlreadyExists));
+
+    // 3. Verify content-addressed invariants:
+    assert_eq!(
+        storage.resolve_tag("test/repo", "v1").await.unwrap(),
+        m1_digest
+    );
+    assert!(storage.get_manifest("test/repo", &m2_digest).await.is_ok());
+    let referrers = storage
+        .list_referrers("test/repo", &subject_blob)
+        .await
+        .unwrap();
+    assert!(referrers.iter().any(|r| r.digest == m2_digest.as_str()));
+}
+
+#[tokio::test]
+async fn test_public_api_manifest_publication_compatibility() {
+    // Compile-time and runtime proof that all 9 deprecated public names are fully accessible:
+    #[allow(deprecated)]
+    {
+        use registry_rust::manifest_publication::{
+            MAX_MANIFEST_SIZE, ManifestLifecycleService, ManifestPublisher, ProxyEvictionResult,
+            ProxyPublicationEvidence, PublishManifestError, PublishManifestRequest,
+            PublishedManifest, is_supported_manifest_media_type,
+        };
+
+        assert_eq!(MAX_MANIFEST_SIZE, 4 * 1024 * 1024);
+        assert!(is_supported_manifest_media_type(
+            "application/vnd.oci.image.manifest.v1+json"
+        ));
+
+        let _evidence_builder = |repo: &str, tag: &str, d: Digest| -> ProxyPublicationEvidence {
+            ProxyPublicationEvidence::new_for_test(
+                repo,
+                tag,
+                Bytes::from_static(b"{}"),
+                None,
+                true,
+                d,
+            )
+        };
+        let _eviction_res: Option<ProxyEvictionResult> = None;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs_root = dir.path().join("data");
+        std::fs::create_dir_all(&fs_root).unwrap();
+        let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
+        let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+
+        let publisher: ManifestPublisher =
+            ManifestLifecycleService::new(storage.clone(), None, coordinator);
+
+        let req = PublishManifestRequest {
+            repo: "compat/repo".to_string(),
+            reference: "latest".to_string(),
+            payload: Bytes::from("invalid-json"),
+            declared_media_type: None,
+            allow_tag_overwrite: true,
+        };
+
+        let res: Result<PublishedManifest, PublishManifestError> = publisher.publish(req).await;
+        assert!(matches!(res, Err(PublishManifestError::InvalidManifest(_))));
+    }
+}

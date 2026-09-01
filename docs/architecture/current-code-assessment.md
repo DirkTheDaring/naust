@@ -7,6 +7,21 @@
 
 ---
 
+## Post-Slice-7 Implementation Status (ADR-007 Accepted)
+
+> **Implementation Note (Post-Slice-7 Verification State):**
+> Following Slices 1 through 6, **Slice 7 (ADR-007: Manifest Compatibility Re-Export Deprecation and Test Consolidation)** was implemented and verified.
+>
+> * **ADR-007 Status:** Accepted.
+> * **Preserved Public API Compatibility (`src/manifest_publication.rs` & `src/lib.rs`):** Converted `src/manifest_publication.rs` into a minimal, 10-line backwards-compatibility re-export shim containing only documentation, the nine original public exported items (`ManifestPublisher`, `PublishManifestError`, `ManifestLifecycleService`, `PublishManifestRequest`, `PublishedManifest`, `ProxyEvictionResult`, `ProxyPublicationEvidence`, `MAX_MANIFEST_SIZE`, `is_supported_manifest_media_type`), and marked the module deprecated in `src/lib.rs` with `#[deprecated(note = "use crate::manifest_lifecycle instead")]`.
+> * **Internal Caller Migration:** All internal production callers (`src/http_api/handlers.rs`) updated to reference `crate::manifest_lifecycle` directly. Zero internal production callers depend on `manifest_publication`.
+> * **Assertion-Level Test Migration:** Audited all 11 legacy inline unit tests from `src/manifest_publication.rs`, migrating 8 unique behavioral scenarios and 1 compile-time public API compatibility verification test into `tests/manifest_lifecycle_tests.rs`. Retired redundant duplicate tests whose coverage is fully provided in `tests/gc_adversarial_coordination_tests.rs`.
+> * **Massive Ghost Code Reduction:** Reduced `src/manifest_publication.rs` from 993 lines to 10 lines (98.9% technical debt reduction), removing 963 lines of test fixtures from production compilation units.
+> * **Verified Test Inventory:** 708 total listed tests across 18 test binaries. **708 passed, 0 failed, 0 ignored** with local MinIO backend healthy.
+> * **Technical Debt Register:** Item **D-05** marked as **Resolved (ADR-007)**.
+
+---
+
 ## Post-Slice-6 Implementation Status (ADR-006 Accepted)
 
 > **Implementation Note (Post-Slice-6 Verification State):**
@@ -387,7 +402,7 @@ Total Test Suite: 602 Tests
 | **D-02** | **P1** | Unencapsulated `AppState` in Handlers | Direct handler access to 17 internal fields | Business logic leakage into transport layer | HTTP dispatch, Proxy caching | `src/services/` | Introduce `RegistryApplicationService` facade; pass focused contexts to handlers | Planned (Slice 2) |
 | **D-03** | **P2** | Conventional `consistency_gate` Synchronization | Unwrapped `Arc<Mutex<()>>` | Risk of future mutators bypassing gate | Manifest publish, GC sweep, Upload finalize | `src/consistency.rs` | Encapsulate gate inside transactional coordinator guards | **Resolved (ADR-001)** |
 | **D-04** | **P2** | In-Source Test Footprint Bloat | Historical co-location of extensive mocks | 55% of `src/` is test code; hinders maintainability | Development & Review | `tests/` or `src/fixtures/` | Extract mock drivers and unit tests into dedicated submodules or integration tests | Planned |
-| **D-05** | **P3** | Ghost Re-export Module | Partial refactoring of `manifest_publication` | Redundant 972-line file with duplicate tests | Build / Navigation | `src/manifest_lifecycle.rs` | Deprecate `manifest_publication.rs` and migrate residual test cases to `manifest_lifecycle_tests.rs` | Planned |
+| **D-05** | **P3** | Ghost Re-export Module | Partial refactoring of `manifest_publication` | Redundant 972-line file with duplicate tests | Build / Navigation | `src/manifest_lifecycle.rs` | Deprecate `manifest_publication.rs` and migrate residual test cases to `manifest_lifecycle_tests.rs` | **Resolved (ADR-007)** |
 | **D-06** | **P3** | Stringly-Typed Internal Error Tunneling | Generic `StorageError::Internal(String)` | Loss of error root cause and retry semantics | Error reporting, CLI exit codes | `src/errors.rs` | Introduce structured `StorageErrorKind` with typed underlying causes | Planned |
 
 ---
