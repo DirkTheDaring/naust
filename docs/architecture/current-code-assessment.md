@@ -7,6 +7,23 @@
 
 ---
 
+## Post-Slice-6 Implementation Status (ADR-006 Accepted)
+
+> **Implementation Note (Post-Slice-6 Verification State):**
+> Following Slices 1 through 5, **Slice 6 (ADR-006: CLI Runtime Composition, Command Safety Policies, and Typed Errors)** was implemented and verified.
+>
+> * **ADR-006 Status:** Accepted.
+> * **Command Safety Policy Taxonomy (`src/cli/policy.rs`):** Introduced crate-private `CommandPolicy` classifying all 15 commands and subcommands into `Pure`, `ReadOnly`, `ExclusiveInspection`, `ExclusiveMutation`, `Migration`, and `BreakGlass`.
+> * **Non-Mutating Read-Only Invariants:**
+>   * `BlobRefIndex::check_path_health` and `BlobRefIndex::open_existing` guarantee that checking a missing or corrupted index creates zero database files, directories, WAL entries, or lock metadata on disk.
+>   * `blob-gc plan` and `ref-index check` acquire zero locks (`FsRootLock` or `RuntimeMutationAuthority`) and perform zero auto-repair or writes.
+> * **Bounded Maintenance Runtime (`src/cli/runtime.rs`):** Introduced `MaintenanceRuntime` as the bounded composition root for CLI commands, consuming narrow capability ports from `StorageWiring`, enforcing strict lock ordering (`FsRootLock` -> `RuntimeMutationAuthority`), and maintaining single ownership of `RuntimeMutationAuthority` with non-owning delegation to `GcService`.
+> * **Typed CLI Errors (`src/cli/errors.rs`):** Introduced `CliError` enum replacing all untyped strings and internal `process::exit` calls, with preserved process exit codes (0 = success, 1 = operational failure, 2 = usage/configuration error) and compound error preservation (`ExecutionAndTeardownFailed`).
+> * **Deterministic Unit & Integration Tests:** Added 19 new tests in `tests/supervisor_and_command_tests.rs` covering command policies, pure commands, non-mutating index checks and GC plan, readiness rules, authority unwinding, lock contention on FS and S3, delete failure unwinding, compound teardown failures, break-glass recovery isolation, and live S3 MinIO backend operations.
+> * **Verified Test Inventory:** 710 total listed tests across 18 test binaries. **710 passed, 0 failed, 0 ignored** with local MinIO backend healthy.
+
+---
+
 ## Post-Slice-5 Implementation Status (ADR-005 Accepted)
 
 > **Implementation Note (Post-Slice-5 Verification State):**

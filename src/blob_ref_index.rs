@@ -26,6 +26,9 @@ pub enum RefIndexError {
 
     #[error("ref-index corrupt: {0}")]
     Corrupt(String),
+
+    #[error("ref-index not found at {0}")]
+    NotFound(PathBuf),
 }
 
 #[derive(Clone)]
@@ -109,6 +112,23 @@ impl BlobRefIndex {
             fail_mark_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_mark_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Open an existing index if it exists on disk, returning NotFound without creating files if absent.
+    pub fn open_existing(path: &Path) -> Result<Self, RefIndexError> {
+        if !path.exists() {
+            return Err(RefIndexError::NotFound(path.to_path_buf()));
+        }
+        Self::open(path.to_path_buf())
+    }
+
+    /// Check health of an index on disk without creating files if absent.
+    pub fn check_path_health(path: &Path) -> Result<(), RefIndexError> {
+        if !path.exists() {
+            return Err(RefIndexError::NotFound(path.to_path_buf()));
+        }
+        let idx = Self::open(path.to_path_buf())?;
+        idx.check_health()
     }
 
     // Pin/lease store (for online blob GC safety): best-effort and conservative.

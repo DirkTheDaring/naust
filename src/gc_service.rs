@@ -1,5 +1,6 @@
 use crate::blob_gc::{
-    BlobGcLimits, BlobGcPolicy, BlobGcStats, blob_gc_delete, blob_gc_plan, blob_gc_quarantine,
+    BlobGcLimits, BlobGcPolicy, BlobGcStats, blob_gc_delete, blob_gc_delete_with_authority,
+    blob_gc_plan, blob_gc_quarantine, blob_gc_quarantine_with_authority,
 };
 use crate::blob_ref_index::BlobRefIndex;
 use crate::storage;
@@ -349,6 +350,69 @@ impl GcService {
         })
     }
 
+    pub async fn quarantine_with_authority(
+        &self,
+        authority: &RuntimeMutationAuthority,
+        policy: BlobGcPolicy,
+        min_age: Duration,
+        budgets: GcBudgets,
+    ) -> Result<BlobGcStats, GcServiceError> {
+        let t0 = Instant::now();
+
+        if self.storage.gc_strategy() == storage::GcStorageStrategy::S3DirectConditional {
+            return Err(GcServiceError::StrategyUnsupported {
+                message: "quarantine is not supported for S3 storage backend; use delete or scheduled cleanup with S3DirectConditional",
+                source: None,
+            });
+        }
+
+        let _run_guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
+
+        let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
+
+        if !self.config.blob_gc_enabled {
+            return Err(GcServiceError::Disabled);
+        }
+
+        if !authority.is_active() {
+            return Err(GcServiceError::AuthorityReleased);
+        }
+
+        self.ensure_ref_index_ready().await?;
+        self.refresh_tag_rooted_index_if_needed(policy).await?;
+
+        blob_gc_quarantine_with_authority(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            &self.consistency,
+            authority,
+            policy,
+            min_age,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::GcOperation)
+        .inspect(|stats| {
+            tracing::info!(
+                event = "blob_gc",
+                action = "quarantine",
+                policy = ?policy,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                scanned_blobs = stats.scanned_blobs,
+                scanned_bytes = stats.scanned_bytes,
+                quarantined_blobs = stats.quarantined_blobs,
+                quarantined_bytes = stats.quarantined_bytes,
+                restored_blobs = stats.restored_blobs,
+                restored_bytes = stats.restored_bytes,
+                "blob gc quarantine finished"
+            );
+        })
+    }
+
     pub async fn delete(
         &self,
         policy: BlobGcPolicy,
@@ -408,6 +472,73 @@ impl GcService {
             &self.idx,
             &self.consistency,
             &self.mutation_authority,
+            policy,
+            quarantine_delay,
+            budgets.to_limits(),
+        )
+        .await
+        .map_err(GcServiceError::GcOperation)
+        .inspect(|stats| {
+            tracing::info!(
+                event = "blob_gc",
+                action = "delete",
+                policy = ?policy,
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                restored_blobs = stats.restored_blobs,
+                restored_bytes = stats.restored_bytes,
+                deleted_blobs = stats.deleted_blobs,
+                deleted_bytes = stats.deleted_bytes,
+                "blob gc delete finished"
+            );
+        })
+    }
+
+    pub async fn delete_with_authority(
+        &self,
+        authority: &RuntimeMutationAuthority,
+        policy: BlobGcPolicy,
+        quarantine_delay: Duration,
+        budgets: GcBudgets,
+    ) -> Result<BlobGcStats, GcServiceError> {
+        let t0 = Instant::now();
+
+        let _run_guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| GcServiceError::AlreadyRunning)?;
+
+        let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
+
+        if !self.config.blob_gc_enabled {
+            return Err(GcServiceError::Disabled);
+        }
+        if !self.config.blob_gc_enable_delete {
+            return Err(GcServiceError::DeleteDisabled);
+        }
+
+        if !authority.is_active() {
+            return Err(GcServiceError::AuthorityReleased);
+        }
+
+        self.ensure_ref_index_ready().await?;
+        self.refresh_tag_rooted_index_if_needed(policy).await?;
+
+        if self.storage.gc_strategy() == storage::GcStorageStrategy::S3DirectConditional {
+            self.storage
+                .check_bucket_versioning_for_gc()
+                .await
+                .map_err(|e| GcServiceError::StrategyUnsupported {
+                    message: "S3 bucket versioning check failed",
+                    source: Some(e),
+                })?;
+        }
+
+        blob_gc_delete_with_authority(
+            &self.config,
+            &self.storage,
+            &self.idx,
+            &self.consistency,
+            authority,
             policy,
             quarantine_delay,
             budgets.to_limits(),

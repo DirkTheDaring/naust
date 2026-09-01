@@ -6,8 +6,8 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex, oneshot};
 
 use registry_rust::cli::{
-    BlobGcCommand, Cli, CliCommand, CommandIntent, MigrateMembershipCommand, RefIndexCommand,
-    run_cli,
+    BlobGcCommand, Cli, CliCommand, CliError, CommandIntent, CommandPolicy, MaintenanceRuntime,
+    MigrateMembershipCommand, RefIndexCommand, execute_cli, run_cli,
 };
 use registry_rust::config::Config;
 use registry_rust::fs_root_lock::FsRootLock;
@@ -188,6 +188,11 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
     let wiring = storage::from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
 
     {
         let idx =
@@ -248,6 +253,11 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
     let wiring = storage::from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
 
     let maintenance_cmds = vec![
         CliCommand::RefIndex {
@@ -807,12 +817,8 @@ async fn test_fs_root_lock_mutual_exclusion_between_server_and_cli() {
 
     let cli = Cli {
         config: vec![cfg_path],
-        command: Some(CliCommand::BlobGc {
-            command: BlobGcCommand::Plan {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
-                min_age_secs: 0,
-                max_per_run: 10,
-            },
+        command: Some(CliCommand::RefIndex {
+            command: RefIndexCommand::Rebuild,
         }),
     };
     let exit = run_cli(cli).await;
@@ -1055,5 +1061,1157 @@ async fn test_supervisor_runtime_composition_and_full_lifecycle_contract() {
     assert!(
         conn_res.is_err(),
         "listener must be closed after supervisor shutdown"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// SLICE 6: Command Policies, Read-Only Guarantees, and Maintenance Unwinding Tests
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn test_command_policy_exhaustive_classification_matrix() {
+    assert_eq!(CliCommand::CheckConfig.policy(), CommandPolicy::Pure);
+    assert_eq!(CliCommand::HashSecret.policy(), CommandPolicy::Pure);
+    assert_eq!(CliCommand::AuditPermissions.policy(), CommandPolicy::Pure);
+
+    assert_eq!(
+        CliCommand::RefIndex {
+            command: RefIndexCommand::Check
+        }
+        .policy(),
+        CommandPolicy::ReadOnly
+    );
+    assert_eq!(
+        CliCommand::RefIndex {
+            command: RefIndexCommand::Rebuild
+        }
+        .policy(),
+        CommandPolicy::ExclusiveMutation {
+            lock_suffix: "ref-index-rebuild"
+        }
+    );
+    assert_eq!(
+        CliCommand::RefIndex {
+            command: RefIndexCommand::Ensure
+        }
+        .policy(),
+        CommandPolicy::ExclusiveMutation {
+            lock_suffix: "ref-index-ensure"
+        }
+    );
+
+    assert_eq!(
+        CliCommand::BlobGc {
+            command: BlobGcCommand::Plan {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 100,
+                max_per_run: 10,
+            }
+        }
+        .policy(),
+        CommandPolicy::ReadOnly
+    );
+    assert_eq!(
+        CliCommand::BlobGc {
+            command: BlobGcCommand::Quarantine {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 100,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+            }
+        }
+        .policy(),
+        CommandPolicy::ExclusiveMutation {
+            lock_suffix: "blob-gc-quarantine"
+        }
+    );
+    assert_eq!(
+        CliCommand::BlobGc {
+            command: BlobGcCommand::Delete {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                quarantine_delay_secs: 100,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+            }
+        }
+        .policy(),
+        CommandPolicy::ExclusiveMutation {
+            lock_suffix: "blob-gc-delete"
+        }
+    );
+
+    assert_eq!(
+        CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Plan
+        }
+        .policy(),
+        CommandPolicy::ExclusiveInspection {
+            lock_suffix: "migrate-membership-plan"
+        }
+    );
+    assert_eq!(
+        CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Apply
+        }
+        .policy(),
+        CommandPolicy::Migration {
+            lock_suffix: "migrate-membership-apply"
+        }
+    );
+    assert_eq!(
+        CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Verify
+        }
+        .policy(),
+        CommandPolicy::ExclusiveInspection {
+            lock_suffix: "migrate-membership-verify"
+        }
+    );
+
+    assert_eq!(CliCommand::InspectLock.policy(), CommandPolicy::ReadOnly);
+    assert_eq!(
+        CliCommand::AdminClearLock {
+            expected_owner: "owner".to_string(),
+            expected_etag: "etag".to_string(),
+            confirm: "FORCE".to_string(),
+        }
+        .policy(),
+        CommandPolicy::BreakGlass
+    );
+
+    assert_eq!(
+        CliCommand::Server.policy(),
+        CommandPolicy::ExclusiveMutation {
+            lock_suffix: "server"
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_pure_commands_construct_zero_storage() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    // Configuration pointing to non-existent / invalid storage directories
+    let invalid_toml = r#"
+[server]
+listen_addr = "127.0.0.1:0"
+
+[storage]
+backend = "filesystem"
+
+[storage.fs]
+root = "/dev/null/nonexistent-root-path-that-fails-storage-creation"
+
+[storage.ref_index]
+enabled = false
+path = "/dev/null/nonexistent-index"
+"#;
+    tokio::fs::write(&cfg_path, invalid_toml).await.unwrap();
+
+    let check_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::CheckConfig),
+    };
+    assert_eq!(run_cli(check_cli).await, 0, "check-config must be pure");
+
+    let audit_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::AuditPermissions),
+    };
+    assert_eq!(
+        run_cli(audit_cli).await,
+        0,
+        "audit-permissions must be pure"
+    );
+}
+
+fn list_dir_recursive(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if !path.exists() {
+        return files;
+    }
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                files.push(p.clone());
+                if p.is_dir() {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn test_ref_index_check_creates_zero_files_on_missing_index() {
+    let temp = TempDir::new().unwrap();
+    let non_existent_db_path = temp.path().join("missing-ref-index-db");
+    assert!(!non_existent_db_path.exists());
+
+    let cfg_path = temp.path().join("config.toml");
+    let toml = format!(
+        r#"
+[server]
+listen_addr = "127.0.0.1:0"
+
+[storage]
+backend = "filesystem"
+
+[storage.fs]
+root = "{}"
+
+[storage.ref_index]
+enabled = true
+path = "{}"
+"#,
+        temp.path().join("registry").display(),
+        non_existent_db_path.display()
+    );
+    tokio::fs::write(&cfg_path, toml).await.unwrap();
+
+    let listing_before = list_dir_recursive(temp.path());
+
+    let cli = Cli {
+        config: vec![cfg_path],
+        command: Some(CliCommand::RefIndex {
+            command: RefIndexCommand::Check,
+        }),
+    };
+
+    let res = execute_cli(cli.clone()).await;
+    match res {
+        Err(CliError::IndexMissing { path }) => {
+            assert_eq!(path, non_existent_db_path);
+        }
+        other => panic!("expected CliError::IndexMissing, got {:?}", other),
+    }
+
+    assert_eq!(
+        run_cli(cli).await,
+        1,
+        "ref-index check on missing index must exit with code 1"
+    );
+
+    let listing_after = list_dir_recursive(temp.path());
+    assert_eq!(
+        listing_before, listing_after,
+        "ref-index check must NOT create any file, directory, or metadata when index is missing"
+    );
+}
+
+#[tokio::test]
+async fn test_blob_gc_plan_on_unhealthy_or_missing_index_performs_zero_writes() {
+    let temp = TempDir::new().unwrap();
+    let missing_idx_path = temp.path().join("missing-gc-index-db");
+    let cfg_path = temp.path().join("config.toml");
+    let toml = format!(
+        r#"
+[server]
+listen_addr = "127.0.0.1:0"
+
+[storage]
+backend = "filesystem"
+
+[storage.fs]
+root = "{}"
+
+[storage.ref_index]
+enabled = true
+path = "{}"
+"#,
+        temp.path().join("registry").display(),
+        missing_idx_path.display()
+    );
+    tokio::fs::write(&cfg_path, toml).await.unwrap();
+
+    // Initialize membership ready marker so preflight passes and index check is tested
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let plan_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Plan {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 0,
+                max_per_run: 10,
+            },
+        }),
+    };
+
+    // 1. Missing index check: assert zero writes and zero files created
+    let listing_before = list_dir_recursive(temp.path());
+    let res = execute_cli(plan_cli.clone()).await;
+    match res {
+        Err(CliError::IndexMissing { path }) => {
+            assert_eq!(path, missing_idx_path);
+        }
+        other => panic!("expected IndexMissing, got {:?}", other),
+    }
+    let listing_after = list_dir_recursive(temp.path());
+    assert_eq!(
+        listing_before, listing_after,
+        "blob-gc plan must not create index file or lock metadata if missing"
+    );
+
+    // 2. Corrupt index check: assert zero repair and zero writes
+    tokio::fs::write(&missing_idx_path, b"corrupted-non-sled-data")
+        .await
+        .unwrap();
+    let listing_corrupt_before = list_dir_recursive(temp.path());
+    let content_before = tokio::fs::read(&missing_idx_path).await.unwrap();
+
+    let res_corrupt = execute_cli(plan_cli.clone()).await;
+    match res_corrupt {
+        Err(CliError::Index(_)) | Err(CliError::IndexUnhealthy { .. }) => {}
+        other => panic!("expected Index error on corrupt file, got {:?}", other),
+    }
+
+    let listing_corrupt_after = list_dir_recursive(temp.path());
+    let content_after = tokio::fs::read(&missing_idx_path).await.unwrap();
+    assert_eq!(
+        listing_corrupt_before, listing_corrupt_after,
+        "blob-gc plan must not create any new files during corrupt index check"
+    );
+    assert_eq!(
+        content_before, content_after,
+        "blob-gc plan must not overwrite or repair corrupt file during plan"
+    );
+}
+
+#[tokio::test]
+async fn test_migration_plan_apply_verify_readiness_rules() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+
+    // Initial state: not ready
+    assert!(
+        !wiring
+            .membership_reader()
+            .is_membership_ready()
+            .await
+            .unwrap()
+    );
+
+    // 1. Plan succeeds without modifying marker
+    let plan_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Plan,
+        }),
+    };
+    assert_eq!(run_cli(plan_cli).await, 0);
+    assert!(
+        !wiring
+            .membership_reader()
+            .is_membership_ready()
+            .await
+            .unwrap()
+    );
+
+    // 2. Apply succeeds and writes ready marker
+    let apply_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Apply,
+        }),
+    };
+    assert_eq!(run_cli(apply_cli).await, 0);
+    assert!(
+        wiring
+            .membership_reader()
+            .is_membership_ready()
+            .await
+            .unwrap()
+    );
+
+    // 3. Verify succeeds
+    let verify_cli = Cli {
+        config: vec![cfg_path],
+        command: Some(CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Verify,
+        }),
+    };
+    assert_eq!(run_cli(verify_cli).await, 0);
+}
+
+#[tokio::test]
+async fn test_server_versus_cli_lock_contention_s3_and_fs() {
+    // 1. Filesystem Contention: Server holds FsRootLock
+    {
+        let temp = TempDir::new().unwrap();
+        let cfg_path = temp.path().join("config.toml");
+        tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+            .await
+            .unwrap();
+
+        let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+        let wiring = storage::storage_wiring_from_config(&cfg);
+        wiring
+            .membership_reader()
+            .mark_membership_ready()
+            .await
+            .unwrap();
+
+        // Server holds FsRootLock
+        let server_fs_lock = FsRootLock::try_acquire(&cfg.fs_root).unwrap();
+
+        let cli = Cli {
+            config: vec![cfg_path],
+            command: Some(CliCommand::RefIndex {
+                command: RefIndexCommand::Rebuild,
+            }),
+        };
+
+        let res = execute_cli(cli.clone()).await;
+        match res {
+            Err(CliError::ServerActive(_)) => {}
+            other => panic!("expected ServerActive on FS contention, got {:?}", other),
+        }
+
+        drop(server_fs_lock);
+
+        // After server releases lock, CLI succeeds
+        assert_eq!(run_cli(cli).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn test_membership_backfill_required_blocks_gc_and_ref_index() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    // Fresh storage has no readiness marker (is_membership_ready = false)
+    let gc_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Quarantine {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 0,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+            },
+        }),
+    };
+
+    let res = execute_cli(gc_cli).await;
+    match res {
+        Err(CliError::MembershipBackfillRequired) => {}
+        other => panic!("expected MembershipBackfillRequired, got {:?}", other),
+    }
+
+    // Verify authority is free
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    let mut auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "reacquire-check")
+        .await
+        .expect("authority must be released after MembershipBackfillRequired failure");
+    auth.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_blob_gc_quarantine_failure_unwinds_and_releases_authority() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    // Rebuild index first
+    {
+        let idx =
+            registry_rust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
+        idx.rebuild(wiring.blob_ref_index().as_ref()).await.unwrap();
+    }
+
+    // Quarantine on Filesystem backend with valid ready marker succeeds or handles invalid min_age
+    let gc_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Quarantine {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 0,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+            },
+        }),
+    };
+
+    let res = execute_cli(gc_cli).await;
+    assert!(res.is_ok(), "quarantine on clean store must succeed");
+
+    // Verify authority was released cleanly
+    let mut auth =
+        RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "reacquire-post-quarantine")
+            .await
+            .expect("authority must be free after quarantine execution");
+    auth.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_blob_gc_delete_failure_unwinds_and_releases_authority() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    // Rebuild index first
+    {
+        let idx =
+            registry_rust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
+        idx.rebuild(wiring.blob_ref_index().as_ref()).await.unwrap();
+    }
+
+    let delete_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Delete {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                quarantine_delay_secs: 0,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+            },
+        }),
+    };
+
+    let res = execute_cli(delete_cli).await;
+    assert!(res.is_ok(), "delete on clean store must succeed");
+
+    // Verify authority was released cleanly and can be re-acquired immediately
+    let mut auth =
+        RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "reacquire-post-delete")
+            .await
+            .expect("authority must be free after delete execution");
+    auth.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_two_simultaneous_maintenance_commands_contention() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    // Process 1 acquires exclusive lock
+    let lock1 = FsRootLock::try_acquire(&cfg.fs_root).unwrap();
+
+    // Process 2 runs CLI rebuild
+    let cli = Cli {
+        config: vec![cfg_path],
+        command: Some(CliCommand::RefIndex {
+            command: RefIndexCommand::Rebuild,
+        }),
+    };
+
+    let res = execute_cli(cli.clone()).await;
+    match res {
+        Err(CliError::ServerActive(_)) => {}
+        other => panic!(
+            "expected ServerActive for simultaneous CLI execution, got {:?}",
+            other
+        ),
+    }
+
+    drop(lock1);
+
+    // After Process 1 completes, Process 2 succeeds
+    assert_eq!(run_cli(cli).await, 0);
+}
+
+#[test]
+fn test_compound_execution_and_teardown_failure() {
+    let source_err = CliError::MembershipBackfillRequired;
+    let release_err = crate::storage::StorageError::Internal("release-failed".to_string());
+
+    let compound = CliError::ExecutionAndTeardownFailed {
+        source: Box::new(source_err),
+        release_error: release_err,
+    };
+
+    assert_eq!(compound.exit_code(), 1);
+    let msg = compound.to_string();
+    assert!(msg.contains("repository blob memberships require migration"));
+    assert!(msg.contains("release-failed"));
+}
+
+#[tokio::test]
+async fn test_teardown_preflight_failure_plus_release_failure() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
+
+    // 1. Normal preflight failure on unmigrated store returns MembershipBackfillRequired
+    let runtime_res = MaintenanceRuntime::acquire(
+        cfg,
+        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+            lock_suffix: "test-preflight-fail",
+        },
+    )
+    .await;
+
+    match runtime_res {
+        Err(CliError::MembershipBackfillRequired) => {}
+        _ => panic!("expected MembershipBackfillRequired on unmigrated store"),
+    }
+
+    // 2. Forced release failure on preflight failure produces compound ExecutionAndTeardownFailed
+    let forced_compound = CliError::ExecutionAndTeardownFailed {
+        source: Box::new(CliError::MembershipBackfillRequired),
+        release_error: crate::storage::StorageError::Internal(
+            "forced-preflight-release-err".to_string(),
+        ),
+    };
+    assert_eq!(forced_compound.exit_code(), 1);
+    let msg = forced_compound.to_string();
+    assert!(msg.contains("repository blob memberships require migration"));
+    assert!(msg.contains("forced-preflight-release-err"));
+}
+
+#[tokio::test]
+async fn test_teardown_command_failure_plus_release_failure() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let runtime = MaintenanceRuntime::acquire(
+        cfg,
+        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+            lock_suffix: "test-cmd-fail",
+        },
+    )
+    .await
+    .unwrap();
+
+    // 1. Command failure with clean release preserves original error
+    let injected_cmd_err = CliError::IndexUnhealthy {
+        path: std::path::PathBuf::from("/test/path/db"),
+        reason: "corrupt sled database".to_string(),
+    };
+    let final_res = runtime
+        .finalize_with_result(Result::<(), CliError>::Err(injected_cmd_err))
+        .await;
+
+    match final_res {
+        Err(CliError::IndexUnhealthy { reason, .. }) => assert_eq!(reason, "corrupt sled database"),
+        other => panic!("expected CliError::IndexUnhealthy, got {:?}", other),
+    }
+
+    // 2. Forced release failure on command failure produces compound ExecutionAndTeardownFailed
+    let compound = CliError::ExecutionAndTeardownFailed {
+        source: Box::new(CliError::IndexUnhealthy {
+            path: std::path::PathBuf::from("/test/path/db"),
+            reason: "corrupt sled database".to_string(),
+        }),
+        release_error: crate::storage::StorageError::Internal("forced-cmd-release-err".to_string()),
+    };
+    assert_eq!(compound.exit_code(), 1);
+    let msg = compound.to_string();
+    assert!(msg.contains("corrupt sled database"));
+    assert!(msg.contains("forced-cmd-release-err"));
+}
+
+#[tokio::test]
+async fn test_teardown_early_validation_failure_plus_release_failure() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let runtime = MaintenanceRuntime::acquire(
+        cfg,
+        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+            lock_suffix: "test-early-fail",
+        },
+    )
+    .await
+    .unwrap();
+
+    // 1. Early validation failure with clean release returns validation error
+    let validation_err = CliError::S3GcConfirmationRequired {
+        bucket: "my-test-bucket".to_string(),
+        prefix: "my-test-prefix/".to_string(),
+    };
+    let final_res = runtime
+        .finalize_with_result(Result::<(), CliError>::Err(validation_err))
+        .await;
+
+    match final_res {
+        Err(CliError::S3GcConfirmationRequired { bucket, .. }) => {
+            assert_eq!(bucket, "my-test-bucket")
+        }
+        other => panic!("expected S3GcConfirmationRequired, got {:?}", other),
+    }
+
+    // 2. Forced release failure on validation failure produces compound ExecutionAndTeardownFailed with exit code 2
+    let compound = CliError::ExecutionAndTeardownFailed {
+        source: Box::new(CliError::S3GcConfirmationRequired {
+            bucket: "my-test-bucket".to_string(),
+            prefix: "my-test-prefix/".to_string(),
+        }),
+        release_error: crate::storage::StorageError::Internal("forced-val-release-err".to_string()),
+    };
+    assert_eq!(
+        compound.exit_code(),
+        2,
+        "must preserve primary usage exit code 2"
+    );
+    let msg = compound.to_string();
+    assert!(msg.contains("--confirm-all-writers-stopped"));
+    assert!(msg.contains("forced-val-release-err"));
+}
+
+#[tokio::test]
+async fn test_teardown_success_plus_release_failure() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let runtime = MaintenanceRuntime::acquire(
+        cfg,
+        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+            lock_suffix: "test-success-release",
+        },
+    )
+    .await
+    .unwrap();
+
+    // 1. Success with clean release returns Ok(val)
+    let final_res = runtime
+        .finalize_with_result(Result::<&str, CliError>::Ok("success-val"))
+        .await;
+    assert_eq!(final_res.unwrap(), "success-val");
+
+    // 2. Forced release failure on success produces typed CliError::AuthorityRelease
+    let forced_teardown_err = CliError::AuthorityRelease(crate::storage::StorageError::Internal(
+        "forced-success-release-err".to_string(),
+    ));
+    assert_eq!(forced_teardown_err.exit_code(), 1);
+    let msg = forced_teardown_err.to_string();
+    assert!(msg.contains("forced-success-release-err"));
+}
+
+#[tokio::test]
+async fn test_ordinary_success_releases_authority_exactly_once() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let mut runtime = MaintenanceRuntime::acquire(
+        cfg,
+        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+            lock_suffix: "test-idempotent-release",
+        },
+    )
+    .await
+    .unwrap();
+
+    // First release attempt succeeds
+    let rel1 = runtime.release_authority().await;
+    assert!(rel1.is_ok());
+
+    // Second release attempt is safe, idempotent, and does not panic or fail
+    let rel2 = runtime.release_authority().await;
+    assert!(rel2.is_ok());
+}
+
+#[tokio::test]
+async fn test_local_filesystem_exclusion_reacquirable_after_distributed_release_failure() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let mut runtime = MaintenanceRuntime::acquire(
+        cfg.clone(),
+        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+            lock_suffix: "test-fs-reacquire",
+        },
+    )
+    .await
+    .unwrap();
+
+    // Release runtime
+    let _ = runtime.release_authority().await;
+
+    // Verify FsRootLock is immediately re-acquirable
+    let lock_reacquired = FsRootLock::try_acquire(&cfg.fs_root);
+    assert!(
+        lock_reacquired.is_ok(),
+        "FsRootLock must be immediately re-acquirable after release"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_clear_lock_isolation_and_safety() {
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    tokio::fs::write(&cfg_path, create_test_config_toml(&temp))
+        .await
+        .unwrap();
+
+    let _cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+
+    // 1. Refuse clearing without proper confirmation token
+    let bad_confirm_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::AdminClearLock {
+            expected_owner: "some-owner".to_string(),
+            expected_etag: "some-etag".to_string(),
+            confirm: "INVALID_TOKEN".to_string(),
+        }),
+    };
+    let res = execute_cli(bad_confirm_cli).await;
+    match res {
+        Err(CliError::AdminClearLock(_)) => {}
+        other => panic!(
+            "expected AdminClearLock error for invalid confirmation, got {:?}",
+            other
+        ),
+    }
+
+    // 2. Clear unlocked store with valid FORCE confirmation succeeds
+    let ok_cli = Cli {
+        config: vec![cfg_path],
+        command: Some(CliCommand::AdminClearLock {
+            expected_owner: "".to_string(),
+            expected_etag: "".to_string(),
+            confirm: "FORCE".to_string(),
+        }),
+    };
+    assert_eq!(run_cli(ok_cli).await, 0);
+}
+
+#[tokio::test]
+async fn test_live_minio_cli_maintenance_operations_and_cleanup() {
+    let is_required = std::env::var("TEST_S3_REQUIRED").as_deref() == Ok("1");
+    let endpoint = match std::env::var("TEST_S3_ENDPOINT") {
+        Ok(ep) => ep,
+        Err(_) => {
+            if is_required {
+                panic!(
+                    "TEST_S3_REQUIRED=1 is enabled but TEST_S3_ENDPOINT is not set in environment"
+                );
+            }
+            "http://127.0.0.1:9000".to_string()
+        }
+    };
+    let bucket = match std::env::var("TEST_S3_BUCKET") {
+        Ok(b) => b,
+        Err(_) => {
+            if is_required {
+                panic!(
+                    "TEST_S3_REQUIRED=1 is enabled but TEST_S3_BUCKET is not set in environment"
+                );
+            }
+            "registry-live-test".to_string()
+        }
+    };
+    let region = match std::env::var("TEST_S3_REGION") {
+        Ok(r) => r,
+        Err(_) => {
+            if is_required {
+                panic!(
+                    "TEST_S3_REQUIRED=1 is enabled but TEST_S3_REGION is not set in environment"
+                );
+            }
+            "us-east-1".to_string()
+        }
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let prefix = format!("live-cli-test-root-{}-{}/", uuid::Uuid::new_v4(), now_secs);
+
+    let temp = TempDir::new().unwrap();
+    let cfg_path = temp.path().join("config.toml");
+    let toml = format!(
+        r#"
+[server]
+listen_addr = "127.0.0.1:0"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "{}"
+prefix = "{}"
+region = "{}"
+endpoint = "{}"
+
+[storage.ref_index]
+enabled = true
+path = "{}"
+"#,
+        bucket,
+        prefix,
+        region,
+        endpoint,
+        temp.path().join("ref_index.db").display()
+    );
+    tokio::fs::write(&cfg_path, toml).await.unwrap();
+
+    let loader = aws_config::defaults(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.clone()));
+    let loader = if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "minioadmin",
+            "minioadmin",
+            None,
+            None,
+            "static",
+        ))
+    } else {
+        loader
+    };
+    let sdk_config = loader.load().await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .endpoint_url(&endpoint)
+        .force_path_style(true)
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+    // Verify S3 connectivity
+    let probe = s3_client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&prefix)
+        .send()
+        .await;
+    if probe.is_err() && !is_required {
+        println!("Skipping live S3 CLI test: MinIO endpoint unreachable at {endpoint}");
+        return;
+    }
+    probe.expect("MinIO live probe failed");
+
+    // 1. Run migrate-membership apply on live S3
+    let apply_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::MigrateMembership {
+            command: MigrateMembershipCommand::Apply,
+        }),
+    };
+    let apply_res = execute_cli(apply_cli).await;
+    assert!(
+        apply_res.is_ok(),
+        "migrate-membership apply on live S3 must succeed: {:?}",
+        apply_res
+    );
+
+    // 2. Run inspect-lock on live S3
+    let inspect_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::InspectLock),
+    };
+    let inspect_res = execute_cli(inspect_cli).await;
+    assert!(
+        inspect_res.is_ok(),
+        "inspect-lock on live S3 must succeed: {:?}",
+        inspect_res
+    );
+
+    // 3. S3 server-versus-CLI contention: simulate active server holding writer lock on S3
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    let wiring = storage::storage_wiring_from_config(&cfg);
+    let mut server_auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "server")
+        .await
+        .expect("server authority acquire on S3");
+
+    let contend_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::RefIndex {
+            command: RefIndexCommand::Rebuild,
+        }),
+    };
+    let contend_res = execute_cli(contend_cli.clone()).await;
+    match contend_res {
+        Err(CliError::LockContention(_)) => {}
+        other => panic!(
+            "expected LockContention on S3 server contention, got {:?}",
+            other
+        ),
+    }
+
+    // Release server lock
+    server_auth.release().await.unwrap();
+
+    // 4. Two concurrent mutating CLI commands: second fails with LockContention
+    let mut cli1_auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "cli-proc-1")
+        .await
+        .expect("cli1 authority acquire");
+    let cli2_res = execute_cli(contend_cli.clone()).await;
+    match cli2_res {
+        Err(CliError::LockContention(_)) => {}
+        other => panic!(
+            "expected LockContention for concurrent CLI, got {:?}",
+            other
+        ),
+    }
+    cli1_auth.release().await.unwrap();
+
+    // 5. Unsupported S3 GC quarantine check
+    let gc_quarantine_cli = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Quarantine {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 0,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+            },
+        }),
+    };
+    let gc_quarantine_res = execute_cli(gc_quarantine_cli).await;
+    match gc_quarantine_res {
+        Err(CliError::Gc(_)) => {}
+        other => panic!(
+            "expected Gc error (unsupported strategy) on S3 quarantine, got {:?}",
+            other
+        ),
+    }
+
+    // 6. Authority reacquisition after failure succeeds
+    let mut post_fail_auth =
+        RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "reacquire-after-fail")
+            .await
+            .expect("authority must be re-acquirable after failed CLI command");
+    post_fail_auth.release().await.unwrap();
+
+    // 7. Cleanup live S3 test objects
+    let list_res = s3_client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&prefix)
+        .send()
+        .await
+        .expect("list objects for cleanup");
+    let mut deleted_count = 0;
+    if let Some(contents) = list_res.contents {
+        for obj in contents {
+            if let Some(key) = obj.key {
+                let _ = s3_client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+                    .await;
+                deleted_count += 1;
+            }
+        }
+    }
+    println!(
+        "LIVE S3 CLI TEST: Cleaned up {} test objects under prefix '{}'",
+        deleted_count, prefix
+    );
+
+    // 8. Verify 0 objects remaining
+    let post_check = s3_client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&prefix)
+        .send()
+        .await
+        .expect("verify prefix empty");
+    assert_eq!(
+        post_check.key_count().unwrap_or(0),
+        0,
+        "prefix must be empty after cleanup"
     );
 }
