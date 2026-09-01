@@ -7,6 +7,20 @@
 
 ---
 
+## Post-Slice-8 Implementation Status (ADR-008 Accepted)
+
+> **Implementation Note (Post-Slice-8 Verification State):**
+> Following Slices 1 through 7, **Slice 8 (ADR-008: HTTP Transport Test Topology and Production Visibility Preservation)** was implemented and verified.
+>
+> * **ADR-008 Status:** Accepted.
+> * **Test Topology Standard (`src/http_api/handlers/tests.rs`):** Extracted 1,514 lines of inline unit test code (lines 596–2110) from `src/http_api/handlers.rs` into the file-backed child module `src/http_api/handlers/tests.rs` (1,495 lines) declared via `#[cfg(test)] #[path = "handlers/tests.rs"] mod tests;`.
+> * **Production Visibility Invariant Preserved:** Zero production functions, structs, enums, or constructors widened in visibility. `AppState::new_test` remains strictly gated under `#[cfg(test)]` without leaking into release builds.
+> * **Unchanged Test Identity & Coverage:** Exactly 46 compiled handler unit tests verified identical via `diff -u` before and after. Total workspace test count remains exactly **708 tests across 18 binaries**.
+> * **Production File Size Reduction:** `src/http_api/handlers.rs` reduced from 3,050 to 1,538 lines, leaving purely production routing and handler dispatch logic.
+> * **Technical Debt Register:** Item **D-04** partially resolved (HTTP handler test bloat eliminated).
+
+---
+
 ## Post-Slice-7 Implementation Status (ADR-007 Accepted)
 
 > **Implementation Note (Post-Slice-7 Verification State):**
