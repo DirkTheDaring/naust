@@ -7,6 +7,21 @@
 
 ---
 
+## Post-Slice-10 Implementation Status (Slice 10 Implemented)
+
+> **Implementation Note (Post-Slice-10 Verification State):**
+> Following Slices 1 through 9, **Slice 10 (Filesystem Storage Private Test Extraction)** was implemented and verified under the governing policy established in ADR-008.
+>
+> * **Test Topology Standard (`src/storage/fs/tests.rs`):** Extracted the private inline test module (baseline `src/storage/fs.rs` 5,103 lines; `#[cfg(test)]` attribute line 3676, declaration `mod tests {` line 3677, closing brace line 5103; inclusive span 1,428 lines; test body lines 3678–5102 comprising 1,425 lines) into the dedicated file-backed sidecar `src/storage/fs/tests.rs` (1,409 lines, formatted under `rustfmt --edition 2024`).
+> * **Production Module Declaration & Visibility:** Declared in `src/storage/fs.rs` via `#[cfg(test)] #[path = "fs/tests.rs"] mod tests;` (2 insertions, 1,427 deletions per `git diff --numstat`). Visibility remains strictly private (`mod tests;`), identical to baseline.
+> * **Production Content & Size Reduction:** Production filesystem storage adapter logic (lines 1–3676) is 100% byte-for-byte identical to baseline. Tracked `src/storage/fs.rs` reduced from 5,103 to 3,678 lines (27.9% reduction). Total combined source across tracked file and sidecar is 5,087 lines.
+> * **Production Test Isolation:** Gated strictly behind `#[cfg(test)]`. No production code or signatures widened; zero test fixtures compiled into release builds (`cargo build --release --locked`).
+> * **Unchanged Test Identity & Coverage:** Exactly 28 compiled filesystem unit tests (`storage::fs::tests::*`) verified identical via `diff -u` before and after. Total workspace test count remains exactly **708 tests across 18 binaries**.
+> * **Rustfmt Reinlining Equivalence:** Normalized reinlining comparison of `src/storage/fs.rs` with `src/storage/fs/tests.rs` confirmed 100% byte-identical against baseline (`0 diffs`).
+> * **Technical Debt Register:** Item **D-04** marked as **Resolved (Slices 8–10)** (in-source test bloat eliminated across `src/http_api/handlers.rs`, `src/storage/s3.rs`, and `src/storage/fs.rs`).
+
+---
+
 ## Post-Slice-9 Implementation Status (Slice 9 Implemented)
 
 > **Implementation Note (Post-Slice-9 Verification State):**
@@ -429,7 +444,7 @@ Total Test Suite: 602 Tests
 | **D-01** | **P1** | `Storage` God-Trait Overload | Rapid feature addition to single trait | Leaky abstraction; monolithic mock requirements | All storage access | `src/storage/ports/` | Segregate `Storage` into `BlobCasStorage`, `ManifestStorage`, `TagStorage`, `LockStorage` | Planned (Slice 3) |
 | **D-02** | **P1** | Unencapsulated `AppState` in Handlers | Direct handler access to 17 internal fields | Business logic leakage into transport layer | HTTP dispatch, Proxy caching | `src/services/` | Introduce `RegistryApplicationService` facade; pass focused contexts to handlers | Planned (Slice 2) |
 | **D-03** | **P2** | Conventional `consistency_gate` Synchronization | Unwrapped `Arc<Mutex<()>>` | Risk of future mutators bypassing gate | Manifest publish, GC sweep, Upload finalize | `src/consistency.rs` | Encapsulate gate inside transactional coordinator guards | **Resolved (ADR-001)** |
-| **D-04** | **P2** | In-Source Test Footprint Bloat | Historical co-location of extensive mocks | 55% of `src/` is test code; hinders maintainability | Development & Review | `tests/` or `src/fixtures/` | Extract mock drivers and unit tests into dedicated submodules or integration tests | Planned |
+| **D-04** | **P2** | In-Source Test Footprint Bloat | Historical co-location of extensive mocks | 55% of `src/` is test code; hinders maintainability | Development & Review | `tests/` or `src/fixtures/` | Extract mock drivers and unit tests into dedicated submodules or integration tests | **Resolved (Slices 8–10)** |
 | **D-05** | **P3** | Ghost Re-export Module | Partial refactoring of `manifest_publication` | Redundant 972-line file with duplicate tests | Build / Navigation | `src/manifest_lifecycle.rs` | Deprecate `manifest_publication.rs` and migrate residual test cases to `manifest_lifecycle_tests.rs` | **Resolved (ADR-007)** |
 | **D-06** | **P3** | Stringly-Typed Internal Error Tunneling | Generic `StorageError::Internal(String)` | Loss of error root cause and retry semantics | Error reporting, CLI exit codes | `src/errors.rs` | Introduce structured `StorageErrorKind` with typed underlying causes | Planned |
 
