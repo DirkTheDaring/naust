@@ -1042,9 +1042,9 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
         err2
     );
 
-    // State 3: Unknown/Denied -> StrategyUnsupported error, delete driver never called
+    // State 3: AccessDenied -> StrategyUnsupported error, delete driver never called
     *driver.versioning_state.lock().unwrap() =
-        registry_rust::storage::s3::S3BucketVersioningState::UnknownOrDenied(
+        registry_rust::storage::s3::S3BucketVersioningState::AccessDenied(
             "AccessDenied: 403 Forbidden".to_string(),
         );
     let err3 = service
@@ -1060,8 +1060,30 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
             err3,
             registry_rust::gc_service::GcServiceError::StrategyUnsupported { .. }
         ),
-        "expected StrategyUnsupported for UnknownOrDenied, got: {:?}",
+        "expected StrategyUnsupported for AccessDenied, got: {:?}",
         err3
+    );
+
+    // State 4: BackendError -> StrategyUnsupported error, delete driver never called
+    *driver.versioning_state.lock().unwrap() =
+        registry_rust::storage::s3::S3BucketVersioningState::BackendError(
+            "500 InternalServerError".to_string(),
+        );
+    let err4 = service
+        .delete(
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            budgets.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err4,
+            registry_rust::gc_service::GcServiceError::StrategyUnsupported { .. }
+        ),
+        "expected StrategyUnsupported for BackendError, got: {:?}",
+        err4
     );
 
     // Assert that delete was never called in call log for any of the rejected states

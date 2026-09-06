@@ -208,7 +208,9 @@ impl S3Driver for MockS3Driver {
         let mut assembled = Vec::new();
         for (num, _) in parts {
             let Some((p_bytes, _)) = stored_parts.get(&num) else {
-                return Err(StorageError::Internal(format!("missing part {num}")));
+                return Err(StorageError::internal_invariant(format!(
+                    "missing part {num}"
+                )));
             };
             assembled.extend_from_slice(p_bytes);
         }

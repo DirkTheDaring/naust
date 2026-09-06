@@ -1704,15 +1704,13 @@ async fn test_proxy_blob_publication_barrier_paused_after_cas_before_membership_
                     .join("blobs")
                     .join(prepared.expected_digest.algorithm())
                     .join(prepared.expected_digest.prefix2());
-                tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
-                    UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                })?;
+                tokio::fs::create_dir_all(&dest_dir)
+                    .await
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
                 let dest_path = dest_dir.join(prepared.expected_digest.hex());
                 tokio::fs::rename(&data_path, &dest_path)
                     .await
-                    .map_err(|e| {
-                        UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                    })?;
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
 
                 // STEP 2: Signal barrier reached (CAS exists, membership does NOT exist)
                 if let Some(tx) = in_tx.lock().await.take() {
@@ -1735,9 +1733,9 @@ async fn test_proxy_blob_publication_barrier_paused_after_cas_before_membership_
 
                 // STEP 4: Finalized receipt
                 let fin_dir = fs_root.join("finalized");
-                tokio::fs::create_dir_all(&fin_dir).await.map_err(|e| {
-                    UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                })?;
+                tokio::fs::create_dir_all(&fin_dir)
+                    .await
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
                 let receipt_path = fin_dir.join(format!("{}.json", prepared.session.uuid));
                 let receipt = FinalizedReceipt {
                     repo: prepared.session.repo.clone(),
@@ -1749,9 +1747,7 @@ async fn test_proxy_blob_publication_barrier_paused_after_cas_before_membership_
                 };
                 tokio::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap())
                     .await
-                    .map_err(|e| {
-                        UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                    })?;
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
 
                 Ok(FinalizeOutcome::Published(BlobMeta {
                     size: prepared.size,
@@ -1900,19 +1896,17 @@ async fn test_proxy_blob_publication_injected_membership_failure_typed_error_pin
                     .join("blobs")
                     .join(prepared.expected_digest.algorithm())
                     .join(prepared.expected_digest.prefix2());
-                tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
-                    UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                })?;
+                tokio::fs::create_dir_all(&dest_dir)
+                    .await
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
                 let dest_path = dest_dir.join(prepared.expected_digest.hex());
                 tokio::fs::rename(&data_path, &dest_path)
                     .await
-                    .map_err(|e| {
-                        UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                    })?;
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
 
                 // Inject typed error on membership linking
-                Err(UploadTransitionError::Storage(StorageError::Internal(
-                    "injected membership ledger failure".to_string(),
+                Err(UploadTransitionError::Storage(StorageError::backend(
+                    "injected membership ledger failure",
                 )))
             })
         }));
@@ -2088,15 +2082,13 @@ async fn test_proxy_blob_publication_crash_after_membership_before_pin_release_m
                     .join("blobs")
                     .join(prepared.expected_digest.algorithm())
                     .join(prepared.expected_digest.prefix2());
-                tokio::fs::create_dir_all(&dest_dir).await.map_err(|e| {
-                    UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                })?;
+                tokio::fs::create_dir_all(&dest_dir)
+                    .await
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
                 let dest_path = dest_dir.join(prepared.expected_digest.hex());
                 tokio::fs::rename(&data_path, &dest_path)
                     .await
-                    .map_err(|e| {
-                        UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                    })?;
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
 
                 // 2. Durably write repository membership record in authoritative storage
                 let membership = RepoBlobMembershipRecord::new_upload(
@@ -2111,9 +2103,9 @@ async fn test_proxy_blob_publication_crash_after_membership_before_pin_release_m
 
                 // 3. Durably write finalized receipt
                 let fin_dir = fs_root.join("finalized");
-                tokio::fs::create_dir_all(&fin_dir).await.map_err(|e| {
-                    UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                })?;
+                tokio::fs::create_dir_all(&fin_dir)
+                    .await
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
                 let receipt_path = fin_dir.join(format!("{}.json", prepared.session.uuid));
                 let receipt = FinalizedReceipt {
                     repo: prepared.session.repo.clone(),
@@ -2125,9 +2117,7 @@ async fn test_proxy_blob_publication_crash_after_membership_before_pin_release_m
                 };
                 tokio::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap())
                     .await
-                    .map_err(|e| {
-                        UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
-                    })?;
+                    .map_err(|e| UploadTransitionError::Storage(StorageError::io(e.to_string())))?;
 
                 // 4. Signal barrier reached: CAS exists, repo membership is durable, receipt is written.
                 // Execution pauses here before commit_finalize returns to coordinator, holding the publication pin active!
@@ -3358,11 +3348,40 @@ async fn test_http_endpoint_invalid_repo_name_400_and_unknown_entities_404_error
 
 #[tokio::test]
 async fn test_application_read_and_proxy_publication_services_s3_minio() {
-    let endpoint =
-        std::env::var("TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
-    let region = std::env::var("TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let bucket =
-        std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "registry-live-test".to_string());
+    let is_required = std::env::var("TEST_S3_REQUIRED").as_deref() == Ok("1");
+    let endpoint = match std::env::var("TEST_S3_ENDPOINT") {
+        Ok(ep) => ep,
+        Err(_) => {
+            if is_required {
+                panic!(
+                    "TEST_S3_REQUIRED=1 is enabled but TEST_S3_ENDPOINT is not set in environment"
+                );
+            }
+            "http://127.0.0.1:9000".to_string()
+        }
+    };
+    let bucket = match std::env::var("TEST_S3_BUCKET") {
+        Ok(b) => b,
+        Err(_) => {
+            if is_required {
+                panic!(
+                    "TEST_S3_REQUIRED=1 is enabled but TEST_S3_BUCKET is not set in environment"
+                );
+            }
+            "registry-live-test".to_string()
+        }
+    };
+    let region = match std::env::var("TEST_S3_REGION") {
+        Ok(r) => r,
+        Err(_) => {
+            if is_required {
+                panic!(
+                    "TEST_S3_REQUIRED=1 is enabled but TEST_S3_REGION is not set in environment"
+                );
+            }
+            "us-east-1".to_string()
+        }
+    };
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3388,6 +3407,14 @@ async fn test_application_read_and_proxy_publication_services_s3_minio() {
         .endpoint_url(&endpoint)
         .force_path_style(true);
     let s3_client = aws_sdk_s3::Client::from_conf(builder.build());
+
+    // Verify S3 connectivity via endpoint-level probe (independent of test bucket existence)
+    let probe = s3_client.list_buckets().send().await;
+    if probe.is_err() && !is_required {
+        println!("Skipping live S3 test: MinIO endpoint unreachable at {endpoint}");
+        return;
+    }
+    probe.expect("MinIO live probe failed");
 
     let create_res = s3_client.create_bucket().bucket(&bucket).send().await;
     if let Err(e) = create_res {

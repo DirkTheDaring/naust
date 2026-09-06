@@ -22,7 +22,7 @@ pub async fn plan_membership_migration(
                 stats.manifests_scanned += 1;
                 let (_meta, bytes) = storage.get_manifest(repo, &manifest_digest).await?;
                 let refs = parse_manifest_refs(&bytes).map_err(|e| {
-                    StorageError::Internal(format!(
+                    StorageError::corrupt_data(format!(
                         "corrupt manifest {manifest_digest} in repo {repo}: {e}"
                     ))
                 })?;
@@ -61,7 +61,7 @@ pub async fn apply_membership_migration(
                 (&existing.owner_id, existing.lease_expiry_unix_secs)
             {
                 if now < expiry && owner != &my_owner_id {
-                    return Err(StorageError::Internal(format!(
+                    return Err(StorageError::conflict(format!(
                         "concurrent migrator {owner} holds active lease until {expiry}"
                     )));
                 }
@@ -135,7 +135,7 @@ pub async fn apply_membership_migration(
                     err_msg.truncate(512);
                     checkpoint.failure_info = Some(err_msg);
                     let _ = storage.save_migration_checkpoint(&checkpoint);
-                    StorageError::Internal(format!(
+                    StorageError::corrupt_data(format!(
                         "corrupt manifest {manifest_digest} in repo {repo}: {e}"
                     ))
                 })?;
@@ -185,8 +185,8 @@ pub async fn apply_membership_migration(
         );
         checkpoint.verification_result = Some(false);
         storage.save_migration_checkpoint(&checkpoint).await?;
-        return Err(StorageError::Internal(
-            "membership verification failed after apply; not all referenced blobs have durable records".to_string(),
+        return Err(StorageError::corrupt_data(
+            "membership verification failed after apply; not all referenced blobs have durable records",
         ));
     }
 

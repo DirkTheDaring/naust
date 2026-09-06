@@ -24,7 +24,42 @@ pub use ports::*;
 pub use repo_membership::*;
 pub use upload_session::*;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StorageErrorKind {
+    /// Low-level filesystem or local operating system I/O failure (e.g. read, write, rename, open, mkdir).
+    Io,
+    /// Remote storage service, network transport, or SDK communication failure.
+    Backend,
+    /// Permission or access denied by the operating system or storage backend (e.g. HTTP 403, EACCES).
+    PermissionDenied,
+    /// Corrupt, unparseable, or malformed data stored in the repository, index, or metadata.
+    CorruptData,
+    /// Serialization failure when preparing in-memory structures for storage.
+    Serialization,
+    /// Invalid storage configuration or unsupported backend capability (e.g. bucket versioning incompatible with GC).
+    Configuration,
+    /// Concurrency or precondition conflict on storage resources (e.g. CAS ETag mismatch, active lease conflict).
+    Conflict,
+    /// Internal invariant violation or inconsistent state-machine transition in registry logic.
+    InternalInvariant,
+}
+
+impl std::fmt::Display for StorageErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io => write!(f, "io"),
+            Self::Backend => write!(f, "backend"),
+            Self::PermissionDenied => write!(f, "permission_denied"),
+            Self::CorruptData => write!(f, "corrupt_data"),
+            Self::Serialization => write!(f, "serialization"),
+            Self::Configuration => write!(f, "configuration"),
+            Self::Conflict => write!(f, "conflict"),
+            Self::InternalInvariant => write!(f, "internal_invariant"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error)]
 pub enum StorageError {
     #[error("not found")]
     NotFound,
@@ -44,6 +79,9 @@ pub enum StorageError {
     #[error("tag already exists")]
     TagAlreadyExists,
 
+    #[error("precondition failed")]
+    PreconditionFailed,
+
     #[error("exclusive writer lock held by another deployment/instance: {0}")]
     ExclusiveWriterLocked(String),
 
@@ -53,8 +91,104 @@ pub enum StorageError {
     #[error("migration required: {0}")]
     MigrationRequired(String),
 
-    #[error("internal error: {0}")]
-    Internal(String),
+    #[error("internal error: {message}")]
+    Internal {
+        kind: StorageErrorKind,
+        message: String,
+    },
+}
+
+impl StorageError {
+    #[inline]
+    pub fn internal(kind: StorageErrorKind, message: impl Into<String>) -> Self {
+        Self::Internal {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    #[inline]
+    pub fn io(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::Io,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn backend(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::Backend,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn corrupt_data(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::CorruptData,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn serialization(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::Serialization,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn configuration(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::Configuration,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn conflict(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::Conflict,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn internal_invariant(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::InternalInvariant,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn permission_denied(err: impl std::fmt::Display) -> Self {
+        Self::Internal {
+            kind: StorageErrorKind::PermissionDenied,
+            message: err.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn internal_kind(&self) -> Option<StorageErrorKind> {
+        match self {
+            Self::Internal { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::Internal { message, .. } => Some(message.as_str()),
+            Self::ExclusiveWriterLocked(msg) => Some(msg.as_str()),
+            Self::InvalidRepoName(msg) => Some(msg.as_str()),
+            Self::MigrationRequired(msg) => Some(msg.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -743,9 +877,8 @@ pub fn proxy_cache_storage_try_from_config(
         StorageBackend::Filesystem => {
             let root = match upstream {
                 Some(up) => up.cache_fs_root.clone().ok_or_else(|| {
-                    StorageError::Internal(
-                        "proxy upstream enabled: filesystem cache requires cache_fs_root"
-                            .to_string(),
+                    StorageError::configuration(
+                        "proxy upstream enabled: filesystem cache requires cache_fs_root",
                     )
                 })?,
                 None => config
@@ -759,25 +892,19 @@ pub fn proxy_cache_storage_try_from_config(
         }
         StorageBackend::S3 => {
             let endpoint = config.s3_endpoint.clone().ok_or_else(|| {
-                StorageError::Internal(
-                    "proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT".to_string(),
-                )
+                StorageError::configuration("proxy enabled: S3 cache requires STORAGE_S3_ENDPOINT")
             })?;
             let region = config.s3_region.clone().ok_or_else(|| {
-                StorageError::Internal(
-                    "proxy enabled: S3 cache requires STORAGE_S3_REGION".to_string(),
-                )
+                StorageError::configuration("proxy enabled: S3 cache requires STORAGE_S3_REGION")
             })?;
             let bucket = config.s3_bucket.clone().ok_or_else(|| {
-                StorageError::Internal(
-                    "proxy enabled: S3 cache requires STORAGE_S3_BUCKET".to_string(),
-                )
+                StorageError::configuration("proxy enabled: S3 cache requires STORAGE_S3_BUCKET")
             })?;
             let prefix =
                 match upstream {
                     Some(up) => up.cache_s3_prefix.clone().ok_or_else(|| {
-                        StorageError::Internal(
-                            "proxy upstream enabled: S3 cache requires cache_s3_prefix".to_string(),
+                        StorageError::configuration(
+                            "proxy upstream enabled: S3 cache requires cache_s3_prefix",
                         )
                     })?,
                     None => config.proxy.cache_s3_prefix.clone().unwrap_or_else(|| {
@@ -799,9 +926,12 @@ pub fn proxy_cache_storage_try_from_config(
 pub(crate) fn ensure_dir(path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
     let p = path.as_ref();
     std::fs::create_dir_all(p).map_err(|err| {
-        StorageError::Internal(format!(
+        StorageError::io(format!(
             "failed to create storage dir {}: {err}",
             p.display()
         ))
     })
 }
+
+#[cfg(test)]
+mod tests;

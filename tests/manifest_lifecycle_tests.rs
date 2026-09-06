@@ -2358,6 +2358,10 @@ async fn test_index_durability_ordering_crash_between_flush_and_mark_ready() {
         // State on disk is strictly DIRTY (not ready-and-stale)
         assert!(ref_index.check_health().is_err());
 
+        // Simulated crash boundary: deterministically drop all first-process index owners
+        drop(service);
+        drop(ref_index);
+
         let journal = LifecycleJournalRecord {
             op_id: "durability-op-1".to_string(),
             repo: CanonicalRepoName::parse(repo).unwrap(),

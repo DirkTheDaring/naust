@@ -185,10 +185,12 @@ impl ServerRuntime {
     }
 
     /// Asynchronously releases the deployment writer mutation authority during shutdown Step 7.
-    pub(crate) async fn release_mutation_authority(&self) -> Result<(), String> {
+    pub(crate) async fn release_mutation_authority(
+        &self,
+    ) -> Result<(), crate::storage::StorageError> {
         let mut guard = self.mutation_authority.lock().await;
         if let Some(mut authority) = guard.take() {
-            authority.release().await.map_err(|e| e.to_string())?;
+            authority.release().await?;
         }
         Ok(())
     }
@@ -226,7 +228,7 @@ async fn unwind_runtime_and_fail(
         );
         RuntimeBuildError::UnwindFailed {
             source: Box::new(error),
-            release_error: crate::storage::StorageError::Internal(release_err),
+            release_error: release_err,
         }
     } else {
         error
@@ -1196,8 +1198,8 @@ mod tests {
 
         driver.set_hook_before(|method, _key| {
             if method == "list_objects_v2_page" {
-                Some(crate::storage::StorageError::Internal(
-                    "simulated S3 connection reset on page 2".to_string(),
+                Some(crate::storage::StorageError::backend(
+                    "simulated S3 connection reset on page 2",
                 ))
             } else {
                 None
@@ -1214,8 +1216,9 @@ mod tests {
         let inspect_res = storage.is_storage_empty().await;
         assert!(inspect_res.is_err(), "page 2 failure must fail closed");
         match inspect_res {
-            Err(crate::storage::StorageError::Internal(msg)) => {
-                assert!(msg.contains("simulated S3 connection reset"));
+            Err(crate::storage::StorageError::Internal { kind, message }) => {
+                assert_eq!(kind, crate::storage::StorageErrorKind::Backend);
+                assert!(message.contains("simulated S3 connection reset"));
             }
             other => panic!("expected StorageError::Internal, got {:?}", other),
         }
@@ -1223,8 +1226,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_preflight_s3_repeated_continuation_token_fails_closed() {
-        let err = crate::storage::StorageError::Internal(
-            "repeated S3 continuation token detected during storage readiness check".to_string(),
+        let err = crate::storage::StorageError::backend(
+            "repeated S3 continuation token detected during storage readiness check",
         );
         let compound = unwind_and_fail(
             RuntimeMutationAuthority::acquire(
@@ -1241,10 +1244,12 @@ mod tests {
         .await;
 
         match compound {
-            RuntimeBuildError::MembershipInspection(crate::storage::StorageError::Internal(
-                msg,
-            )) => {
-                assert!(msg.contains("repeated S3 continuation token"));
+            RuntimeBuildError::MembershipInspection(crate::storage::StorageError::Internal {
+                kind,
+                message,
+            }) => {
+                assert_eq!(kind, crate::storage::StorageErrorKind::Backend);
+                assert!(message.contains("repeated S3 continuation token"));
             }
             other => panic!("expected MembershipInspection error, got {:?}", other),
         }
@@ -1337,8 +1342,8 @@ mod tests {
                 _doc: &crate::storage::mutation_authority::DeploymentWriterLockDoc,
                 _expected_etag: Option<&str>,
             ) -> Result<bool, crate::storage::StorageError> {
-                Err(crate::storage::StorageError::Internal(
-                    "simulated lease release failure".to_string(),
+                Err(crate::storage::StorageError::backend(
+                    "simulated lease release failure",
                 ))
             }
 
@@ -1382,8 +1387,9 @@ mod tests {
                     other => panic!("expected MembershipBackfillRequired root, got {:?}", other),
                 }
                 match release_error {
-                    crate::storage::StorageError::Internal(msg) => {
-                        assert!(msg.contains("simulated lease release failure"));
+                    crate::storage::StorageError::Internal { kind, message } => {
+                        assert_eq!(kind, crate::storage::StorageErrorKind::Backend);
+                        assert!(message.contains("simulated lease release failure"));
                     }
                     other => panic!("expected StorageError::Internal, got {:?}", other),
                 }
@@ -1527,10 +1533,14 @@ mod tests {
 
         let create_res = s3_client.create_bucket().bucket(&bucket).send().await;
         if let Err(e) = create_res {
-            let err_str = e.to_string();
-            if !err_str.contains("BucketAlreadyOwnedByYou")
-                && !err_str.contains("BucketAlreadyExists")
-            {
+            let is_already_exists = match &e {
+                aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                    let code = se.err().meta().code().unwrap_or("");
+                    code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists"
+                }
+                _ => false,
+            };
+            if !is_already_exists {
                 s3_client
                     .head_bucket()
                     .bucket(&bucket)

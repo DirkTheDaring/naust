@@ -201,7 +201,9 @@ impl S3Driver for MockS3Driver {
         let mut assembled = Vec::new();
         for (num, _) in parts {
             let Some((p_bytes, _)) = stored_parts.get(&num) else {
-                return Err(StorageError::Internal(format!("missing part {num}")));
+                return Err(StorageError::internal_invariant(format!(
+                    "missing part {num}"
+                )));
             };
             assembled.extend_from_slice(p_bytes);
         }
@@ -2562,9 +2564,7 @@ async fn test_s3_all_eight_finalization_crash_boundaries() {
 
     driver.set_hook_before(move |method, _key| {
         if method == "complete_multipart_upload" {
-            Some(StorageError::Internal(
-                "simulated s3 network cut".to_string(),
-            ))
+            Some(StorageError::backend("simulated s3 network cut"))
         } else {
             None
         }
@@ -2698,9 +2698,7 @@ async fn test_s3_all_eight_finalization_crash_boundaries() {
     let f5_key = storage.finalized_key(&session5.uuid);
     driver.set_hook_before(move |method, key| {
         if method == "put_object" && key == f5_key {
-            Some(StorageError::Internal(
-                "disk full writing receipt".to_string(),
-            ))
+            Some(StorageError::backend("disk full writing receipt"))
         } else {
             None
         }
@@ -2768,9 +2766,7 @@ async fn test_s3_all_eight_finalization_crash_boundaries() {
     let s6_key = storage.session_key(&session6.uuid);
     driver.set_hook_before(move |method, key| {
         if method == "delete_object" && key == s6_key {
-            Some(StorageError::Internal(
-                "failed to delete session.json".to_string(),
-            ))
+            Some(StorageError::backend("failed to delete session.json"))
         } else {
             None
         }
@@ -2838,7 +2834,7 @@ async fn test_s3_reaper_fail_closed_on_metadata_read_error() {
     let s_key = storage.session_key("orphan-err-uuid");
     driver.set_hook_before(move |method, key| {
         if method == "get_object" && key == s_key {
-            Some(StorageError::Internal("transient S3 500 error".to_string()))
+            Some(StorageError::backend("transient S3 500 error"))
         } else {
             None
         }
@@ -2995,19 +2991,19 @@ async fn test_s3_reaper_error_matrix_all_non_not_found_fail_closed() {
     let test_cases = vec![
         (
             "timeout",
-            StorageError::Internal("RequestTimeout: connection timed out".into()),
+            StorageError::backend("RequestTimeout: connection timed out"),
         ),
         (
             "throttling",
-            StorageError::Internal("SlowDown: Please reduce your request rate".into()),
+            StorageError::backend("SlowDown: Please reduce your request rate"),
         ),
         (
             "access_denied",
-            StorageError::Internal("AccessDenied: 403 Forbidden".into()),
+            StorageError::permission_denied("AccessDenied: 403 Forbidden"),
         ),
         (
             "internal_error",
-            StorageError::Internal("InternalError: 500 Internal Server Error".into()),
+            StorageError::backend("InternalError: 500 Internal Server Error"),
         ),
     ];
 
@@ -3027,17 +3023,11 @@ async fn test_s3_reaper_error_matrix_all_non_not_found_fail_closed() {
         driver.multiparts.lock().unwrap().get_mut(&mp_id).unwrap().2 = 100;
 
         let s_key = storage.session_key(&format!("orphan-{name}"));
-        let err_clone = match &error {
-            StorageError::Internal(msg) => StorageError::Internal(msg.clone()),
-            _ => StorageError::Internal("error".into()),
-        };
+        let err_clone = error.clone();
 
         driver.set_hook_before(move |method, key| {
             if method == "get_object" && key == s_key {
-                Some(match &err_clone {
-                    StorageError::Internal(m) => StorageError::Internal(m.clone()),
-                    _ => StorageError::Internal("err".into()),
-                })
+                Some(err_clone.clone())
             } else {
                 None
             }
@@ -3127,9 +3117,7 @@ async fn test_s3_reaper_pre_abort_revalidation_error_fails_closed() {
                 None
             } else {
                 // Second (pre-abort) lookup: Transient error!
-                Some(StorageError::Internal(
-                    "S3 500 during pre-abort check".into(),
-                ))
+                Some(StorageError::backend("S3 500 during pre-abort check"))
             }
         } else {
             None
@@ -3197,8 +3185,8 @@ async fn test_s3_membership_candidate_transition_racing_activation_fails_safe_on
     let key_clone = key.clone();
     driver.set_hook_before(move |method, k| {
         if method == "put_object" && k == key_clone {
-            Some(StorageError::Internal(
-                "412 PreconditionFailed: ETag mismatch".into(),
+            Some(StorageError::conflict(
+                "412 PreconditionFailed: ETag mismatch",
             ))
         } else {
             None
@@ -3487,5 +3475,1324 @@ async fn test_s3_cas_enumeration_fails_closed_on_malformed_key() {
         res.is_err(),
         "S3 enumeration must fail closed on malformed key format"
     );
-    assert!(matches!(res.unwrap_err(), StorageError::Internal(_)));
+    let err = res.unwrap_err();
+    let expected_message = "malformed CAS object key structure in S3 (expected 2 parts): blobs/sha256/invalid_key_format";
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_aws_s3_driver_missing_region_is_configuration() {
+    let driver = AwsS3Driver::new(Some("http://127.0.0.1:9000".into()), None);
+    let res = driver.client().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Configuration),
+        "Missing S3 region must classify as Configuration"
+    );
+    assert_eq!(err.message(), Some("STORAGE_S3_REGION is required"));
+    assert_eq!(
+        err.to_string(),
+        "internal error: STORAGE_S3_REGION is required"
+    );
+}
+
+#[tokio::test]
+async fn test_aws_s3_driver_missing_upload_id_is_backend() {
+    let success = validate_multipart_upload_id(Some("valid-upload-id-123")).unwrap();
+    assert_eq!(success, "valid-upload-id-123");
+
+    let res = validate_multipart_upload_id(None);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err.message(), Some("missing upload_id"));
+    assert_eq!(err.to_string(), "internal error: missing upload_id");
+}
+
+#[tokio::test]
+async fn test_aws_s3_driver_continuation_token_cycle_is_backend() {
+    let mut seen = HashSet::new();
+    let token = "test-pagination-token-xyz";
+
+    assert!(track_continuation_token(&mut seen, token).is_ok());
+
+    let res = track_continuation_token(&mut seen, token);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(
+        err.message(),
+        Some("cyclic continuation token from S3 list_objects_v2")
+    );
+    assert_eq!(
+        err.to_string(),
+        "internal error: cyclic continuation token from S3 list_objects_v2"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_storage_missing_bucket_is_configuration() {
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(None, "".to_string(), 100_000_000, driver);
+    let res = storage.bucket();
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Configuration)
+    );
+    assert_eq!(err.message(), Some("STORAGE_S3_BUCKET is required"));
+    assert_eq!(
+        err.to_string(),
+        "internal error: STORAGE_S3_BUCKET is required"
+    );
+}
+
+#[tokio::test]
+async fn test_detect_manifest_media_type_malformed_json_is_corrupt_data() {
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver,
+    );
+    let malformed_bytes = b"{{{ malformed manifest json bytes";
+    let expected_err = serde_json::from_slice::<serde_json::Value>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let res = storage.detect_manifest_media_type(malformed_bytes).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_delete_blob_conditional_missing_version_is_conflict() {
+    use crate::storage::GcStorage;
+    use crate::storage::mutation_authority::RuntimeMutationAuthority;
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = Arc::new(S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver,
+    ));
+    let authority = RuntimeMutationAuthority::acquire(storage.clone(), "test-gc-owner")
+        .await
+        .expect("acquire");
+    let permit = authority.gc_mutation_permit();
+    let digest =
+        Digest::parse("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            .unwrap();
+
+    let res = GcStorage::delete_blob_conditional(&*storage, &permit, &digest, None).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Conflict)
+    );
+    assert_eq!(
+        err.message(),
+        Some(
+            "S3 conditional delete requires an explicit object version/ETag; unconditional delete is forbidden in GC"
+        )
+    );
+    assert_eq!(
+        err.to_string(),
+        "internal error: S3 conditional delete requires an explicit object version/ETag; unconditional delete is forbidden in GC"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_mutate_tag_preserves_conflict_backend_and_permission_denied() {
+    let digest =
+        Digest::parse("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            .unwrap();
+    let tag_key = "repos/test-repo/tags/v1.0.0";
+
+    // 1. Absent tag + repeated 412 contention on creation -> Conflict (baseline line 1626)
+    let driver1 = Arc::new(MockS3Driver::new(1000));
+    let storage1 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver1.clone(),
+    );
+    driver1.inject_412_on_key(tag_key);
+    let res_create_conflict = storage1
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &digest,
+            crate::storage::TagMutationPolicy::Replace,
+        )
+        .await;
+    assert!(res_create_conflict.is_err());
+    let err_create = res_create_conflict.unwrap_err();
+    assert_eq!(
+        err_create.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Conflict)
+    );
+    assert_eq!(
+        err_create.message(),
+        Some("tag mutation contention limit exceeded")
+    );
+    assert_eq!(
+        err_create.to_string(),
+        "internal error: tag mutation contention limit exceeded"
+    );
+
+    // 2. Existing tag + repeated 412 contention on update -> Conflict (baseline line 1662)
+    let driver2 = Arc::new(MockS3Driver::new(1000));
+    let storage2 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver2.clone(),
+    );
+    let old_digest =
+        Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    driver2.objects.lock().unwrap().insert(
+        tag_key.to_string(),
+        (
+            bytes::Bytes::from(old_digest.as_str().to_string().into_bytes()),
+            "etag-v1-old".to_string(),
+        ),
+    );
+    driver2.inject_412_on_key(tag_key);
+    let res_update_conflict = storage2
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &digest,
+            crate::storage::TagMutationPolicy::Replace,
+        )
+        .await;
+    assert!(res_update_conflict.is_err());
+    let err_update = res_update_conflict.unwrap_err();
+    assert_eq!(
+        err_update.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Conflict)
+    );
+    assert_eq!(
+        err_update.message(),
+        Some("tag mutation contention limit exceeded")
+    );
+    assert_eq!(
+        err_update.to_string(),
+        "internal error: tag mutation contention limit exceeded"
+    );
+
+    // 3. Underlying backend transport/service failure -> Backend
+    let driver3 = Arc::new(MockS3Driver::new(1000));
+    let storage3 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver3.clone(),
+    );
+    driver3.set_hook_before(|method, key| {
+        if method == "put_object" && key == "repos/test-repo/tags/v1.0.0" {
+            Some(StorageError::backend("s3 service 503 slow down"))
+        } else {
+            None
+        }
+    });
+    let res_backend = storage3
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &digest,
+            crate::storage::TagMutationPolicy::Replace,
+        )
+        .await;
+    assert!(res_backend.is_err());
+    let err_backend = res_backend.unwrap_err();
+    assert_eq!(
+        err_backend.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_backend.message(), Some("s3 service 503 slow down"));
+    assert_eq!(
+        err_backend.to_string(),
+        "internal error: s3 service 503 slow down"
+    );
+
+    // 4. Underlying permission failure -> PermissionDenied
+    let driver4 = Arc::new(MockS3Driver::new(1000));
+    let storage4 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver4.clone(),
+    );
+    driver4.set_hook_before(|method, key| {
+        if method == "put_object" && key == "repos/test-repo/tags/v1.0.0" {
+            Some(StorageError::permission_denied("s3:PutObject forbidden"))
+        } else {
+            None
+        }
+    });
+    let res_perm = storage4
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &digest,
+            crate::storage::TagMutationPolicy::Replace,
+        )
+        .await;
+    assert!(res_perm.is_err());
+    let err_perm = res_perm.unwrap_err();
+    assert_eq!(
+        err_perm.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_perm.message(), Some("s3:PutObject forbidden"));
+    assert_eq!(
+        err_perm.to_string(),
+        "internal error: s3:PutObject forbidden"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_get_tag_with_version_corrupt_digest_is_corrupt_data() {
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver.clone(),
+    );
+
+    let tag_key = "repos/test-repo/tags/corrupt-tag";
+    driver.objects.lock().unwrap().insert(
+        tag_key.to_string(),
+        (
+            bytes::Bytes::from_static(b"not-a-valid-sha256-digest"),
+            "etag-tag-1".to_string(),
+        ),
+    );
+
+    let res = storage
+        .get_tag_with_version("test-repo", "corrupt-tag")
+        .await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    let expected_parse_err = Digest::parse("not-a-valid-sha256-digest").unwrap_err();
+    let expected_message = format!("corrupt tag corrupt-tag: {expected_parse_err}");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_s3_get_finalized_receipt_malformed_json_is_corrupt_data() {
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver.clone(),
+    );
+    let session = UploadSessionId::new(
+        CanonicalRepoName::parse("test-repo").unwrap(),
+        "session-uuid-123",
+    );
+    let key = format!("uploads/{}/finalized.json", session.uuid);
+    let malformed_bytes = b"{{{ malformed finalized receipt json";
+    driver.objects.lock().unwrap().insert(
+        key,
+        (
+            bytes::Bytes::from_static(malformed_bytes),
+            "etag-rec-1".to_string(),
+        ),
+    );
+
+    let res = storage.get_finalized_receipt(&session).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    let expected_err = serde_json::from_slice::<FinalizedReceipt>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let digest =
+        Digest::parse("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            .unwrap();
+    let canonical = CanonicalRepoName::parse("test-repo").unwrap();
+    let key =
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest);
+
+    // 1. Malformed membership record -> CorruptData (baseline line 3427)
+    let driver1 = Arc::new(MockS3Driver::new(1000));
+    let storage1 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver1.clone(),
+    );
+    let malformed_bytes = b"{{{ malformed membership json";
+    driver1.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from_static(malformed_bytes),
+            "etag-mem-1".to_string(),
+        ),
+    );
+    let res_get = storage1
+        .get_repo_blob_membership("test-repo", &digest)
+        .await;
+    assert!(res_get.is_err());
+    let err_get = res_get.unwrap_err();
+    let expected_parse_err = serde_json::from_slice::<
+        crate::storage::repo_membership::RepoBlobMembershipRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_get_msg =
+        format!("corrupt membership record in s3 key {key}: {expected_parse_err}");
+    assert_eq!(
+        err_get.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err_get.message(), Some(expected_get_msg.as_str()));
+    assert_eq!(
+        err_get.to_string(),
+        format!("internal error: {expected_get_msg}")
+    );
+
+    // 2. Underlying backend failure during candidate mutation -> Backend (baseline line 3481)
+    let driver2 = Arc::new(MockS3Driver::new(1000));
+    let storage2 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver2.clone(),
+    );
+    let record = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+        canonical.clone(),
+        digest.clone(),
+        None,
+    );
+    let rec_bytes = serde_json::to_vec(&record).unwrap();
+    driver2.objects.lock().unwrap().insert(
+        key.clone(),
+        (bytes::Bytes::from(rec_bytes), "etag-mem-2".to_string()),
+    );
+    let hook_key = key.clone();
+    driver2.set_hook_before(move |method, k| {
+        if method == "put_object" && k == hook_key {
+            Some(StorageError::backend("s3 service 500 error"))
+        } else {
+            None
+        }
+    });
+    let res_backend = storage2
+        .set_membership_candidate("test-repo", &digest, 200)
+        .await;
+    assert!(res_backend.is_err());
+    let err_backend = res_backend.unwrap_err();
+    assert_eq!(
+        err_backend.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_backend.message(), Some("s3 service 500 error"));
+    assert_eq!(
+        err_backend.to_string(),
+        "internal error: s3 service 500 error"
+    );
+
+    // 3. Underlying permission failure during candidate mutation -> PermissionDenied
+    let driver3 = Arc::new(MockS3Driver::new(1000));
+    let storage3 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver3.clone(),
+    );
+    driver3.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from(serde_json::to_vec(&record).unwrap()),
+            "etag-mem-3".to_string(),
+        ),
+    );
+    let hook_key3 = key.clone();
+    driver3.set_hook_before(move |method, k| {
+        if method == "put_object" && k == hook_key3 {
+            Some(StorageError::permission_denied(
+                "s3:PutObject access denied",
+            ))
+        } else {
+            None
+        }
+    });
+    let res_perm = storage3
+        .set_membership_candidate("test-repo", &digest, 200)
+        .await;
+    assert!(res_perm.is_err());
+    let err_perm = res_perm.unwrap_err();
+    assert_eq!(
+        err_perm.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_perm.message(), Some("s3:PutObject access denied"));
+    assert_eq!(
+        err_perm.to_string(),
+        "internal error: s3:PutObject access denied"
+    );
+
+    // 4. Concurrently deleted membership record during pagination is skipped gracefully
+    let driver4 = Arc::new(MockS3Driver::new(1000));
+    let storage4 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver4.clone(),
+    );
+    driver4.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from(serde_json::to_vec(&record).unwrap()),
+            "etag-mem-4".to_string(),
+        ),
+    );
+    let driver4_for_hook = driver4.clone();
+    let hook_key4 = key.clone();
+    driver4.set_hook_before(move |method, k| {
+        if method == "get_object" && k == hook_key4 {
+            // Simulate another actor deleting the membership record concurrently
+            driver4_for_hook.objects.lock().unwrap().remove(k);
+        }
+        None
+    });
+    let res_list = storage4
+        .list_repo_blob_memberships_page("test-repo", None, 10)
+        .await;
+    assert!(res_list.is_ok());
+    let (records, next_token) = res_list.unwrap();
+    assert!(records.is_empty());
+    assert_eq!(next_token, None);
+
+    // Verify both listing and point fetch were actually executed
+    let call_log = driver4.get_call_log();
+    assert!(
+        call_log
+            .iter()
+            .any(|entry| entry.method == "list_objects_v2"),
+        "list_objects_v2 must have been called during pagination traversal"
+    );
+    assert!(
+        call_log
+            .iter()
+            .any(|entry| entry.method == "get_object" && entry.key == key),
+        "get_object must have been called on the listed key before observing disappearance"
+    );
+
+    // 5. Structured Conflict from put_object_conditional becomes Ok(false) in set_membership_candidate (baseline line 3481)
+    let driver5 = Arc::new(MockS3Driver::new(1000));
+    let storage5 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver5.clone(),
+    );
+    driver5.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from(serde_json::to_vec(&record).unwrap()),
+            "etag-mem-5".to_string(),
+        ),
+    );
+    let hook_key5 = key.clone();
+    driver5.set_hook_before(move |method, k| {
+        if method == "put_object" && k == hook_key5 {
+            Some(StorageError::conflict("opaque-membership-conflict"))
+        } else {
+            None
+        }
+    });
+    let res_set_conf = storage5
+        .set_membership_candidate("test-repo", &digest, 200)
+        .await;
+    assert_eq!(res_set_conf.unwrap(), false);
+
+    // 6. Structured Conflict from put_object_conditional becomes Ok(false) in clear_membership_candidate (baseline line 3529)
+    let driver6 = Arc::new(MockS3Driver::new(1000));
+    let storage6 = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver6.clone(),
+    );
+    let mut candidate_record = record.clone();
+    candidate_record.mark_candidate(200);
+    driver6.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from(serde_json::to_vec(&candidate_record).unwrap()),
+            "etag-mem-6".to_string(),
+        ),
+    );
+    let hook_key6 = key.clone();
+    driver6.set_hook_before(move |method, k| {
+        if method == "put_object" && k == hook_key6 {
+            Some(StorageError::conflict("opaque-membership-conflict"))
+        } else {
+            None
+        }
+    });
+    let res_clear_conf = storage6
+        .clear_membership_candidate("test-repo", &digest)
+        .await;
+    assert_eq!(res_clear_conf.unwrap(), false);
+}
+
+#[tokio::test]
+async fn test_s3_list_all_repo_blob_memberships_page_concurrent_disappearance_advances_safely() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver.clone(),
+    );
+
+    let digest1 =
+        Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let digest2 =
+        Digest::parse("sha256:2222222222222222222222222222222222222222222222222222222222222222")
+            .unwrap();
+    let canonical = CanonicalRepoName::parse("test-repo").unwrap();
+    let key1 =
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest1);
+    let key2 =
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest2);
+
+    let rec1 = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+        canonical.clone(),
+        digest1.clone(),
+        None,
+    );
+    let rec2 = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+        canonical.clone(),
+        digest2.clone(),
+        None,
+    );
+
+    driver.objects.lock().unwrap().insert(
+        key1.clone(),
+        (
+            bytes::Bytes::from(serde_json::to_vec(&rec1).unwrap()),
+            "etag-rec-1".to_string(),
+        ),
+    );
+    driver.objects.lock().unwrap().insert(
+        key2.clone(),
+        (
+            bytes::Bytes::from(serde_json::to_vec(&rec2).unwrap()),
+            "etag-rec-2".to_string(),
+        ),
+    );
+
+    // Simulate concurrent deletion of key1 during point fetch
+    let driver_for_hook = driver.clone();
+    let hook_key1 = key1.clone();
+    driver.set_hook_before(move |method, k| {
+        if method == "get_object" && k == hook_key1 {
+            driver_for_hook.objects.lock().unwrap().remove(k);
+        }
+        None
+    });
+
+    // 1. First page with page_limit = 1 (covers key1)
+    let res_p1 = storage.list_all_repo_blob_memberships_page(None, 1).await;
+    assert!(res_p1.is_ok());
+    let (records_p1, next_tok_p1) = res_p1.unwrap();
+    // key1 disappeared, so records on this page is empty, but token advances to key1
+    assert!(records_p1.is_empty());
+    assert_eq!(next_tok_p1, Some(key1.clone()));
+
+    // 2. Second page continuing from key1 with page_limit = 1
+    let res_p2 = storage
+        .list_all_repo_blob_memberships_page(next_tok_p1.as_deref(), 1)
+        .await;
+    assert!(res_p2.is_ok());
+    let (records_p2, next_tok_p2) = res_p2.unwrap();
+    assert_eq!(records_p2.len(), 1);
+    assert_eq!(records_p2[0].digest, digest2);
+    assert_eq!(next_tok_p2, None);
+
+    // 3. Verify call log proves list_objects_v2 ran and get_object ran on both keys
+    let log = driver.get_call_log();
+    assert!(
+        log.iter().any(|entry| entry.method == "list_objects_v2"),
+        "list_objects_v2 must have executed"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| entry.method == "get_object" && entry.key == key1),
+        "get_object must have attempted to fetch key1"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| entry.method == "get_object" && entry.key == key2),
+        "get_object must have fetched key2"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_migration_checkpoint_malformed_json_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver.clone(),
+    );
+
+    let key = "meta/migration_checkpoint.json";
+    let malformed_bytes = b"{{{ malformed migration checkpoint json";
+    driver.objects.lock().unwrap().insert(
+        key.to_string(),
+        (
+            bytes::Bytes::from_static(malformed_bytes),
+            "etag-cp-1".to_string(),
+        ),
+    );
+
+    let res = storage.get_migration_checkpoint().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    let expected_parse_err = serde_json::from_slice::<
+        crate::storage::repo_membership::MigrationCheckpointRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_message = format!("corrupt s3 migration checkpoint: {expected_parse_err}");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_s3_delete_error_classification_uses_typed_metadata() {
+    use crate::storage::ConditionalDeleteResult;
+    let dummy_msg = "some-arbitrary-unrelated-error-payload-12345";
+
+    // 1. Status 412 -> Ok(ConditionalDeleteResult::PreconditionFailed)
+    let res_412 = classify_s3_delete_service_error(412, "OtherCode", dummy_msg.to_string());
+    assert_eq!(
+        res_412.unwrap(),
+        ConditionalDeleteResult::PreconditionFailed {
+            current_version: None
+        }
+    );
+
+    // 2. Code PreconditionFailed at non-412 status -> Ok(ConditionalDeleteResult::PreconditionFailed)
+    let res_code_prec =
+        classify_s3_delete_service_error(400, "PreconditionFailed", dummy_msg.to_string());
+    assert_eq!(
+        res_code_prec.unwrap(),
+        ConditionalDeleteResult::PreconditionFailed {
+            current_version: None
+        }
+    );
+
+    // 3. Code AtLeastOnePreconditionFailed at non-412 status -> Ok(ConditionalDeleteResult::PreconditionFailed)
+    let res_code_atleast = classify_s3_delete_service_error(
+        400,
+        "AtLeastOnePreconditionFailed",
+        dummy_msg.to_string(),
+    );
+    assert_eq!(
+        res_code_atleast.unwrap(),
+        ConditionalDeleteResult::PreconditionFailed {
+            current_version: None
+        }
+    );
+
+    // 3b. Code AtLeastOneConditionFailed at non-412 status -> Ok(ConditionalDeleteResult::PreconditionFailed)
+    let res_code_atleast_cond =
+        classify_s3_delete_service_error(400, "AtLeastOneConditionFailed", dummy_msg.to_string());
+    assert_eq!(
+        res_code_atleast_cond.unwrap(),
+        ConditionalDeleteResult::PreconditionFailed {
+            current_version: None
+        }
+    );
+
+    // 4. Status 404 -> Ok(ConditionalDeleteResult::NotFound)
+    let res_404 = classify_s3_delete_service_error(404, "OtherCode", dummy_msg.to_string());
+    assert_eq!(res_404.unwrap(), ConditionalDeleteResult::NotFound);
+
+    // 5. Code NoSuchKey at non-404 status -> Ok(ConditionalDeleteResult::NotFound)
+    let res_code_no_key = classify_s3_delete_service_error(400, "NoSuchKey", dummy_msg.to_string());
+    assert_eq!(res_code_no_key.unwrap(), ConditionalDeleteResult::NotFound);
+
+    // 6. Code NotFound at non-404 status -> Ok(ConditionalDeleteResult::NotFound)
+    let res_code_not_found =
+        classify_s3_delete_service_error(400, "NotFound", dummy_msg.to_string());
+    assert_eq!(
+        res_code_not_found.unwrap(),
+        ConditionalDeleteResult::NotFound
+    );
+
+    // 7. Status 403 -> PermissionDenied
+    let res_403 = classify_s3_delete_service_error(403, "OtherCode", dummy_msg.to_string());
+    assert!(res_403.is_err());
+    let err_403 = res_403.unwrap_err();
+    assert_eq!(
+        err_403.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_403.message(), Some(dummy_msg));
+    assert_eq!(err_403.to_string(), format!("internal error: {dummy_msg}"));
+
+    // 8. Code AccessDenied at non-403 status -> PermissionDenied
+    let res_code_access =
+        classify_s3_delete_service_error(400, "AccessDenied", dummy_msg.to_string());
+    assert!(res_code_access.is_err());
+    let err_code_access = res_code_access.unwrap_err();
+    assert_eq!(
+        err_code_access.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_code_access.message(), Some(dummy_msg));
+    assert_eq!(
+        err_code_access.to_string(),
+        format!("internal error: {dummy_msg}")
+    );
+
+    // 9. Ordinary status/code -> Backend
+    let res_generic = classify_s3_delete_service_error(500, "InternalError", dummy_msg.to_string());
+    assert!(res_generic.is_err());
+    let err_generic = res_generic.unwrap_err();
+    assert_eq!(
+        err_generic.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_generic.message(), Some(dummy_msg));
+    assert_eq!(
+        err_generic.to_string(),
+        format!("internal error: {dummy_msg}")
+    );
+}
+
+#[tokio::test]
+async fn test_s3_list_repo_blob_memberships_page_malformed_json_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver.clone(),
+    );
+
+    let digest =
+        Digest::parse("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            .unwrap();
+    let canonical = CanonicalRepoName::parse("test-repo").unwrap();
+    let key =
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest);
+
+    let malformed_bytes = b"{{{ malformed membership record json";
+    driver.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from_static(malformed_bytes),
+            "etag-mem-malformed-1".to_string(),
+        ),
+    );
+
+    let res = storage
+        .list_repo_blob_memberships_page("test-repo", None, 10)
+        .await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    let expected_parse_err = serde_json::from_slice::<
+        crate::storage::repo_membership::RepoBlobMembershipRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_message =
+        format!("corrupt membership record at key '{key}': {expected_parse_err}");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_s3_list_all_repo_blob_memberships_page_malformed_json_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let driver = Arc::new(MockS3Driver::new(1000));
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver.clone(),
+    );
+
+    let digest =
+        Digest::parse("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            .unwrap();
+    let canonical = CanonicalRepoName::parse("test-repo").unwrap();
+    let key =
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest);
+
+    let malformed_bytes = b"{{{ malformed all memberships record json";
+    driver.objects.lock().unwrap().insert(
+        key.clone(),
+        (
+            bytes::Bytes::from_static(malformed_bytes),
+            "etag-mem-malformed-2".to_string(),
+        ),
+    );
+
+    let res = storage.list_all_repo_blob_memberships_page(None, 10).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    let expected_parse_err = serde_json::from_slice::<
+        crate::storage::repo_membership::RepoBlobMembershipRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_message =
+        format!("corrupt membership record at key '{key}': {expected_parse_err}");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_s3_is_storage_empty_repeated_continuation_token_is_backend() {
+    struct CyclicPageDriver {
+        inner: MockS3Driver,
+    }
+
+    #[async_trait]
+    impl S3Driver for CyclicPageDriver {
+        async fn get_bucket_versioning_state(&self, bucket: &str) -> S3BucketVersioningState {
+            self.inner.get_bucket_versioning_state(bucket).await
+        }
+        async fn create_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<String, StorageError> {
+            self.inner.create_multipart_upload(bucket, key).await
+        }
+        async fn upload_part(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            part_number: i32,
+            body: Bytes,
+        ) -> Result<String, StorageError> {
+            self.inner
+                .upload_part(bucket, key, upload_id, part_number, body)
+                .await
+        }
+        async fn complete_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            parts: Vec<(i32, String)>,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .complete_multipart_upload(bucket, key, upload_id, parts)
+                .await
+        }
+        async fn abort_multipart_upload(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .abort_multipart_upload(bucket, key, upload_id)
+                .await
+        }
+        async fn list_multipart_uploads(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            key_marker: Option<&str>,
+            upload_id_marker: Option<&str>,
+        ) -> Result<S3MultipartListResult, StorageError> {
+            self.inner
+                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker)
+                .await
+        }
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<Option<(Bytes, String)>, StorageError> {
+            self.inner.get_object(bucket, key).await
+        }
+        async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, StorageError> {
+            self.inner.head_object(bucket, key).await
+        }
+        async fn put_object_conditional(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Bytes,
+            if_match: Option<String>,
+            if_none_match: Option<String>,
+        ) -> Result<String, StorageError> {
+            self.inner
+                .put_object_conditional(bucket, key, body, if_match, if_none_match)
+                .await
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+            self.inner.delete_object(bucket, key).await
+        }
+        async fn delete_object_conditional(
+            &self,
+            bucket: &str,
+            key: &str,
+            if_match: Option<String>,
+        ) -> Result<super::super::ConditionalDeleteResult, StorageError> {
+            self.inner
+                .delete_object_conditional(bucket, key, if_match)
+                .await
+        }
+        async fn copy_object(
+            &self,
+            src_bucket: &str,
+            src_key: &str,
+            dst_bucket: &str,
+            dst_key: &str,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .copy_object(src_bucket, src_key, dst_bucket, dst_key)
+                .await
+        }
+        async fn list_objects_v2(
+            &self,
+            bucket: &str,
+            prefix: &str,
+        ) -> Result<Vec<S3ObjectSummary>, StorageError> {
+            self.inner.list_objects_v2(bucket, prefix).await
+        }
+        async fn list_objects_v2_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+            _max_keys: i32,
+        ) -> Result<S3ObjectsPage, StorageError> {
+            Ok(S3ObjectsPage {
+                objects: Vec::new(),
+                next_continuation_token: Some("cyclic-token-abc".to_string()),
+            })
+        }
+    }
+
+    let driver = Arc::new(CyclicPageDriver {
+        inner: MockS3Driver::new(1000),
+    });
+    let storage = S3Storage::new_with_driver(
+        Some("test-bucket".to_string()),
+        "".to_string(),
+        100_000_000,
+        driver,
+    );
+
+    let res = storage.is_storage_empty().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(
+        err.message(),
+        Some("repeated S3 continuation token detected during storage readiness check")
+    );
+    assert_eq!(
+        err.to_string(),
+        "internal error: repeated S3 continuation token detected during storage readiness check"
+    );
+}
+
+#[test]
+fn test_classify_s3_generic_service_error_uses_typed_metadata() {
+    let dummy_msg = "test generic error message";
+
+    // 1. Status 403 -> PermissionDenied
+    let err_403 = classify_s3_generic_service_error(403, "OtherCode", dummy_msg.to_string());
+    assert_eq!(
+        err_403.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_403.message(), Some(dummy_msg));
+    assert_eq!(err_403.to_string(), format!("internal error: {dummy_msg}"));
+
+    // 2. Code AccessDenied at non-403 status -> PermissionDenied
+    let err_access_denied =
+        classify_s3_generic_service_error(400, "AccessDenied", dummy_msg.to_string());
+    assert_eq!(
+        err_access_denied.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_access_denied.message(), Some(dummy_msg));
+    assert_eq!(
+        err_access_denied.to_string(),
+        format!("internal error: {dummy_msg}")
+    );
+
+    // 3. Status 500 / other code -> Backend
+    let err_500 = classify_s3_generic_service_error(500, "InternalError", dummy_msg.to_string());
+    assert_eq!(
+        err_500.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_500.message(), Some(dummy_msg));
+    assert_eq!(err_500.to_string(), format!("internal error: {dummy_msg}"));
+
+    // 4. Status 503 -> Backend
+    let err_503 = classify_s3_generic_service_error(503, "SlowDown", dummy_msg.to_string());
+    assert_eq!(
+        err_503.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_503.message(), Some(dummy_msg));
+    assert_eq!(err_503.to_string(), format!("internal error: {dummy_msg}"));
+}
+
+#[test]
+fn test_classify_s3_copy_service_error_uses_typed_metadata() {
+    let dummy_msg = "test copy error message";
+
+    // 1. Status 404 -> NotFound
+    let err_404 = classify_s3_copy_service_error(404, "OtherCode", dummy_msg.to_string());
+    assert!(matches!(err_404, StorageError::NotFound));
+    assert_eq!(err_404.internal_kind(), None);
+    assert_eq!(err_404.message(), None);
+    assert_eq!(err_404.to_string(), "not found");
+
+    // 2. Code NoSuchKey at non-404 status -> NotFound
+    let err_no_such_key = classify_s3_copy_service_error(400, "NoSuchKey", dummy_msg.to_string());
+    assert!(matches!(err_no_such_key, StorageError::NotFound));
+    assert_eq!(err_no_such_key.internal_kind(), None);
+    assert_eq!(err_no_such_key.message(), None);
+    assert_eq!(err_no_such_key.to_string(), "not found");
+
+    // 3. Code NotFound at non-404 status -> NotFound
+    let err_not_found = classify_s3_copy_service_error(400, "NotFound", dummy_msg.to_string());
+    assert!(matches!(err_not_found, StorageError::NotFound));
+    assert_eq!(err_not_found.internal_kind(), None);
+    assert_eq!(err_not_found.message(), None);
+    assert_eq!(err_not_found.to_string(), "not found");
+
+    // 4. Status 403 -> PermissionDenied
+    let err_403 = classify_s3_copy_service_error(403, "OtherCode", dummy_msg.to_string());
+    assert_eq!(
+        err_403.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_403.message(), Some(dummy_msg));
+    assert_eq!(err_403.to_string(), format!("internal error: {dummy_msg}"));
+
+    // 5. Code AccessDenied at non-403 status -> PermissionDenied
+    let err_access_denied =
+        classify_s3_copy_service_error(400, "AccessDenied", dummy_msg.to_string());
+    assert_eq!(
+        err_access_denied.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(err_access_denied.message(), Some(dummy_msg));
+    assert_eq!(
+        err_access_denied.to_string(),
+        format!("internal error: {dummy_msg}")
+    );
+
+    // 6. Status 412 -> Backend (copy_object sends no precondition headers)
+    let err_412 = classify_s3_copy_service_error(412, "OtherCode", dummy_msg.to_string());
+    assert_eq!(
+        err_412.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_412.message(), Some(dummy_msg));
+    assert_eq!(err_412.to_string(), format!("internal error: {dummy_msg}"));
+
+    // 7. Code PreconditionFailed at non-412 status -> Backend (no precondition semantics for copy_object)
+    let err_precondition =
+        classify_s3_copy_service_error(400, "PreconditionFailed", dummy_msg.to_string());
+    assert_eq!(
+        err_precondition.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_precondition.message(), Some(dummy_msg));
+    assert_eq!(
+        err_precondition.to_string(),
+        format!("internal error: {dummy_msg}")
+    );
+
+    // 8. Status 500 / other code -> Backend
+    let err_500 = classify_s3_copy_service_error(500, "InternalError", dummy_msg.to_string());
+    assert_eq!(
+        err_500.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(err_500.message(), Some(dummy_msg));
+    assert_eq!(err_500.to_string(), format!("internal error: {dummy_msg}"));
+}
+
+#[test]
+fn test_map_sdk_err_service_error_uses_typed_metadata_and_full_message() {
+    let err_meta = aws_sdk_s3::error::ErrorMetadata::builder()
+        .code("AccessDenied")
+        .message("User is not authorized")
+        .build();
+    let get_err = aws_sdk_s3::operation::get_object::GetObjectError::generic(err_meta);
+    let raw_http = aws_sdk_s3::config::http::HttpResponse::new(
+        403u16.try_into().unwrap(),
+        aws_sdk_s3::primitives::SdkBody::empty(),
+    );
+    let sdk_err = aws_sdk_s3::error::SdkError::service_error(get_err, raw_http);
+    let expected_message = sdk_err.to_string();
+
+    let storage_err = map_sdk_err(sdk_err, classify_s3_generic_service_error);
+    assert_eq!(
+        storage_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied)
+    );
+    assert_eq!(storage_err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        storage_err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[test]
+fn test_map_sdk_err_service_error_404_maps_to_not_found() {
+    let raw_http = aws_sdk_s3::config::http::HttpResponse::new(
+        404u16.try_into().unwrap(),
+        aws_sdk_s3::primitives::SdkBody::empty(),
+    );
+    let err_meta = aws_sdk_s3::error::ErrorMetadata::builder()
+        .code("NoSuchKey")
+        .message("The specified key does not exist.")
+        .build();
+    let copy_err = aws_sdk_s3::operation::copy_object::CopyObjectError::generic(err_meta);
+    let sdk_err = aws_sdk_s3::error::SdkError::service_error(copy_err, raw_http);
+
+    let storage_err = map_sdk_err(sdk_err, classify_s3_copy_service_error);
+    assert!(matches!(storage_err, StorageError::NotFound));
+    assert_eq!(storage_err.internal_kind(), None);
+    assert_eq!(storage_err.message(), None);
+    assert_eq!(storage_err.to_string(), "not found");
+}
+
+#[test]
+fn test_map_sdk_err_service_error_500_maps_to_backend_and_preserves_full_message() {
+    let raw_http = aws_sdk_s3::config::http::HttpResponse::new(
+        500u16.try_into().unwrap(),
+        aws_sdk_s3::primitives::SdkBody::empty(),
+    );
+    let err_meta = aws_sdk_s3::error::ErrorMetadata::builder()
+        .code("InternalError")
+        .message("We encountered an internal error. Please try again.")
+        .build();
+    let get_err = aws_sdk_s3::operation::get_object::GetObjectError::generic(err_meta);
+    let sdk_err = aws_sdk_s3::error::SdkError::service_error(get_err, raw_http);
+    let expected_message = sdk_err.to_string();
+
+    let storage_err = map_sdk_err(sdk_err, classify_s3_generic_service_error);
+    assert_eq!(
+        storage_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(storage_err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        storage_err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[test]
+fn test_map_sdk_err_transport_error_maps_to_backend_and_preserves_message() {
+    let custom_err = "simulated network timeout during send";
+    let sdk_err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError> =
+        aws_sdk_s3::error::SdkError::construction_failure(custom_err);
+    let expected_message = sdk_err.to_string();
+
+    let storage_err = map_sdk_err(sdk_err, classify_s3_generic_service_error);
+    assert_eq!(
+        storage_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert_eq!(storage_err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        storage_err.to_string(),
+        format!("internal error: {expected_message}")
+    );
 }

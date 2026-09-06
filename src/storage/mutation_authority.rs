@@ -58,6 +58,8 @@ pub struct RuntimeMutationAuthority {
     doc: DeploymentWriterLockDoc,
     etag: Option<String>,
     released: bool,
+    #[cfg(test)]
+    test_force_inactive: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for RuntimeMutationAuthority {
@@ -89,6 +91,8 @@ impl RuntimeMutationAuthority {
             doc,
             etag,
             released: false,
+            #[cfg(test)]
+            test_force_inactive: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -104,6 +108,13 @@ impl RuntimeMutationAuthority {
 
     #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .test_force_inactive
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
         !self.released
     }
 
@@ -126,6 +137,27 @@ impl RuntimeMutationAuthority {
             .release_deployment_writer_lock(&self.doc, self.etag.as_deref())
             .await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_inactive_guard(&self) -> TestInactiveGuard<'_> {
+        self.test_force_inactive
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        TestInactiveGuard { authority: self }
+    }
+}
+
+#[cfg(test)]
+pub(super) struct TestInactiveGuard<'a> {
+    authority: &'a RuntimeMutationAuthority,
+}
+
+#[cfg(test)]
+impl<'a> Drop for TestInactiveGuard<'a> {
+    fn drop(&mut self) {
+        self.authority
+            .test_force_inactive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -165,8 +197,8 @@ pub async fn admin_clear_abandoned_deployment_writer_lock(
     confirmation: &str,
 ) -> Result<(), StorageError> {
     if confirmation != "CONFIRM-CLEAR-ABANDONED-WRITER" {
-        return Err(StorageError::Internal(
-            "destructive lock clearing requires exact confirmation token: 'CONFIRM-CLEAR-ABANDONED-WRITER'".to_string(),
+        return Err(StorageError::permission_denied(
+            "destructive lock clearing requires exact confirmation token: 'CONFIRM-CLEAR-ABANDONED-WRITER'",
         ));
     }
 
@@ -191,7 +223,7 @@ pub async fn force_unlock_deployment_writer(
         && confirmation_token != doc.owner_token
         && confirmation_token != doc.owner_id
     {
-        return Err(StorageError::Internal(format!(
+        return Err(StorageError::permission_denied(format!(
             "confirmation token '{confirmation_token}' did not match lock owner '{}'",
             doc.owner_id
         )));

@@ -1667,7 +1667,7 @@ async fn test_two_simultaneous_maintenance_commands_contention() {
 #[test]
 fn test_compound_execution_and_teardown_failure() {
     let source_err = CliError::MembershipBackfillRequired;
-    let release_err = crate::storage::StorageError::Internal("release-failed".to_string());
+    let release_err = crate::storage::StorageError::backend("release-failed");
 
     let compound = CliError::ExecutionAndTeardownFailed {
         source: Box::new(source_err),
@@ -1707,9 +1707,7 @@ async fn test_teardown_preflight_failure_plus_release_failure() {
     // 2. Forced release failure on preflight failure produces compound ExecutionAndTeardownFailed
     let forced_compound = CliError::ExecutionAndTeardownFailed {
         source: Box::new(CliError::MembershipBackfillRequired),
-        release_error: crate::storage::StorageError::Internal(
-            "forced-preflight-release-err".to_string(),
-        ),
+        release_error: crate::storage::StorageError::backend("forced-preflight-release-err"),
     };
     assert_eq!(forced_compound.exit_code(), 1);
     let msg = forced_compound.to_string();
@@ -1762,7 +1760,7 @@ async fn test_teardown_command_failure_plus_release_failure() {
             path: std::path::PathBuf::from("/test/path/db"),
             reason: "corrupt sled database".to_string(),
         }),
-        release_error: crate::storage::StorageError::Internal("forced-cmd-release-err".to_string()),
+        release_error: crate::storage::StorageError::backend("forced-cmd-release-err"),
     };
     assert_eq!(compound.exit_code(), 1);
     let msg = compound.to_string();
@@ -1817,7 +1815,7 @@ async fn test_teardown_early_validation_failure_plus_release_failure() {
             bucket: "my-test-bucket".to_string(),
             prefix: "my-test-prefix/".to_string(),
         }),
-        release_error: crate::storage::StorageError::Internal("forced-val-release-err".to_string()),
+        release_error: crate::storage::StorageError::backend("forced-val-release-err"),
     };
     assert_eq!(
         compound.exit_code(),
@@ -1861,8 +1859,8 @@ async fn test_teardown_success_plus_release_failure() {
     assert_eq!(final_res.unwrap(), "success-val");
 
     // 2. Forced release failure on success produces typed CliError::AuthorityRelease
-    let forced_teardown_err = CliError::AuthorityRelease(crate::storage::StorageError::Internal(
-        "forced-success-release-err".to_string(),
+    let forced_teardown_err = CliError::AuthorityRelease(crate::storage::StorageError::backend(
+        "forced-success-release-err",
     ));
     assert_eq!(forced_teardown_err.exit_code(), 1);
     let msg = forced_teardown_err.to_string();

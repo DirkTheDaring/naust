@@ -194,8 +194,9 @@ async fn delete_manifest_fails_safe_on_malformed_manifest() {
         .await
         .expect_err("should abort on malformed manifest");
     match err {
-        StorageError::Internal(msg) => {
-            assert!(msg.contains("malformed"));
+        StorageError::Internal { kind, message } => {
+            assert_eq!(kind, crate::storage::StorageErrorKind::CorruptData);
+            assert!(message.contains("malformed"));
         }
         other => panic!("expected StorageError::Internal, got {other:?}"),
     }
@@ -1253,7 +1254,10 @@ async fn test_storage_try_from_config_invalid_path_fails_cleanly() {
     let res = FsStorage::try_new(invalid_root.clone(), 1024 * 1024);
     assert!(res.is_err());
     let err = res.unwrap_err();
-    assert!(matches!(err, StorageError::Internal(_)));
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
     let err_msg = err.to_string();
     assert!(err_msg.contains(&invalid_root.display().to_string()));
     assert!(err_msg.contains("failed to create storage dir"));
@@ -1381,7 +1385,10 @@ async fn test_fs_cas_enumeration_fails_closed_on_malformed_prefix_dir() {
         res.is_err(),
         "enumeration must fail closed on non-dir prefix"
     );
-    assert!(matches!(res.unwrap_err(), StorageError::Internal(_)));
+    assert_eq!(
+        res.unwrap_err().internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
 }
 
 #[tokio::test]
@@ -1405,5 +1412,686 @@ async fn test_fs_cas_enumeration_fails_closed_on_malformed_blob_file() {
         res.is_err(),
         "enumeration must fail closed on malformed hex filename"
     );
-    assert!(matches!(res.unwrap_err(), StorageError::Internal(_)));
+    assert_eq!(
+        res.unwrap_err().internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData)
+    );
+}
+
+#[tokio::test]
+async fn test_atomic_write_file_invalid_path_invariant() {
+    let res = atomic_write_file(Path::new(""), b"test-payload").await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::InternalInvariant),
+        "atomic_write_file with path having no parent must return StorageErrorKind::InternalInvariant"
+    );
+    assert_eq!(err.message(), Some("invalid path"));
+    assert_eq!(err.to_string(), "internal error: invalid path");
+}
+
+#[tokio::test]
+async fn test_detect_manifest_media_type_malformed_json_is_corrupt_data() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root, 1024 * 1024);
+
+    let malformed_bytes = b"{{{ malformed JSON";
+    let expected_err = serde_json::from_slice::<serde_json::Value>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let res = storage.detect_manifest_media_type(malformed_bytes).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed manifest JSON in detect_manifest_media_type must classify as CorruptData"
+    );
+
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_repository_enumeration_io_failure_is_io() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Create a regular file at the 'repos' path so read_dir fails with ENOTDIR (deterministic, root-safe)
+    let repos_path = root.join("repos");
+    std::fs::write(&repos_path, b"not a directory").unwrap();
+
+    let expected_err = tokio::fs::read_dir(&repos_path).await.unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let res = storage.list_repositories().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "read_dir on non-directory file must classify as StorageErrorKind::Io"
+    );
+
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_get_upload_session_malformed_json_is_corrupt_data() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical_repo =
+        crate::registry::canonical_name::CanonicalRepoName::parse("testrepo").unwrap();
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let session = UploadSessionId::new(canonical_repo, &uuid);
+
+    // Ensure uploads directory exists and write malformed session metadata JSON
+    let uploads_dir = storage.uploads_dir();
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let meta_path = storage.session_meta_path(&session.uuid);
+    let malformed_bytes = b"{{{ malformed session json";
+    std::fs::write(&meta_path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<FsSessionMetaRecord>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let res = storage.session_status(&session).await;
+    match res {
+        Err(UploadTransitionError::Storage(err)) => {
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::CorruptData),
+                "Malformed session metadata in session_status must classify as CorruptData"
+            );
+            assert_eq!(err.message(), Some(expected_message.as_str()));
+            assert_eq!(
+                err.to_string(),
+                format!("internal error: {expected_message}")
+            );
+        }
+        other => panic!("expected UploadTransitionError::Storage with CorruptData, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_upload_session_mutation_malformed_json_is_corrupt_data() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical_repo =
+        crate::registry::canonical_name::CanonicalRepoName::parse("testrepo").unwrap();
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let session = UploadSessionId::new(canonical_repo, &uuid);
+
+    // Ensure uploads directory exists and write malformed session metadata JSON
+    let uploads_dir = storage.uploads_dir();
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let meta_path = storage.session_meta_path(&session.uuid);
+    let malformed_bytes = b"{{{ malformed mutation session json";
+    std::fs::write(&meta_path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<FsSessionMetaRecord>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let res = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![]),
+            1024 * 1024,
+        )
+        .await;
+
+    match res {
+        Err(UploadTransitionError::Storage(err)) => {
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::CorruptData),
+                "Malformed session metadata in append_if_offset must classify as CorruptData"
+            );
+            assert_eq!(err.message(), Some(expected_message.as_str()));
+            assert_eq!(
+                err.to_string(),
+                format!("internal error: {expected_message}")
+            );
+        }
+        other => panic!("expected UploadTransitionError::Storage with CorruptData, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_begin_finalize_malformed_json_is_corrupt_data() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical_repo =
+        crate::registry::canonical_name::CanonicalRepoName::parse("testrepo").unwrap();
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let session = UploadSessionId::new(canonical_repo, &uuid);
+
+    // Ensure uploads directory exists and write malformed session metadata JSON
+    let uploads_dir = storage.uploads_dir();
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let meta_path = storage.session_meta_path(&session.uuid);
+    let malformed_bytes = b"{{{ malformed finalize session json";
+    std::fs::write(&meta_path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<FsSessionMetaRecord>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let digest =
+        Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .unwrap();
+
+    let res = storage
+        .begin_finalize(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            None,
+            &digest,
+            1024 * 1024,
+            false,
+        )
+        .await;
+
+    match res {
+        Err(UploadTransitionError::Storage(err)) => {
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::CorruptData),
+                "Malformed session metadata in begin_finalize must classify as CorruptData"
+            );
+            assert_eq!(err.message(), Some(expected_message.as_str()));
+            assert_eq!(
+                err.to_string(),
+                format!("internal error: {expected_message}")
+            );
+        }
+        other => panic!("expected UploadTransitionError::Storage with CorruptData, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_commit_finalize_malformed_json_is_corrupt_data() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical_repo =
+        crate::registry::canonical_name::CanonicalRepoName::parse("testrepo").unwrap();
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let session = UploadSessionId::new(canonical_repo, &uuid);
+
+    // Ensure uploads directory exists and write malformed session metadata JSON
+    let uploads_dir = storage.uploads_dir();
+    std::fs::create_dir_all(&uploads_dir).unwrap();
+    let meta_path = storage.session_meta_path(&session.uuid);
+    let malformed_bytes = b"{{{ malformed commit finalize session json";
+    std::fs::write(&meta_path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<FsSessionMetaRecord>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let digest =
+        Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .unwrap();
+
+    let prepared = crate::storage::upload_session::PreparedFinalize {
+        session,
+        operation_id: "op-test-123".to_string(),
+        expected_digest: digest,
+        committed_offset: 0,
+        size: 0,
+    };
+
+    let res = storage.commit_finalize(&prepared).await;
+
+    match res {
+        Err(UploadTransitionError::Storage(err)) => {
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::CorruptData),
+                "Malformed session metadata in commit_finalize must classify as CorruptData"
+            );
+            assert_eq!(err.message(), Some(expected_message.as_str()));
+            assert_eq!(
+                err.to_string(),
+                format!("internal error: {expected_message}")
+            );
+        }
+        other => panic!("expected UploadTransitionError::Storage with CorruptData, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_get_finalized_receipt_malformed_json_is_corrupt_data() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical_repo =
+        crate::registry::canonical_name::CanonicalRepoName::parse("testrepo").unwrap();
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let session = UploadSessionId::new(canonical_repo, &uuid);
+
+    // Ensure finalized directory exists and write malformed receipt JSON
+    let finalized_dir = storage.finalized_dir();
+    std::fs::create_dir_all(&finalized_dir).unwrap();
+    let receipt_path = storage.finalized_receipt_path(&session.uuid);
+    let malformed_bytes = b"{{{ malformed receipt json";
+    std::fs::write(&receipt_path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<FinalizedReceipt>(malformed_bytes).unwrap_err();
+    let expected_message = expected_err.to_string();
+
+    let res = storage.get_finalized_receipt(&session).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed finalized receipt JSON must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_get_repo_blob_membership_malformed_json_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical = CanonicalRepoName::parse("testrepo").unwrap();
+    let digest =
+        Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .unwrap();
+
+    let path = storage.repo_blob_path(&canonical, &digest);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let malformed_bytes = b"{{{ malformed membership json";
+    std::fs::write(&path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<
+        crate::storage::repo_membership::RepoBlobMembershipRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_message = format!(
+        "corrupt membership record in {}: {expected_err}",
+        path.display()
+    );
+
+    let res = storage.get_repo_blob_membership("testrepo", &digest).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed repo blob membership JSON must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_set_membership_candidate_malformed_json_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical = CanonicalRepoName::parse("testrepo").unwrap();
+    let digest =
+        Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .unwrap();
+
+    let path = storage.repo_blob_path(&canonical, &digest);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let malformed_bytes = b"{{{ malformed candidate membership json";
+    std::fs::write(&path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<
+        crate::storage::repo_membership::RepoBlobMembershipRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_message = format!("corrupt membership record: {expected_err}");
+
+    let res = storage
+        .set_membership_candidate("testrepo", &digest, 12345)
+        .await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed candidate membership JSON must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_list_all_repo_blob_memberships_page_corrupt_repo_dir_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let invalid_repo_encoded = "invalid!!repo++name";
+    let repo_dir = root
+        .join("repo-memberships")
+        .join("by-repo")
+        .join(invalid_repo_encoded);
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    let expected_err =
+        crate::storage::repo_membership::decode_canonical_repo_key(invalid_repo_encoded)
+            .unwrap_err();
+    let expected_message =
+        format!("corrupt repository membership directory '{invalid_repo_encoded}': {expected_err}");
+
+    let res = storage.list_all_repo_blob_memberships_page(None, 10).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Corrupt repository membership directory name must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_list_repo_blob_memberships_page_io_error_is_io() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let canonical = CanonicalRepoName::parse("testrepo").unwrap();
+    let encoded_repo = crate::storage::repo_membership::encode_canonical_repo_key(&canonical);
+    let algo_dir = root
+        .join("repo-memberships")
+        .join("by-repo")
+        .join(encoded_repo)
+        .join("sha256");
+
+    // Create a directory instead of a regular file ending in .json to deterministically trigger an OS I/O error on file read
+    let cand_path =
+        algo_dir.join("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.json");
+    std::fs::create_dir_all(&cand_path).unwrap();
+
+    let raw_io_err = tokio::fs::read(&cand_path).await.unwrap_err();
+    let expected_message = format!(
+        "failed to read membership in {}: {raw_io_err}",
+        cand_path.display()
+    );
+
+    let res = storage
+        .list_repo_blob_memberships_page("testrepo", None, 10)
+        .await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "Filesystem read failure during membership enumeration must classify as Io"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_get_migration_checkpoint_malformed_json_is_corrupt_data() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let meta_dir = root.join("meta");
+    std::fs::create_dir_all(&meta_dir).unwrap();
+    let cp_path = meta_dir.join("migration_checkpoint.json");
+    let malformed_bytes = b"{{{ malformed migration checkpoint json";
+    std::fs::write(&cp_path, malformed_bytes).unwrap();
+
+    let expected_err = serde_json::from_slice::<
+        crate::storage::repo_membership::MigrationCheckpointRecord,
+    >(malformed_bytes)
+    .unwrap_err();
+    let expected_message = format!("corrupt migration checkpoint: {expected_err}");
+
+    let res = storage.get_migration_checkpoint().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed migration checkpoint JSON must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_for_gc_malformed_prefix_is_corrupt_data() {
+    use crate::storage::GcStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let invalid_prefix_name = "invalid_prefix_name";
+    let invalid_prefix = root.join("blobs").join("sha256").join(invalid_prefix_name);
+    std::fs::create_dir_all(&invalid_prefix).unwrap();
+
+    let expected_message =
+        format!("malformed 2-char prefix directory name in CAS root: {invalid_prefix_name}");
+
+    let res = storage.list_cas_blobs_page(None, 10).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed 2-char prefix directory name in CAS root must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_for_gc_malformed_blob_filename_is_corrupt_data() {
+    use crate::storage::GcStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let shard_name = "e3";
+    let shard_dir = root.join("blobs").join("sha256").join(shard_name);
+    std::fs::create_dir_all(&shard_dir).unwrap();
+
+    let invalid_filename = "not_a_valid_64_char_hex_hash.bin";
+    let invalid_file = shard_dir.join(invalid_filename);
+    std::fs::write(&invalid_file, b"test content").unwrap();
+
+    let expected_message = format!(
+        "malformed blob file name in CAS shard {}: {invalid_filename}",
+        shard_dir.display()
+    );
+
+    let res = storage.list_cas_blobs_page(None, 10).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Malformed blob filename in CAS shard must classify as CorruptData"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_blocking_task_join_error_is_internal_invariant() {
+    let join_handle = tokio::task::spawn_blocking(|| {
+        panic!("deliberate worker panic for join error test");
+    });
+    let join_res = join_handle.await;
+    assert!(join_res.is_err(), "deliberate panic must yield JoinError");
+    let join_err = join_res.unwrap_err();
+    let expected_message = join_err.to_string();
+
+    let err = map_blocking_join_error(join_err);
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::InternalInvariant)
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_for_gc_io_error_is_io() {
+    use crate::storage::GcStorage;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let blobs_dir = root.join("blobs");
+    std::fs::create_dir_all(&blobs_dir).unwrap();
+    let cas_root_file = blobs_dir.join("sha256");
+    std::fs::write(&cas_root_file, b"not a directory").unwrap();
+
+    let raw_io_err = tokio::fs::read_dir(&cas_root_file).await.unwrap_err();
+    let expected_message = format!("read_dir {}: {raw_io_err}", cas_root_file.display());
+
+    let res = storage.list_cas_blobs_page(None, 10).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "Filesystem read_dir failure during GC blob listing must classify as Io"
+    );
+    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_delete_blob_conditional_missing_version_precondition_is_conflict() {
+    use crate::storage::GcStorage;
+    use crate::storage::mutation_authority::RuntimeMutationAuthority;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let authority = RuntimeMutationAuthority::acquire(
+        Arc::new(FsStorage::new(root.clone(), 1024 * 1024)),
+        "test-gc-node",
+    )
+    .await
+    .expect("acquire mutation authority");
+    let permit = authority.gc_mutation_permit();
+    let digest =
+        Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .expect("valid digest");
+
+    let expected_message = "conditional delete on filesystem storage requires expected version";
+    let res = storage
+        .delete_blob_conditional(&permit, &digest, None)
+        .await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Conflict),
+        "Missing version precondition must classify as Conflict"
+    );
+    assert_eq!(err.message(), Some(expected_message));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
+}
+
+#[tokio::test]
+async fn test_quarantine_blob_invalid_permit_is_permission_denied() {
+    use crate::storage::GcStorage;
+    use crate::storage::mutation_authority::RuntimeMutationAuthority;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let authority = RuntimeMutationAuthority::acquire(
+        Arc::new(FsStorage::new(root.clone(), 1024 * 1024)),
+        "test-gc-node",
+    )
+    .await
+    .expect("acquire mutation authority");
+    let permit = authority.gc_mutation_permit();
+    let _guard = authority.set_test_inactive_guard();
+    assert!(!permit.is_valid());
+
+    let digest =
+        Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .expect("valid digest");
+    let version = BlobObjectVersion("fs:0:0:dummy".to_string());
+
+    let expected_message = "invalid or inactive GC mutation permit";
+    let res = storage.quarantine_blob(&permit, &digest, &version).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::PermissionDenied),
+        "Invalid permit must classify as PermissionDenied"
+    );
+    assert_eq!(err.message(), Some(expected_message));
+    assert_eq!(
+        err.to_string(),
+        format!("internal error: {expected_message}")
+    );
 }

@@ -51,7 +51,7 @@ async fn scan_repo_for_blob(
             let parsed = match parse_manifest_refs(&bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(StorageError::Internal(format!(
+                    return Err(StorageError::corrupt_data(format!(
                         "unparsable manifest {}: {e}",
                         digest.as_str()
                     )));
@@ -164,6 +164,30 @@ pub enum BlobDeleteResult {
     InUse { message: String },
 }
 
+pub(crate) fn map_ledger_error(
+    err: crate::repository_membership_ledger::LedgerError,
+) -> StorageError {
+    let msg = err.to_string();
+    match err {
+        crate::repository_membership_ledger::LedgerError::Storage(se) => match se {
+            StorageError::Internal { kind, .. } => StorageError::internal(kind, msg),
+            other => other,
+        },
+        crate::repository_membership_ledger::LedgerError::RefIndex(e) => {
+            match crate::upload_coordinator::map_ref_index_error(e) {
+                StorageError::Internal { kind, .. } => StorageError::internal(kind, msg),
+                other => other,
+            }
+        }
+        crate::repository_membership_ledger::LedgerError::Corrupt(_) => {
+            StorageError::corrupt_data(msg)
+        }
+        crate::repository_membership_ledger::LedgerError::IndexRequired(_) => {
+            StorageError::configuration(msg)
+        }
+    }
+}
+
 pub struct BlobDeleteService {
     ledger: crate::repository_membership_ledger::RepositoryMembershipLedger,
     index_storage: Arc<dyn BlobIndexStoragePort>,
@@ -218,8 +242,7 @@ impl BlobDeleteService {
         match self.ledger.unlink_with_guard(&guard, repo, digest).await {
             Ok(true) => Ok(BlobDeleteResult::Success),
             Ok(false) => Ok(BlobDeleteResult::NotFound),
-            Err(crate::repository_membership_ledger::LedgerError::Storage(e)) => Err(e),
-            Err(e) => Err(StorageError::Internal(e.to_string())),
+            Err(e) => Err(map_ledger_error(e)),
         }
     }
 }
@@ -227,8 +250,10 @@ impl BlobDeleteService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
+    use crate::blob_ref_index::RefIndexError;
+    use crate::repository_membership_ledger::LedgerError;
     use crate::storage::fs::FsStorage;
+    use crate::storage::{Storage, StorageErrorKind};
     use sha2::{Digest as _, Sha256, Sha512};
     use std::path::PathBuf;
 
@@ -239,6 +264,263 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).expect("create temp fs_root");
         p
+    }
+
+    #[test]
+    fn test_delete_repo_blob_ledger_error_typed_mapping() {
+        use std::path::PathBuf;
+
+        // 1. LedgerError::Storage(Conflict) -> preserved directly
+        let ledger_conflict = LedgerError::Storage(StorageError::conflict("tag lock contention"));
+        let expected_conflict_msg = ledger_conflict.to_string();
+        let mapped_conflict = map_ledger_error(ledger_conflict);
+        assert!(matches!(
+            mapped_conflict,
+            StorageError::Internal {
+                kind: StorageErrorKind::Conflict,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_conflict.internal_kind(),
+            Some(StorageErrorKind::Conflict)
+        );
+        assert_eq!(
+            mapped_conflict.message(),
+            Some(expected_conflict_msg.as_str())
+        );
+        assert_eq!(
+            mapped_conflict.to_string(),
+            format!("internal error: {expected_conflict_msg}")
+        );
+
+        // 2. LedgerError::Storage(PermissionDenied) -> preserved directly
+        let ledger_perm =
+            LedgerError::Storage(StorageError::permission_denied("read-only storage mode"));
+        let expected_perm_msg = ledger_perm.to_string();
+        let mapped_perm = map_ledger_error(ledger_perm);
+        assert!(matches!(
+            mapped_perm,
+            StorageError::Internal {
+                kind: StorageErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_perm.internal_kind(),
+            Some(StorageErrorKind::PermissionDenied)
+        );
+        assert_eq!(mapped_perm.message(), Some(expected_perm_msg.as_str()));
+        assert_eq!(
+            mapped_perm.to_string(),
+            format!("internal error: {expected_perm_msg}")
+        );
+
+        // 3. LedgerError::Storage(NotFound) -> preserved directly (dedicated variant)
+        let ledger_nf = LedgerError::Storage(StorageError::NotFound);
+        let mapped_nf = map_ledger_error(ledger_nf);
+        assert!(matches!(mapped_nf, StorageError::NotFound));
+        assert_eq!(mapped_nf.internal_kind(), None);
+        assert_eq!(mapped_nf.message(), None);
+        assert_eq!(mapped_nf.to_string(), "not found");
+
+        // 4. LedgerError::RefIndex(RefIndexError::Sled(Io(PermissionDenied))) -> StorageErrorKind::PermissionDenied
+        let sled_perm = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let ledger_sled_perm = LedgerError::RefIndex(RefIndexError::Sled(sled_perm));
+        let expected_sled_perm_msg = ledger_sled_perm.to_string();
+        let mapped_sled_perm = map_ledger_error(ledger_sled_perm);
+        assert!(matches!(
+            mapped_sled_perm,
+            StorageError::Internal {
+                kind: StorageErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_sled_perm.internal_kind(),
+            Some(StorageErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            mapped_sled_perm.message(),
+            Some(expected_sled_perm_msg.as_str())
+        );
+        assert_eq!(
+            mapped_sled_perm.to_string(),
+            format!("internal error: {expected_sled_perm_msg}")
+        );
+
+        // 5. LedgerError::RefIndex(RefIndexError::Sled(Io(ordinary))) -> StorageErrorKind::Io
+        let sled_io = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        let ledger_sled_io = LedgerError::RefIndex(RefIndexError::Sled(sled_io));
+        let expected_sled_io_msg = ledger_sled_io.to_string();
+        let mapped_sled_io = map_ledger_error(ledger_sled_io);
+        assert!(matches!(
+            mapped_sled_io,
+            StorageError::Internal {
+                kind: StorageErrorKind::Io,
+                ..
+            }
+        ));
+        assert_eq!(mapped_sled_io.internal_kind(), Some(StorageErrorKind::Io));
+        assert_eq!(
+            mapped_sled_io.message(),
+            Some(expected_sled_io_msg.as_str())
+        );
+        assert_eq!(
+            mapped_sled_io.to_string(),
+            format!("internal error: {expected_sled_io_msg}")
+        );
+
+        // 5b. LedgerError::RefIndex(RefIndexError::Storage(StorageError::backend(...))) -> StorageErrorKind::Backend
+        let ledger_ref_backend = LedgerError::RefIndex(RefIndexError::Storage(
+            StorageError::backend("s3 connection reset"),
+        ));
+        let expected_ref_backend_msg = ledger_ref_backend.to_string();
+        let mapped_ref_backend = map_ledger_error(ledger_ref_backend);
+        assert!(matches!(
+            mapped_ref_backend,
+            StorageError::Internal {
+                kind: StorageErrorKind::Backend,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_ref_backend.internal_kind(),
+            Some(StorageErrorKind::Backend)
+        );
+        assert_eq!(
+            mapped_ref_backend.message(),
+            Some(expected_ref_backend_msg.as_str())
+        );
+        assert_eq!(
+            mapped_ref_backend.to_string(),
+            format!("internal error: {expected_ref_backend_msg}")
+        );
+
+        // 6. LedgerError::RefIndex(RefIndexError::Sled(Io(ENOSPC))) -> dedicated StorageError::InsufficientStorage
+        let sled_enospc = sled::Error::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        let ledger_sled_enospc = LedgerError::RefIndex(RefIndexError::Sled(sled_enospc));
+        let mapped_sled_enospc = map_ledger_error(ledger_sled_enospc);
+        assert!(matches!(
+            mapped_sled_enospc,
+            StorageError::InsufficientStorage
+        ));
+        assert_eq!(mapped_sled_enospc.internal_kind(), None);
+        assert_eq!(mapped_sled_enospc.message(), None);
+        assert_eq!(mapped_sled_enospc.to_string(), "insufficient storage");
+
+        // 7. LedgerError::RefIndex(RefIndexError::Sled(Corruption)) -> StorageErrorKind::CorruptData
+        let sled_corr = sled::Error::Corruption { at: None, bt: () };
+        let ledger_sled_corr = LedgerError::RefIndex(RefIndexError::Sled(sled_corr));
+        let expected_sled_corr_msg = ledger_sled_corr.to_string();
+        let mapped_sled_corr = map_ledger_error(ledger_sled_corr);
+        assert!(matches!(
+            mapped_sled_corr,
+            StorageError::Internal {
+                kind: StorageErrorKind::CorruptData,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_sled_corr.internal_kind(),
+            Some(StorageErrorKind::CorruptData)
+        );
+        assert_eq!(
+            mapped_sled_corr.message(),
+            Some(expected_sled_corr_msg.as_str())
+        );
+        assert_eq!(
+            mapped_sled_corr.to_string(),
+            format!("internal error: {expected_sled_corr_msg}")
+        );
+
+        // 8. LedgerError::RefIndex(RefIndexError::Corrupt) -> StorageErrorKind::CorruptData
+        let ledger_ref_corr =
+            LedgerError::RefIndex(RefIndexError::Corrupt("bad index checksum".to_string()));
+        let expected_ref_corr_msg = ledger_ref_corr.to_string();
+        let mapped_ref_corr = map_ledger_error(ledger_ref_corr);
+        assert!(matches!(
+            mapped_ref_corr,
+            StorageError::Internal {
+                kind: StorageErrorKind::CorruptData,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_ref_corr.internal_kind(),
+            Some(StorageErrorKind::CorruptData)
+        );
+        assert_eq!(
+            mapped_ref_corr.message(),
+            Some(expected_ref_corr_msg.as_str())
+        );
+        assert_eq!(
+            mapped_ref_corr.to_string(),
+            format!("internal error: {expected_ref_corr_msg}")
+        );
+
+        // 9. LedgerError::RefIndex(RefIndexError::NotFound) -> StorageError::NotFound
+        let ledger_ref_nf =
+            LedgerError::RefIndex(RefIndexError::NotFound(PathBuf::from("/missing/db")));
+        let mapped_ref_nf = map_ledger_error(ledger_ref_nf);
+        assert!(matches!(mapped_ref_nf, StorageError::NotFound));
+        assert_eq!(mapped_ref_nf.internal_kind(), None);
+        assert_eq!(mapped_ref_nf.message(), None);
+        assert_eq!(mapped_ref_nf.to_string(), "not found");
+
+        // 10. LedgerError::Corrupt -> StorageErrorKind::CorruptData
+        let ledger_corr = LedgerError::Corrupt("invalid marker schema".to_string());
+        let expected_ledger_corr_msg = ledger_corr.to_string();
+        let mapped_ledger_corr = map_ledger_error(ledger_corr);
+        assert!(matches!(
+            mapped_ledger_corr,
+            StorageError::Internal {
+                kind: StorageErrorKind::CorruptData,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_ledger_corr.internal_kind(),
+            Some(StorageErrorKind::CorruptData)
+        );
+        assert_eq!(
+            mapped_ledger_corr.message(),
+            Some(expected_ledger_corr_msg.as_str())
+        );
+        assert_eq!(
+            mapped_ledger_corr.to_string(),
+            format!("internal error: {expected_ledger_corr_msg}")
+        );
+
+        // 11. LedgerError::IndexRequired -> StorageErrorKind::Configuration
+        let ledger_idx_req = LedgerError::IndexRequired("secondary index is mandatory".to_string());
+        let expected_idx_req_msg = ledger_idx_req.to_string();
+        let mapped_idx_req = map_ledger_error(ledger_idx_req);
+        assert!(matches!(
+            mapped_idx_req,
+            StorageError::Internal {
+                kind: StorageErrorKind::Configuration,
+                ..
+            }
+        ));
+        assert_eq!(
+            mapped_idx_req.internal_kind(),
+            Some(StorageErrorKind::Configuration)
+        );
+        assert_eq!(
+            mapped_idx_req.message(),
+            Some(expected_idx_req_msg.as_str())
+        );
+        assert_eq!(
+            mapped_idx_req.to_string(),
+            format!("internal error: {expected_idx_req_msg}")
+        );
     }
 
     #[tokio::test]

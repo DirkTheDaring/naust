@@ -2,7 +2,7 @@ use super::upload_session::*;
 use super::{
     BlobMeta, BlobObjectVersion, ConditionalDeleteResult, GcBlobCandidate, GcBlobPage, GcCursor,
     GcDeleteResult, GcQuarantineResult, GcStorage, GcStorageStrategy, ManifestMeta,
-    ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta,
+    ReferrerDescriptor, RepoTimestamps, Storage, StorageError, StorageErrorKind, UploadMeta,
 };
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
@@ -67,7 +67,8 @@ pub enum S3BucketVersioningState {
     Unversioned,
     Enabled,
     Suspended,
-    UnknownOrDenied(String),
+    AccessDenied(String),
+    BackendError(String),
 }
 
 #[async_trait]
@@ -178,7 +179,7 @@ impl AwsS3Driver {
         let region_str = self
             .region
             .as_deref()
-            .ok_or_else(|| StorageError::Internal("STORAGE_S3_REGION is required".to_string()))?;
+            .ok_or_else(|| StorageError::configuration("STORAGE_S3_REGION is required"))?;
         let c = self
             .client
             .get_or_try_init(|| async {
@@ -222,12 +223,32 @@ impl AwsS3Driver {
     }
 }
 
+pub(crate) fn validate_multipart_upload_id(
+    upload_id: Option<&str>,
+) -> Result<String, StorageError> {
+    upload_id
+        .map(|s| s.to_string())
+        .ok_or_else(|| StorageError::backend("missing upload_id"))
+}
+
+pub(crate) fn track_continuation_token(
+    seen_tokens: &mut HashSet<String>,
+    token: &str,
+) -> Result<(), StorageError> {
+    if !seen_tokens.insert(token.to_string()) {
+        return Err(StorageError::backend(
+            "cyclic continuation token from S3 list_objects_v2",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl S3Driver for AwsS3Driver {
     async fn get_bucket_versioning_state(&self, bucket: &str) -> S3BucketVersioningState {
         let client = match self.client().await {
             Ok(c) => c,
-            Err(e) => return S3BucketVersioningState::UnknownOrDenied(e.to_string()),
+            Err(e) => return S3BucketVersioningState::BackendError(e.to_string()),
         };
         match client.get_bucket_versioning().bucket(bucket).send().await {
             Ok(resp) => match resp.status() {
@@ -239,7 +260,18 @@ impl S3Driver for AwsS3Driver {
                 }
                 _ => S3BucketVersioningState::Unversioned,
             },
-            Err(e) => S3BucketVersioningState::UnknownOrDenied(e.to_string()),
+            Err(e) => match e {
+                aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                    let status = se.raw().status().as_u16();
+                    let code = se.err().meta().code().unwrap_or("");
+                    if status == 403 || code == "AccessDenied" {
+                        S3BucketVersioningState::AccessDenied(se.err().to_string())
+                    } else {
+                        S3BucketVersioningState::BackendError(se.err().to_string())
+                    }
+                }
+                other => S3BucketVersioningState::BackendError(other.to_string()),
+            },
         }
     }
 
@@ -255,10 +287,8 @@ impl S3Driver for AwsS3Driver {
             .key(key)
             .send()
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
-        resp.upload_id()
-            .map(|s| s.to_string())
-            .ok_or_else(|| StorageError::Internal("missing upload_id".to_string()))
+            .map_err(|err| map_sdk_err(err, classify_s3_generic_service_error))?;
+        validate_multipart_upload_id(resp.upload_id())
     }
 
     async fn upload_part(
@@ -279,7 +309,7 @@ impl S3Driver for AwsS3Driver {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(|err| map_sdk_err(err, classify_s3_generic_service_error))?;
         Ok(resp.e_tag().unwrap_or("").trim_matches('"').to_string())
     }
 
@@ -311,7 +341,7 @@ impl S3Driver for AwsS3Driver {
             .multipart_upload(upload)
             .send()
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(|err| map_sdk_err(err, classify_s3_generic_service_error))?;
         Ok(())
     }
 
@@ -353,7 +383,7 @@ impl S3Driver for AwsS3Driver {
         let resp = req
             .send()
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(|err| map_sdk_err(err, classify_s3_generic_service_error))?;
 
         let uploads = resp
             .uploads()
@@ -401,7 +431,7 @@ impl S3Driver for AwsS3Driver {
             .body
             .collect()
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| StorageError::backend(e.to_string()))?
             .into_bytes();
         Ok(Some((bytes, etag)))
     }
@@ -450,21 +480,25 @@ impl S3Driver for AwsS3Driver {
                     aws_sdk_s3::error::SdkError::ServiceError(se) => {
                         let status = se.raw().status().as_u16();
                         let code = se.err().meta().code().unwrap_or("");
-                        status == 412
-                            || code == "PreconditionFailed"
-                            || code == "AtLeastOnePreconditionFailed"
+                        is_s3_precondition_failure(status, code)
                     }
                     _ => false,
                 };
-                let err_str = err.to_string();
-                if is_precondition_failed
-                    || err_str.contains("PreconditionFailed")
-                    || err_str.contains("AtLeastOnePreconditionFailed")
-                    || err_str.contains("412")
-                {
+                if is_precondition_failed {
                     return Err(StorageError::TagAlreadyExists);
                 }
-                return Err(StorageError::Internal(err_str));
+                let is_permission = match &err {
+                    aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                        let status = se.raw().status().as_u16();
+                        let code = se.err().meta().code().unwrap_or("");
+                        status == 403 || code == "AccessDenied"
+                    }
+                    _ => false,
+                };
+                if is_permission {
+                    return Err(StorageError::permission_denied(err.to_string()));
+                }
+                return Err(StorageError::backend(err.to_string()));
             }
         };
         Ok(resp.e_tag().unwrap_or("").trim_matches('"').to_string())
@@ -503,40 +537,24 @@ impl S3Driver for AwsS3Driver {
         }
         match req.send().await {
             Ok(_) => Ok(super::ConditionalDeleteResult::Deleted),
-            Err(e) => {
-                let (is_412, is_404) = match &e {
-                    aws_sdk_s3::error::SdkError::ServiceError(se) => {
-                        let status = se.raw().status().as_u16();
-                        let code = se.err().meta().code().unwrap_or("");
-                        (
-                            status == 412
-                                || code == "PreconditionFailed"
-                                || code == "AtLeastOnePreconditionFailed",
-                            status == 404 || code == "NoSuchKey" || code == "NotFound",
-                        )
+            Err(e) => match &e {
+                aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                    let status = se.raw().status().as_u16();
+                    let code = se.err().meta().code().unwrap_or("");
+                    if is_s3_precondition_failure(status, code) {
+                        let latest = match self.get_object(bucket, key).await {
+                            Ok(Some((_, etag))) => Some(etag),
+                            _ => None,
+                        };
+                        Ok(super::ConditionalDeleteResult::PreconditionFailed {
+                            current_version: latest,
+                        })
+                    } else {
+                        classify_s3_delete_service_error(status, code, e.to_string())
                     }
-                    _ => (false, false),
-                };
-                let err_str = e.to_string();
-                if is_412
-                    || err_str.contains("PreconditionFailed")
-                    || err_str
-                        .contains("At least one of the pre-conditions you specified did not hold")
-                    || err_str.contains("412")
-                {
-                    let latest = match self.get_object(bucket, key).await {
-                        Ok(Some((_, etag))) => Some(etag),
-                        _ => None,
-                    };
-                    Ok(super::ConditionalDeleteResult::PreconditionFailed {
-                        current_version: latest,
-                    })
-                } else if is_404 || err_str.contains("NoSuchKey") || err_str.contains("404") {
-                    Ok(super::ConditionalDeleteResult::NotFound)
-                } else {
-                    Err(StorageError::Internal(err_str))
                 }
-            }
+                _ => Err(StorageError::backend(e.to_string())),
+            },
         }
     }
 
@@ -555,7 +573,7 @@ impl S3Driver for AwsS3Driver {
             .copy_source(format!("{src_bucket}/{src_key}"))
             .send()
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(|e| map_sdk_err(e, classify_s3_copy_service_error))?;
         Ok(())
     }
 
@@ -580,7 +598,7 @@ impl S3Driver for AwsS3Driver {
             let resp = req
                 .send()
                 .await
-                .map_err(|err| StorageError::Internal(err.to_string()))?;
+                .map_err(|err| map_sdk_err(err, classify_s3_generic_service_error))?;
 
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
@@ -602,11 +620,7 @@ impl S3Driver for AwsS3Driver {
             if resp.is_truncated().unwrap_or(false) {
                 if let Some(next) = resp.next_continuation_token() {
                     let next_str = next.to_string();
-                    if !seen_tokens.insert(next_str.clone()) {
-                        return Err(StorageError::Internal(
-                            "continuation token cycle detected during list_objects_v2".to_string(),
-                        ));
-                    }
+                    track_continuation_token(&mut seen_tokens, &next_str)?;
                     token = Some(next_str);
                 } else {
                     break;
@@ -638,7 +652,7 @@ impl S3Driver for AwsS3Driver {
         let resp = req
             .send()
             .await
-            .map_err(|err| StorageError::Internal(err.to_string()))?;
+            .map_err(|err| map_sdk_err(err, classify_s3_generic_service_error))?;
 
         let mut objects = Vec::new();
         for obj in resp.contents() {
@@ -773,7 +787,7 @@ impl S3Storage {
     fn bucket(&self) -> Result<&str, StorageError> {
         self.bucket
             .as_deref()
-            .ok_or_else(|| StorageError::Internal("STORAGE_S3_BUCKET is required".to_string()))
+            .ok_or_else(|| StorageError::configuration("STORAGE_S3_BUCKET is required"))
     }
 
     fn key(&self, suffix: &str) -> String {
@@ -845,7 +859,7 @@ impl S3Storage {
     pub async fn check_bucket_versioning(&self) -> S3BucketVersioningState {
         match self.bucket() {
             Ok(b) => self.driver.get_bucket_versioning_state(b).await,
-            Err(e) => S3BucketVersioningState::UnknownOrDenied(e.to_string()),
+            Err(e) => S3BucketVersioningState::BackendError(e.to_string()),
         }
     }
 
@@ -1041,8 +1055,8 @@ impl S3Storage {
     }
 
     async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|err| StorageError::Internal(err.to_string()))?;
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|err| StorageError::corrupt_data(err.to_string()))?;
         let media_type = value
             .get("mediaType")
             .and_then(|v| v.as_str())
@@ -1062,7 +1076,7 @@ impl S3Storage {
             None => Ok(None),
             Some((bytes, etag)) => {
                 let s = std::str::from_utf8(&bytes)
-                    .map_err(|_| StorageError::Internal("invalid tag pointer".to_string()))?;
+                    .map_err(|_| StorageError::corrupt_data("invalid tag pointer"))?;
                 let digest = Digest::parse(s.trim()).map_err(|_| StorageError::NotFound)?;
                 Ok(Some((digest, etag)))
             }
@@ -1080,7 +1094,7 @@ impl S3Storage {
             None => Ok(None),
             Some((bytes, etag)) => {
                 let doc: S3SessionDoc = serde_json::from_slice(&bytes)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(|e| StorageError::corrupt_data(e.to_string()))?;
                 Ok(Some((doc, etag)))
             }
         }
@@ -1094,7 +1108,8 @@ impl S3Storage {
     ) -> Result<String, StorageError> {
         let bucket = self.bucket()?;
         let key = self.session_key(uuid);
-        let body = serde_json::to_vec(doc).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let body =
+            serde_json::to_vec(doc).map_err(|e| StorageError::serialization(e.to_string()))?;
         let if_match = expected_etag.map(|s| s.to_string());
         let if_none_match = if expected_etag.is_none() {
             Some("*".to_string())
@@ -1107,6 +1122,110 @@ impl S3Storage {
     }
 }
 
+pub(crate) fn classify_s3_get_head_service_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> StorageError {
+    if status == 404 || code == "NoSuchKey" || code == "NotFound" {
+        StorageError::NotFound
+    } else if status == 403 || code == "AccessDenied" {
+        StorageError::permission_denied(raw_message)
+    } else {
+        StorageError::backend(raw_message)
+    }
+}
+
+fn is_s3_precondition_failure(status: u16, code: &str) -> bool {
+    status == 412
+        || code == "PreconditionFailed"
+        || code == "AtLeastOneConditionFailed"
+        || code == "AtLeastOnePreconditionFailed"
+}
+
+pub(crate) fn classify_s3_put_service_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> StorageError {
+    if status == 403 || code == "AccessDenied" {
+        StorageError::permission_denied(raw_message)
+    } else if is_s3_precondition_failure(status, code) {
+        StorageError::conflict(raw_message)
+    } else {
+        StorageError::backend(raw_message)
+    }
+}
+
+pub(crate) fn classify_s3_delete_service_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> Result<super::ConditionalDeleteResult, StorageError> {
+    if is_s3_precondition_failure(status, code) {
+        Ok(super::ConditionalDeleteResult::PreconditionFailed {
+            current_version: None,
+        })
+    } else if status == 404 || code == "NoSuchKey" || code == "NotFound" {
+        Ok(super::ConditionalDeleteResult::NotFound)
+    } else if status == 403 || code == "AccessDenied" {
+        Err(StorageError::permission_denied(raw_message))
+    } else {
+        Err(StorageError::backend(raw_message))
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn classify_s3_service_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> StorageError {
+    classify_s3_get_head_service_error(status, code, raw_message)
+}
+
+pub(crate) fn classify_s3_generic_service_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> StorageError {
+    if status == 403 || code == "AccessDenied" {
+        StorageError::permission_denied(raw_message)
+    } else {
+        StorageError::backend(raw_message)
+    }
+}
+
+pub(crate) fn classify_s3_copy_service_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> StorageError {
+    if status == 404 || code == "NoSuchKey" || code == "NotFound" {
+        StorageError::NotFound
+    } else if status == 403 || code == "AccessDenied" {
+        StorageError::permission_denied(raw_message)
+    } else {
+        StorageError::backend(raw_message)
+    }
+}
+
+pub(crate) fn map_sdk_err<
+    E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
+>(
+    err: aws_sdk_s3::error::SdkError<E>,
+    classifier: fn(u16, &str, String) -> StorageError,
+) -> StorageError {
+    match &err {
+        aws_sdk_s3::error::SdkError::ServiceError(se) => {
+            let status = se.raw().status().as_u16();
+            let code = se.err().meta().code().unwrap_or("");
+            classifier(status, code, err.to_string())
+        }
+        _ => StorageError::backend(err.to_string()),
+    }
+}
+
 fn map_s3_err(
     err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
 ) -> StorageError {
@@ -1114,13 +1233,9 @@ fn map_s3_err(
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
             let status = se.raw().status().as_u16();
             let code = se.err().meta().code().unwrap_or("");
-            if status == 404 || code == "NoSuchKey" || code == "NotFound" {
-                StorageError::NotFound
-            } else {
-                StorageError::Internal(se.err().to_string())
-            }
+            classify_s3_get_head_service_error(status, code, se.err().to_string())
         }
-        other => StorageError::Internal(other.to_string()),
+        other => StorageError::backend(other.to_string()),
     }
 }
 
@@ -1131,13 +1246,9 @@ fn map_head_err(
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
             let status = se.raw().status().as_u16();
             let code = se.err().meta().code().unwrap_or("");
-            if status == 404 || code == "NoSuchKey" || code == "NotFound" {
-                StorageError::NotFound
-            } else {
-                StorageError::Internal(se.err().to_string())
-            }
+            classify_s3_get_head_service_error(status, code, se.err().to_string())
         }
-        other => StorageError::Internal(other.to_string()),
+        other => StorageError::backend(other.to_string()),
     }
 }
 
@@ -1147,9 +1258,11 @@ fn map_put_err(
 ) -> StorageError {
     match err {
         aws_sdk_s3::error::SdkError::ServiceError(se) => {
-            StorageError::Internal(se.err().to_string())
+            let status = se.raw().status().as_u16();
+            let code = se.err().meta().code().unwrap_or("");
+            classify_s3_put_service_error(status, code, se.err().to_string())
         }
-        other => StorageError::Internal(other.to_string()),
+        other => StorageError::backend(other.to_string()),
     }
 }
 
@@ -1158,17 +1271,18 @@ impl GcStorage for S3Storage {
     async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
         match self.check_bucket_versioning().await {
             S3BucketVersioningState::Unversioned => Ok(()),
-            S3BucketVersioningState::Enabled => Err(StorageError::Internal(
-                "S3 physical GC requires an unversioned bucket; bucket versioning is Enabled (delete would create delete markers rather than reclaim physical space)"
-                    .to_string(),
+            S3BucketVersioningState::Enabled => Err(StorageError::configuration(
+                "S3 physical GC requires an unversioned bucket; bucket versioning is Enabled (delete would create delete markers rather than reclaim physical space)",
             )),
-            S3BucketVersioningState::Suspended => Err(StorageError::Internal(
-                "S3 physical GC requires an unversioned bucket; bucket versioning is Suspended (noncurrent versions exist and cannot be reclaimed without version-aware GC)"
-                    .to_string(),
+            S3BucketVersioningState::Suspended => Err(StorageError::configuration(
+                "S3 physical GC requires an unversioned bucket; bucket versioning is Suspended (noncurrent versions exist and cannot be reclaimed without version-aware GC)",
             )),
-            S3BucketVersioningState::UnknownOrDenied(err) => Err(StorageError::Internal(
+            S3BucketVersioningState::AccessDenied(err) => Err(StorageError::permission_denied(
                 format!("S3 bucket versioning preflight check failed or permission denied: {err}"),
             )),
+            S3BucketVersioningState::BackendError(err) => Err(StorageError::backend(format!(
+                "S3 bucket versioning preflight check failed or permission denied: {err}"
+            ))),
         }
     }
 
@@ -1195,7 +1309,7 @@ impl GcStorage for S3Storage {
             let suffix = match obj.key.strip_prefix(&prefix) {
                 Some(s) => s,
                 None => {
-                    return Err(StorageError::Internal(format!(
+                    return Err(StorageError::corrupt_data(format!(
                         "malformed object key not starting with CAS prefix: {}",
                         obj.key
                     )));
@@ -1203,7 +1317,7 @@ impl GcStorage for S3Storage {
             };
             let parts: Vec<&str> = suffix.split('/').collect();
             if parts.len() != 2 {
-                return Err(StorageError::Internal(format!(
+                return Err(StorageError::corrupt_data(format!(
                     "malformed CAS object key structure in S3 (expected 2 parts): {}",
                     obj.key
                 )));
@@ -1217,7 +1331,7 @@ impl GcStorage for S3Storage {
                 || !p2.chars().all(|c| c.is_ascii_hexdigit())
                 || !hex.chars().all(|c| c.is_ascii_hexdigit())
             {
-                return Err(StorageError::Internal(format!(
+                return Err(StorageError::corrupt_data(format!(
                     "malformed CAS object key hex/prefix in S3: {}",
                     obj.key
                 )));
@@ -1226,7 +1340,7 @@ impl GcStorage for S3Storage {
             let digest = match Digest::parse(&format!("sha256:{}", hex.to_ascii_lowercase())) {
                 Ok(d) => d,
                 Err(e) => {
-                    return Err(StorageError::Internal(format!(
+                    return Err(StorageError::corrupt_data(format!(
                         "unparsable digest from CAS object key {}: {e}",
                         obj.key
                     )));
@@ -1260,8 +1374,8 @@ impl GcStorage for S3Storage {
         _version: &BlobObjectVersion,
     ) -> Result<GcQuarantineResult, StorageError> {
         if !permit.is_valid() {
-            return Err(StorageError::Internal(
-                "invalid or inactive GC mutation permit".to_string(),
+            return Err(StorageError::permission_denied(
+                "invalid or inactive GC mutation permit",
             ));
         }
         Ok(GcQuarantineResult::Skipped)
@@ -1273,8 +1387,8 @@ impl GcStorage for S3Storage {
         _digest: &Digest,
     ) -> Result<Option<u64>, StorageError> {
         if !permit.is_valid() {
-            return Err(StorageError::Internal(
-                "invalid or inactive GC mutation permit".to_string(),
+            return Err(StorageError::permission_denied(
+                "invalid or inactive GC mutation permit",
             ));
         }
         Ok(None)
@@ -1287,14 +1401,13 @@ impl GcStorage for S3Storage {
         version: Option<&BlobObjectVersion>,
     ) -> Result<GcDeleteResult, StorageError> {
         if !permit.is_valid() {
-            return Err(StorageError::Internal(
-                "invalid or inactive GC mutation permit".to_string(),
+            return Err(StorageError::permission_denied(
+                "invalid or inactive GC mutation permit",
             ));
         }
         let Some(version) = version else {
-            return Err(StorageError::Internal(
-                "S3 conditional delete requires an explicit object version/ETag; unconditional delete is forbidden in GC"
-                    .to_string(),
+            return Err(StorageError::conflict(
+                "S3 conditional delete requires an explicit object version/ETag; unconditional delete is forbidden in GC",
             ));
         };
         let bucket = self.bucket()?;
@@ -1363,7 +1476,7 @@ impl Storage for S3Storage {
                     let canon =
                         crate::storage::repo_membership::decode_canonical_repo_key(repo_enc)
                             .map_err(|e| {
-                                StorageError::Internal(format!(
+                                StorageError::corrupt_data(format!(
                                     "malformed repository membership key in S3: {e}"
                                 ))
                             })?;
@@ -1429,9 +1542,8 @@ impl Storage for S3Storage {
 
             if let Some(next_token) = page.next_continuation_token {
                 if !seen_tokens.insert(next_token.clone()) {
-                    return Err(StorageError::Internal(
-                        "repeated S3 continuation token detected during storage readiness check"
-                            .to_string(),
+                    return Err(StorageError::backend(
+                        "repeated S3 continuation token detected during storage readiness check",
                     ));
                 }
                 continuation_token = Some(next_token);
@@ -1482,7 +1594,7 @@ impl Storage for S3Storage {
         let key = self.tag_key(name, tag);
         let bytes = self.get_object_bytes(&key).await?;
         let s = std::str::from_utf8(&bytes)
-            .map_err(|_| StorageError::Internal("invalid tag pointer".to_string()))?;
+            .map_err(|_| StorageError::corrupt_data("invalid tag pointer"))?;
         Digest::parse(s.trim()).map_err(|_| StorageError::NotFound)
     }
 
@@ -1623,8 +1735,8 @@ impl Storage for S3Storage {
                                         .await;
                                         continue;
                                     }
-                                    return Err(StorageError::Internal(
-                                        "tag mutation contention limit exceeded".to_string(),
+                                    return Err(StorageError::conflict(
+                                        "tag mutation contention limit exceeded",
                                     ));
                                 }
                                 Err(err) => return Err(err),
@@ -1659,8 +1771,8 @@ impl Storage for S3Storage {
                                         .await;
                                         continue;
                                     }
-                                    return Err(StorageError::Internal(
-                                        "tag mutation contention limit exceeded".to_string(),
+                                    return Err(StorageError::conflict(
+                                        "tag mutation contention limit exceeded",
                                     ));
                                 }
                                 Err(err) => return Err(err),
@@ -1668,8 +1780,8 @@ impl Storage for S3Storage {
                         }
                     }
                 }
-                Err(StorageError::Internal(
-                    "tag mutation contention limit exceeded".to_string(),
+                Err(StorageError::conflict(
+                    "tag mutation contention limit exceeded",
                 ))
             }
         }
@@ -1814,7 +1926,7 @@ impl Storage for S3Storage {
         if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
             let s = String::from_utf8_lossy(&bytes);
             let digest = Digest::parse(s.trim())
-                .map_err(|e| StorageError::Internal(format!("corrupt tag {tag}: {e}")))?;
+                .map_err(|e| StorageError::corrupt_data(format!("corrupt tag {tag}: {e}")))?;
             return Ok(Some((digest, etag)));
         }
         Ok(None)
@@ -2158,7 +2270,7 @@ impl Storage for S3Storage {
                 && doc.owner_id != expected_owner
                 && doc.owner_token != expected_owner
             {
-                return Err(StorageError::Internal(format!(
+                return Err(StorageError::conflict(format!(
                     "lock owner mismatch: expected '{expected_owner}', current is '{}'",
                     doc.owner_id
                 )));
@@ -2273,7 +2385,7 @@ impl Storage for S3Storage {
             Err(e) => return Err(e),
         };
         serde_json::from_slice::<Vec<ReferrerDescriptor>>(&bytes)
-            .map_err(|err| StorageError::Internal(err.to_string()))
+            .map_err(|err| StorageError::corrupt_data(err.to_string()))
     }
 
     async fn add_referrer(
@@ -2290,8 +2402,8 @@ impl Storage for S3Storage {
         if !existing.iter().any(|d| d.digest == descriptor.digest) {
             existing.push(descriptor);
         }
-        let body =
-            serde_json::to_vec(&existing).map_err(|err| StorageError::Internal(err.to_string()))?;
+        let body = serde_json::to_vec(&existing)
+            .map_err(|err| StorageError::serialization(err.to_string()))?;
 
         self.driver
             .put_object_conditional(bucket, &key, Bytes::from(body), None, None)
@@ -2321,7 +2433,7 @@ impl Storage for S3Storage {
             let _ = self.driver.delete_object(bucket, &key).await;
         } else {
             let body = serde_json::to_vec(&existing)
-                .map_err(|err| StorageError::Internal(err.to_string()))?;
+                .map_err(|err| StorageError::serialization(err.to_string()))?;
             self.driver
                 .put_object_conditional(bucket, &key, Bytes::from(body), None, None)
                 .await?;
@@ -2335,7 +2447,7 @@ impl Storage for S3Storage {
 
         let bytes = self.get_object_bytes(&key).await?;
         let maybe_subject = crate::manifest_refs::extract_subject_digest(&bytes).map_err(|e| {
-            StorageError::Internal(format!(
+            StorageError::corrupt_data(format!(
                 "cannot delete manifest with malformed structure: {e}"
             ))
         })?;
@@ -3090,8 +3202,9 @@ impl UploadSessionStorage for S3Storage {
             finalized_at_unix_secs: now,
             format_version: 1,
         };
-        let receipt_bytes = serde_json::to_vec(&receipt)
-            .map_err(|e| UploadTransitionError::Storage(StorageError::Internal(e.to_string())))?;
+        let receipt_bytes = serde_json::to_vec(&receipt).map_err(|e| {
+            UploadTransitionError::Storage(StorageError::serialization(e.to_string()))
+        })?;
         self.driver
             .put_object_conditional(
                 bucket,
@@ -3290,9 +3403,8 @@ impl UploadSessionStorage for S3Storage {
                         .delete_object(bucket, &self.session_key(&session.uuid))
                         .await;
                 } else {
-                    return Err(UploadTransitionError::Storage(StorageError::Internal(
-                        "neither CAS blob nor staged object found for finalizing session"
-                            .to_string(),
+                    return Err(UploadTransitionError::Storage(StorageError::corrupt_data(
+                        "neither CAS blob nor staged object found for finalizing session",
                     )));
                 }
             }
@@ -3306,7 +3418,7 @@ impl UploadSessionStorage for S3Storage {
                 doc.state = UploadSessionState::Active;
                 doc.current_operation = None;
                 let bytes = serde_json::to_vec(&doc).map_err(|e| {
-                    UploadTransitionError::Storage(StorageError::Internal(e.to_string()))
+                    UploadTransitionError::Storage(StorageError::serialization(e.to_string()))
                 })?;
                 let _ = self
                     .driver
@@ -3333,7 +3445,7 @@ impl UploadSessionStorage for S3Storage {
         match self.driver.get_object(bucket, &key).await? {
             Some((bytes, _)) => {
                 let receipt: FinalizedReceipt = serde_json::from_slice(&bytes)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(|e| StorageError::corrupt_data(e.to_string()))?;
                 if receipt.repo == session.repo && receipt.uuid == session.uuid {
                     Ok(Some(receipt))
                 } else {
@@ -3424,7 +3536,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
             >(&bytes)
             .map_err(|e| {
-                StorageError::Internal(format!("corrupt membership record in s3 key {key}: {e}"))
+                StorageError::corrupt_data(format!(
+                    "corrupt membership record in s3 key {key}: {e}"
+                ))
             })?;
             return Ok(Some(record));
         }
@@ -3439,7 +3553,7 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         let bucket = self.bucket()?;
         let key = self.repo_blob_key(&record.repo, &record.digest);
         let bytes = serde_json::to_vec(record)
-            .map_err(|e| StorageError::Internal(format!("serialize membership error: {e}")))?;
+            .map_err(|e| StorageError::serialization(format!("serialize membership error: {e}")))?;
 
         self.driver
             .put_object_conditional(bucket, &key, Bytes::from(bytes), None, None)
@@ -3461,14 +3575,16 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
             let mut record = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
             >(&bytes)
-            .map_err(|e| StorageError::Internal(format!("corrupt membership record in s3: {e}")))?;
+            .map_err(|e| {
+                StorageError::corrupt_data(format!("corrupt membership record in s3: {e}"))
+            })?;
 
             if record.state != crate::storage::repo_membership::MembershipState::Candidate
                 || record.unreferenced_since_unix_secs != Some(since_unix_secs)
             {
                 record.mark_candidate(since_unix_secs);
                 let new_bytes = serde_json::to_vec(&record).map_err(|e| {
-                    StorageError::Internal(format!("serialize membership error: {e}"))
+                    StorageError::serialization(format!("serialize membership error: {e}"))
                 })?;
 
                 match self
@@ -3478,11 +3594,10 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
                 {
                     Ok(_) => Ok(true),
                     Err(StorageError::TagAlreadyExists) => Ok(false),
-                    Err(StorageError::Internal(err))
-                        if err.contains("412")
-                            || err.contains("PreconditionFailed")
-                            || err.contains("AtLeastOneConditionFailed") =>
-                    {
+                    Err(StorageError::Internal {
+                        kind: StorageErrorKind::Conflict,
+                        ..
+                    }) => {
                         // Stale ETag: concurrent modification occurred, return false safely
                         Ok(false)
                     }
@@ -3509,14 +3624,16 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
             let mut record = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
             >(&bytes)
-            .map_err(|e| StorageError::Internal(format!("corrupt membership record in s3: {e}")))?;
+            .map_err(|e| {
+                StorageError::corrupt_data(format!("corrupt membership record in s3: {e}"))
+            })?;
 
             if record.state != crate::storage::repo_membership::MembershipState::Active
                 || record.unreferenced_since_unix_secs.is_some()
             {
                 record.mark_active();
                 let new_bytes = serde_json::to_vec(&record).map_err(|e| {
-                    StorageError::Internal(format!("serialize membership error: {e}"))
+                    StorageError::serialization(format!("serialize membership error: {e}"))
                 })?;
 
                 match self
@@ -3526,11 +3643,10 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
                 {
                     Ok(_) => Ok(true),
                     Err(StorageError::TagAlreadyExists) => Ok(false),
-                    Err(StorageError::Internal(err))
-                        if err.contains("412")
-                            || err.contains("PreconditionFailed")
-                            || err.contains("AtLeastOneConditionFailed") =>
-                    {
+                    Err(StorageError::Internal {
+                        kind: StorageErrorKind::Conflict,
+                        ..
+                    }) => {
                         // Stale ETag: concurrent modification occurred, return false safely
                         Ok(false)
                     }
@@ -3592,14 +3708,15 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
 
         let mut records = Vec::new();
         for key in page_slice {
-            let (bytes, _etag) = self.driver.get_object(bucket, key).await?.ok_or_else(|| {
-                StorageError::Internal(format!("missing membership object for key '{key}'"))
-            })?;
+            let (bytes, _etag) = match self.driver.get_object(bucket, key).await? {
+                Some(res) => res,
+                None => continue,
+            };
             let rec = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
             >(&bytes)
             .map_err(|e| {
-                StorageError::Internal(format!("corrupt membership record at key '{key}': {e}"))
+                StorageError::corrupt_data(format!("corrupt membership record at key '{key}': {e}"))
             })?;
             records.push(rec);
         }
@@ -3649,14 +3766,15 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
 
         let mut records = Vec::new();
         for key in page_slice {
-            let (bytes, _etag) = self.driver.get_object(bucket, key).await?.ok_or_else(|| {
-                StorageError::Internal(format!("missing membership object for key '{key}'"))
-            })?;
+            let (bytes, _etag) = match self.driver.get_object(bucket, key).await? {
+                Some(res) => res,
+                None => continue,
+            };
             let rec = serde_json::from_slice::<
                 crate::storage::repo_membership::RepoBlobMembershipRecord,
             >(&bytes)
             .map_err(|e| {
-                StorageError::Internal(format!("corrupt membership record at key '{key}': {e}"))
+                StorageError::corrupt_data(format!("corrupt membership record at key '{key}': {e}"))
             })?;
             records.push(rec);
         }
@@ -3748,7 +3866,9 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
             let rec = serde_json::from_slice::<
                 crate::storage::repo_membership::MigrationCheckpointRecord,
             >(&bytes)
-            .map_err(|e| StorageError::Internal(format!("corrupt s3 migration checkpoint: {e}")))?;
+            .map_err(|e| {
+                StorageError::corrupt_data(format!("corrupt s3 migration checkpoint: {e}"))
+            })?;
             return Ok(Some(rec));
         }
         Ok(None)
@@ -3761,7 +3881,7 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         let bucket = self.bucket()?;
         let key = self.key("meta/migration_checkpoint.json");
         let bytes = serde_json::to_vec(checkpoint).map_err(|e| {
-            StorageError::Internal(format!("serialize s3 migration checkpoint: {e}"))
+            StorageError::serialization(format!("serialize s3 migration checkpoint: {e}"))
         })?;
         self.driver
             .put_object_conditional(bucket, &key, Bytes::from(bytes), None, None)

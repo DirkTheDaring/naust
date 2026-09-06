@@ -62,6 +62,76 @@ impl From<UploadTransitionError> for CoordinatorError {
     }
 }
 
+pub(crate) fn map_ref_index_error(e: crate::blob_ref_index::RefIndexError) -> StorageError {
+    let msg = e.to_string();
+    match e {
+        crate::blob_ref_index::RefIndexError::Storage(se) => match se {
+            StorageError::Internal { kind, .. } => StorageError::internal(kind, msg),
+            other => other,
+        },
+        crate::blob_ref_index::RefIndexError::Corrupt(_) => StorageError::corrupt_data(msg),
+        crate::blob_ref_index::RefIndexError::ManifestParse(_) => StorageError::corrupt_data(msg),
+        crate::blob_ref_index::RefIndexError::NotFound(_) => StorageError::NotFound,
+        crate::blob_ref_index::RefIndexError::Sled(err) => match err {
+            sled::Error::Io(ref io_err) => {
+                if io_err.raw_os_error() == Some(libc::ENOSPC)
+                    || io_err.kind() == std::io::ErrorKind::StorageFull
+                {
+                    StorageError::InsufficientStorage
+                } else if io_err.kind() == std::io::ErrorKind::PermissionDenied {
+                    StorageError::permission_denied(msg)
+                } else {
+                    StorageError::io(msg)
+                }
+            }
+            sled::Error::Corruption { .. } => StorageError::corrupt_data(msg),
+            sled::Error::Unsupported(_) => StorageError::configuration(msg),
+            sled::Error::ReportableBug(_) => StorageError::internal_invariant(msg),
+            sled::Error::CollectionNotFound(_) => StorageError::internal_invariant(msg),
+        },
+    }
+}
+
+pub(crate) fn map_ref_index_error_with_context(
+    e: crate::blob_ref_index::RefIndexError,
+    context: &str,
+) -> StorageError {
+    let msg = format!("{context}: {e}");
+    match e {
+        crate::blob_ref_index::RefIndexError::Storage(se) => match se {
+            StorageError::Internal { kind, .. } => StorageError::internal(kind, msg),
+            other => other,
+        },
+        crate::blob_ref_index::RefIndexError::Corrupt(_) => StorageError::corrupt_data(msg),
+        crate::blob_ref_index::RefIndexError::ManifestParse(_) => StorageError::corrupt_data(msg),
+        crate::blob_ref_index::RefIndexError::NotFound(_) => StorageError::NotFound,
+        crate::blob_ref_index::RefIndexError::Sled(err) => match err {
+            sled::Error::Io(ref io_err) => {
+                if io_err.raw_os_error() == Some(libc::ENOSPC)
+                    || io_err.kind() == std::io::ErrorKind::StorageFull
+                {
+                    StorageError::InsufficientStorage
+                } else if io_err.kind() == std::io::ErrorKind::PermissionDenied {
+                    StorageError::permission_denied(msg)
+                } else {
+                    StorageError::io(msg)
+                }
+            }
+            sled::Error::Corruption { .. } => StorageError::corrupt_data(msg),
+            sled::Error::Unsupported(_) => StorageError::configuration(msg),
+            sled::Error::ReportableBug(_) => StorageError::internal_invariant(msg),
+            sled::Error::CollectionNotFound(_) => StorageError::internal_invariant(msg),
+        },
+    }
+}
+
+#[inline]
+pub(crate) fn resolve_pin_failure_or_fallback(failure_err: Option<StorageError>) -> StorageError {
+    failure_err.unwrap_or_else(|| {
+        StorageError::internal_invariant("pin renewal heartbeat failed during commit")
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct StartUploadResult {
     pub session: UploadSessionId,
@@ -141,7 +211,7 @@ pub struct PinLeaseGuard {
     digest: Digest,
     op_id: String,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    failure_rx: tokio::sync::mpsc::Receiver<String>,
+    failure_rx: tokio::sync::mpsc::Receiver<StorageError>,
     stopped: bool,
     released: bool,
 }
@@ -154,17 +224,19 @@ impl PinLeaseGuard {
         pin_ttl_secs: u64,
     ) -> Result<Self, CoordinatorError> {
         idx.check_health().map_err(|e| {
-            CoordinatorError::Storage(StorageError::Internal(format!(
-                "ref-index unhealthy before acquiring GC pin: {e}"
-            )))
+            CoordinatorError::Storage(map_ref_index_error_with_context(
+                e,
+                "ref-index unhealthy before acquiring GC pin",
+            ))
         })?;
 
         let pin_until = SystemTime::now() + Duration::from_secs(pin_ttl_secs);
         idx.acquire_pin(digest, op_id, pin_until, "upload_finalizing")
             .map_err(|e| {
-                CoordinatorError::Storage(StorageError::Internal(format!(
-                    "failed to acquire GC pin: {e}"
-                )))
+                CoordinatorError::Storage(map_ref_index_error_with_context(
+                    e,
+                    "failed to acquire GC pin",
+                ))
             })?;
 
         let (failure_tx, failure_rx) = tokio::sync::mpsc::channel(1);
@@ -178,7 +250,7 @@ impl PinLeaseGuard {
                 tokio::time::sleep(renew_interval).await;
                 if let Err(e) = idx_clone.check_health() {
                     let _ = failure_tx
-                        .send(format!("pin renewal health check failed: {e}"))
+                        .send(map_ref_index_error_with_context(e, "pin renewal failed"))
                         .await;
                     break;
                 }
@@ -189,7 +261,9 @@ impl PinLeaseGuard {
                     refreshed_until,
                     "upload_finalizing_renewal",
                 ) {
-                    let _ = failure_tx.send(format!("pin renewal failed: {e}")).await;
+                    let _ = failure_tx
+                        .send(map_ref_index_error_with_context(e, "pin renewal failed"))
+                        .await;
                     break;
                 }
             }
@@ -225,14 +299,15 @@ impl PinLeaseGuard {
         self.idx
             .release_pin(&self.digest, &self.op_id)
             .map_err(|e| {
-                CoordinatorError::Storage(StorageError::Internal(format!(
-                    "failed to release pin: {e}"
-                )))
+                CoordinatorError::Storage(map_ref_index_error_with_context(
+                    e,
+                    "failed to release pin",
+                ))
             })?;
         Ok(())
     }
 
-    pub async fn wait_for_failure(&mut self) -> Option<String> {
+    pub async fn wait_for_failure(&mut self) -> Option<StorageError> {
         self.failure_rx.recv().await
     }
 }
@@ -454,12 +529,16 @@ impl BlobUploadCoordinator {
                 });
             }
             // Fail closed if global CAS blob is missing
-            if self.storage.head_blob(expected_digest).await.is_err() {
-                return Err(CoordinatorError::Storage(
-                    crate::storage::StorageError::Internal(
-                        "corrupt receipt: global CAS blob missing".to_string(),
-                    ),
-                ));
+            match self.storage.head_blob(expected_digest).await {
+                Ok(_) => {}
+                Err(StorageError::NotFound) => {
+                    return Err(CoordinatorError::Storage(
+                        crate::storage::StorageError::corrupt_data(
+                            "corrupt receipt: global CAS blob missing",
+                        ),
+                    ));
+                }
+                Err(other) => return Err(CoordinatorError::Storage(other)),
             }
             // Fail closed if repository membership is missing (e.g. deleted) or corrupt
             let membership = self
@@ -538,9 +617,9 @@ impl BlobUploadCoordinator {
         if let Some(ref idx) = self.ref_index {
             idx.ensure_healthy_or_rebuild(&self.storage, true, false)
                 .await
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
             idx.mark_dirty()
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
         }
 
         // STEP 4: Commit finalize in storage backend under the consistency coordinator
@@ -550,12 +629,11 @@ impl BlobUploadCoordinator {
                 outcome_res = self.storage.commit_finalize(&prepared) => {
                     outcome_res?
                 }
-                failure_msg = guard.wait_for_failure() => {
+                failure_err = guard.wait_for_failure() => {
                     drop(_guard);
                     guard.stop().await;
-                    return Err(CoordinatorError::Storage(StorageError::Internal(
-                        failure_msg.unwrap_or_else(|| "pin renewal heartbeat failed during commit".to_string())
-                    )));
+                    let err = resolve_pin_failure_or_fallback(failure_err);
+                    return Err(CoordinatorError::Storage(err));
                 }
             }
         } else {
@@ -565,11 +643,11 @@ impl BlobUploadCoordinator {
         // STEP 5: Update reverse index, flush, and mark ready
         if let Some(ref idx) = self.ref_index {
             idx.record_membership(expected_digest, repo)
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
             idx.flush()
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
             idx.mark_ready()
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
         }
         drop(_guard);
 
@@ -719,9 +797,9 @@ impl BlobUploadCoordinator {
         if let Some(ref idx) = self.ref_index {
             idx.ensure_healthy_or_rebuild(&self.storage, true, false)
                 .await
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
             idx.mark_dirty()
-                .map_err(|e| CoordinatorError::Storage(StorageError::Internal(e.to_string())))?;
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
         }
 
         // 5. Durably create target repository membership under the consistency coordinator
@@ -1502,9 +1580,9 @@ mod tests {
     // Property 6: renewal failure interrupts the in-progress commit wait
     #[tokio::test]
     async fn test_pin_property_6_renewal_failure_interrupts_in_progress_commit_wait() {
-        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel::<StorageError>(1);
         failure_tx
-            .send("simulated sled corruption".to_string())
+            .send(StorageError::io("simulated sled corruption"))
             .await
             .unwrap();
 
@@ -1513,7 +1591,12 @@ mod tests {
                 panic!("commit wait should have been interrupted by failure channel");
             }
             msg = failure_rx.recv() => {
-                assert_eq!(msg, Some("simulated sled corruption".to_string()));
+                let err = msg.expect("channel must yield error");
+                assert_eq!(
+                    err.internal_kind(),
+                    Some(crate::storage::StorageErrorKind::Io)
+                );
+                assert_eq!(err.message(), Some("simulated sled corruption"));
                 true
             }
         };
@@ -1523,14 +1606,24 @@ mod tests {
     // Property 7: renewal failure produces a typed retryable error
     #[tokio::test]
     async fn test_pin_property_7_renewal_failure_produces_typed_retryable_error() {
-        let err = CoordinatorError::Storage(StorageError::Internal(
-            "pin renewal failed: IO error".to_string(),
-        ));
-        assert!(matches!(
-            err,
-            CoordinatorError::Storage(StorageError::Internal(_))
-        ));
-        assert!(err.to_string().contains("pin renewal failed"));
+        let err =
+            CoordinatorError::Storage(StorageError::io("pin renewal failed: sled error: IO error"));
+        let storage_err = match err {
+            CoordinatorError::Storage(se) => se,
+            _ => panic!("expected CoordinatorError::Storage"),
+        };
+        assert_eq!(
+            storage_err.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Io)
+        );
+        assert_eq!(
+            storage_err.message(),
+            Some("pin renewal failed: sled error: IO error")
+        );
+        assert_eq!(
+            storage_err.to_string(),
+            "internal error: pin renewal failed: sled error: IO error"
+        );
     }
 
     // Property 8: an S3 copy that completes after its future was cancelled is reconciled
@@ -1758,6 +1851,616 @@ mod tests {
             drop(guard);
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(handle.is_finished());
+        }
+    }
+
+    #[test]
+    fn test_upload_coordinator_ref_index_error_context_preservation() {
+        // --- 1. Sled Error Variants: Non-contextual mapping ---
+        // 1a. sled::Error::Io(PermissionDenied) -> StorageErrorKind::PermissionDenied
+        let sled_perm = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let ref_err_perm = crate::blob_ref_index::RefIndexError::Sled(sled_perm);
+        let expected_perm_str = ref_err_perm.to_string();
+        let err_perm_nc = map_ref_index_error(ref_err_perm);
+        assert!(matches!(
+            err_perm_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_perm_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::PermissionDenied)
+        );
+        assert_eq!(err_perm_nc.message(), Some(expected_perm_str.as_str()));
+        assert_eq!(
+            err_perm_nc.to_string(),
+            format!("internal error: {expected_perm_str}")
+        );
+
+        // 1b. sled::Error::Io(ordinary) -> StorageErrorKind::Io
+        let sled_io = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        let ref_err_io = crate::blob_ref_index::RefIndexError::Sled(sled_io);
+        let expected_io_str = ref_err_io.to_string();
+        let err_io_nc = map_ref_index_error(ref_err_io);
+        assert!(matches!(
+            err_io_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Io,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_io_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Io)
+        );
+        assert_eq!(err_io_nc.message(), Some(expected_io_str.as_str()));
+        assert_eq!(
+            err_io_nc.to_string(),
+            format!("internal error: {expected_io_str}")
+        );
+
+        // 1c. sled::Error::Io(ENOSPC) -> dedicated StorageError::InsufficientStorage
+        let sled_enospc = sled::Error::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        let ref_err_enospc = crate::blob_ref_index::RefIndexError::Sled(sled_enospc);
+        let err_enospc_nc = map_ref_index_error(ref_err_enospc);
+        assert!(matches!(err_enospc_nc, StorageError::InsufficientStorage));
+        assert_eq!(err_enospc_nc.internal_kind(), None);
+        assert_eq!(err_enospc_nc.message(), None);
+        assert_eq!(err_enospc_nc.to_string(), "insufficient storage");
+
+        // 1d. sled::Error::Corruption -> StorageErrorKind::CorruptData
+        let sled_corr = sled::Error::Corruption { at: None, bt: () };
+        let ref_err_corr = crate::blob_ref_index::RefIndexError::Sled(sled_corr);
+        let expected_corr_str = ref_err_corr.to_string();
+        let err_corr_nc = map_ref_index_error(ref_err_corr);
+        assert!(matches!(
+            err_corr_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::CorruptData,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_corr_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::CorruptData)
+        );
+        assert_eq!(err_corr_nc.message(), Some(expected_corr_str.as_str()));
+        assert_eq!(
+            err_corr_nc.to_string(),
+            format!("internal error: {expected_corr_str}")
+        );
+
+        // 1e. sled::Error::Unsupported -> StorageErrorKind::Configuration
+        let sled_unsupp = sled::Error::Unsupported("unsupported compaction feature".to_string());
+        let ref_err_unsupp = crate::blob_ref_index::RefIndexError::Sled(sled_unsupp);
+        let expected_unsupp_str = ref_err_unsupp.to_string();
+        let err_unsupp_nc = map_ref_index_error(ref_err_unsupp);
+        assert!(matches!(
+            err_unsupp_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Configuration,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_unsupp_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Configuration)
+        );
+        assert_eq!(err_unsupp_nc.message(), Some(expected_unsupp_str.as_str()));
+        assert_eq!(
+            err_unsupp_nc.to_string(),
+            format!("internal error: {expected_unsupp_str}")
+        );
+
+        // 1f. sled::Error::ReportableBug -> StorageErrorKind::InternalInvariant
+        let sled_bug = sled::Error::ReportableBug("fatal btree invariant broken".to_string());
+        let ref_err_bug = crate::blob_ref_index::RefIndexError::Sled(sled_bug);
+        let expected_bug_str = ref_err_bug.to_string();
+        let err_bug_nc = map_ref_index_error(ref_err_bug);
+        assert!(matches!(
+            err_bug_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::InternalInvariant,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_bug_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::InternalInvariant)
+        );
+        assert_eq!(err_bug_nc.message(), Some(expected_bug_str.as_str()));
+        assert_eq!(
+            err_bug_nc.to_string(),
+            format!("internal error: {expected_bug_str}")
+        );
+
+        // 1g. sled::Error::CollectionNotFound -> StorageErrorKind::InternalInvariant
+        let sled_cnf = sled::Error::CollectionNotFound(sled::IVec::from(b"meta_tree"));
+        let ref_err_cnf = crate::blob_ref_index::RefIndexError::Sled(sled_cnf);
+        let expected_cnf_str = ref_err_cnf.to_string();
+        let err_cnf_nc = map_ref_index_error(ref_err_cnf);
+        assert!(matches!(
+            err_cnf_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::InternalInvariant,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_cnf_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::InternalInvariant)
+        );
+        assert_eq!(err_cnf_nc.message(), Some(expected_cnf_str.as_str()));
+        assert_eq!(
+            err_cnf_nc.to_string(),
+            format!("internal error: {expected_cnf_str}")
+        );
+
+        // 1h. Storage(Internal { kind: Backend, .. }) -> StorageErrorKind::Backend
+        let ref_err_backend_nc = crate::blob_ref_index::RefIndexError::Storage(
+            StorageError::backend("s3 connection reset"),
+        );
+        let expected_backend_nc_str = ref_err_backend_nc.to_string();
+        let err_backend_nc = map_ref_index_error(ref_err_backend_nc);
+        assert!(matches!(
+            err_backend_nc,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Backend,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_backend_nc.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Backend)
+        );
+        assert_eq!(
+            err_backend_nc.message(),
+            Some(expected_backend_nc_str.as_str())
+        );
+        assert_eq!(
+            err_backend_nc.to_string(),
+            format!("internal error: {expected_backend_nc_str}")
+        );
+
+        // --- 2. Sled Error Variants: Contextual mapping ---
+        let context = "failed to acquire GC pin";
+
+        // 2a. sled::Error::Io(PermissionDenied) with context
+        let sled_perm_ctx = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let ref_err_sled_perm = crate::blob_ref_index::RefIndexError::Sled(sled_perm_ctx);
+        let expected_sled_perm_msg = format!("{context}: {ref_err_sled_perm}");
+        let err_sled_perm = map_ref_index_error_with_context(ref_err_sled_perm, context);
+        assert!(matches!(
+            err_sled_perm,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_sled_perm.internal_kind(),
+            Some(crate::storage::StorageErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            err_sled_perm.message(),
+            Some(expected_sled_perm_msg.as_str())
+        );
+        assert_eq!(
+            err_sled_perm.to_string(),
+            format!("internal error: {expected_sled_perm_msg}")
+        );
+
+        // 2b. sled::Error::Io(ordinary) with context
+        let sled_io_ctx = sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "mock disk fault",
+        ));
+        let ref_err_sled_io = crate::blob_ref_index::RefIndexError::Sled(sled_io_ctx);
+        let expected_sled_io_msg = format!("{context}: {ref_err_sled_io}");
+        let err_sled_io = map_ref_index_error_with_context(ref_err_sled_io, context);
+        assert!(matches!(
+            err_sled_io,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Io,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_sled_io.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Io)
+        );
+        assert_eq!(err_sled_io.message(), Some(expected_sled_io_msg.as_str()));
+        assert_eq!(
+            err_sled_io.to_string(),
+            format!("internal error: {expected_sled_io_msg}")
+        );
+
+        // 2c. sled::Error::Io(ENOSPC) with context -> dedicated StorageError::InsufficientStorage (NO context prefix)
+        let sled_enospc_ctx = sled::Error::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        let ref_err_sled_enospc = crate::blob_ref_index::RefIndexError::Sled(sled_enospc_ctx);
+        let err_sled_enospc = map_ref_index_error_with_context(ref_err_sled_enospc, context);
+        assert!(matches!(err_sled_enospc, StorageError::InsufficientStorage));
+        assert_eq!(err_sled_enospc.internal_kind(), None);
+        assert_eq!(err_sled_enospc.message(), None);
+        assert_eq!(err_sled_enospc.to_string(), "insufficient storage");
+
+        // 2d. sled::Error::Corruption with context
+        let sled_corr_ctx = sled::Error::Corruption { at: None, bt: () };
+        let ref_err_sled_corr = crate::blob_ref_index::RefIndexError::Sled(sled_corr_ctx);
+        let expected_sled_corr_msg = format!("{context}: {ref_err_sled_corr}");
+        let err_sled_corr = map_ref_index_error_with_context(ref_err_sled_corr, context);
+        assert!(matches!(
+            err_sled_corr,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::CorruptData,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_sled_corr.internal_kind(),
+            Some(crate::storage::StorageErrorKind::CorruptData)
+        );
+        assert_eq!(
+            err_sled_corr.message(),
+            Some(expected_sled_corr_msg.as_str())
+        );
+        assert_eq!(
+            err_sled_corr.to_string(),
+            format!("internal error: {expected_sled_corr_msg}")
+        );
+
+        // 2e. sled::Error::Unsupported with context
+        let sled_unsupp_ctx = sled::Error::Unsupported("unsupported option".to_string());
+        let ref_err_sled_unsupp = crate::blob_ref_index::RefIndexError::Sled(sled_unsupp_ctx);
+        let expected_sled_unsupp_msg = format!("{context}: {ref_err_sled_unsupp}");
+        let err_sled_unsupp = map_ref_index_error_with_context(ref_err_sled_unsupp, context);
+        assert!(matches!(
+            err_sled_unsupp,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Configuration,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_sled_unsupp.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Configuration)
+        );
+        assert_eq!(
+            err_sled_unsupp.message(),
+            Some(expected_sled_unsupp_msg.as_str())
+        );
+        assert_eq!(
+            err_sled_unsupp.to_string(),
+            format!("internal error: {expected_sled_unsupp_msg}")
+        );
+
+        // 2f. sled::Error::ReportableBug with context
+        let sled_bug_ctx = sled::Error::ReportableBug("fatal bug".to_string());
+        let ref_err_sled_bug = crate::blob_ref_index::RefIndexError::Sled(sled_bug_ctx);
+        let expected_sled_bug_msg = format!("{context}: {ref_err_sled_bug}");
+        let err_sled_bug = map_ref_index_error_with_context(ref_err_sled_bug, context);
+        assert!(matches!(
+            err_sled_bug,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::InternalInvariant,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_sled_bug.internal_kind(),
+            Some(crate::storage::StorageErrorKind::InternalInvariant)
+        );
+        assert_eq!(err_sled_bug.message(), Some(expected_sled_bug_msg.as_str()));
+        assert_eq!(
+            err_sled_bug.to_string(),
+            format!("internal error: {expected_sled_bug_msg}")
+        );
+
+        // 2g. sled::Error::CollectionNotFound with context
+        let sled_cnf_ctx = sled::Error::CollectionNotFound(sled::IVec::from(b"pins_tree"));
+        let ref_err_sled_cnf = crate::blob_ref_index::RefIndexError::Sled(sled_cnf_ctx);
+        let expected_sled_cnf_msg = format!("{context}: {ref_err_sled_cnf}");
+        let err_sled_cnf = map_ref_index_error_with_context(ref_err_sled_cnf, context);
+        assert!(matches!(
+            err_sled_cnf,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::InternalInvariant,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_sled_cnf.internal_kind(),
+            Some(crate::storage::StorageErrorKind::InternalInvariant)
+        );
+        assert_eq!(err_sled_cnf.message(), Some(expected_sled_cnf_msg.as_str()));
+        assert_eq!(
+            err_sled_cnf.to_string(),
+            format!("internal error: {expected_sled_cnf_msg}")
+        );
+
+        // --- 3. Other RefIndexError Variants ---
+        // 3a. Corrupt ref-index -> StorageErrorKind::CorruptData with exact contextual prefix
+        let ref_err_corrupt =
+            crate::blob_ref_index::RefIndexError::Corrupt("bad crc in index record".to_string());
+        let expected_corrupt_msg =
+            format!("ref-index unhealthy before acquiring GC pin: {ref_err_corrupt}");
+        let err_corrupt = map_ref_index_error_with_context(
+            ref_err_corrupt,
+            "ref-index unhealthy before acquiring GC pin",
+        );
+        assert!(matches!(
+            err_corrupt,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::CorruptData,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_corrupt.internal_kind(),
+            Some(crate::storage::StorageErrorKind::CorruptData)
+        );
+        assert_eq!(err_corrupt.message(), Some(expected_corrupt_msg.as_str()));
+        assert_eq!(
+            err_corrupt.to_string(),
+            format!("internal error: {expected_corrupt_msg}")
+        );
+
+        // 3b. Storage(Internal { kind: Backend, .. }) -> StorageErrorKind::Backend with exact contextual prefix
+        let ref_err_backend = crate::blob_ref_index::RefIndexError::Storage(StorageError::backend(
+            "s3 connection reset",
+        ));
+        let expected_backend_msg = format!("failed to release pin: {ref_err_backend}");
+        let err_backend =
+            map_ref_index_error_with_context(ref_err_backend, "failed to release pin");
+        assert!(matches!(
+            err_backend,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Backend,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_backend.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Backend)
+        );
+        assert_eq!(err_backend.message(), Some(expected_backend_msg.as_str()));
+        assert_eq!(
+            err_backend.to_string(),
+            format!("internal error: {expected_backend_msg}")
+        );
+
+        // 3c. RefIndexError::NotFound -> dedicated StorageError::NotFound (NO context prefix)
+        let ref_err_not_found = crate::blob_ref_index::RefIndexError::NotFound(
+            std::path::PathBuf::from("/nonexistent/ref.db"),
+        );
+        let err_nf =
+            map_ref_index_error_with_context(ref_err_not_found, "failed to acquire GC pin");
+        assert!(matches!(err_nf, StorageError::NotFound));
+        assert_eq!(err_nf.internal_kind(), None);
+        assert_eq!(err_nf.message(), None);
+        assert_eq!(err_nf.to_string(), "not found");
+
+        // 3d. Storage(StorageError::NotFound) -> dedicated StorageError::NotFound (NO context prefix)
+        let ref_err_storage_nf =
+            crate::blob_ref_index::RefIndexError::Storage(StorageError::NotFound);
+        let err_storage_nf =
+            map_ref_index_error_with_context(ref_err_storage_nf, "failed to release pin");
+        assert!(matches!(err_storage_nf, StorageError::NotFound));
+        assert_eq!(err_storage_nf.internal_kind(), None);
+        assert_eq!(err_storage_nf.message(), None);
+        assert_eq!(err_storage_nf.to_string(), "not found");
+
+        // 3e. Storage(StorageError::Internal { kind: Conflict, .. }) -> StorageErrorKind::Conflict with exact contextual prefix
+        let ref_err_storage_conflict = crate::blob_ref_index::RefIndexError::Storage(
+            StorageError::conflict("tag lock contention"),
+        );
+        let expected_conflict_msg = format!("failed to release pin: {ref_err_storage_conflict}");
+        let err_storage_conflict =
+            map_ref_index_error_with_context(ref_err_storage_conflict, "failed to release pin");
+        assert!(matches!(
+            err_storage_conflict,
+            StorageError::Internal {
+                kind: crate::storage::StorageErrorKind::Conflict,
+                ..
+            }
+        ));
+        assert_eq!(
+            err_storage_conflict.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Conflict)
+        );
+        assert_eq!(
+            err_storage_conflict.message(),
+            Some(expected_conflict_msg.as_str())
+        );
+        assert_eq!(
+            err_storage_conflict.to_string(),
+            format!("internal error: {expected_conflict_msg}")
+        );
+
+        // 3f. Storage(StorageError::PreconditionFailed) -> dedicated StorageError::PreconditionFailed (NO context prefix)
+        let ref_err_storage_precond =
+            crate::blob_ref_index::RefIndexError::Storage(StorageError::PreconditionFailed);
+        let err_storage_precond =
+            map_ref_index_error_with_context(ref_err_storage_precond, "failed to release pin");
+        assert!(matches!(
+            err_storage_precond,
+            StorageError::PreconditionFailed
+        ));
+        assert_eq!(err_storage_precond.internal_kind(), None);
+        assert_eq!(err_storage_precond.message(), None);
+        assert_eq!(err_storage_precond.to_string(), "precondition failed");
+    }
+
+    #[test]
+    fn test_upload_coordinator_pin_failure_fallback_on_channel_loss() {
+        let fallback_err = resolve_pin_failure_or_fallback(None);
+        assert_eq!(
+            fallback_err.internal_kind(),
+            Some(crate::storage::StorageErrorKind::InternalInvariant)
+        );
+        assert_eq!(
+            fallback_err.message(),
+            Some("pin renewal heartbeat failed during commit")
+        );
+        assert_eq!(
+            fallback_err.to_string(),
+            "internal error: pin renewal heartbeat failed during commit"
+        );
+
+        let typed_err = StorageError::io("disk failure during pin renewal");
+        let preserved_err = resolve_pin_failure_or_fallback(Some(typed_err));
+        assert_eq!(
+            preserved_err.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Io)
+        );
+        assert_eq!(
+            preserved_err.message(),
+            Some("disk failure during pin renewal")
+        );
+        assert_eq!(
+            preserved_err.to_string(),
+            "internal error: disk failure during pin renewal"
+        );
+
+        let nf_err = StorageError::NotFound;
+        let preserved_nf = resolve_pin_failure_or_fallback(Some(nf_err));
+        assert!(matches!(preserved_nf, StorageError::NotFound));
+        assert_eq!(preserved_nf.internal_kind(), None);
+        assert_eq!(preserved_nf.message(), None);
+        assert_eq!(preserved_nf.to_string(), "not found");
+    }
+
+    #[tokio::test]
+    async fn test_upload_coordinator_finalized_receipt_head_blob_error_classification() {
+        let (storage, driver) = crate::storage::s3::tests::create_mock_storage();
+        let config = BlobUploadCoordinatorConfig::default();
+        let coordinator = test_coordinator(Arc::new(storage), None, config);
+
+        let repo = "test-head-err/repo";
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+        let digest = Digest::parse(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+
+        // 1. Insert valid finalized receipt in mock S3 storage
+        let receipt = crate::storage::FinalizedReceipt {
+            format_version: 1,
+            repo: canonical.clone(),
+            uuid: uuid.to_string(),
+            digest: digest.as_str().to_string(),
+            size: 1024,
+            finalized_at_unix_secs: 1000,
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        let receipt_key = format!("uploads/{uuid}/finalized.json");
+        driver.objects.lock().unwrap().insert(
+            receipt_key,
+            (
+                bytes::Bytes::from(receipt_bytes),
+                "etag-receipt".to_string(),
+            ),
+        );
+
+        // Case 1: head_blob returns NotFound -> StorageErrorKind::CorruptData
+        {
+            let res = coordinator
+                .finalize_upload(repo, uuid, None, None, None, &digest)
+                .await;
+            assert!(res.is_err());
+            let err = match res.unwrap_err() {
+                CoordinatorError::Storage(e) => e,
+                other => panic!("expected CoordinatorError::Storage, got {:?}", other),
+            };
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::CorruptData)
+            );
+            assert_eq!(
+                err.message(),
+                Some("corrupt receipt: global CAS blob missing")
+            );
+            assert_eq!(
+                err.to_string(),
+                "internal error: corrupt receipt: global CAS blob missing"
+            );
+
+            // Verify head_object was called for the CAS blob key
+            let log = driver.get_call_log();
+            let expected_cas_key = format!("blobs/sha256/{}/{}", digest.prefix2(), digest.hex());
+            assert!(
+                log.iter()
+                    .any(|e| e.method == "head_object" && e.key == expected_cas_key),
+                "head_blob must have been invoked on expected CAS key"
+            );
+        }
+
+        // Case 2: head_blob returns Backend error -> StorageErrorKind::Backend
+        {
+            driver.set_hook_before(|method, key| {
+                if method == "head_object" && key.starts_with("blobs/") {
+                    Some(StorageError::backend("head backend failure"))
+                } else {
+                    None
+                }
+            });
+
+            let res = coordinator
+                .finalize_upload(repo, uuid, None, None, None, &digest)
+                .await;
+            assert!(res.is_err());
+            let err = match res.unwrap_err() {
+                CoordinatorError::Storage(e) => e,
+                other => panic!("expected CoordinatorError::Storage, got {:?}", other),
+            };
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::Backend)
+            );
+            assert_eq!(err.message(), Some("head backend failure"));
+            assert_eq!(err.to_string(), "internal error: head backend failure");
+
+            driver.clear_hooks();
+        }
+
+        // Case 3: head_blob returns PermissionDenied error -> StorageErrorKind::PermissionDenied
+        {
+            driver.set_hook_before(|method, key| {
+                if method == "head_object" && key.starts_with("blobs/") {
+                    Some(StorageError::permission_denied("head permission failure"))
+                } else {
+                    None
+                }
+            });
+
+            let res = coordinator
+                .finalize_upload(repo, uuid, None, None, None, &digest)
+                .await;
+            assert!(res.is_err());
+            let err = match res.unwrap_err() {
+                CoordinatorError::Storage(e) => e,
+                other => panic!("expected CoordinatorError::Storage, got {:?}", other),
+            };
+            assert_eq!(
+                err.internal_kind(),
+                Some(crate::storage::StorageErrorKind::PermissionDenied)
+            );
+            assert_eq!(err.message(), Some("head permission failure"));
+            assert_eq!(err.to_string(), "internal error: head permission failure");
+
+            driver.clear_hooks();
         }
     }
 }
