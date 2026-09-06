@@ -1,6 +1,6 @@
 # ADR-009: Structured Storage Error Taxonomy and Stringly-Typed Tunneling Resolution
 
-* **Status:** Proposed (Under Review)
+* **Status:** Accepted (Implemented in commit 49d405483b6ea729fc6a4e9a0a99177ec37c2bfd; Release boundary: 0.9.0; not yet tagged, published, or distributed)
 * **Date:** 2026-09-02
 * **Authors:** Senior Software Architect (OCI Distribution & Storage Systems)
 * **Scope:** Storage Error Taxonomy, Error Control Flow, Internal Error Structuring, Elimination of String-Matching Control Flow, D-06 Resolution
@@ -164,7 +164,7 @@ The transformation of `StorageError::Internal` from a tuple variant `StorageErro
   // Or:
   StorageError::internal(StorageErrorKind::Io, "disk error")
   ```
-* **SemVer Assessment:** Under Cargo/Semantic Versioning rules for pre-1.0 releases (`0.y.z`), breaking API changes must increment the minor version number (i.e. from `0.8.18` to `0.9.0`, not `0.8.19`). The crate package version is preserved during Slice 11, and this architectural decision records the required `0.9.0` release boundary. Downstream consumers must migrate to the constructor helpers (`StorageError::io`, `backend`, `corrupt_data`, etc.) and the accessor methods (`err.internal_kind()`, `err.message()`).
+* **SemVer Assessment:** Under Cargo/Semantic Versioning rules for pre-1.0 releases (`0.y.z`), breaking API changes must increment the minor version number (i.e. from `0.8.18` to `0.9.0`, not `0.8.19`). The implementation was completed in Slice 11 at commit `49d405483b6ea729fc6a4e9a0a99177ec37c2bfd`, and this accepted architectural decision establishes the `0.9.0` release boundary in `Cargo.toml`. The crate is now versioned at `0.9.0` as the required release boundary; the release has not been tagged, published, or distributed. Downstream consumers must migrate to the constructor helpers (`StorageError::io`, `backend`, `corrupt_data`, etc.) and the accessor methods (`err.internal_kind()`, `err.message()`).
 
 ### 5.2 Outward Wire, Display, and Protocol Compatibility
 
