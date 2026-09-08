@@ -2366,3 +2366,269 @@ async fn test_storage_error_conversion_evidence_permission_denied() {
     assert_eq!(outward_err.message(), Some(expected_msg.as_str()));
     assert_eq!(outward_err.to_string(), expected_display);
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_fs_metadata_containment_symlink_inside_root() {
+    // Characterizes Case 1: Final blob entry is a symlink to an ordinary file inside configured root.
+    // Legacy behavior: tokio::fs::metadata follows the symlink and returns the target size.
+    // Note: In an extracted, contained backend, symlinks below the root must be rejected.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111101")
+            .unwrap();
+    let target_inside = root.join("blobs").join("target_inside.bin");
+    let target_content = b"inside root regular file target";
+    write_file(&target_inside, target_content);
+
+    let blob_path = storage.blob_path(&digest);
+    if let Some(parent) = blob_path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    std::os::unix::fs::symlink(&target_inside, &blob_path).expect("create inside-root symlink");
+
+    // fs_metadata_size and head_blob follow symlink
+    let size = fs_metadata_size(&blob_path)
+        .await
+        .expect("fs_metadata_size follows inside-root symlink");
+    assert_eq!(size, target_content.len() as u64);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob succeeds via inside-root symlink");
+    assert_eq!(meta.size, target_content.len() as u64);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_fs_metadata_containment_symlink_outside_root() {
+    // Characterizes Case 2: Final blob entry points outside configured root but inside test fixture.
+    // Legacy behavior: tokio::fs::metadata follows the symlink outside root and returns target size.
+    // Open containment gap: Escapes storage root boundary.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    let outside = fixture.path().join("outside_target");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    std::fs::create_dir_all(&outside).expect("create outside target dir");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:2222222222222222222222222222222222222222222222222222222222222202")
+            .unwrap();
+    let target_outside = outside.join("target_outside.bin");
+    let outside_content = b"outside root target payload with unique length";
+    write_file(&target_outside, outside_content);
+
+    let blob_path = storage.blob_path(&digest);
+    if let Some(parent) = blob_path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    std::os::unix::fs::symlink(&target_outside, &blob_path).expect("create outside-root symlink");
+
+    let size = fs_metadata_size(&blob_path)
+        .await
+        .expect("fs_metadata_size follows outside-root symlink");
+    assert_eq!(size, outside_content.len() as u64);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob succeeds via outside-root symlink");
+    assert_eq!(meta.size, outside_content.len() as u64);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_fs_metadata_containment_intermediate_dir_symlink_outside_root() {
+    // Characterizes Case 3: Intermediate path component is a directory symlink to sibling fixture directory outside root.
+    // Legacy behavior: tokio::fs::metadata traverses through intermediate directory symlink.
+    // Open containment gap: Path traversal through symlinked directory escapes storage root.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    let outside = fixture.path().join("outside_dir");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:3333333333333333333333333333333333333333333333333333333333333303")
+            .unwrap();
+    let blob_path = storage.blob_path(&digest);
+    let parent = blob_path.parent().expect("blob path parent");
+    let grandparent = parent.parent().expect("blob path grandparent");
+    std::fs::create_dir_all(grandparent).expect("create grandparent dirs");
+
+    // parent is <root>/blobs/sha256/33; link it to outside
+    std::os::unix::fs::symlink(&outside, parent).expect("create intermediate dir symlink");
+
+    // Write target file in outside directory with name matching digest.hex()
+    let target_file = outside.join(digest.hex());
+    let content = b"intermediate directory symlink outside target";
+    write_file(&target_file, content);
+
+    let size = fs_metadata_size(&blob_path)
+        .await
+        .expect("fs_metadata_size traverses intermediate dir symlink");
+    assert_eq!(size, content.len() as u64);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob succeeds via intermediate dir symlink");
+    assert_eq!(meta.size, content.len() as u64);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_fs_metadata_containment_dangling_symlink_falls_back_to_quarantine() {
+    // Characterizes Case 4: Dangling ordinary blob symlink with a valid quarantine blob.
+    // Behavior: stat() on dangling symlink fails with NotFound, which causes head_blob
+    // to fall back to the quarantine blob rather than surfacing an invalid symlink error.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:4444444444444444444444444444444444444444444444444444444444444404")
+            .unwrap();
+
+    // Quarantine blob exists with valid content
+    let quarantine_content = b"quarantine fallback for dangling symlink";
+    write_file(&storage.quarantine_blob_path(&digest), quarantine_content);
+
+    // Ordinary blob path is a dangling symlink to a non-existent file
+    let blob_path = storage.blob_path(&digest);
+    if let Some(parent) = blob_path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    let nonexistent_target = root.join("nonexistent_target.bin");
+    std::os::unix::fs::symlink(&nonexistent_target, &blob_path).expect("create dangling symlink");
+
+    // Direct fs_metadata_size on dangling symlink yields NotFound
+    let io_err = fs_metadata_size(&blob_path)
+        .await
+        .expect_err("metadata on dangling symlink must fail");
+    assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
+
+    // head_blob treats NotFound as missing ordinary blob and falls back to quarantine
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob falls back to quarantine on dangling symlink");
+    assert_eq!(meta.size, quarantine_content.len() as u64);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_fs_metadata_containment_quarantine_symlink_outside_root() {
+    // Characterizes Case 5: Quarantine-path symlink to target outside configured root, ordinary path absent.
+    // Legacy behavior: Ordinary lookup fails with NotFound, fallback to quarantine follows symlink outside root.
+    // Open containment gap: Quarantine lookup also escapes storage root.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    let outside = fixture.path().join("outside_quarantine");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:5555555555555555555555555555555555555555555555555555555555555505")
+            .unwrap();
+
+    // Ordinary blob is absent (does not exist)
+
+    // Quarantine path is a symlink pointing outside root
+    let qpath = storage.quarantine_blob_path(&digest);
+    if let Some(parent) = qpath.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    let target_outside = outside.join("quarantine_target.bin");
+    let outside_content = b"quarantine outside root payload";
+    write_file(&target_outside, outside_content);
+    std::os::unix::fs::symlink(&target_outside, &qpath).expect("create quarantine symlink");
+
+    let size = fs_metadata_size(&qpath)
+        .await
+        .expect("fs_metadata_size follows quarantine symlink outside root");
+    assert_eq!(size, outside_content.len() as u64);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob succeeds via quarantine symlink outside root");
+    assert_eq!(meta.size, outside_content.len() as u64);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_fs_metadata_containment_storage_root_is_symlink() {
+    // Characterizes Case 6: Configured storage root itself supplied through directory symlink.
+    // Behavior: FsStorage initialization succeeds and metadata lookup succeeds through symlinked root.
+    // Distinguishes root configuration policy from symlinks below the established root.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let real_root = fixture.path().join("real_storage_root");
+    let symlink_root = fixture.path().join("symlink_storage_root");
+    std::fs::create_dir_all(&real_root).expect("create real storage root");
+    std::os::unix::fs::symlink(&real_root, &symlink_root).expect("create symlink storage root");
+
+    let storage = FsStorage::try_new(symlink_root.clone(), 1024 * 1024)
+        .expect("FsStorage::try_new succeeds with symlinked root");
+
+    let digest =
+        Digest::parse("sha256:6666666666666666666666666666666666666666666666666666666666666606")
+            .unwrap();
+    let content = b"blob stored under symlinked root";
+    write_file(&storage.blob_path(&digest), content);
+
+    let blob_path = storage.blob_path(&digest);
+    let size = fs_metadata_size(&blob_path)
+        .await
+        .expect("fs_metadata_size succeeds through symlinked root");
+    assert_eq!(size, content.len() as u64);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob succeeds through symlinked root");
+    assert_eq!(meta.size, content.len() as u64);
+}
+
+#[tokio::test]
+async fn test_fs_metadata_containment_directory_blob_returns_metadata_size() {
+    // Characterizes Case 7: Ordinary blob path resolves to a directory rather than a regular file.
+    // Current behavior: fs_metadata_size returns directory metadata size (e.g. 4096 on Linux)
+    // without error, and head_blob returns Ok(BlobMeta { size }) because is_file() is not checked.
+    // Open containment/contract gap: Directories are not rejected at the metadata boundary.
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:7777777777777777777777777777777777777777777777777777777777777707")
+            .unwrap();
+    let blob_path = storage.blob_path(&digest);
+    std::fs::create_dir_all(&blob_path).expect("create directory at blob path");
+
+    // Obtain actual platform directory metadata length as ground truth
+    let expected_dir_size = std::fs::metadata(&blob_path)
+        .expect("query directory metadata")
+        .len();
+
+    let size = fs_metadata_size(&blob_path)
+        .await
+        .expect("fs_metadata_size returns directory size");
+    assert_eq!(size, expected_dir_size);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob returns directory size without error");
+    assert_eq!(meta.size, expected_dir_size);
+}
