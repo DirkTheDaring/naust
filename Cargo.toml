@@ -53,4 +53,5 @@ storage-s3 = []
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
-
+storage-core = { path = "../storage-layer-rust/crates/storage-core" }
+storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }

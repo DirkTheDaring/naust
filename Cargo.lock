@@ -2352,6 +2352,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sled",
+ "storage-core",
+ "storage-fs",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -2818,6 +2820,24 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "storage-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "storage-fs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "storage-core",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "strsim"
