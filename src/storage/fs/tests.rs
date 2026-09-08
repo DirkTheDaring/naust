@@ -2095,3 +2095,274 @@ async fn test_quarantine_blob_invalid_permit_is_permission_denied() {
         format!("internal error: {expected_message}")
     );
 }
+
+#[tokio::test]
+async fn test_fs_metadata_size_sparse_file_preserves_exact_size_above_u32() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 10 * 1024 * 1024 * 1024);
+
+    let hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let digest = Digest::parse(&format!("sha256:{hex}")).unwrap();
+    let path = storage.blob_path(&digest);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+
+    let expected_size: u64 = 8_589_934_592; // 8 GiB (> 4 GiB u32 boundary)
+    let file = std::fs::File::create(&path).expect("create sparse file");
+    file.set_len(expected_size).expect("set sparse file length");
+
+    // Test the low-level mechanism directly
+    let size = fs_metadata_size(&path)
+        .await
+        .expect("fs_metadata_size must succeed");
+    assert_eq!(size, expected_size);
+
+    // Test delegation through head_blob
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob must succeed");
+    assert_eq!(meta.size, expected_size);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+struct PermGuard<'a>(&'a Path);
+
+#[cfg(unix)]
+impl<'a> Drop for PermGuard<'a> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[tokio::test]
+async fn test_fs_metadata_size_deterministic_typed_io_errors() {
+    let root = tmp_fs_root();
+
+    // 1. NotFound case: nonexistent path returns typed NotFound
+    let missing_path = root.join("nonexistent_blob.bin");
+    let err_not_found = fs_metadata_size(&missing_path)
+        .await
+        .expect_err("nonexistent file must fail");
+    assert_eq!(err_not_found.kind(), std::io::ErrorKind::NotFound);
+
+    // 2. Intermediate regular file component: non-NotFound typed I/O error
+    let intermediate_file = root.join("intermediate_regular_file.bin");
+    std::fs::write(&intermediate_file, b"content").expect("write intermediate regular file");
+    let child_path = intermediate_file.join("sub_item");
+    let err_not_dir = fs_metadata_size(&child_path)
+        .await
+        .expect_err("metadata lookup through regular file must fail");
+    assert_ne!(
+        err_not_dir.kind(),
+        std::io::ErrorKind::NotFound,
+        "Intermediate regular file must yield a non-NotFound I/O error"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_fs_metadata_size_environment_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp_fs_root();
+    let restricted_dir = root.join("restricted_dir");
+    std::fs::create_dir_all(&restricted_dir).expect("create restricted dir");
+    let inaccessible_path = restricted_dir.join("inaccessible.bin");
+    std::fs::write(&inaccessible_path, b"secret").expect("write test file");
+
+    {
+        let _guard = PermGuard(&restricted_dir);
+        std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("set permissions 0o000");
+
+        let err_perm = fs_metadata_size(&inaccessible_path)
+            .await
+            .expect_err("metadata query on inaccessible path must fail");
+        assert_eq!(err_perm.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    std::fs::remove_dir_all(&root).expect("cleanup test temp directory");
+}
+
+#[tokio::test]
+async fn test_head_blob_ordinary_wins_over_quarantine() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+            .unwrap();
+    let live_content = b"live payload";
+    let quarantine_content = b"quarantine payload is different length";
+
+    write_file(&storage.blob_path(&digest), live_content);
+    write_file(&storage.quarantine_blob_path(&digest), quarantine_content);
+
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob must succeed");
+    assert_eq!(meta.size, live_content.len() as u64);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn test_head_blob_quarantine_only_and_both_missing_baselines() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest_quarantine =
+        Digest::parse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+    let quarantine_content = b"quarantined content";
+    write_file(
+        &storage.quarantine_blob_path(&digest_quarantine),
+        quarantine_content,
+    );
+
+    // Quarantine-only succeeds
+    let meta = storage
+        .head_blob(&digest_quarantine)
+        .await
+        .expect("head_blob must fall back to quarantine");
+    assert_eq!(meta.size, quarantine_content.len() as u64);
+
+    // Both missing returns StorageError::NotFound
+    let digest_missing =
+        Digest::parse("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+    let res = storage.head_blob(&digest_missing).await;
+    assert!(matches!(res, Err(StorageError::NotFound)));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn test_head_blob_deterministic_non_not_found_suppresses_quarantine_and_preserves_error() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+            .unwrap();
+
+    // Quarantine blob exists
+    let quarantine_content = b"quarantine blob exists";
+    write_file(&storage.quarantine_blob_path(&digest), quarantine_content);
+
+    // Live blob path is: <root>/blobs/<prefix>/<hex_rest>
+    // Create <root>/blobs/<prefix> as a regular file so directory traversal fails
+    let blob_path = storage.blob_path(&digest);
+    let parent = blob_path.parent().expect("blob path parent");
+    if let Some(grandparent) = parent.parent() {
+        std::fs::create_dir_all(grandparent).expect("create grandparent dirs");
+    }
+    std::fs::write(parent, b"regular file blocking directory").expect("write blocking file");
+
+    // Capture the exact low-level I/O error from fs_metadata_size
+    let expected_io_err = fs_metadata_size(&blob_path)
+        .await
+        .expect_err("metadata on child of regular file must fail");
+    assert_ne!(expected_io_err.kind(), std::io::ErrorKind::NotFound);
+
+    let expected_msg = expected_io_err.to_string();
+    let expected_display = format!("internal error: {expected_msg}");
+
+    let res = storage.head_blob(&digest).await;
+    assert!(res.is_err(), "head_blob must fail on non-not-found error");
+    let err = res.unwrap_err();
+
+    // Outward error must remain StorageErrorKind::Io without falling back to quarantine
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "Non-NotFound error must produce StorageErrorKind::Io without falling back to quarantine"
+    );
+    // Compare exact diagnostic and Display string by equality against original reference
+    assert_eq!(err.message(), Some(expected_msg.as_str()));
+    assert_eq!(err.to_string(), expected_display);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_head_blob_environment_permission_denied_suppresses_quarantine() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+            .unwrap();
+
+    // Quarantine blob exists
+    let quarantine_content = b"quarantine blob exists";
+    write_file(&storage.quarantine_blob_path(&digest), quarantine_content);
+
+    let blob_path = storage.blob_path(&digest);
+    let parent = blob_path.parent().expect("blob path parent");
+    std::fs::create_dir_all(parent).expect("create parent dirs");
+    write_file(&blob_path, b"live blob");
+
+    {
+        // RAII guard ensures 0o700 is restored on drop even if an assertion panics
+        let _guard = PermGuard(parent);
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o000))
+            .expect("set parent permissions 0o000");
+
+        // Capture expected I/O error directly from the low-level helper
+        let expected_io_err = fs_metadata_size(&blob_path)
+            .await
+            .expect_err("metadata on permission-denied path must fail");
+        assert_eq!(expected_io_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let expected_msg = expected_io_err.to_string();
+        let expected_display = format!("internal error: {expected_msg}");
+
+        let res = storage.head_blob(&digest).await;
+        assert!(res.is_err(), "head_blob must fail on permission error");
+        let err = res.unwrap_err();
+
+        // Outward error must remain StorageErrorKind::Io without falling back to quarantine
+        assert_eq!(
+            err.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Io),
+            "Permission error must produce StorageErrorKind::Io without falling back to quarantine"
+        );
+        // Compare exact diagnostic and Display string by equality against OS reference
+        assert_eq!(err.message(), Some(expected_msg.as_str()));
+        assert_eq!(err.to_string(), expected_display);
+    }
+
+    std::fs::remove_dir_all(&root).expect("cleanup test temp directory");
+}
+
+#[tokio::test]
+async fn test_storage_error_conversion_evidence_permission_denied() {
+    // Synthetic conversion evidence: verifies outward boundary conversion preserves
+    // StorageErrorKind::Io and formatting for PermissionDenied without needing OS chmod.
+    let synthetic_io_err = std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "synthetic permission denied for conversion verification",
+    );
+    let expected_msg = synthetic_io_err.to_string();
+    let expected_display = format!("internal error: {expected_msg}");
+
+    let outward_err = StorageError::io(synthetic_io_err.to_string());
+    assert_eq!(
+        outward_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
+    assert_eq!(outward_err.message(), Some(expected_msg.as_str()));
+    assert_eq!(outward_err.to_string(), expected_display);
+}

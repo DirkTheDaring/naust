@@ -669,6 +669,14 @@ async fn fs_dir_has_any_entry(path: &Path) -> Result<bool, StorageError> {
     }
 }
 
+/// Low-level filesystem metadata inquiry returning object byte size.
+///
+/// Retains the original [`std::io::Error`] on failure so its [`std::io::ErrorKind`]
+/// remains available for typed inspection before outward conversion.
+async fn fs_metadata_size(path: &Path) -> Result<u64, std::io::Error> {
+    tokio::fs::metadata(path).await.map(|m| m.len())
+}
+
 #[async_trait]
 impl Storage for FsStorage {
     fn kind(&self) -> &'static str {
@@ -726,12 +734,12 @@ impl Storage for FsStorage {
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
         let path = self.blob_path(digest);
-        match tokio::fs::metadata(&path).await {
-            Ok(meta) => Ok(BlobMeta { size: meta.len() }),
+        match fs_metadata_size(&path).await {
+            Ok(size) => Ok(BlobMeta { size }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let qpath = self.quarantine_blob_path(digest);
-                match tokio::fs::metadata(&qpath).await {
-                    Ok(meta) => Ok(BlobMeta { size: meta.len() }),
+                match fs_metadata_size(&qpath).await {
+                    Ok(size) => Ok(BlobMeta { size }),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                         Err(StorageError::NotFound)
                     }
