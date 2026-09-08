@@ -11,6 +11,7 @@ use std::{pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
+pub(crate) mod facade;
 pub mod fs;
 pub mod mutation_authority;
 pub mod ports;

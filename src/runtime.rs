@@ -13,6 +13,7 @@ use crate::consistency::ConsistencyCoordinator;
 use crate::gc_service::GcService;
 use crate::ip_concurrency::IpConcurrencyLimiter;
 use crate::storage::StorageWiring;
+use crate::storage::facade::StorageWiringFacade;
 use crate::storage::mutation_authority::RuntimeMutationAuthority;
 use crate::upload_coordinator::BlobUploadCoordinatorConfig;
 
@@ -120,8 +121,9 @@ pub(crate) fn assemble_application_services(
         ref_index.clone(),
         consistency.clone(),
     ));
+    let storage_facade = StorageWiringFacade::new(storage_wiring.clone());
     let blob_read_service = Arc::new(BlobReadService::new(
-        storage_wiring.blob_reader(),
+        storage_facade.blob_reader(),
         storage_wiring.membership_reader(),
         blob_service.clone(),
     ));
