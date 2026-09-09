@@ -85,6 +85,12 @@ pub(crate) fn translate_read_error(err: storage_core::ReadError) -> StorageError
                                 "openat2 is unavailable in this execution environment: {io_err}"
                             ));
                         }
+                        storage_fs::FsMetadataError::RuntimeMissing(_) => {
+                            return StorageError::backend(fs_err.to_string());
+                        }
+                        storage_fs::FsMetadataError::TaskJoinFailed(_) => {
+                            return StorageError::backend(fs_err.to_string());
+                        }
                         _ => return StorageError::io(fs_err.to_string()),
                     }
                 }
@@ -400,6 +406,206 @@ mod tests {
             other => panic!("expected StorageError::Internal(Configuration), got: {other:?}"),
         }
         assert_eq!(fake.calls(), vec![primary_key]);
+    }
+
+    #[test]
+    fn test_fake_primary_runtime_missing_suppresses_quarantine() {
+        // Obtain genuine TryCurrentError outside an entered Tokio runtime.
+        let try_current_err = match tokio::runtime::Handle::try_current() {
+            Ok(_) => std::thread::spawn(|| {
+                tokio::runtime::Handle::try_current()
+                    .expect_err("clean OS thread must not have an entered Tokio runtime")
+            })
+            .join()
+            .expect("join thread"),
+            Err(e) => e,
+        };
+
+        let try_current_err_str = try_current_err.to_string();
+        let fs_err = storage_fs::FsMetadataError::RuntimeMissing(try_current_err);
+        let expected_msg = fs_err.to_string();
+        assert!(
+            expected_msg.starts_with("tokio runtime required: "),
+            "expected diagnostic prefix, got: {expected_msg}"
+        );
+        assert_eq!(
+            expected_msg,
+            format!("tokio runtime required: {try_current_err_str}")
+        );
+
+        // 1. Direct translation check
+        let try_current_err_direct = match tokio::runtime::Handle::try_current() {
+            Ok(_) => std::thread::spawn(|| {
+                tokio::runtime::Handle::try_current()
+                    .expect_err("clean OS thread must not have an entered Tokio runtime")
+            })
+            .join()
+            .expect("join thread"),
+            Err(e) => e,
+        };
+        let fs_err_direct = storage_fs::FsMetadataError::RuntimeMissing(try_current_err_direct);
+        let expected_msg_direct = fs_err_direct.to_string();
+        let direct_err = translate_read_error(ReadError::backend_with_source(
+            "tokio runtime missing",
+            Box::new(fs_err_direct),
+        ));
+        match direct_err {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Backend);
+                assert_eq!(message, expected_msg_direct);
+            }
+            other => panic!("expected StorageError::Internal(Backend), got: {other:?}"),
+        }
+
+        // 2. Seam execution in dedicated runtime
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build isolated test runtime");
+
+        rt.block_on(async {
+            let fake = RecordingFakeReader::new();
+            let digest =
+                test_digest("1010101010101010101010101010101010101010101010101010101010101010");
+            let primary_key = ObjectKey::parse(
+                "blobs/sha256/10/1010101010101010101010101010101010101010101010101010101010101010",
+            )
+            .unwrap();
+
+            fake.script(
+                primary_key.clone(),
+                Err(ReadError::backend_with_source(
+                    "tokio runtime missing",
+                    Box::new(fs_err),
+                )),
+            );
+
+            let err = head_blob_seam(&fake, &digest)
+                .await
+                .expect_err("runtime missing must return error and suppress quarantine");
+
+            match &err {
+                StorageError::Internal { kind, message } => {
+                    assert_eq!(*kind, StorageErrorKind::Backend);
+                    assert_eq!(message, &expected_msg);
+                    assert_eq!(
+                        message,
+                        &format!("tokio runtime required: {try_current_err_str}")
+                    );
+                }
+                other => panic!("expected StorageError::Internal(Backend), got: {other:?}"),
+            }
+
+            // Verify error does not become NotFound or PermissionDenied
+            assert!(!matches!(err, StorageError::NotFound));
+            assert_ne!(
+                match &err {
+                    StorageError::Internal { kind, .. } => *kind,
+                    _ => StorageErrorKind::InternalInvariant,
+                },
+                StorageErrorKind::PermissionDenied
+            );
+
+            // Verify quarantine fallback is suppressed and fake records only primary lookup
+            assert_eq!(fake.calls(), vec![primary_key]);
+        });
+    }
+
+    #[test]
+    fn test_fake_primary_task_join_failed_suppresses_quarantine() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build isolated test runtime");
+
+        // Obtain genuine JoinError from an explicitly awaited task that intentionally panics
+        // in an isolated test runtime. This fixture demonstrates translation of a genuine
+        // JoinError; it does not represent or prove that a storage syscall panicked.
+        let (join_err, join_err_direct) = rt.block_on(async {
+            let task1 = tokio::task::spawn_blocking(|| {
+                panic!("deliberate worker panic to construct genuine JoinError fixture");
+            });
+            let task2 = tokio::task::spawn_blocking(|| {
+                panic!("deliberate worker panic to construct genuine JoinError fixture");
+            });
+            let err1 = task1
+                .await
+                .expect_err("task1 deliberate panic must yield JoinError");
+            let err2 = task2
+                .await
+                .expect_err("task2 deliberate panic must yield JoinError");
+            (err1, err2)
+        });
+
+        assert!(
+            join_err.is_panic(),
+            "constructed JoinError must represent a panic"
+        );
+        let fs_err = storage_fs::FsMetadataError::TaskJoinFailed(join_err);
+        let expected_msg = fs_err.to_string();
+        assert!(
+            expected_msg.starts_with("blocking metadata task failed: "),
+            "expected diagnostic prefix, got: {expected_msg}"
+        );
+
+        // 1. Direct translation check
+        let fs_err_direct = storage_fs::FsMetadataError::TaskJoinFailed(join_err_direct);
+        let expected_msg_direct = fs_err_direct.to_string();
+        let direct_err = translate_read_error(ReadError::backend_with_source(
+            "blocking task failed",
+            Box::new(fs_err_direct),
+        ));
+        match direct_err {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Backend);
+                assert_eq!(message, expected_msg_direct);
+            }
+            other => panic!("expected StorageError::Internal(Backend), got: {other:?}"),
+        }
+
+        // 2. Seam execution in dedicated runtime
+        rt.block_on(async {
+            let fake = RecordingFakeReader::new();
+            let digest =
+                test_digest("2020202020202020202020202020202020202020202020202020202020202020");
+            let primary_key = ObjectKey::parse(
+                "blobs/sha256/20/2020202020202020202020202020202020202020202020202020202020202020",
+            )
+            .unwrap();
+
+            fake.script(
+                primary_key.clone(),
+                Err(ReadError::backend_with_source(
+                    "blocking metadata task failed",
+                    Box::new(fs_err),
+                )),
+            );
+
+            let err = head_blob_seam(&fake, &digest)
+                .await
+                .expect_err("task join failure must return error and suppress quarantine");
+
+            match &err {
+                StorageError::Internal { kind, message } => {
+                    assert_eq!(*kind, StorageErrorKind::Backend);
+                    assert_eq!(message, &expected_msg);
+                }
+                other => panic!("expected StorageError::Internal(Backend), got: {other:?}"),
+            }
+
+            // Verify error does not become NotFound or PermissionDenied
+            assert!(!matches!(err, StorageError::NotFound));
+            assert_ne!(
+                match &err {
+                    StorageError::Internal { kind, .. } => *kind,
+                    _ => StorageErrorKind::InternalInvariant,
+                },
+                StorageErrorKind::PermissionDenied
+            );
+
+            // Verify quarantine fallback is suppressed and fake records only primary lookup
+            assert_eq!(fake.calls(), vec![primary_key]);
+        });
     }
 
     #[tokio::test]
