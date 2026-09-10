@@ -31,136 +31,17 @@
 //!   `kind: StorageErrorKind` and `message: String`. Useful diagnostic text is preserved within the message.
 
 use crate::registry::digest::Digest;
-use crate::storage::{BlobMeta, StorageError, StorageErrorKind};
+use crate::storage::{StorageError, StorageErrorKind};
 use std::pin::Pin;
 use tokio::io::AsyncRead;
 
-/// Registry-owned async integration seam for acquiring readable blob payload streams via [`storage_core::ObjectPayloadReader`].
-///
-/// Implements two-stage digest resolution:
-/// 1. Primary lookup at `blobs/<algorithm>/<prefix2>/<hex>`.
-/// 2. Quarantine fallback at `quarantine/blobs/<algorithm>/<prefix2>/<hex>` **only** if the primary
-///    lookup returns [`storage_core::ReadError::NotFound`].
-///
-/// Any other failure on primary immediately returns without attempting quarantine.
-/// Any failure on quarantine returns immediately without further lookup.
-///
-/// Returns the registry-compatible [`BlobMeta`] and owned [`Pin<Box<dyn AsyncRead + Send>>`].
-/// Preserves the exact `u64` size without reading, buffering, or collecting bytes during acquisition.
-/// Once acquired, stream read failures are surfaced directly as [`std::io::Error`] during polling,
-/// without triggering re-acquisition or fallback.
-pub(crate) async fn open_blob_seam(
-    reader: &dyn storage_core::ObjectPayloadReader,
-    digest: &Digest,
-) -> Result<(BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
-    let primary_key_str = format!(
-        "blobs/{}/{}/{}",
-        digest.algorithm(),
-        digest.prefix2(),
-        digest.hex()
-    );
-    let primary_key = storage_core::ObjectKey::parse(&primary_key_str)
-        .map_err(|e| StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string()))?;
+pub(crate) use super::read_adapter::open_blob_seam;
 
-    match reader.open_payload(&primary_key).await {
-        Ok(payload) => {
-            let (meta, stream) = payload.into_parts();
-            Ok((BlobMeta { size: meta.size() }, stream))
-        }
-        Err(storage_core::ReadError::NotFound { .. }) => {
-            let quarantine_key_str = format!(
-                "quarantine/blobs/{}/{}/{}",
-                digest.algorithm(),
-                digest.prefix2(),
-                digest.hex()
-            );
-            let quarantine_key =
-                storage_core::ObjectKey::parse(&quarantine_key_str).map_err(|e| {
-                    StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string())
-                })?;
-
-            match reader.open_payload(&quarantine_key).await {
-                Ok(payload) => {
-                    let (meta, stream) = payload.into_parts();
-                    Ok((BlobMeta { size: meta.size() }, stream))
-                }
-                Err(storage_core::ReadError::NotFound { .. }) => Err(StorageError::NotFound),
-                Err(other) => Err(translate_read_error(other)),
-            }
-        }
-        Err(other) => Err(translate_read_error(other)),
-    }
-}
-
-/// Translates strongly typed [`storage_core::ReadError`] outcomes into legacy [`StorageError`] taxonomy.
+/// Translates strongly typed [`storage_core::ReadError`] outcomes into legacy [`StorageError`] taxonomy
+/// by delegating to the shared [`super::read_adapter::translate_payload_read_error`].
+#[allow(dead_code)] // Preserved for symmetry with metadata_seam translation helper
 pub(crate) fn translate_read_error(err: storage_core::ReadError) -> StorageError {
-    match err {
-        storage_core::ReadError::NotFound { .. } => StorageError::NotFound,
-        storage_core::ReadError::PermissionDenied { ref source, .. } => {
-            if let Some(src) = source {
-                if let Some(io_err) = src.downcast_ref::<std::io::Error>() {
-                    return StorageError::io(io_err.to_string());
-                }
-                StorageError::io(src.to_string())
-            } else {
-                StorageError::io("permission denied")
-            }
-        }
-        storage_core::ReadError::Backend {
-            ref message,
-            ref source,
-            ..
-        } => {
-            if let Some(src) = source {
-                if let Some(fs_err) = src.downcast_ref::<storage_fs::FsMetadataError>() {
-                    match fs_err {
-                        storage_fs::FsMetadataError::ResolutionRejected { source, .. } => {
-                            StorageError::io(source.to_string())
-                        }
-                        storage_fs::FsMetadataError::UnsupportedObjectType { mode, .. } => {
-                            StorageError::io(format!("unsupported object type (mode: {mode:#o})"))
-                        }
-                        storage_fs::FsMetadataError::SyscallUnsupported(io_err) => {
-                            StorageError::configuration(format!(
-                                "openat2 is unavailable in this execution environment: {io_err}"
-                            ))
-                        }
-                        storage_fs::FsMetadataError::StatFailed { stage, source } => {
-                            StorageError::io(format!("failed to stat {stage} descriptor: {source}"))
-                        }
-                        storage_fs::FsMetadataError::ProcfsReopenFailed { source } => {
-                            StorageError::io(format!(
-                                "failed to reopen descriptor via procfs: {source}"
-                            ))
-                        }
-                        storage_fs::FsMetadataError::IdentityMismatch { .. } => {
-                            StorageError::io(fs_err.to_string())
-                        }
-                        storage_fs::FsMetadataError::InvalidMetadata { .. } => {
-                            StorageError::io(fs_err.to_string())
-                        }
-                        storage_fs::FsMetadataError::PlatformUnsupported => {
-                            StorageError::io(fs_err.to_string())
-                        }
-                        storage_fs::FsMetadataError::RuntimeMissing(_) => {
-                            StorageError::backend(fs_err.to_string())
-                        }
-                        storage_fs::FsMetadataError::TaskJoinFailed(_) => {
-                            StorageError::backend(fs_err.to_string())
-                        }
-                        _ => StorageError::io(fs_err.to_string()),
-                    }
-                } else if let Some(io_err) = src.downcast_ref::<std::io::Error>() {
-                    StorageError::io(io_err.to_string())
-                } else {
-                    StorageError::io(src.to_string())
-                }
-            } else {
-                StorageError::io(message)
-            }
-        }
-        _ => StorageError::io("unknown storage payload read failure"),
-    }
+    super::read_adapter::translate_payload_read_error(err)
 }
 
 #[cfg(test)]

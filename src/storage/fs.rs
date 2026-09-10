@@ -3699,6 +3699,9 @@ mod tests;
 #[path = "fs/contained_metadata.rs"]
 mod contained_metadata;
 
+#[path = "fs/read_adapter.rs"]
+pub(crate) mod read_adapter;
+
 #[cfg(test)]
 #[path = "fs/metadata_seam.rs"]
 mod metadata_seam;

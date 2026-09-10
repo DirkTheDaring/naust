@@ -2,108 +2,14 @@
 //! `registry-rust` storage semantics and quarantine orchestration.
 
 use crate::registry::digest::Digest;
-use crate::storage::{BlobMeta, StorageError, StorageErrorKind};
+use crate::storage::{StorageError, StorageErrorKind};
 
-/// Registry-owned async integration seam for querying blob metadata via an [`storage_core::ObjectMetadataReader`].
-///
-/// Implements two-stage digest resolution:
-/// 1. Primary lookup at `blobs/<algorithm>/<prefix2>/<hex>`.
-/// 2. Quarantine fallback at `quarantine/blobs/<algorithm>/<prefix2>/<hex>` **only** if the primary
-///    lookup returns [`storage_core::ReadError::NotFound`].
-///
-/// Any other failure on primary immediately returns without attempting quarantine.
-/// Any failure on quarantine returns immediately without further lookup.
-pub(crate) async fn head_blob_seam(
-    reader: &dyn storage_core::ObjectMetadataReader,
-    digest: &Digest,
-) -> Result<BlobMeta, StorageError> {
-    let primary_key_str = format!(
-        "blobs/{}/{}/{}",
-        digest.algorithm(),
-        digest.prefix2(),
-        digest.hex()
-    );
-    let primary_key = storage_core::ObjectKey::parse(&primary_key_str)
-        .map_err(|e| StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string()))?;
+pub(crate) use super::read_adapter::head_blob_seam;
 
-    match reader.head(&primary_key).await {
-        Ok(meta) => Ok(BlobMeta { size: meta.size() }),
-        Err(storage_core::ReadError::NotFound { .. }) => {
-            let quarantine_key_str = format!(
-                "quarantine/blobs/{}/{}/{}",
-                digest.algorithm(),
-                digest.prefix2(),
-                digest.hex()
-            );
-            let quarantine_key =
-                storage_core::ObjectKey::parse(&quarantine_key_str).map_err(|e| {
-                    StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string())
-                })?;
-
-            match reader.head(&quarantine_key).await {
-                Ok(meta) => Ok(BlobMeta { size: meta.size() }),
-                Err(storage_core::ReadError::NotFound { .. }) => Err(StorageError::NotFound),
-                Err(other) => Err(translate_read_error(other)),
-            }
-        }
-        Err(other) => Err(translate_read_error(other)),
-    }
-}
-
-/// Translates strongly typed [`storage_core::ReadError`] outcomes into legacy [`StorageError`] taxonomy.
+/// Translates strongly typed [`storage_core::ReadError`] outcomes into legacy [`StorageError`] taxonomy
+/// by delegating to the shared [`super::read_adapter::translate_metadata_read_error`].
 pub(crate) fn translate_read_error(err: storage_core::ReadError) -> StorageError {
-    match err {
-        storage_core::ReadError::NotFound { .. } => StorageError::NotFound,
-        storage_core::ReadError::PermissionDenied { ref source, .. } => {
-            if let Some(src) = source {
-                if let Some(io_err) = src.downcast_ref::<std::io::Error>() {
-                    return StorageError::io(io_err.to_string());
-                }
-                StorageError::io(src.to_string())
-            } else {
-                StorageError::io("permission denied")
-            }
-        }
-        storage_core::ReadError::Backend {
-            ref message,
-            ref source,
-            ..
-        } => {
-            if let Some(src) = source {
-                if let Some(fs_err) = src.downcast_ref::<storage_fs::FsMetadataError>() {
-                    match fs_err {
-                        storage_fs::FsMetadataError::ResolutionRejected { source, .. } => {
-                            return StorageError::io(source.to_string());
-                        }
-                        storage_fs::FsMetadataError::UnsupportedObjectType { mode, .. } => {
-                            return StorageError::io(format!(
-                                "unsupported object type (mode: {mode:#o})"
-                            ));
-                        }
-                        storage_fs::FsMetadataError::SyscallUnsupported(io_err) => {
-                            return StorageError::configuration(format!(
-                                "openat2 is unavailable in this execution environment: {io_err}"
-                            ));
-                        }
-                        storage_fs::FsMetadataError::RuntimeMissing(_) => {
-                            return StorageError::backend(fs_err.to_string());
-                        }
-                        storage_fs::FsMetadataError::TaskJoinFailed(_) => {
-                            return StorageError::backend(fs_err.to_string());
-                        }
-                        _ => return StorageError::io(fs_err.to_string()),
-                    }
-                }
-                if let Some(io_err) = src.downcast_ref::<std::io::Error>() {
-                    return StorageError::io(io_err.to_string());
-                }
-                StorageError::io(src.to_string())
-            } else {
-                StorageError::io(message)
-            }
-        }
-        _ => StorageError::io("unknown storage metadata read failure"),
-    }
+    super::read_adapter::translate_metadata_read_error(err)
 }
 
 #[cfg(test)]

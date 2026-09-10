@@ -43,6 +43,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 acmecert-core = { path = "../acmecert/crates/acmecert-core" }
+storage-core = { path = "../storage-layer-rust/crates/storage-core" }
+storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
 
 [features]
 default = ["storage-fs"]
@@ -53,5 +55,3 @@ storage-s3 = []
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
-storage-core = { path = "../storage-layer-rust/crates/storage-core" }
-storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
