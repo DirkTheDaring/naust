@@ -924,6 +924,57 @@ pub fn proxy_cache_storage_try_from_config(
     }
 }
 
+pub(crate) async fn storage_wiring_try_from_config_async_with_factory<F>(
+    config: &Config,
+    storage_factory: F,
+) -> Result<StorageWiring, StorageError>
+where
+    F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
+{
+    match config.storage_backend {
+        StorageBackend::Filesystem => {
+            let config_clone = config.clone();
+            tokio::task::spawn_blocking(move || storage_factory(&config_clone))
+                .await
+                .map_err(|join_err| {
+                    StorageError::backend(format!(
+                        "filesystem storage initialization task failed: {join_err}"
+                    ))
+                })?
+        }
+        StorageBackend::S3 => storage_factory(config),
+    }
+}
+
+pub(crate) async fn proxy_cache_storage_try_from_config_async_with_factory<F>(
+    config: &Config,
+    upstream: Option<&crate::config::ProxyUpstreamRoute>,
+    factory: F,
+) -> Result<Arc<dyn ports::ProxyStoragePort>, StorageError>
+where
+    F: FnOnce(
+            &Config,
+            Option<&crate::config::ProxyUpstreamRoute>,
+        ) -> Result<Arc<dyn ports::ProxyStoragePort>, StorageError>
+        + Send
+        + 'static,
+{
+    match config.storage_backend {
+        StorageBackend::Filesystem => {
+            let config_clone = config.clone();
+            let upstream_clone = upstream.cloned();
+            tokio::task::spawn_blocking(move || factory(&config_clone, upstream_clone.as_ref()))
+                .await
+                .map_err(|join_err| {
+                    StorageError::backend(format!(
+                        "filesystem proxy cache storage initialization task failed: {join_err}"
+                    ))
+                })?
+        }
+        StorageBackend::S3 => factory(config, upstream),
+    }
+}
+
 pub(crate) fn ensure_dir(path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
     let p = path.as_ref();
     std::fs::create_dir_all(p).map_err(|err| {

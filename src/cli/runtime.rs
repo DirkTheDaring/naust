@@ -13,13 +13,13 @@ use crate::membership_migration::{
     MigrationStats, apply_membership_migration, plan_membership_migration,
     verify_membership_migration,
 };
-use crate::storage;
 use crate::storage::mutation_authority::{
     DeploymentWriterLockDoc, RuntimeMutationAuthority,
     admin_clear_abandoned_deployment_writer_lock, force_unlock_deployment_writer,
     inspect_deployment_writer_lock,
 };
 use crate::storage::ports::StorageWiring;
+use crate::storage::{self, StorageError};
 
 /// Bounded maintenance runtime managing configuration, storage wiring, filesystem exclusion,
 /// and distributed mutation authority leases with strict single-ownership unwinding.
@@ -33,6 +33,18 @@ pub struct MaintenanceRuntime {
 impl MaintenanceRuntime {
     /// Acquire and initialize the maintenance runtime according to the given command policy.
     pub async fn acquire(config: Arc<Config>, policy: CommandPolicy) -> Result<Self, CliError> {
+        Self::acquire_with_storage_factory(config, policy, storage::storage_wiring_try_from_config)
+            .await
+    }
+
+    pub(crate) async fn acquire_with_storage_factory<F>(
+        config: Arc<Config>,
+        policy: CommandPolicy,
+        storage_factory: F,
+    ) -> Result<Self, CliError>
+    where
+        F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
+    {
         // 1. Filesystem root lock (where applicable) - mirrors server acquisition order
         let fs_root_lock = if policy.requires_fs_root_lock()
             && config.storage_backend == StorageBackend::Filesystem
@@ -48,7 +60,12 @@ impl MaintenanceRuntime {
         };
 
         // 2. Storage wiring initialization
-        let storage_wiring = match storage::storage_wiring_try_from_config(config.as_ref()) {
+        let storage_wiring = match storage::storage_wiring_try_from_config_async_with_factory(
+            config.as_ref(),
+            storage_factory,
+        )
+        .await
+        {
             Ok(wiring) => wiring,
             Err(err) => {
                 return Err(CliError::Storage(err));
@@ -423,7 +440,30 @@ impl MaintenanceRuntime {
         expected_etag: &str,
         confirm: &str,
     ) -> Result<(), CliError> {
-        let wiring = storage::storage_wiring_try_from_config(config).map_err(CliError::Storage)?;
+        Self::admin_clear_lock_with_storage_factory(
+            config,
+            expected_owner,
+            expected_etag,
+            confirm,
+            storage::storage_wiring_try_from_config,
+        )
+        .await
+    }
+
+    pub(crate) async fn admin_clear_lock_with_storage_factory<F>(
+        config: &Config,
+        expected_owner: &str,
+        expected_etag: &str,
+        confirm: &str,
+        storage_factory: F,
+    ) -> Result<(), CliError>
+    where
+        F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
+    {
+        let wiring =
+            storage::storage_wiring_try_from_config_async_with_factory(config, storage_factory)
+                .await
+                .map_err(CliError::Storage)?;
         if confirm == "CONFIRM-CLEAR-ABANDONED-WRITER" {
             admin_clear_abandoned_deployment_writer_lock(
                 wiring.cluster_lock().as_ref(),
@@ -442,5 +482,211 @@ impl MaintenanceRuntime {
                 "destructive lock clearing requires exact confirmation token 'CONFIRM-CLEAR-ABANDONED-WRITER' or 'FORCE'".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::StorageErrorKind;
+    use tempfile::TempDir;
+
+    fn create_test_config(temp: &TempDir) -> Config {
+        let mut cfg = Config::from_env().expect("config from env");
+        cfg.storage_backend = StorageBackend::Filesystem;
+        cfg.fs_root = temp.path().join("storage_root");
+        cfg.max_upload_bytes = 10 * 1024 * 1024;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_runtime_acquire_offloads_filesystem_storage_to_blocking_thread() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+
+        let mut runtime = MaintenanceRuntime::acquire_with_storage_factory(
+            cfg.clone(),
+            CommandPolicy::ReadOnly,
+            move |c| {
+                let current_id = std::thread::current().id();
+                let _ = worker_tx.send(current_id);
+                crate::storage::storage_wiring_try_from_config(c)
+            },
+        )
+        .await
+        .expect("maintenance acquire must succeed");
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_ne!(
+            calling_thread_id, construction_thread_id,
+            "filesystem storage construction in MaintenanceRuntime::acquire must execute on a separate blocking thread"
+        );
+        assert!(runtime.release_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_admin_clear_lock_offloads_filesystem_storage_to_blocking_thread() {
+        let temp = TempDir::new().unwrap();
+        let cfg = create_test_config(&temp);
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+
+        let res = MaintenanceRuntime::admin_clear_lock_with_storage_factory(
+            &cfg,
+            "owner",
+            "etag",
+            "INVALID_CONFIRM",
+            move |c| {
+                let current_id = std::thread::current().id();
+                let _ = worker_tx.send(current_id);
+                crate::storage::storage_wiring_try_from_config(c)
+            },
+        )
+        .await;
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_ne!(
+            calling_thread_id, construction_thread_id,
+            "filesystem storage construction in admin_clear_lock must execute on a separate blocking thread"
+        );
+        assert!(matches!(res, Err(CliError::AdminClearLock(_))));
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_acquire_awaits_construction_before_authority_acquisition() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        struct ReleaseGuard(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let guard = ReleaseGuard(Some(release_tx));
+
+        let cfg_clone = cfg.clone();
+        let acquire_handle = tokio::spawn(async move {
+            MaintenanceRuntime::acquire_with_storage_factory(
+                cfg_clone,
+                CommandPolicy::ExclusiveInspection {
+                    lock_suffix: "test_await",
+                },
+                move |c| {
+                    let _ = started_tx.send(());
+                    if let Err(err) = release_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        panic!("worker wait failed: {err}");
+                    }
+                    crate::storage::storage_wiring_try_from_config(c)
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("worker must start");
+        assert!(
+            !acquire_handle.is_finished(),
+            "acquire must not complete while construction is pending"
+        );
+
+        drop(guard);
+
+        let mut runtime = acquire_handle
+            .await
+            .expect("join handle must succeed")
+            .expect("maintenance acquire must succeed after release");
+        assert!(runtime.release_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_acquire_factory_failure_preserves_error() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+
+        let res =
+            MaintenanceRuntime::acquire_with_storage_factory(cfg, CommandPolicy::ReadOnly, |_| {
+                Err(StorageError::permission_denied("denied by custom factory"))
+            })
+            .await;
+
+        match res {
+            Err(CliError::Storage(err)) => {
+                assert_eq!(
+                    err.internal_kind(),
+                    Some(StorageErrorKind::PermissionDenied)
+                );
+                assert!(err.to_string().contains("denied by custom factory"));
+            }
+            Err(other) => {
+                panic!("expected CliError::Storage with PermissionDenied, got other error: {other}")
+            }
+            Ok(_) => panic!("expected CliError::Storage with PermissionDenied, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_acquire_blocking_task_failure_maps_to_backend() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+
+        let res =
+            MaintenanceRuntime::acquire_with_storage_factory(cfg, CommandPolicy::ReadOnly, |_| {
+                panic!("simulated blocking worker panic")
+            })
+            .await;
+
+        match res {
+            Err(CliError::Storage(err)) => {
+                assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+                assert!(
+                    err.to_string()
+                        .contains("filesystem storage initialization task failed")
+                );
+            }
+            Err(other) => {
+                panic!("expected CliError::Storage with Backend, got other error: {other}")
+            }
+            Ok(_) => panic!("expected CliError::Storage with Backend, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_acquire_s3_retains_existing_construction_path() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+        cfg.storage_backend = StorageBackend::S3;
+        cfg.s3_endpoint = Some("http://localhost:9000".to_string());
+        cfg.s3_region = Some("us-east-1".to_string());
+        cfg.s3_bucket = Some("test-bucket".to_string());
+        cfg.s3_prefix = "test".to_string();
+        let cfg = Arc::new(cfg);
+
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+
+        let _res = MaintenanceRuntime::acquire_with_storage_factory(
+            cfg,
+            CommandPolicy::ReadOnly,
+            move |c| {
+                let current_id = std::thread::current().id();
+                let _ = worker_tx.send(current_id);
+                crate::storage::storage_wiring_try_from_config(c)
+            },
+        )
+        .await;
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_eq!(
+            calling_thread_id, construction_thread_id,
+            "S3 storage construction must execute synchronously on the calling thread without spawn_blocking"
+        );
     }
 }

@@ -193,11 +193,21 @@ pub struct FsStorage {
     upload_hashes: Vec<Mutex<std::collections::HashMap<String, SerializableSha256>>>,
     referrer_locks: Vec<Mutex<()>>,
     repo_locks: std::sync::Mutex<std::collections::HashMap<String, std::fs::File>>,
+    read_adapter: std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>>,
 }
 
 impl FsStorage {
     pub fn try_new(root: PathBuf, max_upload_bytes: u64) -> Result<Self, StorageError> {
         ensure_dir(&root)?;
+        let reader = storage_fs::FsMetadataReader::open(&root)
+            .map_err(read_adapter::map_fs_startup_error)?;
+        reader
+            .probe_capability()
+            .map_err(read_adapter::map_fs_startup_error)?;
+        let read_adapter = std::sync::Arc::new(read_adapter::FsBlobCasReadAdapter::new(
+            std::sync::Arc::new(reader),
+        ));
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
@@ -212,6 +222,7 @@ impl FsStorage {
             upload_hashes,
             referrer_locks,
             repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            read_adapter,
         })
     }
 
@@ -219,6 +230,14 @@ impl FsStorage {
         Self::try_new(root, max_upload_bytes).unwrap_or_else(|err| {
             panic!("failed to initialize FsStorage: {err}");
         })
+    }
+
+    /// Returns a reference to the underlying read adapter.
+    #[cfg(test)]
+    pub(crate) fn read_adapter(
+        &self,
+    ) -> &std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>> {
+        &self.read_adapter
     }
 
     /// Computes the repository root directory for a validated canonical repository identity.
@@ -363,7 +382,8 @@ impl FsStorage {
             .join(digest.hex())
     }
 
-    fn quarantine_blob_path(&self, digest: &Digest) -> PathBuf {
+    #[cfg(test)]
+    pub(crate) fn quarantine_blob_path(&self, digest: &Digest) -> PathBuf {
         // data/quarantine/blobs/<algo>/ab/<hex>
         self.root
             .join("quarantine")
@@ -673,7 +693,9 @@ async fn fs_dir_has_any_entry(path: &Path) -> Result<bool, StorageError> {
 ///
 /// Retains the original [`std::io::Error`] on failure so its [`std::io::ErrorKind`]
 /// remains available for typed inspection before outward conversion.
-async fn fs_metadata_size(path: &Path) -> Result<u64, std::io::Error> {
+/// Preserved as a historical helper for low-level baseline characterization tests.
+#[cfg(test)]
+pub(crate) async fn fs_metadata_size(path: &Path) -> Result<u64, std::io::Error> {
     tokio::fs::metadata(path).await.map(|m| m.len())
 }
 
@@ -733,47 +755,16 @@ impl Storage for FsStorage {
     }
 
     async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
-        let path = self.blob_path(digest);
-        match fs_metadata_size(&path).await {
-            Ok(size) => Ok(BlobMeta { size }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let qpath = self.quarantine_blob_path(digest);
-                match fs_metadata_size(&qpath).await {
-                    Ok(size) => Ok(BlobMeta { size }),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        Err(StorageError::NotFound)
-                    }
-                    Err(err) => Err(StorageError::io(err.to_string())),
-                }
-            }
-            Err(err) => Err(StorageError::io(err.to_string())),
-        }
+        use crate::storage::ports::BlobCasReader;
+        self.read_adapter.head_blob(digest).await
     }
 
     async fn open_blob(
         &self,
         digest: &Digest,
     ) -> Result<(BlobMeta, std::pin::Pin<Box<dyn AsyncRead + Send>>), StorageError> {
-        let path = self.blob_path(digest);
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let qpath = self.quarantine_blob_path(digest);
-                match tokio::fs::File::open(&qpath).await {
-                    Ok(f) => f,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(StorageError::NotFound);
-                    }
-                    Err(err) => return Err(StorageError::io(err.to_string())),
-                }
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        let meta = match file.metadata().await {
-            Ok(m) => m,
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        Ok((BlobMeta { size: meta.len() }, Box::pin(file)))
+        use crate::storage::ports::BlobCasReader;
+        self.read_adapter.open_blob(digest).await
     }
 
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {

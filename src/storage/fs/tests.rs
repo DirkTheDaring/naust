@@ -1,6 +1,18 @@
 use super::*;
+use crate::storage::StorageErrorKind;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+
+async fn expect_open_blob_err(
+    storage: &FsStorage,
+    digest: &Digest,
+    panic_msg: &str,
+) -> StorageError {
+    match storage.open_blob(digest).await {
+        Ok(_) => panic!("{panic_msg}"),
+        Err(err) => err,
+    }
+}
 
 fn tmp_fs_root() -> PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -2371,8 +2383,7 @@ async fn test_storage_error_conversion_evidence_permission_denied() {
 #[cfg(unix)]
 async fn test_fs_metadata_containment_symlink_inside_root() {
     // Characterizes Case 1: Final blob entry is a symlink to an ordinary file inside configured root.
-    // Legacy behavior: tokio::fs::metadata follows the symlink and returns the target size.
-    // Note: In an extracted, contained backend, symlinks below the root must be rejected.
+    // Under accepted Policy C: symlinks below root are strictly rejected during acquisition.
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage_root");
     std::fs::create_dir_all(&root).expect("create storage root");
@@ -2391,25 +2402,42 @@ async fn test_fs_metadata_containment_symlink_inside_root() {
     }
     std::os::unix::fs::symlink(&target_inside, &blob_path).expect("create inside-root symlink");
 
-    // fs_metadata_size and head_blob follow symlink
+    // Legacy helper fs_metadata_size follows symlink (historical baseline preserved)
     let size = fs_metadata_size(&blob_path)
         .await
         .expect("fs_metadata_size follows inside-root symlink");
     assert_eq!(size, target_content.len() as u64);
 
-    let meta = storage
+    // Production head_blob rejects symlink under accepted containment policy
+    let head_err = storage
         .head_blob(&digest)
         .await
-        .expect("head_blob succeeds via inside-root symlink");
-    assert_eq!(meta.size, target_content.len() as u64);
+        .expect_err("production head_blob must reject inside-root symlink under containment");
+    assert_eq!(
+        head_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "containment rejection must map to StorageErrorKind::Io"
+    );
+
+    // Production open_blob rejects symlink under accepted containment policy
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "production open_blob must reject inside-root symlink under containment",
+    )
+    .await;
+    assert_eq!(
+        open_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "containment rejection must map to StorageErrorKind::Io"
+    );
 }
 
 #[tokio::test]
 #[cfg(unix)]
 async fn test_fs_metadata_containment_symlink_outside_root() {
     // Characterizes Case 2: Final blob entry points outside configured root but inside test fixture.
-    // Legacy behavior: tokio::fs::metadata follows the symlink outside root and returns target size.
-    // Open containment gap: Escapes storage root boundary.
+    // Under accepted Policy C: symlinks escaping root boundary are strictly rejected.
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage_root");
     let outside = fixture.path().join("outside_target");
@@ -2421,7 +2449,7 @@ async fn test_fs_metadata_containment_symlink_outside_root() {
         Digest::parse("sha256:2222222222222222222222222222222222222222222222222222222222222202")
             .unwrap();
     let target_outside = outside.join("target_outside.bin");
-    let outside_content = b"outside root target payload with unique length";
+    let outside_content = b"outside root regular file payload";
     write_file(&target_outside, outside_content);
 
     let blob_path = storage.blob_path(&digest);
@@ -2430,24 +2458,40 @@ async fn test_fs_metadata_containment_symlink_outside_root() {
     }
     std::os::unix::fs::symlink(&target_outside, &blob_path).expect("create outside-root symlink");
 
+    // Legacy helper fs_metadata_size follows symlink (historical baseline preserved)
     let size = fs_metadata_size(&blob_path)
         .await
         .expect("fs_metadata_size follows outside-root symlink");
     assert_eq!(size, outside_content.len() as u64);
 
-    let meta = storage
+    // Production head_blob rejects outside-root symlink under accepted containment policy
+    let head_err = storage
         .head_blob(&digest)
         .await
-        .expect("head_blob succeeds via outside-root symlink");
-    assert_eq!(meta.size, outside_content.len() as u64);
+        .expect_err("production head_blob must reject outside-root symlink under containment");
+    assert_eq!(
+        head_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
+
+    // Production open_blob rejects outside-root symlink under accepted containment policy
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "production open_blob must reject outside-root symlink under containment",
+    )
+    .await;
+    assert_eq!(
+        open_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
 }
 
 #[tokio::test]
 #[cfg(unix)]
 async fn test_fs_metadata_containment_intermediate_dir_symlink_outside_root() {
-    // Characterizes Case 3: Intermediate path component is a directory symlink to sibling fixture directory outside root.
-    // Legacy behavior: tokio::fs::metadata traverses through intermediate directory symlink.
-    // Open containment gap: Path traversal through symlinked directory escapes storage root.
+    // Characterizes Case 3: Intermediate directory is a symlink pointing outside root.
+    // Under accepted Policy C: intermediate directory symlinks are rejected during openat2 resolution.
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage_root");
     let outside = fixture.path().join("outside_dir");
@@ -2471,24 +2515,41 @@ async fn test_fs_metadata_containment_intermediate_dir_symlink_outside_root() {
     let content = b"intermediate directory symlink outside target";
     write_file(&target_file, content);
 
+    // Legacy helper fs_metadata_size traverses intermediate dir symlink (historical baseline preserved)
     let size = fs_metadata_size(&blob_path)
         .await
         .expect("fs_metadata_size traverses intermediate dir symlink");
     assert_eq!(size, content.len() as u64);
 
-    let meta = storage
+    // Production head_blob rejects intermediate directory symlink
+    let head_err = storage
         .head_blob(&digest)
         .await
-        .expect("head_blob succeeds via intermediate dir symlink");
-    assert_eq!(meta.size, content.len() as u64);
+        .expect_err("production head_blob must reject intermediate directory symlink");
+    assert_eq!(
+        head_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
+
+    // Production open_blob rejects intermediate directory symlink
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "production open_blob must reject intermediate directory symlink",
+    )
+    .await;
+    assert_eq!(
+        open_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
 }
 
 #[tokio::test]
 #[cfg(unix)]
 async fn test_fs_metadata_containment_dangling_symlink_falls_back_to_quarantine() {
     // Characterizes Case 4: Dangling ordinary blob symlink with a valid quarantine blob.
-    // Behavior: stat() on dangling symlink fails with NotFound, which causes head_blob
-    // to fall back to the quarantine blob rather than surfacing an invalid symlink error.
+    // Under accepted Policy C: Dangling and ordinary primary symlinks suppress quarantine fallback.
+    // Only genuine primary NotFound permits quarantine fallback.
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage_root");
     std::fs::create_dir_all(&root).expect("create storage root");
@@ -2510,26 +2571,44 @@ async fn test_fs_metadata_containment_dangling_symlink_falls_back_to_quarantine(
     let nonexistent_target = root.join("nonexistent_target.bin");
     std::os::unix::fs::symlink(&nonexistent_target, &blob_path).expect("create dangling symlink");
 
-    // Direct fs_metadata_size on dangling symlink yields NotFound
+    // Direct fs_metadata_size on dangling symlink yields NotFound (historical baseline preserved)
     let io_err = fs_metadata_size(&blob_path)
         .await
         .expect_err("metadata on dangling symlink must fail");
     assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
 
-    // head_blob treats NotFound as missing ordinary blob and falls back to quarantine
-    let meta = storage
+    // Production head_blob rejects dangling symlink via openat2 containment (ResolutionRejected),
+    // strictly suppressing quarantine fallback and returning StorageErrorKind::Io.
+    let head_err = storage
         .head_blob(&digest)
         .await
-        .expect("head_blob falls back to quarantine on dangling symlink");
-    assert_eq!(meta.size, quarantine_content.len() as u64);
+        .expect_err("production head_blob must suppress quarantine fallback on dangling symlink");
+    assert_eq!(
+        head_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "dangling symlink containment rejection must map to StorageErrorKind::Io"
+    );
+
+    // Production open_blob also suppresses quarantine fallback on dangling symlink
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "production open_blob must suppress quarantine fallback on dangling symlink",
+    )
+    .await;
+    assert_eq!(
+        open_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "dangling symlink containment rejection must map to StorageErrorKind::Io"
+    );
 }
 
 #[tokio::test]
 #[cfg(unix)]
 async fn test_fs_metadata_containment_quarantine_symlink_outside_root() {
     // Characterizes Case 5: Quarantine-path symlink to target outside configured root, ordinary path absent.
-    // Legacy behavior: Ordinary lookup fails with NotFound, fallback to quarantine follows symlink outside root.
-    // Open containment gap: Quarantine lookup also escapes storage root.
+    // Under accepted Policy C: Ordinary lookup fails with NotFound (permitting quarantine fallback),
+    // but quarantine lookup fails containment on the symlink, returning StorageErrorKind::Io.
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage_root");
     let outside = fixture.path().join("outside_quarantine");
@@ -2553,16 +2632,33 @@ async fn test_fs_metadata_containment_quarantine_symlink_outside_root() {
     write_file(&target_outside, outside_content);
     std::os::unix::fs::symlink(&target_outside, &qpath).expect("create quarantine symlink");
 
+    // Legacy helper fs_metadata_size follows quarantine symlink (historical baseline preserved)
     let size = fs_metadata_size(&qpath)
         .await
         .expect("fs_metadata_size follows quarantine symlink outside root");
     assert_eq!(size, outside_content.len() as u64);
 
-    let meta = storage
+    // Production head_blob falls back to quarantine on primary NotFound, then rejects quarantine symlink
+    let head_err = storage
         .head_blob(&digest)
         .await
-        .expect("head_blob succeeds via quarantine symlink outside root");
-    assert_eq!(meta.size, outside_content.len() as u64);
+        .expect_err("production head_blob must reject quarantine symlink");
+    assert_eq!(
+        head_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
+
+    // Production open_blob also rejects quarantine symlink
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "production open_blob must reject quarantine symlink",
+    )
+    .await;
+    assert_eq!(
+        open_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io)
+    );
 }
 
 #[tokio::test]
@@ -2597,14 +2693,23 @@ async fn test_fs_metadata_containment_storage_root_is_symlink() {
         .await
         .expect("head_blob succeeds through symlinked root");
     assert_eq!(meta.size, content.len() as u64);
+
+    let (payload_meta, mut stream) = storage
+        .open_blob(&digest)
+        .await
+        .expect("open_blob succeeds through symlinked root");
+    assert_eq!(payload_meta.size, content.len() as u64);
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read stream");
+    assert_eq!(buf, content);
 }
 
 #[tokio::test]
 async fn test_fs_metadata_containment_directory_blob_returns_metadata_size() {
     // Characterizes Case 7: Ordinary blob path resolves to a directory rather than a regular file.
-    // Current behavior: fs_metadata_size returns directory metadata size (e.g. 4096 on Linux)
-    // without error, and head_blob returns Ok(BlobMeta { size }) because is_file() is not checked.
-    // Open containment/contract gap: Directories are not rejected at the metadata boundary.
+    // Under accepted Policy C: Directories and other non-regular objects fail during acquisition
+    // with UnsupportedObjectType -> StorageErrorKind::Io.
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage_root");
     std::fs::create_dir_all(&root).expect("create storage root");
@@ -2616,7 +2721,7 @@ async fn test_fs_metadata_containment_directory_blob_returns_metadata_size() {
     let blob_path = storage.blob_path(&digest);
     std::fs::create_dir_all(&blob_path).expect("create directory at blob path");
 
-    // Obtain actual platform directory metadata length as ground truth
+    // Legacy helper fs_metadata_size returns directory metadata length (historical baseline preserved)
     let expected_dir_size = std::fs::metadata(&blob_path)
         .expect("query directory metadata")
         .len();
@@ -2626,9 +2731,302 @@ async fn test_fs_metadata_containment_directory_blob_returns_metadata_size() {
         .expect("fs_metadata_size returns directory size");
     assert_eq!(size, expected_dir_size);
 
+    // Under Policy C: Production head_blob rejects directory blob during acquisition (UnsupportedObjectType)
+    let head_err = storage
+        .head_blob(&digest)
+        .await
+        .expect_err("production head_blob must reject directory blob");
+    assert_eq!(
+        head_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "directory rejection must map to StorageErrorKind::Io"
+    );
+
+    // Production open_blob also rejects directory blob
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "production open_blob must reject directory blob",
+    )
+    .await;
+    assert_eq!(
+        open_err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Io),
+        "directory rejection must map to StorageErrorKind::Io"
+    );
+}
+
+// --------------------------------------------------------------------------------------------
+// Focused Production Cutover Verification Tests (Policies A, B, and C)
+// --------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_production_read_cutover_head_and_open_blob_execute_extracted_path() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:8888888888888888888888888888888888888888888888888888888888888808")
+            .unwrap();
+    let content = b"verified payload through extracted production cutover adapter";
+    write_file(&storage.blob_path(&digest), content);
+
+    // Verify head_blob executes extracted path and returns accurate metadata
     let meta = storage
         .head_blob(&digest)
         .await
-        .expect("head_blob returns directory size without error");
-    assert_eq!(meta.size, expected_dir_size);
+        .expect("production head_blob succeeds on regular blob file");
+    assert_eq!(meta.size, content.len() as u64);
+
+    // Verify open_blob executes extracted path and streams identical payload bytes
+    let (payload_meta, mut stream) = storage
+        .open_blob(&digest)
+        .await
+        .expect("production open_blob succeeds on regular blob file");
+    assert_eq!(payload_meta.size, content.len() as u64);
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read stream");
+    assert_eq!(buf, content);
+
+    // Verify underlying read_adapter points to the configured root
+    assert_eq!(storage.read_adapter().reader().root_path(), &root);
+}
+
+#[tokio::test]
+async fn test_production_read_cutover_quarantine_fallback_on_primary_not_found() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:9999999999999999999999999999999999999999999999999999999999999909")
+            .unwrap();
+    let quarantine_content = b"quarantine payload for genuine primary not found fallback";
+    write_file(&storage.quarantine_blob_path(&digest), quarantine_content);
+
+    // Primary is absent: head_blob falls back to quarantine
+    let meta = storage
+        .head_blob(&digest)
+        .await
+        .expect("head_blob falls back to quarantine on genuine primary NotFound");
+    assert_eq!(meta.size, quarantine_content.len() as u64);
+
+    // Primary is absent: open_blob falls back to quarantine and streams payload
+    let (payload_meta, mut stream) = storage
+        .open_blob(&digest)
+        .await
+        .expect("open_blob falls back to quarantine on genuine primary NotFound");
+    assert_eq!(payload_meta.size, quarantine_content.len() as u64);
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read stream");
+    assert_eq!(buf, quarantine_content);
+
+    // When both primary and quarantine are absent, returns NotFound
+    let missing_digest =
+        Digest::parse("sha256:9999999999999999999999999999999999999999999999999999999999999999")
+            .unwrap();
+    let head_missing = storage.head_blob(&missing_digest).await;
+    assert!(matches!(head_missing, Err(StorageError::NotFound)));
+
+    let open_missing = storage.open_blob(&missing_digest).await;
+    assert!(matches!(open_missing, Err(StorageError::NotFound)));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_production_read_cutover_primary_symlinks_suppress_quarantine_fallback() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    let outside = fixture.path().join("outside_store");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    std::fs::create_dir_all(&outside).expect("create outside store");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Case A: Ordinary symlink pointing to an existing file outside root
+    let digest_symlink =
+        Digest::parse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01")
+            .unwrap();
+    let outside_target = outside.join("target.bin");
+    write_file(&outside_target, b"outside target payload");
+    write_file(
+        &storage.quarantine_blob_path(&digest_symlink),
+        b"valid quarantine payload",
+    );
+
+    let blob_path_a = storage.blob_path(&digest_symlink);
+    if let Some(parent) = blob_path_a.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    std::os::unix::fs::symlink(&outside_target, &blob_path_a).expect("create symlink");
+
+    // Both head_blob and open_blob must reject the symlink and suppress quarantine fallback
+    let head_err_a = storage
+        .head_blob(&digest_symlink)
+        .await
+        .expect_err("head_blob must reject ordinary symlink and suppress quarantine fallback");
+    assert_eq!(head_err_a.internal_kind(), Some(StorageErrorKind::Io));
+
+    let open_err_a = expect_open_blob_err(
+        &storage,
+        &digest_symlink,
+        "open_blob must reject ordinary symlink and suppress quarantine fallback",
+    )
+    .await;
+    assert_eq!(open_err_a.internal_kind(), Some(StorageErrorKind::Io));
+
+    // Case B: Dangling symlink pointing to a nonexistent file
+    let digest_dangling =
+        Digest::parse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02")
+            .unwrap();
+    write_file(
+        &storage.quarantine_blob_path(&digest_dangling),
+        b"valid quarantine payload for dangling case",
+    );
+
+    let blob_path_b = storage.blob_path(&digest_dangling);
+    if let Some(parent) = blob_path_b.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dirs");
+    }
+    let nonexistent = root.join("nonexistent_path.bin");
+    std::os::unix::fs::symlink(&nonexistent, &blob_path_b).expect("create dangling symlink");
+
+    // Both head_blob and open_blob must reject the dangling symlink and suppress quarantine fallback
+    let head_err_b = storage
+        .head_blob(&digest_dangling)
+        .await
+        .expect_err("head_blob must reject dangling symlink and suppress quarantine fallback");
+    assert_eq!(head_err_b.internal_kind(), Some(StorageErrorKind::Io));
+
+    let open_err_b = expect_open_blob_err(
+        &storage,
+        &digest_dangling,
+        "open_blob must reject dangling symlink and suppress quarantine fallback",
+    )
+    .await;
+    assert_eq!(open_err_b.internal_kind(), Some(StorageErrorKind::Io));
+}
+
+#[tokio::test]
+async fn test_production_read_cutover_nonregular_objects_rejected_during_acquisition() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01")
+            .unwrap();
+    let blob_path = storage.blob_path(&digest);
+    std::fs::create_dir_all(&blob_path).expect("create directory at blob path");
+
+    // head_blob must reject directory blob during acquisition
+    let head_err = storage
+        .head_blob(&digest)
+        .await
+        .expect_err("head_blob must reject directory at blob path");
+    assert_eq!(head_err.internal_kind(), Some(StorageErrorKind::Io));
+    assert!(
+        head_err.to_string().contains("unsupported object type"),
+        "expected unsupported object type diagnostic, got: {head_err}"
+    );
+
+    // open_blob must reject directory blob during acquisition
+    let open_err = expect_open_blob_err(
+        &storage,
+        &digest,
+        "open_blob must reject directory at blob path",
+    )
+    .await;
+    assert_eq!(open_err.internal_kind(), Some(StorageErrorKind::Io));
+    assert!(
+        open_err.to_string().contains("unsupported object type"),
+        "expected unsupported object type diagnostic, got: {open_err}"
+    );
+}
+
+#[tokio::test]
+async fn test_production_read_cutover_both_methods_share_reader_and_root_ownership() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage_root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Verify that storage owns exactly one shared FsBlobCasReadAdapter
+    let adapter_a = storage.read_adapter();
+    let adapter_b = storage.read_adapter();
+    assert!(std::sync::Arc::ptr_eq(adapter_a, adapter_b));
+
+    // Verify that the adapter's reader has the exact root path
+    assert_eq!(adapter_a.reader().root_path(), &root);
+}
+
+#[test]
+fn test_production_read_cutover_startup_error_mapping_categories_and_diagnostics() {
+    use crate::storage::fs::read_adapter::map_fs_startup_error;
+
+    // 1. PlatformUnsupported -> StorageErrorKind::Configuration
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::PlatformUnsupported);
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Configuration));
+    assert!(err.to_string().contains("platform unsupported"));
+
+    // 2. SyscallUnsupported -> StorageErrorKind::Configuration
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::SyscallUnsupported(
+        std::io::Error::from_raw_os_error(libc::ENOSYS),
+    ));
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Configuration));
+    assert!(err.to_string().contains("openat2 is unavailable"));
+
+    // 3. EmptyRootPath -> StorageErrorKind::Configuration
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::EmptyRootPath);
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Configuration));
+    assert!(err.to_string().contains("cannot be empty"));
+
+    // 4. NulInRootPath -> StorageErrorKind::Configuration
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::NulInRootPath);
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Configuration));
+    assert!(err.to_string().contains("embedded NUL byte"));
+
+    // 5. UnsupportedObjectType -> StorageErrorKind::Configuration
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::UnsupportedObjectType {
+        mode: libc::S_IFREG as u32 | 0o644,
+    });
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Configuration));
+    assert!(err.to_string().contains("not a directory"));
+
+    // 6. ProbeDenied -> StorageErrorKind::Backend
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::ProbeDenied(
+        std::io::Error::from_raw_os_error(libc::EACCES),
+    ));
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(err.to_string().contains("probe denied"));
+
+    // 7. ProbeFailed -> StorageErrorKind::Backend
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::ProbeFailed {
+        source: std::io::Error::from_raw_os_error(libc::EMFILE),
+    });
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(err.to_string().contains("probe failed"));
+
+    // 8. RootOpenFailed -> StorageErrorKind::Io
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::RootOpenFailed {
+        source: std::io::Error::from_raw_os_error(libc::ENOENT),
+    });
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
+    assert!(err.to_string().contains("failed to open root directory"));
+
+    // 9. Conservative fallback for unexpected/non-exhaustive variants -> StorageErrorKind::Backend
+    let err = map_fs_startup_error(storage_fs::FsMetadataError::ResolutionRejected {
+        raw_os_error: libc::ELOOP,
+        source: std::io::Error::from_raw_os_error(libc::ELOOP),
+    });
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err.to_string()
+            .contains("unexpected storage initialization failure")
+    );
 }

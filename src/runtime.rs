@@ -253,20 +253,12 @@ pub(crate) async fn init_server_storage_wiring<F>(
 where
     F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
 {
-    match config.storage_backend {
-        StorageBackend::Filesystem => {
-            let config_for_storage = Arc::clone(&config);
-            tokio::task::spawn_blocking(move || storage_factory(config_for_storage.as_ref()))
-                .await
-                .map_err(|join_err| {
-                    RuntimeBuildError::Storage(StorageError::backend(format!(
-                        "filesystem storage initialization task failed: {join_err}"
-                    )))
-                })?
-                .map_err(RuntimeBuildError::Storage)
-        }
-        StorageBackend::S3 => storage_factory(config.as_ref()).map_err(RuntimeBuildError::Storage),
-    }
+    crate::storage::storage_wiring_try_from_config_async_with_factory(
+        config.as_ref(),
+        storage_factory,
+    )
+    .await
+    .map_err(RuntimeBuildError::Storage)
 }
 
 /// Assembles the production `ServerRuntime` from configuration with failure unwinding.
@@ -291,7 +283,34 @@ pub(crate) async fn build_server_runtime_with_storage_factory<F>(
 where
     F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
 {
+    build_server_runtime_with_factories(
+        config,
+        injector,
+        storage_factory,
+        crate::storage::proxy_cache_storage_try_from_config,
+    )
+    .await
+}
+
+/// Assembles `ServerRuntime` using pluggable storage and proxy cache factories for startup testing.
+pub(crate) async fn build_server_runtime_with_factories<F, P>(
+    config: Arc<Config>,
+    injector: Option<Arc<dyn crate::supervisor::SupervisorFaultInjector>>,
+    storage_factory: F,
+    proxy_cache_factory: P,
+) -> Result<ServerRuntime, RuntimeBuildError>
+where
+    F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
+    P: Fn(
+            &Config,
+            Option<&crate::config::ProxyUpstreamRoute>,
+        ) -> Result<Arc<dyn crate::storage::ports::ProxyStoragePort>, StorageError>
+        + Send
+        + Sync
+        + 'static,
+{
     let injector = injector.unwrap_or_else(|| Arc::new(crate::supervisor::NoopFaultInjector));
+    let proxy_cache_factory = Arc::new(proxy_cache_factory);
 
     let storage_wiring = init_server_storage_wiring(config.clone(), storage_factory).await?;
     injector.record_event("storage_initialized").await;
@@ -484,19 +503,24 @@ where
                 }
             };
 
-            let cache = match crate::storage::proxy_cache_storage_try_from_config(
-                config.as_ref(),
-                Some(up),
-            ) {
-                Ok(c) => c,
-                Err(err) => {
-                    return Err(unwind_and_fail(
-                        mutation_authority,
-                        RuntimeBuildError::ProxyCache(err),
-                    )
-                    .await);
-                }
-            };
+            let pcf = proxy_cache_factory.clone();
+            let cache =
+                match crate::storage::proxy_cache_storage_try_from_config_async_with_factory(
+                    config.as_ref(),
+                    Some(up),
+                    move |c, u| pcf(c, u),
+                )
+                .await
+                {
+                    Ok(c) => c,
+                    Err(err) => {
+                        return Err(unwind_and_fail(
+                            mutation_authority,
+                            RuntimeBuildError::ProxyCache(err),
+                        )
+                        .await);
+                    }
+                };
 
             proxy_upstreams.push(ProxyTarget {
                 proxy,
@@ -524,7 +548,14 @@ where
 
     let proxy_cache: Option<Arc<dyn crate::storage::ports::ProxyStoragePort>> =
         if config.proxy.enabled && config.proxy.upstreams.is_empty() {
-            match crate::storage::proxy_cache_storage_try_from_config(config.as_ref(), None) {
+            let pcf = proxy_cache_factory.clone();
+            match crate::storage::proxy_cache_storage_try_from_config_async_with_factory(
+                config.as_ref(),
+                None,
+                move |c, u| pcf(c, u),
+            )
+            .await
+            {
                 Ok(c) => Some(c),
                 Err(err) => {
                     return Err(unwind_and_fail(
@@ -689,6 +720,7 @@ pub(crate) fn build_test_app_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageErrorKind;
     use crate::storage::ports::StorageReadinessInspector;
     use crate::supervisor::{StartupPhase, SupervisorFaultInjector};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1946,5 +1978,266 @@ mod tests {
             empty_res.is_ok() && empty_res.unwrap(),
             "truly empty S3 prefix must return Ok(true)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_cache_per_upstream_construction_offloads_filesystem_to_blocking_thread() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+        cfg.proxy.enabled = true;
+        cfg.proxy.upstreams = vec![crate::config::ProxyUpstreamRoute {
+            hosts: vec![crate::proxy::ProxyHostPattern::parse("test.upstream.local").unwrap()],
+            trust_x_forwarded_host: false,
+            upstream_base_url: "http://localhost:5000".to_string(),
+            upstream_username: None,
+            upstream_password: None,
+            allowed_upstream_hosts: vec!["localhost".to_string()],
+            allowed_repo_prefixes: vec![],
+            block_private_networks: false,
+            redirect_policy: crate::config::RedirectPolicy::AnyPublic,
+            max_concurrent_upstream: 10,
+            index_path: temp.path().join("upstream_proxy.db"),
+            cache_fs_root: Some(temp.path().join("upstream_cache")),
+            cache_s3_prefix: None,
+            max_cache_bytes: 1024 * 1024,
+        }];
+        let cfg = Arc::new(cfg);
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+        let worker_tx = Arc::new(std::sync::Mutex::new(Some(worker_tx)));
+
+        let runtime = build_server_runtime_with_factories(
+            cfg.clone(),
+            None,
+            crate::storage::storage_wiring_try_from_config,
+            move |c, u| {
+                let current_id = std::thread::current().id();
+                if let Some(tx) = worker_tx.lock().unwrap().take() {
+                    let _ = tx.send(current_id);
+                }
+                crate::storage::proxy_cache_storage_try_from_config(c, u)
+            },
+        )
+        .await
+        .expect("runtime build with proxy upstream must succeed");
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_ne!(
+            calling_thread_id, construction_thread_id,
+            "filesystem proxy cache construction for per-upstream route must execute on a separate blocking thread"
+        );
+        assert!(runtime.flush_for_shutdown().is_ok());
+        assert!(runtime.release_mutation_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_cache_default_construction_offloads_filesystem_to_blocking_thread() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+        cfg.proxy.enabled = true;
+        cfg.proxy.upstreams = vec![];
+        cfg.proxy.upstream_base_url = Some("http://localhost:5000".to_string());
+        cfg.proxy.index_path = temp.path().join("default_proxy_index.db");
+        cfg.proxy.cache_fs_root = Some(temp.path().join("default_cache"));
+        let cfg = Arc::new(cfg);
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+        let worker_tx = Arc::new(std::sync::Mutex::new(Some(worker_tx)));
+
+        let runtime = build_server_runtime_with_factories(
+            cfg.clone(),
+            None,
+            crate::storage::storage_wiring_try_from_config,
+            move |c, u| {
+                let current_id = std::thread::current().id();
+                if let Some(tx) = worker_tx.lock().unwrap().take() {
+                    let _ = tx.send(current_id);
+                }
+                crate::storage::proxy_cache_storage_try_from_config(c, u)
+            },
+        )
+        .await
+        .expect("runtime build with default proxy cache must succeed");
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_ne!(
+            calling_thread_id, construction_thread_id,
+            "filesystem default proxy cache construction must execute on a separate blocking thread"
+        );
+        assert!(runtime.flush_for_shutdown().is_ok());
+        assert!(runtime.release_mutation_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_cache_construction_failure_preserves_error_kind_and_message() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+        cfg.proxy.enabled = true;
+        cfg.proxy.upstreams = vec![];
+        cfg.proxy.upstream_base_url = Some("http://localhost:5000".to_string());
+        cfg.proxy.index_path = temp.path().join("fail_proxy_index.db");
+        let cfg = Arc::new(cfg);
+
+        let res = build_server_runtime_with_factories(
+            cfg,
+            None,
+            crate::storage::storage_wiring_try_from_config,
+            |_c, _u| {
+                Err(StorageError::configuration(
+                    "custom proxy cache config failure",
+                ))
+            },
+        )
+        .await;
+
+        match res {
+            Err(RuntimeBuildError::ProxyCache(err)) => {
+                assert_eq!(err.internal_kind(), Some(StorageErrorKind::Configuration));
+                assert!(
+                    err.to_string()
+                        .contains("custom proxy cache config failure")
+                );
+            }
+            other => {
+                panic!("expected RuntimeBuildError::ProxyCache with Configuration, got: {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_cache_blocking_task_failure_maps_to_backend() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+        cfg.proxy.enabled = true;
+        cfg.proxy.upstreams = vec![];
+        cfg.proxy.upstream_base_url = Some("http://localhost:5000".to_string());
+        cfg.proxy.index_path = temp.path().join("panic_proxy_index.db");
+        let cfg = Arc::new(cfg);
+
+        let res = build_server_runtime_with_factories(
+            cfg,
+            None,
+            crate::storage::storage_wiring_try_from_config,
+            |_c, _u| panic!("simulated proxy cache blocking worker panic"),
+        )
+        .await;
+
+        match res {
+            Err(RuntimeBuildError::ProxyCache(err)) => {
+                assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+                assert!(
+                    err.to_string()
+                        .contains("filesystem proxy cache storage initialization task failed")
+                );
+            }
+            other => panic!("expected RuntimeBuildError::ProxyCache with Backend, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_cache_s3_retains_existing_construction_path_on_calling_thread() {
+        let temp = TempDir::new().unwrap();
+        let fs_cfg = create_test_config(&temp);
+        let fs_wiring = crate::storage::storage_wiring_try_from_config(&fs_cfg).unwrap();
+
+        let mut cfg = create_test_config(&temp);
+        cfg.storage_backend = StorageBackend::S3;
+        cfg.s3_endpoint = Some("http://localhost:9000".to_string());
+        cfg.s3_region = Some("us-east-1".to_string());
+        cfg.s3_bucket = Some("test-bucket".to_string());
+        cfg.s3_prefix = "test".to_string();
+        cfg.proxy.enabled = true;
+        cfg.proxy.upstreams = vec![];
+        cfg.proxy.upstream_base_url = Some("http://localhost:5000".to_string());
+        cfg.proxy.index_path = temp.path().join("s3_proxy_index.db");
+        cfg.proxy.cache_s3_prefix = Some("test/cache".to_string());
+        let cfg = Arc::new(cfg);
+
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+        let worker_tx = Arc::new(std::sync::Mutex::new(Some(worker_tx)));
+
+        let _res = build_server_runtime_with_factories(
+            cfg,
+            None,
+            move |_c| Ok(fs_wiring),
+            move |c, u| {
+                let current_id = std::thread::current().id();
+                if let Some(tx) = worker_tx.lock().unwrap().take() {
+                    let _ = tx.send(current_id);
+                }
+                crate::storage::proxy_cache_storage_try_from_config(c, u)
+            },
+        )
+        .await;
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_eq!(
+            calling_thread_id, construction_thread_id,
+            "S3 proxy cache storage construction must execute synchronously on the calling thread without spawn_blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_cache_callers_await_construction_before_proceeding() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+        cfg.proxy.enabled = true;
+        cfg.proxy.upstreams = vec![];
+        cfg.proxy.upstream_base_url = Some("http://localhost:5000".to_string());
+        cfg.proxy.index_path = temp.path().join("await_proxy_index.db");
+        let cfg = Arc::new(cfg);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        struct ReleaseGuard(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let guard = ReleaseGuard(Some(release_tx));
+
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+        let cfg_clone = cfg.clone();
+        let runtime_handle = tokio::spawn(async move {
+            build_server_runtime_with_factories(
+                cfg_clone,
+                None,
+                crate::storage::storage_wiring_try_from_config,
+                move |c, u| {
+                    if let Some(tx) = started_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    if let Ok(rx) = release_rx.lock() {
+                        if let Err(err) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            panic!("worker wait failed: {err}");
+                        }
+                    }
+                    crate::storage::proxy_cache_storage_try_from_config(c, u)
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("worker must start");
+        assert!(
+            !runtime_handle.is_finished(),
+            "runtime build must not complete while proxy cache construction is pending"
+        );
+
+        drop(guard);
+
+        let runtime = runtime_handle
+            .await
+            .expect("join handle must succeed")
+            .expect("runtime build must succeed after release");
+        assert!(runtime.flush_for_shutdown().is_ok());
+        assert!(runtime.release_mutation_authority().await.is_ok());
     }
 }

@@ -5,13 +5,12 @@
 //! [`storage_core::ObjectPayloadReader`]) over an owned [`Arc<R>`].
 //!
 //! # Architectural Scope & Status
-//! This module consolidates the validated metadata and payload seam logic into
-//! a single registry-owned adapter. It is a bounded preparation slice:
-//! - The adapter accepts an already-constructed reader; it does not open roots,
-//!   invoke capability probing, or construct separate roots for metadata and payload.
-//! - It is intentionally not yet activated in production startup (`src/runtime.rs`)
-//!   or request routing (`FsStorage`). Unwired items carry narrow `#[allow(dead_code)]`
-//!   annotations explaining this deferral.
+//! This module consolidates metadata and payload seam logic into a single
+//! registry-owned adapter wired into production `FsStorage`.
+//! - The adapter accepts an already-constructed and probed reader; it does not
+//!   open roots or invoke capability probing itself.
+//! - Startup open and probing failures are translated by [`map_fs_startup_error`].
+//! - Read operations (`head_blob`, `open_blob`) are translated by [`translate_read_error`].
 
 use crate::registry::digest::Digest;
 use crate::storage::ports::BlobCasReader;
@@ -21,8 +20,43 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::AsyncRead;
 
+/// Translates strongly typed [`storage_fs::FsMetadataError`] startup and capability-probing
+/// failures into registry [`StorageError`] taxonomy.
+pub(crate) fn map_fs_startup_error(err: storage_fs::FsMetadataError) -> StorageError {
+    match err {
+        storage_fs::FsMetadataError::PlatformUnsupported => StorageError::configuration(
+            "platform unsupported: descriptor-relative containment requires Linux openat2",
+        ),
+        storage_fs::FsMetadataError::SyscallUnsupported(e) => StorageError::configuration(format!(
+            "openat2 is unavailable in this execution environment: {e}"
+        )),
+        storage_fs::FsMetadataError::EmptyRootPath => {
+            StorageError::configuration("root path cannot be empty")
+        }
+        storage_fs::FsMetadataError::NulInRootPath => {
+            StorageError::configuration("root path contains embedded NUL byte")
+        }
+        storage_fs::FsMetadataError::UnsupportedObjectType { mode } => {
+            StorageError::configuration(format!("root path is not a directory (mode: {mode:#o})"))
+        }
+        storage_fs::FsMetadataError::ProbeDenied(e) => {
+            StorageError::backend(format!("openat2 capability probe denied: {e}"))
+        }
+        storage_fs::FsMetadataError::ProbeFailed { source } => {
+            StorageError::backend(format!("openat2 capability probe failed: {source}"))
+        }
+        storage_fs::FsMetadataError::RootOpenFailed { source } => {
+            StorageError::io(format!("failed to open root directory: {source}"))
+        }
+        // Documented conservative fallback: non-exhaustive variants or unexpected errors during
+        // initialization/probing are treated as backend errors with diagnostics preserved.
+        other => StorageError::backend(format!(
+            "unexpected storage initialization failure: {other}"
+        )),
+    }
+}
+
 /// Constructs the primary CAS object key for a blob digest: `blobs/<alg>/<prefix2>/<hex>`.
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) fn blob_primary_key(digest: &Digest) -> Result<storage_core::ObjectKey, StorageError> {
     let key_str = format!(
         "blobs/{}/{}/{}",
@@ -35,7 +69,6 @@ pub(crate) fn blob_primary_key(digest: &Digest) -> Result<storage_core::ObjectKe
 }
 
 /// Constructs the quarantine CAS object key for a blob digest: `quarantine/blobs/<alg>/<prefix2>/<hex>`.
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) fn blob_quarantine_key(
     digest: &Digest,
 ) -> Result<storage_core::ObjectKey, StorageError> {
@@ -50,7 +83,6 @@ pub(crate) fn blob_quarantine_key(
 }
 
 /// Identifies the read operation context for diagnostic differentiation on unknown errors.
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadOp {
     Metadata,
@@ -58,7 +90,6 @@ pub(crate) enum ReadOp {
 }
 
 /// Translates strongly typed [`storage_core::ReadError`] outcomes into legacy [`StorageError`] taxonomy.
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) fn translate_read_error(err: storage_core::ReadError, op: ReadOp) -> StorageError {
     match err {
         storage_core::ReadError::NotFound { .. } => StorageError::NotFound,
@@ -137,13 +168,11 @@ pub(crate) fn translate_read_error(err: storage_core::ReadError, op: ReadOp) -> 
 }
 
 /// Translates metadata read errors into [`StorageError`].
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) fn translate_metadata_read_error(err: storage_core::ReadError) -> StorageError {
     translate_read_error(err, ReadOp::Metadata)
 }
 
 /// Translates payload read errors into [`StorageError`].
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) fn translate_payload_read_error(err: storage_core::ReadError) -> StorageError {
     translate_read_error(err, ReadOp::Payload)
 }
@@ -157,7 +186,6 @@ pub(crate) fn translate_payload_read_error(err: storage_core::ReadError) -> Stor
 ///
 /// Any other failure on primary immediately returns without attempting quarantine.
 /// Any failure on quarantine returns immediately without further lookup.
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) async fn head_blob_seam(
     reader: &(impl storage_core::ObjectMetadataReader + ?Sized),
     digest: &Digest,
@@ -193,7 +221,6 @@ pub(crate) async fn head_blob_seam(
 /// Preserves the exact `u64` size without reading, buffering, or collecting bytes during acquisition.
 /// Once acquired, stream read failures are surfaced directly as [`std::io::Error`] during polling,
 /// without triggering re-acquisition or fallback.
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
 pub(crate) async fn open_blob_seam(
     reader: &(impl storage_core::ObjectPayloadReader + ?Sized),
     digest: &Digest,
@@ -225,20 +252,19 @@ pub(crate) async fn open_blob_seam(
 ///
 /// Accepts an already-constructed reader `R` implementing both [`storage_core::ObjectMetadataReader`]
 /// and [`storage_core::ObjectPayloadReader`].
-#[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
+#[derive(Debug)]
 pub(crate) struct FsBlobCasReadAdapter<R: ?Sized> {
     reader: Arc<R>,
 }
 
 impl<R: ?Sized> FsBlobCasReadAdapter<R> {
     /// Creates a new adapter wrapping the provided reader instance.
-    #[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
     pub(crate) fn new(reader: Arc<R>) -> Self {
         Self { reader }
     }
 
     /// Returns a reference to the inner shared reader.
-    #[allow(dead_code)] // Intentionally unwired in production pending startup/cutover authorization
+    #[cfg(test)]
     pub(crate) fn reader(&self) -> &Arc<R> {
         &self.reader
     }
