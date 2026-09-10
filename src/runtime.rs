@@ -12,9 +12,9 @@ use crate::config::{Config, StorageBackend};
 use crate::consistency::ConsistencyCoordinator;
 use crate::gc_service::GcService;
 use crate::ip_concurrency::IpConcurrencyLimiter;
-use crate::storage::StorageWiring;
 use crate::storage::facade::StorageWiringFacade;
 use crate::storage::mutation_authority::RuntimeMutationAuthority;
+use crate::storage::{StorageError, StorageWiring};
 use crate::upload_coordinator::BlobUploadCoordinatorConfig;
 
 /// Strongly typed errors that can occur during server runtime dependency graph construction.
@@ -237,15 +237,63 @@ async fn unwind_runtime_and_fail(
     }
 }
 
+/// Helper to initialize storage wiring for `build_server_runtime`.
+///
+/// For the filesystem backend, construction is offloaded to Tokio's blocking thread pool via
+/// `tokio::task::spawn_blocking` to ensure that synchronous directory validation (`ensure_dir`)
+/// and storage initialization do not stall the async executor worker thread.
+///
+/// Note on cancellation: Dropping or cancelling the awaiter future does not terminate or abort
+/// an already-running blocking task in the OS thread pool; the blocking thread will continue
+/// executing until the kernel filesystem call finishes or the process exits.
+pub(crate) async fn init_server_storage_wiring<F>(
+    config: Arc<Config>,
+    storage_factory: F,
+) -> Result<StorageWiring, RuntimeBuildError>
+where
+    F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
+{
+    match config.storage_backend {
+        StorageBackend::Filesystem => {
+            let config_for_storage = Arc::clone(&config);
+            tokio::task::spawn_blocking(move || storage_factory(config_for_storage.as_ref()))
+                .await
+                .map_err(|join_err| {
+                    RuntimeBuildError::Storage(StorageError::backend(format!(
+                        "filesystem storage initialization task failed: {join_err}"
+                    )))
+                })?
+                .map_err(RuntimeBuildError::Storage)
+        }
+        StorageBackend::S3 => storage_factory(config.as_ref()).map_err(RuntimeBuildError::Storage),
+    }
+}
+
 /// Assembles the production `ServerRuntime` from configuration with failure unwinding.
 pub(crate) async fn build_server_runtime(
     config: Arc<Config>,
     injector: Option<Arc<dyn crate::supervisor::SupervisorFaultInjector>>,
 ) -> Result<ServerRuntime, RuntimeBuildError> {
+    build_server_runtime_with_storage_factory(
+        config,
+        injector,
+        crate::storage::storage_wiring_try_from_config,
+    )
+    .await
+}
+
+/// Assembles `ServerRuntime` using a pluggable storage factory for startup coordination testing.
+pub(crate) async fn build_server_runtime_with_storage_factory<F>(
+    config: Arc<Config>,
+    injector: Option<Arc<dyn crate::supervisor::SupervisorFaultInjector>>,
+    storage_factory: F,
+) -> Result<ServerRuntime, RuntimeBuildError>
+where
+    F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
+{
     let injector = injector.unwrap_or_else(|| Arc::new(crate::supervisor::NoopFaultInjector));
 
-    let storage_wiring = crate::storage::storage_wiring_try_from_config(config.as_ref())
-        .map_err(RuntimeBuildError::Storage)?;
+    let storage_wiring = init_server_storage_wiring(config.clone(), storage_factory).await?;
     injector.record_event("storage_initialized").await;
     if let Err(msg) = injector
         .on_phase(crate::supervisor::StartupPhase::StorageInitialized)
@@ -780,6 +828,218 @@ mod tests {
 
         assert!(runtime.flush_for_shutdown().is_ok());
         assert!(runtime.release_mutation_authority().await.is_ok());
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Filesystem Storage Startup Offload & Thread Boundary Tests
+    // --------------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_filesystem_storage_construction_executes_off_async_thread() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+        let calling_thread_id = std::thread::current().id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+
+        let runtime = build_server_runtime_with_storage_factory(cfg.clone(), None, move |c| {
+            let current_id = std::thread::current().id();
+            let _ = worker_tx.send(current_id);
+            crate::storage::storage_wiring_try_from_config(c)
+        })
+        .await
+        .expect("runtime build must succeed");
+
+        let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+        assert_ne!(
+            calling_thread_id, construction_thread_id,
+            "filesystem storage construction must execute on a separate blocking thread"
+        );
+
+        assert!(runtime.flush_for_shutdown().is_ok());
+        assert!(runtime.release_mutation_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_startup_does_not_report_initialization_before_construction_completes() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+        let injector = Arc::new(RecordingFaultInjector::new());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        struct ReleaseGuard(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let guard = ReleaseGuard(Some(release_tx));
+
+        let cfg_clone = cfg.clone();
+        let injector_clone = injector.clone();
+        let runtime_handle = tokio::spawn(async move {
+            build_server_runtime_with_storage_factory(cfg_clone, Some(injector_clone), move |c| {
+                let _ = started_tx.send(());
+                // Block worker until test releases it, bounded to avoid indefinite hang if regressed
+                if let Err(err) = release_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    panic!(
+                        "test worker synchronization wait failed (timeout or disconnection): {err}"
+                    );
+                }
+                crate::storage::storage_wiring_try_from_config(c)
+            })
+            .await
+        });
+
+        // Wait deterministically until the blocking task starts
+        started_rx.await.expect("worker must signal start");
+
+        // Verify that while construction is in progress, storage initialization has NOT been recorded
+        {
+            let events = injector.events.lock().await;
+            assert!(
+                events.is_empty(),
+                "storage_initialized must not be recorded while construction is pending"
+            );
+        }
+        assert!(
+            !runtime_handle.is_finished(),
+            "runtime build task must not complete before construction is finished"
+        );
+
+        // Release the worker deterministically
+        drop(guard);
+
+        let runtime = runtime_handle
+            .await
+            .expect("join handle must succeed")
+            .expect("runtime build must succeed after release");
+
+        // Verify that after completion, storage initialization was recorded
+        {
+            let events = injector.events.lock().await;
+            assert_eq!(
+                events.first().map(|s| s.as_str()),
+                Some("storage_initialized"),
+                "storage_initialized must be the first recorded event after completion"
+            );
+        }
+
+        assert!(runtime.flush_for_shutdown().is_ok());
+        assert!(runtime.release_mutation_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_startup_returns_usable_storage_wiring() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+
+        let runtime = build_server_runtime(cfg, None)
+            .await
+            .expect("build_server_runtime must succeed on valid filesystem config");
+
+        let state = runtime.app_state();
+        let start_res = state
+            .blob_service
+            .start_upload("startup-test-repo")
+            .await
+            .expect("storage wiring must be fully usable for upload operations");
+        assert!(!start_res.session.uuid.is_empty());
+
+        assert!(runtime.flush_for_shutdown().is_ok());
+        assert!(runtime.release_mutation_authority().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_real_filesystem_construction_failure_preserves_storage_error() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = create_test_config(&temp);
+
+        // Create a regular file where the storage directory should be, causing ensure_dir to fail
+        let blocking_file = temp.path().join("blocking_file.txt");
+        tokio::fs::write(&blocking_file, b"cannot-create-dir-under-file")
+            .await
+            .unwrap();
+        cfg.fs_root = blocking_file.join("sub_storage_dir");
+        let cfg = Arc::new(cfg);
+
+        // Obtain expected error directly from existing synchronous factory on the same fixture
+        let expected_err = match crate::storage::storage_wiring_try_from_config(cfg.as_ref()) {
+            Err(err) => err,
+            Ok(_) => panic!("synchronous factory must fail on invalid root fixture"),
+        };
+
+        let build_res = build_server_runtime(cfg, None).await;
+        match build_res {
+            Err(RuntimeBuildError::Storage(actual_err)) => match (&actual_err, &expected_err) {
+                (
+                    StorageError::Internal {
+                        kind: actual_kind,
+                        message: actual_msg,
+                    },
+                    StorageError::Internal {
+                        kind: expected_kind,
+                        message: expected_msg,
+                    },
+                ) => {
+                    assert_eq!(
+                        actual_kind, expected_kind,
+                        "StorageErrorKind must match synchronous factory failure exactly"
+                    );
+                    assert_eq!(
+                        actual_msg, expected_msg,
+                        "StorageError message must match synchronous factory failure exactly"
+                    );
+                }
+                _ => panic!(
+                    "expected StorageError::Internal matching {expected_err:?}, got: {actual_err:?}"
+                ),
+            },
+            other => panic!(
+                "expected RuntimeBuildError::Storage matching {expected_err:?}, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocking_task_panic_fixture_maps_to_backend() {
+        let temp = TempDir::new().unwrap();
+        let cfg = Arc::new(create_test_config(&temp));
+        let injector = Arc::new(RecordingFaultInjector::new());
+
+        // Note: This fixture tests runtime JoinError translation upon a task panic;
+        // it does not claim that a real filesystem syscall panicked.
+        let build_res =
+            build_server_runtime_with_storage_factory(cfg, Some(injector.clone()), |_c| {
+                panic!("deliberate test panic in blocking storage factory");
+            })
+            .await;
+
+        match build_res {
+            Err(RuntimeBuildError::Storage(StorageError::Internal { kind, message })) => {
+                assert_eq!(
+                    kind,
+                    crate::storage::StorageErrorKind::Backend,
+                    "JoinError from panicked task must map to StorageErrorKind::Backend"
+                );
+                assert!(
+                    message.contains("filesystem storage initialization task failed"),
+                    "diagnostic message must describe task failure, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected RuntimeBuildError::Storage(Internal(Backend)), got {other:?}")
+            }
+        }
+
+        let events = injector.events.lock().await;
+        assert!(
+            !events.contains(&"storage_initialized".to_string()),
+            "storage_initialized must not be recorded if storage construction panics"
+        );
     }
 
     // --------------------------------------------------------------------------------------------
