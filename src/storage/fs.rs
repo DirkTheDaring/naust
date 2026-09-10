@@ -3702,3 +3702,7 @@ mod contained_metadata;
 #[cfg(test)]
 #[path = "fs/metadata_seam.rs"]
 mod metadata_seam;
+
+#[cfg(test)]
+#[path = "fs/payload_seam.rs"]
+mod payload_seam;
