@@ -3030,3 +3030,524 @@ fn test_production_read_cutover_startup_error_mapping_categories_and_diagnostics
             .contains("unexpected storage initialization failure")
     );
 }
+
+// --- CAS Blob Listing & Pagination Characterization Tests ---
+
+fn put_cas_blob_file(root: &Path, hex: &str, content: &[u8]) {
+    let p2 = &hex[0..2];
+    let path = root.join("blobs").join("sha256").join(p2).join(hex);
+    write_file(&path, content);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_missing_or_empty_root_returns_empty_page() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Case 1: Configured storage root exists, but CAS listing directory (blobs/sha256) is absent
+    let page = storage
+        .list_cas_blobs_page(None, 100)
+        .await
+        .expect("absent CAS listing directory returns empty page");
+    assert!(page.items.is_empty());
+    assert_eq!(page.next_cursor, None);
+
+    // Case 2: blobs/sha256 exists but has no shard directories
+    let cas_root = root.join("blobs").join("sha256");
+    std::fs::create_dir_all(&cas_root).expect("create cas root");
+    let page = storage
+        .list_cas_blobs_page(None, 100)
+        .await
+        .expect("empty cas root returns empty page");
+    assert!(page.items.is_empty());
+    assert_eq!(page.next_cursor, None);
+
+    // Case 3: blobs/sha256 contains an empty shard directory
+    let empty_shard = cas_root.join("aa");
+    std::fs::create_dir_all(&empty_shard).expect("create empty shard");
+    let page = storage
+        .list_cas_blobs_page(None, 100)
+        .await
+        .expect("empty shard returns empty page");
+    assert!(page.items.is_empty());
+    assert_eq!(page.next_cursor, None);
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_initial_metadata_error_suppression() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Make 'blobs' a regular file so metadata("blobs/sha256") fails with NotADirectory (ENOTDIR)
+    let blobs_file = root.join("blobs");
+    std::fs::write(&blobs_file, b"not-a-directory").expect("write blobs as file");
+    let cas_root = blobs_file.join("sha256");
+
+    // Verify actual raw error kind from tokio::fs::metadata
+    let raw_err = tokio::fs::metadata(&cas_root)
+        .await
+        .expect_err("metadata on path through regular file must fail");
+    assert_eq!(
+        raw_err.kind(),
+        std::io::ErrorKind::NotADirectory,
+        "raw error kind must be NotADirectory on Linux"
+    );
+
+    // Assert current listing behavior: the error is suppressed into an empty page
+    let page = storage
+        .list_cas_blobs_page(None, 100)
+        .await
+        .expect("initial metadata error must be suppressed into empty page");
+    assert!(page.items.is_empty());
+    assert_eq!(page.next_cursor, None);
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_ordering_and_pagination_boundaries() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let hexes = [
+        "0a00000000000000000000000000000000000000000000000000000000000001",
+        "0a00000000000000000000000000000000000000000000000000000000000002",
+        "1b00000000000000000000000000000000000000000000000000000000000001",
+        "ff00000000000000000000000000000000000000000000000000000000000001",
+        "ff00000000000000000000000000000000000000000000000000000000000002",
+    ];
+    for hex in &hexes {
+        put_cas_blob_file(&root, hex, b"blob-payload");
+    }
+
+    // Page 1 with limit = 2
+    let page1 = storage.list_cas_blobs_page(None, 2).await.expect("page 1");
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.items[0].digest.hex(), hexes[0]);
+    assert_eq!(page1.items[1].digest.hex(), hexes[1]);
+    let expected_c1 = format!("sha256:{}", hexes[1]);
+    assert_eq!(
+        page1.next_cursor.as_ref().map(|c| c.0.as_str()),
+        Some(expected_c1.as_str())
+    );
+
+    // Page 2 with cursor from Page 1 and limit = 2
+    let page2 = storage
+        .list_cas_blobs_page(page1.next_cursor.as_ref(), 2)
+        .await
+        .expect("page 2");
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.items[0].digest.hex(), hexes[2]);
+    assert_eq!(page2.items[1].digest.hex(), hexes[3]);
+    let expected_c2 = format!("sha256:{}", hexes[3]);
+    assert_eq!(
+        page2.next_cursor.as_ref().map(|c| c.0.as_str()),
+        Some(expected_c2.as_str())
+    );
+
+    // Page 3 with cursor from Page 2 and limit = 2 (final item)
+    let page3 = storage
+        .list_cas_blobs_page(page2.next_cursor.as_ref(), 2)
+        .await
+        .expect("page 3");
+    assert_eq!(page3.items.len(), 1);
+    assert_eq!(page3.items[0].digest.hex(), hexes[4]);
+    // Since items.len() (1) < limit (2), next_cursor must be None
+    assert_eq!(page3.next_cursor, None);
+
+    // Calling with a cursor matching the final element yields an empty page and None
+    let cursor_final = crate::storage::GcCursor(format!("sha256:{}", hexes[4]));
+    let page_empty = storage
+        .list_cas_blobs_page(Some(&cursor_final), 2)
+        .await
+        .expect("page empty");
+    assert!(page_empty.items.is_empty());
+    assert_eq!(page_empty.next_cursor, None);
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_exact_full_final_page() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let hexes = [
+        "0a00000000000000000000000000000000000000000000000000000000000001",
+        "0a00000000000000000000000000000000000000000000000000000000000002",
+        "1b00000000000000000000000000000000000000000000000000000000000001",
+        "1b00000000000000000000000000000000000000000000000000000000000002",
+    ];
+    for hex in &hexes {
+        put_cas_blob_file(&root, hex, b"exact-page-payload");
+    }
+
+    // Limit = 2 with exactly 4 items (2 full pages):
+    // Page 1: items 0 and 1
+    let page1 = storage.list_cas_blobs_page(None, 2).await.expect("page 1");
+    assert_eq!(page1.items.len(), 2);
+    let c1 = page1.next_cursor.expect("page 1 cursor");
+
+    // Page 2: items 2 and 3 (exact-full final page, items.len() == limit)
+    let page2 = storage
+        .list_cas_blobs_page(Some(&c1), 2)
+        .await
+        .expect("page 2");
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.items[0].digest.hex(), hexes[2]);
+    assert_eq!(page2.items[1].digest.hex(), hexes[3]);
+    // Since items.len() == limit, list_cas_blobs_page cannot know it was the final object; returns cursor:
+    let c2 = page2
+        .next_cursor
+        .expect("exact-full page must return cursor");
+    assert_eq!(c2.0, format!("sha256:{}", hexes[3]));
+
+    // Page 3: subsequent query with c2 returns empty terminal page with next_cursor None
+    let page3 = storage
+        .list_cas_blobs_page(Some(&c2), 2)
+        .await
+        .expect("page 3 terminal");
+    assert!(page3.items.is_empty(), "terminal page must be empty");
+    assert_eq!(page3.next_cursor, None, "terminal page must have no cursor");
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_limit_clamping_zero_and_large_fixture() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Populate exactly 1,001 distinct valid CAS objects across shards:
+    // Shards: "00" (items 0..499), "01" (items 500..999), "02" (item 1000)
+    let total_objects = 1001;
+    let mut hexes = Vec::with_capacity(total_objects);
+    for i in 0..total_objects {
+        let p2 = format!("{:02x}", i / 500);
+        let hex = format!("{}{:062x}", p2, i);
+        put_cas_blob_file(&root, &hex, b"large-fixture-payload");
+        hexes.push(hex);
+    }
+    hexes.sort();
+
+    // 1. Zero-limit assertion: limit 0 is clamped to 1
+    let page_zero = storage
+        .list_cas_blobs_page(None, 0)
+        .await
+        .expect("limit 0 clamped to 1");
+    assert_eq!(page_zero.items.len(), 1);
+    assert_eq!(page_zero.items[0].digest.hex(), hexes[0]);
+    assert_eq!(
+        page_zero.next_cursor.as_ref().map(|c| c.0.as_str()),
+        Some(format!("sha256:{}", hexes[0]).as_str())
+    );
+
+    // 2. Upper-limit assertion: request limit 50,000, clamped to 1,000
+    let page1 = storage
+        .list_cas_blobs_page(None, 50_000)
+        .await
+        .expect("request limit 50000");
+    assert_eq!(
+        page1.items.len(),
+        1000,
+        "upper limit must be clamped to exactly 1000 items"
+    );
+    assert_eq!(page1.items[0].digest.hex(), hexes[0]);
+    assert_eq!(page1.items[999].digest.hex(), hexes[999]);
+    let c1 = page1
+        .next_cursor
+        .expect("page 1 of large fixture must return next cursor");
+    assert_eq!(c1.0, format!("sha256:{}", hexes[999]));
+
+    // Page 2: fetches the 1,001st item
+    let page2 = storage
+        .list_cas_blobs_page(Some(&c1), 50_000)
+        .await
+        .expect("page 2 of large fixture");
+    assert_eq!(
+        page2.items.len(),
+        1,
+        "remaining item must be returned on page 2"
+    );
+    assert_eq!(page2.items[0].digest.hex(), hexes[1000]);
+    assert_eq!(
+        page2.next_cursor, None,
+        "page 2 has fewer than limit items; next_cursor must be None"
+    );
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_cursor_lexical_filtering_and_malformed_values() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let hex1 = "0a00000000000000000000000000000000000000000000000000000000000001";
+    let hex2 = "1b00000000000000000000000000000000000000000000000000000000000001";
+    put_cas_blob_file(&root, hex1, b"item1");
+    put_cas_blob_file(&root, hex2, b"item2");
+
+    // Cursor "zzz": all valid sha256 digests are lexicographically <= "zzz", so all are skipped
+    let cursor_zzz = crate::storage::GcCursor("zzz".to_string());
+    let page_zzz = storage
+        .list_cas_blobs_page(Some(&cursor_zzz), 10)
+        .await
+        .expect("cursor zzz");
+    assert!(page_zzz.items.is_empty());
+    assert_eq!(page_zzz.next_cursor, None);
+
+    // Cursor "aaa": all valid sha256 digests are lexicographically > "aaa", so none are skipped
+    let cursor_aaa = crate::storage::GcCursor("aaa".to_string());
+    let page_aaa = storage
+        .list_cas_blobs_page(Some(&cursor_aaa), 10)
+        .await
+        .expect("cursor aaa");
+    assert_eq!(page_aaa.items.len(), 2);
+
+    // Cursor lexicographically between item1 and item2 but malformed (non-digest string)
+    let cursor_mid = crate::storage::GcCursor("sha256:0a_synthetic_middle_marker".to_string());
+    let page_mid = storage
+        .list_cas_blobs_page(Some(&cursor_mid), 10)
+        .await
+        .expect("cursor mid");
+    assert_eq!(page_mid.items.len(), 1);
+    assert_eq!(page_mid.items[0].digest.hex(), hex2);
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_fails_closed_on_symlinks() {
+    use crate::storage::GcStorage;
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let cas_root = root.join("blobs").join("sha256");
+    std::fs::create_dir_all(&cas_root).expect("create cas root");
+
+    // Case 1: Symlinked shard directory (e.g. blobs/sha256/2b -> target_dir)
+    // DirEntry::file_type().is_dir() returns false for a symlink, triggering CorruptData
+    let target_shard = fixture.path().join("external_shard");
+    std::fs::create_dir_all(&target_shard).expect("create target shard");
+    let link_shard = cas_root.join("2b");
+    symlink(&target_shard, &link_shard).expect("create shard symlink");
+
+    let res = storage.list_cas_blobs_page(None, 10).await;
+    assert!(res.is_err(), "symlinked shard directory must fail closed");
+    let err = res.unwrap_err();
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::CorruptData));
+    assert!(
+        err.to_string()
+            .contains("malformed non-directory entry in CAS prefix directory root"),
+        "error must report non-directory entry in CAS prefix directory root: got {err}"
+    );
+
+    // Clean up shard symlink to test file symlink inside a valid shard
+    std::fs::remove_file(&link_shard).expect("remove shard symlink");
+
+    // Case 2: Symlinked blob file inside a valid shard directory
+    // DirEntry::file_type().is_file() returns false for a symlink, triggering CorruptData
+    let real_shard = cas_root.join("0a");
+    std::fs::create_dir_all(&real_shard).expect("create real shard");
+    let target_file = fixture.path().join("target_blob.bin");
+    std::fs::write(&target_file, b"symlinked blob data").expect("write target blob");
+    let valid_hex_name = "0a00000000000000000000000000000000000000000000000000000000000001";
+    let link_file = real_shard.join(valid_hex_name);
+    symlink(&target_file, &link_file).expect("create blob symlink");
+
+    let res = storage.list_cas_blobs_page(None, 10).await;
+    assert!(res.is_err(), "symlinked blob file must fail closed");
+    let err = res.unwrap_err();
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::CorruptData));
+    assert!(
+        err.to_string()
+            .contains("malformed non-file entry in CAS shard directory"),
+        "error must report non-file entry in CAS shard directory: got {err}"
+    );
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_fails_closed_on_nested_subdirectories_in_shard() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let shard = root.join("blobs").join("sha256").join("0a");
+    let nested_subdir = shard.join("nested_subdir");
+    std::fs::create_dir_all(&nested_subdir).expect("create nested subdir in shard");
+
+    let res = storage.list_cas_blobs_page(None, 10).await;
+    assert!(
+        res.is_err(),
+        "nested directory inside shard must fail closed"
+    );
+    let err = res.unwrap_err();
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::CorruptData));
+    assert!(
+        err.to_string()
+            .contains("malformed non-file entry in CAS shard directory"),
+        "nested directory in shard must be rejected as non-file entry: got {err}"
+    );
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_list_cas_blobs_symlink_resolution_through_ancestor_paths() {
+    use crate::storage::GcStorage;
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let hex = "0a00000000000000000000000000000000000000000000000000000000000001";
+
+    // Case A: Configured storage root itself is a symlink pointing to another directory
+    {
+        let target_root = fixture.path().join("target_root_a");
+        put_cas_blob_file(&target_root, hex, b"payload-root-symlink");
+        let sym_root = fixture.path().join("sym_root_a");
+        symlink(&target_root, &sym_root).expect("symlink storage root");
+
+        let storage = FsStorage::new(sym_root, 1024 * 1024);
+        let page = storage
+            .list_cas_blobs_page(None, 10)
+            .await
+            .expect("listing through symlinked storage root succeeds");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].digest.hex(), hex);
+        drop(storage);
+    }
+
+    // Case B: 'blobs' directory is a symlink pointing to an external directory
+    {
+        let root_b = fixture.path().join("root_b");
+        std::fs::create_dir_all(&root_b).expect("create root_b");
+        let target_blobs = fixture.path().join("target_blobs_b");
+        let target_cas = target_blobs.join("sha256");
+        let target_shard = target_cas.join("0a");
+        std::fs::create_dir_all(&target_shard).expect("create target shard");
+        std::fs::write(target_shard.join(hex), b"payload-blobs-symlink").expect("write blob");
+        symlink(&target_blobs, root_b.join("blobs")).expect("symlink blobs dir");
+
+        let storage = FsStorage::new(root_b, 1024 * 1024);
+        let page = storage
+            .list_cas_blobs_page(None, 10)
+            .await
+            .expect("listing through symlinked blobs dir succeeds");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].digest.hex(), hex);
+        drop(storage);
+    }
+
+    // Case C: 'blobs/sha256' is a symlink pointing to an external CAS root
+    {
+        let root_c = fixture.path().join("root_c");
+        let blobs_dir = root_c.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).expect("create root_c/blobs");
+        let target_cas_c = fixture.path().join("target_cas_c");
+        let target_shard_c = target_cas_c.join("0a");
+        std::fs::create_dir_all(&target_shard_c).expect("create target shard c");
+        std::fs::write(target_shard_c.join(hex), b"payload-cas-symlink").expect("write blob");
+        symlink(&target_cas_c, blobs_dir.join("sha256")).expect("symlink blobs/sha256 dir");
+
+        let storage = FsStorage::new(root_c, 1024 * 1024);
+        let page = storage
+            .list_cas_blobs_page(None, 10)
+            .await
+            .expect("listing through symlinked blobs/sha256 dir succeeds");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].digest.hex(), hex);
+        drop(storage);
+    }
+
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_list_cas_blobs_deterministic_inter_page_mutation_no_snapshot() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let hex_0a = "0a00000000000000000000000000000000000000000000000000000000000001";
+    let hex_ff = "ff00000000000000000000000000000000000000000000000000000000000001";
+    put_cas_blob_file(&root, hex_0a, b"first");
+    put_cas_blob_file(&root, hex_ff, b"last");
+
+    // Fetch page 1 (limit 1): returns 0a
+    let page1 = storage.list_cas_blobs_page(None, 1).await.expect("page 1");
+    assert_eq!(page1.items.len(), 1);
+    assert_eq!(page1.items[0].digest.hex(), hex_0a);
+    let cursor1 = page1.next_cursor.expect("cursor after page 1");
+
+    // Deterministic mutation between page calls (characterizing absence of snapshot isolation):
+    // 1. Insert a blob behind the cursor (hex_01 < hex_0a)
+    let hex_01 = "0100000000000000000000000000000000000000000000000000000000000001";
+    put_cas_blob_file(&root, hex_01, b"behind-cursor");
+
+    // 2. Insert a blob ahead of the cursor (hex_88 between 0a and ff)
+    let hex_88 = "8800000000000000000000000000000000000000000000000000000000000001";
+    put_cas_blob_file(&root, hex_88, b"ahead-of-cursor");
+
+    // Fetch page 2 (cursor = cursor1, limit = 10):
+    // hex_01 is skipped because "sha256:01..." <= "sha256:0a..." (missed by this traversal cycle)
+    // hex_88 is observed because "sha256:88..." > "sha256:0a..."
+    // hex_ff is observed because "sha256:ff..." > "sha256:0a..."
+    let page2 = storage
+        .list_cas_blobs_page(Some(&cursor1), 10)
+        .await
+        .expect("page 2");
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.items[0].digest.hex(), hex_88);
+    assert_eq!(page2.items[1].digest.hex(), hex_ff);
+
+    drop(storage);
+    drop(fixture);
+}
