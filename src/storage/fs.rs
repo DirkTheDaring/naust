@@ -3592,3 +3592,7 @@ mod payload_seam;
 
 #[path = "fs/listing.rs"]
 pub(crate) mod listing;
+
+#[cfg(test)]
+#[path = "fs/manifest_seam.rs"]
+mod manifest_seam;
