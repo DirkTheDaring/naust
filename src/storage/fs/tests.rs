@@ -4574,3 +4574,740 @@ async fn test_manifest_read_permission_denied_ignored() {
         .close()
         .expect("fixture directory close must succeed");
 }
+
+// --- Filesystem Manifest Listing Characterization Tests (list_manifest_digests_page) ---
+
+#[tokio::test]
+async fn test_manifest_listing_missing_and_empty_paths() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Case 1: Entire repository directory absent -> returns Ok(([], None))
+    let res_missing_repo = storage
+        .list_manifest_digests_page("nonexistent_repo", None, 10)
+        .await
+        .expect("missing repo succeeds with empty page");
+    assert_eq!(res_missing_repo.0, Vec::<Digest>::new());
+    assert_eq!(res_missing_repo.1, None);
+
+    // Case 2: Repository directory exists, but manifests/ subdirectory is absent -> returns Ok(([], None))
+    let repo_dir = root.join("repos").join("no_manifests_repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+    let res_missing_manifests = storage
+        .list_manifest_digests_page("no_manifests_repo", None, 10)
+        .await
+        .expect("missing manifests dir succeeds with empty page");
+    assert_eq!(res_missing_manifests.0, Vec::<Digest>::new());
+    assert_eq!(res_missing_manifests.1, None);
+
+    // Case 3: manifests/ subdirectory exists and is empty -> returns Ok(([], None))
+    let manifests_dir = repo_dir.join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+    let res_empty = storage
+        .list_manifest_digests_page("no_manifests_repo", None, 10)
+        .await
+        .expect("empty manifests dir succeeds with empty page");
+    assert_eq!(res_empty.0, Vec::<Digest>::new());
+    assert_eq!(res_empty.1, None);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_ordering_independent_of_creation_order() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "order_repo";
+
+    // Create files in deliberate non-alphabetical creation order
+    let hexes = [
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    ];
+    for hex in &hexes {
+        put_manifest_file(&root, repo, hex, b"{}");
+    }
+
+    let (digests, token) = storage
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .expect("list manifests");
+    assert_eq!(digests.len(), 4);
+    assert_eq!(token, None);
+
+    // Expected order: sorted strictly by hex() ascending
+    let returned_hexes: Vec<String> = digests.iter().map(|d| d.hex().to_string()).collect();
+    assert_eq!(
+        returned_hexes,
+        vec![
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_manifest_listing_complete_traversal_and_continuation_tokens() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "pagination_repo";
+
+    let hexes = [
+        "1000000000000000000000000000000000000000000000000000000000000000",
+        "2000000000000000000000000000000000000000000000000000000000000000",
+        "3000000000000000000000000000000000000000000000000000000000000000",
+        "4000000000000000000000000000000000000000000000000000000000000000",
+        "5000000000000000000000000000000000000000000000000000000000000000",
+    ];
+    for hex in &hexes {
+        put_manifest_file(&root, repo, hex, b"{}");
+    }
+
+    // Page 1: limit 2
+    let (p1, tok1) = storage
+        .list_manifest_digests_page(repo, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(p1.len(), 2);
+    assert_eq!(p1[0].hex(), hexes[0]);
+    assert_eq!(p1[1].hex(), hexes[1]);
+    assert_eq!(tok1, Some(format!("sha256:{}", hexes[1])));
+
+    // Page 2: limit 2 with tok1
+    let (p2, tok2) = storage
+        .list_manifest_digests_page(repo, tok1.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(p2.len(), 2);
+    assert_eq!(p2[0].hex(), hexes[2]);
+    assert_eq!(p2[1].hex(), hexes[3]);
+    assert_eq!(tok2, Some(format!("sha256:{}", hexes[3])));
+
+    // Page 3: limit 2 with tok2 (final partial page)
+    let (p3, tok3) = storage
+        .list_manifest_digests_page(repo, tok2.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(p3.len(), 1);
+    assert_eq!(p3[0].hex(), hexes[4]);
+    assert_eq!(tok3, None, "final page continuation token must be None");
+
+    // Page 4: calling with token of last item returns empty and None
+    let (p4, tok4) = storage
+        .list_manifest_digests_page(repo, Some(&format!("sha256:{}", hexes[4])), 2)
+        .await
+        .unwrap();
+    assert_eq!(p4.len(), 0);
+    assert_eq!(tok4, None);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_filename_interpretation_variants() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "filename_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    // 1. Raw 64-hex SHA-256 filename -> parsed as sha256:<hex>
+    let raw_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write_file(&manifests_dir.join(raw_sha256), b"{}");
+
+    // 2. Raw 128-hex SHA-512 filename -> NOT listed! (silently ignored because sha256:{hex} fails len, and no colon)
+    let raw_sha512 = "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555";
+    write_file(&manifests_dir.join(raw_sha512), b"{}");
+
+    // 3. Algorithm-prefixed filename: sha256:<hex> -> parsed as sha256:<hex>
+    let prefixed_sha256 = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    write_file(&manifests_dir.join(prefixed_sha256), b"{}");
+
+    // 4. Algorithm-prefixed filename: sha512:<hex> -> parsed as sha512:<hex>
+    let prefixed_sha512 = "sha512:66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666";
+    write_file(&manifests_dir.join(prefixed_sha512), b"{}");
+
+    // 5. Uppercase SHA-256 filename -> parsed and normalized to lowercase
+    let upper_sha256 = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    write_file(&manifests_dir.join(upper_sha256), b"{}");
+
+    // 6. Temporary and lock files -> skipped
+    write_file(&manifests_dir.join(".tmp.upload123"), b"{}");
+    write_file(&manifests_dir.join(".lock.exclusive"), b"{}");
+
+    // 7. Non-digest filenames -> ignored
+    write_file(&manifests_dir.join("README.txt"), b"{}");
+    write_file(&manifests_dir.join(".DS_Store"), b"{}");
+    write_file(&manifests_dir.join("short_hex"), b"{}");
+
+    let (digests, _) = storage
+        .list_manifest_digests_page(repo, None, 100)
+        .await
+        .unwrap();
+
+    let as_strings: Vec<String> = digests.iter().map(|d| d.as_str()).collect();
+
+    // Verify raw sha256 was included
+    assert!(as_strings.contains(&format!("sha256:{raw_sha256}")));
+    // Verify raw sha512 was NOT included (architectural limitation of list_manifest_digests_page)
+    assert!(
+        !as_strings.iter().any(|s| s.contains(raw_sha512)),
+        "raw 128-hex SHA-512 files are unexpectedly ignored by list_manifest_digests_page"
+    );
+    // Verify prefixed sha256 was included
+    assert!(as_strings.contains(&prefixed_sha256.to_string()));
+    // Verify prefixed sha512 was included
+    assert!(as_strings.contains(&prefixed_sha512.to_string()));
+    // Verify uppercase sha256 was included and normalized to lowercase
+    assert!(as_strings.contains(&format!("sha256:{}", upper_sha256.to_lowercase())));
+
+    // Total listed count is 4 (raw_sha256, prefixed_sha256, prefixed_sha512, upper_sha256)
+    assert_eq!(digests.len(), 4);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_duplicate_digest_filenames_not_deduplicated() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "dup_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    // Write raw hex and prefixed hex that resolve to the same Digest
+    let hex = "1212121212121212121212121212121212121212121212121212121212121212";
+    write_file(&manifests_dir.join(hex), b"{}");
+    write_file(&manifests_dir.join(format!("sha256:{hex}")), b"{}");
+
+    let (digests, _) = storage
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .unwrap();
+
+    // Listing does NOT deduplicate: both entries are returned!
+    assert_eq!(digests.len(), 2);
+    assert_eq!(digests[0], digests[1]);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_manifest_listing_non_utf8_filename_ignored() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "non_utf8_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    // Create a filename containing invalid UTF-8 (0xFF)
+    let non_utf8_bytes = b"0123456789abcdef\xff123456789abcdef0123456789abcdef0123456789abcdef";
+    let non_utf8_os = std::ffi::OsStr::from_bytes(non_utf8_bytes);
+    std::fs::write(manifests_dir.join(non_utf8_os), b"{}").expect("write non-utf8 file");
+
+    let (digests, _) = storage
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .unwrap();
+
+    // to_string_lossy replaces 0xFF with U+FFFD, failing hexdigit validation -> ignored
+    assert_eq!(digests.len(), 0);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_page_limits_zero_and_oversized() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "limits_repo";
+
+    let hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    put_manifest_file(&root, repo, hex, b"{}");
+
+    // Zero page limit: returns empty slice, next_token is None even though items exist!
+    let (p_zero, tok_zero) = storage
+        .list_manifest_digests_page(repo, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(p_zero.len(), 0);
+    assert_eq!(tok_zero, None);
+
+    // Oversized page limit (1000): returns all entries, next_token is None
+    let (p_over, tok_over) = storage
+        .list_manifest_digests_page(repo, None, 1000)
+        .await
+        .unwrap();
+    assert_eq!(p_over.len(), 1);
+    assert_eq!(p_over[0].hex(), hex);
+    assert_eq!(tok_over, None);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_arbitrary_tokens_boundary_cases() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "tokens_repo";
+
+    let hexes = [
+        "2000000000000000000000000000000000000000000000000000000000000000",
+        "4000000000000000000000000000000000000000000000000000000000000000",
+        "6000000000000000000000000000000000000000000000000000000000000000",
+    ];
+    for hex in &hexes {
+        put_manifest_file(&root, repo, hex, b"{}");
+    }
+
+    // 1. Token before all existing digests -> returns from index 0
+    let token_before = "sha256:1000000000000000000000000000000000000000000000000000000000000000";
+    let (p_before, _) = storage
+        .list_manifest_digests_page(repo, Some(token_before), 10)
+        .await
+        .unwrap();
+    assert_eq!(p_before.len(), 3);
+    assert_eq!(p_before[0].hex(), hexes[0]);
+
+    // 2. Token between existing digests -> starts at insertion point (index 1)
+    let token_between = "sha256:3000000000000000000000000000000000000000000000000000000000000000";
+    let (p_between, _) = storage
+        .list_manifest_digests_page(repo, Some(token_between), 10)
+        .await
+        .unwrap();
+    assert_eq!(p_between.len(), 2);
+    assert_eq!(p_between[0].hex(), hexes[1]);
+    assert_eq!(p_between[1].hex(), hexes[2]);
+
+    // 3. Token after all existing digests -> returns empty page
+    let token_after = "sha256:7000000000000000000000000000000000000000000000000000000000000000";
+    let (p_after, tok_after) = storage
+        .list_manifest_digests_page(repo, Some(token_after), 10)
+        .await
+        .unwrap();
+    assert_eq!(p_after.len(), 0);
+    assert_eq!(tok_after, None);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_mixed_algorithm_sorting_and_cursor_mismatch() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "mismatch_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    // Item B: SHA-512 with hex starting with "1111..."
+    let hex_b = "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
+    write_file(&manifests_dir.join(format!("sha512:{hex_b}")), b"{}");
+
+    // Item C: SHA-256 with hex starting with "2222..."
+    let hex_c = "2222222222222222222222222222222222222222222222222222222222222222";
+    write_file(&manifests_dir.join(hex_c), b"{}");
+
+    // Item A: SHA-256 with hex starting with "8888..."
+    let hex_a = "8888888888888888888888888888888888888888888888888888888888888888";
+    write_file(&manifests_dir.join(hex_a), b"{}");
+
+    // 1. Establish deterministic ordering facts:
+    // In a single unpaginated listing (limit 10), all entries are returned.
+    let (all_items, token) = storage
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(all_items.len(), 3);
+    assert_eq!(token, None);
+
+    // Assert the exact returned hex ordering: all_digests is sorted by hex() ascending
+    assert_eq!(all_items[0].hex(), hex_b);
+    assert_eq!(all_items[1].hex(), hex_c);
+    assert_eq!(all_items[2].hex(), hex_a);
+    assert!(all_items[0].hex() < all_items[1].hex());
+    assert!(all_items[1].hex() < all_items[2].hex());
+
+    // Assert the mismatch with canonical digest-string (as_str()) ordering:
+    // In canonical string form ("<algo>:<hex>"), "sha512:1111..." is GREATER than "sha256:2222...".
+    // Therefore, an array sorted by hex() is NOT partitioned with respect to as_str().
+    assert_eq!(all_items[0].as_str(), format!("sha512:{hex_b}"));
+    assert_eq!(all_items[1].as_str(), format!("sha256:{hex_c}"));
+    assert!(
+        all_items[0].as_str() > all_items[1].as_str(),
+        "canonical string ordering must disagree with raw hex ordering on mixed algorithms"
+    );
+
+    // 2. Exercise a bounded observation run across pagination.
+    // Explicitly record termination cause, collected digests, and omissions without
+    // asserting that an incidental failure must occur.
+    const MAX_PAGINATION_STEPS: usize = 5;
+    let mut collected: Vec<Digest> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut step_count = 0;
+    let mut termination_reason = "exhausted iteration bound";
+
+    for _ in 0..MAX_PAGINATION_STEPS {
+        step_count += 1;
+        let (page, next_cursor) = storage
+            .list_manifest_digests_page(repo, cursor.as_deref(), 1)
+            .await
+            .unwrap();
+
+        if page.is_empty() {
+            termination_reason = "empty page";
+            break;
+        }
+
+        if let Some(ref current_cur) = cursor {
+            if let Some(ref next_cur) = next_cursor {
+                if next_cur == current_cur {
+                    termination_reason = "repeated token";
+                    collected.extend(page);
+                    break;
+                }
+            }
+        }
+
+        collected.extend(page);
+        cursor = next_cursor;
+        if cursor.is_none() {
+            termination_reason = "no continuation token";
+            break;
+        }
+    }
+
+    // Determine omitted digests relative to the unpaginated result
+    let omitted: Vec<String> = all_items
+        .iter()
+        .filter(|d| !collected.contains(d))
+        .map(|d| d.as_str())
+        .collect();
+
+    println!(
+        "Mixed-algorithm pagination observation:\n  \
+         Steps executed: {step_count}\n  \
+         Termination reason: {termination_reason}\n  \
+         Collected count: {}\n  \
+         Collected digests: {:?}\n  \
+         Omitted count: {}\n  \
+         Omitted digests: {:?}",
+        collected.len(),
+        collected.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+        omitted.len(),
+        omitted
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_manifest_listing_entry_types_unfiltered() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let outside = fixture.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "entry_types_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    // 1. Regular file with 64-hex name
+    let hex_reg = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(&manifests_dir.join(hex_reg), b"{}");
+
+    // 2. Directory with 64-hex name
+    let hex_dir = "2222222222222222222222222222222222222222222222222222222222222222";
+    std::fs::create_dir(manifests_dir.join(hex_dir)).expect("create dir entry");
+
+    // 3. Symlink pointing to outside file with 64-hex name
+    let hex_sym = "3333333333333333333333333333333333333333333333333333333333333333";
+    let outside_file = outside.join("outside_manifest.json");
+    write_file(&outside_file, b"{}");
+    symlink(&outside_file, manifests_dir.join(hex_sym)).expect("create symlink entry");
+
+    // 4. Dangling symlink with 64-hex name
+    let hex_dangling = "4444444444444444444444444444444444444444444444444444444444444444";
+    symlink(
+        outside.join("nonexistent_file"),
+        manifests_dir.join(hex_dangling),
+    )
+    .expect("create dangling symlink");
+
+    let (digests, _) = storage
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .unwrap();
+
+    // CHARACTERIZATION FINDING:
+    // list_manifest_digests_page does NOT check entry file types!
+    // Regular files, directories, valid symlinks, and dangling symlinks are all listed!
+    let listed_hexes: Vec<String> = digests.iter().map(|d| d.hex().to_string()).collect();
+    assert_eq!(listed_hexes.len(), 4);
+    assert!(listed_hexes.contains(&hex_reg.to_string()));
+    assert!(listed_hexes.contains(&hex_dir.to_string()));
+    assert!(listed_hexes.contains(&hex_sym.to_string()));
+    assert!(listed_hexes.contains(&hex_dangling.to_string()));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_manifest_listing_symlinked_manifests_and_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let outside = fixture.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Case 1: manifests/ directory itself is a symlink to outside directory
+    let repo1 = "sym_manifests_repo";
+    let repo1_dir = root.join("repos").join(repo1);
+    std::fs::create_dir_all(&repo1_dir).expect("create repo1 dir");
+    let outside_manifests1 = outside.join("ext_manifests1");
+    std::fs::create_dir_all(&outside_manifests1).expect("create ext_manifests1");
+    let hex1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write_file(&outside_manifests1.join(hex1), b"{}");
+    symlink(&outside_manifests1, repo1_dir.join("manifests")).expect("symlink manifests dir");
+
+    let (digests1, _) = storage
+        .list_manifest_digests_page(repo1, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(digests1.len(), 1);
+    assert_eq!(digests1[0].hex(), hex1);
+
+    // Case 2: Ancestor repo directory is a symlink to outside directory
+    let outside_repo2 = outside.join("ext_repo2");
+    let outside_manifests2 = outside_repo2.join("manifests");
+    std::fs::create_dir_all(&outside_manifests2).expect("create ext_manifests2");
+    let hex2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    write_file(&outside_manifests2.join(hex2), b"{}");
+
+    let repos_dir = root.join("repos");
+    std::fs::create_dir_all(&repos_dir).expect("create repos dir");
+    symlink(&outside_repo2, repos_dir.join("sym_ancestor_repo")).expect("symlink repo ancestor");
+
+    let (digests2, _) = storage
+        .list_manifest_digests_page("sym_ancestor_repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(digests2.len(), 1);
+    assert_eq!(digests2[0].hex(), hex2);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_path_traversal_and_absolute_paths() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Create an escaped repo outside root/repos
+    let escaped_manifests = fixture.path().join("escaped_repo").join("manifests");
+    std::fs::create_dir_all(&escaped_manifests).expect("create escaped manifests");
+    let hex_escaped = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    write_file(&escaped_manifests.join(hex_escaped), b"{}");
+
+    // Ensure root/repos exists so Path::join can traverse
+    std::fs::create_dir_all(root.join("repos")).expect("create repos dir");
+
+    // Path traversal input: "../../escaped_repo" escapes root/repos via Path::join!
+    let (digests, _) = storage
+        .list_manifest_digests_page("../../escaped_repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        digests.len(),
+        1,
+        "Legacy list_manifest_digests_page permits dot-dot path traversal escape"
+    );
+    assert_eq!(digests[0].hex(), hex_escaped);
+
+    // Absolute path input: Path::join on absolute path discards root.join("repos")
+    // Target is <escaped_dir_path>/manifests:
+    let escaped_dir_path = fixture.path().join("escaped_repo");
+    let abs_repo_input = escaped_dir_path.to_str().unwrap();
+    let (digests_abs, _) = storage
+        .list_manifest_digests_page(abs_repo_input, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        digests_abs.len(),
+        1,
+        "Legacy list_manifest_digests_page permits absolute path redirection"
+    );
+    assert_eq!(digests_abs[0].hex(), hex_escaped);
+}
+
+#[tokio::test]
+async fn test_manifest_listing_component_wrong_type_suppressed() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+    std::fs::create_dir_all(&repos_dir).expect("create repos dir");
+
+    // Case 1: manifests component is a regular file instead of a directory
+    let repo1_dir = repos_dir.join("file_manifests_repo");
+    std::fs::create_dir_all(&repo1_dir).expect("create repo1 dir");
+    write_file(&repo1_dir.join("manifests"), b"regular file, not a dir");
+
+    // read_dir returns ENOTDIR, but list_manifest_digests_page suppresses it with if let Ok
+    let res1 = storage
+        .list_manifest_digests_page("file_manifests_repo", None, 10)
+        .await
+        .expect("ENOTDIR is suppressed and returns empty page");
+    assert_eq!(res1.0.len(), 0);
+    assert_eq!(res1.1, None);
+
+    // Case 2: repo component itself is a regular file instead of a directory
+    write_file(&repos_dir.join("file_repo"), b"regular file, not a dir");
+    let res2 = storage
+        .list_manifest_digests_page("file_repo", None, 10)
+        .await
+        .expect("repo as file is suppressed and returns empty page");
+    assert_eq!(res2.0.len(), 0);
+    assert_eq!(res2.1, None);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_manifest_listing_permission_denied_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "perm_list_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    let hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(&manifests_dir.join(hex), b"{}");
+
+    let orig_perms = std::fs::metadata(&manifests_dir).unwrap().permissions();
+
+    struct ScopedPermReset<'a> {
+        path: &'a std::path::Path,
+        original_permissions: std::fs::Permissions,
+    }
+
+    impl<'a> Drop for ScopedPermReset<'a> {
+        fn drop(&mut self) {
+            if let Err(err) = std::fs::set_permissions(self.path, self.original_permissions.clone())
+            {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "ScopedPermReset: failed to restore permissions on {:?} during unwinding: {err}",
+                        self.path
+                    );
+                } else {
+                    panic!(
+                        "ScopedPermReset: failed to restore permissions on {:?}: {err}",
+                        self.path
+                    );
+                }
+            }
+        }
+    }
+
+    {
+        let _guard = ScopedPermReset {
+            path: &manifests_dir,
+            original_permissions: orig_perms.clone(),
+        };
+        std::fs::set_permissions(&manifests_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("set mode 0o000");
+
+        // Fail-fast assertion: verify permissions actually deny access with PermissionDenied
+        match std::fs::read_dir(&manifests_dir) {
+            Ok(_) => {
+                panic!("ineffective permissions: std::fs::read_dir succeeded under mode 0o000")
+            }
+            Err(err) => assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected PermissionDenied error under mode 0o000, got: {err:?}"
+            ),
+        }
+
+        // list_manifest_digests_page: read_dir error (PermissionDenied) is SILENTLY SUPPRESSED
+        let res = storage
+            .list_manifest_digests_page(repo, None, 10)
+            .await
+            .expect("PermissionDenied on read_dir is suppressed and returns empty page");
+        assert_eq!(res.0.len(), 0);
+        assert_eq!(res.1, None);
+    }
+
+    let restored_perms = std::fs::metadata(&manifests_dir).unwrap().permissions();
+    assert_eq!(restored_perms.mode(), orig_perms.mode());
+}
+
+#[tokio::test]
+async fn test_manifest_listing_inter_page_mutation_lacks_snapshot_isolation() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "mutation_repo";
+
+    let hex_a = "1000000000000000000000000000000000000000000000000000000000000000";
+    let hex_c = "3000000000000000000000000000000000000000000000000000000000000000";
+    put_manifest_file(&root, repo, hex_a, b"{}");
+    put_manifest_file(&root, repo, hex_c, b"{}");
+
+    // Page 1 with limit 1: returns item A, token = A
+    let (p1, tok1) = storage
+        .list_manifest_digests_page(repo, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(p1.len(), 1);
+    assert_eq!(p1[0].hex(), hex_a);
+    assert_eq!(tok1, Some(format!("sha256:{hex_a}")));
+
+    // Sequentially insert item B between completed page calls (between A and C) before Page 2
+    let hex_b = "2000000000000000000000000000000000000000000000000000000000000000";
+    put_manifest_file(&root, repo, hex_b, b"{}");
+
+    // Page 2: Request with tok1 (A) observes the newly inserted item B!
+    let (p2, tok2) = storage
+        .list_manifest_digests_page(repo, tok1.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        p2.len(),
+        1,
+        "inter-page insertion is visible to subsequent page"
+    );
+    assert_eq!(p2[0].hex(), hex_b);
+    assert_eq!(tok2, Some(format!("sha256:{hex_b}")));
+}
+
+#[tokio::test]
+async fn test_manifest_listing_manifest_reader_port_forwarding() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "port_repo";
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    put_manifest_file(&root, repo, hex1, b"{}");
+    put_manifest_file(&root, repo, hex2, b"{}");
+
+    // Invoke through ManifestReader port trait directly
+    let (page, tok) =
+        <FsStorage as crate::storage::ports::ManifestReader>::list_manifest_digests_page(
+            &storage, repo, None, 1,
+        )
+        .await
+        .expect("ManifestReader::list_manifest_digests_page succeeds");
+
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].hex(), hex1);
+    assert_eq!(tok, Some(format!("sha256:{hex1}")));
+}
