@@ -713,7 +713,7 @@ impl ManifestLifecycleService {
                     if let Some(refs) = refs {
                         for blob_d in refs.blob_references() {
                             let still_referenced =
-                                self.is_blob_referenced_in_repo(repo, blob_d).await;
+                                self.is_blob_referenced_in_repo(repo, blob_d).await?;
 
                             if !still_referenced {
                                 if let Ok(Some(record)) =
@@ -744,7 +744,7 @@ impl ManifestLifecycleService {
                                     == crate::storage::repo_membership::MembershipProvenance::Proxy
                                 {
                                     let still_referenced =
-                                        self.is_blob_referenced_in_repo(repo, &rec.digest).await;
+                                        self.is_blob_referenced_in_repo(repo, &rec.digest).await?;
                                     if !still_referenced {
                                         let _ =
                                             self.storage.unlink_repo_blob(repo, &rec.digest).await;
@@ -770,34 +770,44 @@ impl ManifestLifecycleService {
         Ok(())
     }
 
-    async fn is_blob_referenced_in_repo(&self, repo: &str, target_blob: &Digest) -> bool {
+    async fn is_blob_referenced_in_repo(
+        &self,
+        repo: &str,
+        target_blob: &Digest,
+    ) -> Result<bool, StorageError> {
         let mut tok: Option<String> = None;
+        let mut seen_tokens = std::collections::HashSet::<String>::new();
         loop {
-            let (page, next_tok) = match self
+            let (page, next_tok) = self
                 .storage
                 .list_manifest_digests_page(repo, tok.as_deref(), 100)
-                .await
-            {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
+                .await?;
             for m_d in page {
-                if let Ok((_meta, bytes)) = self.storage.get_manifest(repo, &m_d).await {
-                    if let Ok(refs) = crate::manifest_refs::parse_manifest_refs(&bytes) {
-                        for b in refs.blob_references() {
-                            if b == target_blob {
-                                return true;
-                            }
-                        }
+                let (_meta, bytes) = self.storage.get_manifest(repo, &m_d).await?;
+                let refs = crate::manifest_refs::parse_manifest_refs(&bytes).map_err(|e| {
+                    StorageError::corrupt_data(format!(
+                        "failed to parse manifest references for manifest {m_d} in repository '{repo}': {e}"
+                    ))
+                })?;
+                for b in refs.blob_references() {
+                    if b == target_blob {
+                        return Ok(true);
                     }
                 }
             }
             match next_tok {
-                Some(t) => tok = Some(t),
+                Some(next) => {
+                    if !seen_tokens.insert(next.clone()) {
+                        return Err(StorageError::backend(format!(
+                            "pagination cycle detected on continuation token '{next}' in repository '{repo}'"
+                        )));
+                    }
+                    tok = Some(next);
+                }
                 None => break,
             }
         }
-        false
+        Ok(false)
     }
 
     /// Orchestrates manifest publication with strict pre-mutation validation,
@@ -1256,7 +1266,8 @@ impl ManifestLifecycleService {
                 // If refs were parsed, check if remaining manifests in repo reference each blob
                 if let Some(refs) = refs {
                     for blob_d in refs.blob_references() {
-                        let still_referenced = self.is_blob_referenced_in_repo(repo, blob_d).await;
+                        let still_referenced =
+                            self.is_blob_referenced_in_repo(repo, blob_d).await?;
 
                         if !still_referenced {
                             // Check if blob membership is of Proxy provenance
@@ -1678,5 +1689,548 @@ impl ManifestLifecycleService {
             digest: target_digest.clone(),
             mutation,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consistency::ConsistencyCoordinator;
+    use crate::registry::digest::Digest;
+    use crate::storage::fs::FsStorage;
+    use crate::storage::ports::*;
+    use crate::storage::{
+        ManifestMeta, RepositoryBlobMembershipStorage, StorageError, StorageErrorKind,
+    };
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestLifecycleMockStorage {
+        inner: Arc<FsStorage>,
+        fail_listing: AtomicBool,
+        fail_get_manifest: AtomicBool,
+        corrupt_manifest: AtomicBool,
+        immediate_cycle: AtomicBool,
+        multi_cycle: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobCasReader for TestLifecycleMockStorage {
+        async fn head_blob(
+            &self,
+            digest: &Digest,
+        ) -> Result<crate::storage::BlobMeta, StorageError> {
+            self.inner.head_blob(digest).await
+        }
+        async fn open_blob(
+            &self,
+            digest: &Digest,
+        ) -> Result<
+            (
+                crate::storage::BlobMeta,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            ),
+            StorageError,
+        > {
+            self.inner.open_blob(digest).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryCatalogReader for TestLifecycleMockStorage {
+        async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+            self.inner.list_repositories().await
+        }
+        async fn repo_timestamps(
+            &self,
+            name: &str,
+        ) -> Result<crate::storage::RepoTimestamps, StorageError> {
+            self.inner.repo_timestamps(name).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManifestReader for TestLifecycleMockStorage {
+        async fn head_manifest(
+            &self,
+            name: &str,
+            digest: &Digest,
+        ) -> Result<ManifestMeta, StorageError> {
+            self.inner.head_manifest(name, digest).await
+        }
+        async fn get_manifest(
+            &self,
+            name: &str,
+            digest: &Digest,
+        ) -> Result<(ManifestMeta, Bytes), StorageError> {
+            if self.fail_get_manifest.load(Ordering::SeqCst) {
+                return Err(StorageError::io("simulated manifest read I/O error"));
+            }
+            if self.corrupt_manifest.load(Ordering::SeqCst) {
+                return Ok((
+                    ManifestMeta {
+                        size: 7,
+                        media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                    },
+                    Bytes::from("{corrupt"),
+                ));
+            }
+            self.inner.get_manifest(name, digest).await
+        }
+        async fn list_manifest_digests_page(
+            &self,
+            repo: &str,
+            continuation_token: Option<&str>,
+            page_limit: usize,
+        ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+            if self.fail_listing.load(Ordering::SeqCst) {
+                return Err(StorageError::backend("simulated manifest listing error"));
+            }
+            if self.immediate_cycle.load(Ordering::SeqCst) {
+                let (page, _) = self
+                    .inner
+                    .list_manifest_digests_page(repo, continuation_token, page_limit)
+                    .await?;
+                return Ok((page, Some("repeat_token".to_string())));
+            }
+            if self.multi_cycle.load(Ordering::SeqCst) {
+                let (page, _) = self
+                    .inner
+                    .list_manifest_digests_page(repo, continuation_token, page_limit)
+                    .await?;
+                let next_tok = match continuation_token {
+                    None => Some("cycle_tok_A".to_string()),
+                    Some("cycle_tok_A") => Some("cycle_tok_B".to_string()),
+                    Some("cycle_tok_B") => Some("cycle_tok_A".to_string()),
+                    Some(other) => Some(other.to_string()),
+                };
+                return Ok((page, next_tok));
+            }
+            self.inner
+                .list_manifest_digests_page(repo, continuation_token, page_limit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManifestStore for TestLifecycleMockStorage {
+        async fn put_manifest(
+            &self,
+            name: &str,
+            digest: &Digest,
+            bytes: Bytes,
+        ) -> Result<ManifestMeta, StorageError> {
+            self.inner.put_manifest(name, digest, bytes).await
+        }
+        async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
+            self.inner.delete_manifest(name, digest).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TagReader for TestLifecycleMockStorage {
+        async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
+            self.inner.resolve_tag(name, tag).await
+        }
+        async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list_tags(name).await
+        }
+        async fn list_tags_page(
+            &self,
+            repo: &str,
+            continuation_token: Option<&str>,
+            page_limit: usize,
+        ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+            self.inner
+                .list_tags_page(repo, continuation_token, page_limit)
+                .await
+        }
+        async fn get_tag_with_version(
+            &self,
+            repo: &str,
+            tag: &str,
+        ) -> Result<Option<(Digest, String)>, StorageError> {
+            self.inner.get_tag_with_version(repo, tag).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TagStore for TestLifecycleMockStorage {
+        async fn set_tag(
+            &self,
+            name: &str,
+            tag: &str,
+            digest: &Digest,
+        ) -> Result<(), StorageError> {
+            self.inner.set_tag(name, tag, digest).await
+        }
+        async fn mutate_tag(
+            &self,
+            name: &str,
+            tag: &str,
+            digest: &Digest,
+            policy: crate::storage::TagMutationPolicy,
+        ) -> Result<crate::storage::TagMutation, StorageError> {
+            self.inner.mutate_tag(name, tag, digest, policy).await
+        }
+        async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
+            self.inner.delete_tag(name, tag).await
+        }
+        async fn delete_tag_conditional(
+            &self,
+            repo: &str,
+            tag: &str,
+            expected_version: Option<&str>,
+        ) -> Result<crate::storage::ConditionalDeleteResult, StorageError> {
+            self.inner
+                .delete_tag_conditional(repo, tag, expected_version)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReferrersReader for TestLifecycleMockStorage {
+        async fn list_referrers(
+            &self,
+            name: &str,
+            subject: &Digest,
+        ) -> Result<Vec<crate::storage::ReferrerDescriptor>, StorageError> {
+            self.inner.list_referrers(name, subject).await
+        }
+        async fn list_referrers_page(
+            &self,
+            repo: &str,
+            subject: &Digest,
+            continuation_token: Option<&str>,
+            page_limit: usize,
+        ) -> Result<(Vec<crate::storage::ReferrerDescriptor>, Option<String>), StorageError>
+        {
+            self.inner
+                .list_referrers_page(repo, subject, continuation_token, page_limit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReferrersStore for TestLifecycleMockStorage {
+        async fn add_referrer(
+            &self,
+            name: &str,
+            subject: &Digest,
+            descriptor: crate::storage::ReferrerDescriptor,
+        ) -> Result<(), StorageError> {
+            self.inner.add_referrer(name, subject, descriptor).await
+        }
+        async fn remove_referrer(
+            &self,
+            name: &str,
+            subject: &Digest,
+            referrer: &Digest,
+        ) -> Result<(), StorageError> {
+            self.inner.remove_referrer(name, subject, referrer).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryBlobMembershipStorage for TestLifecycleMockStorage {
+        async fn link_repo_blob(
+            &self,
+            record: &crate::storage::RepoBlobMembershipRecord,
+        ) -> Result<(), StorageError> {
+            self.inner.link_repo_blob(record).await
+        }
+        async fn unlink_repo_blob(
+            &self,
+            repo: &str,
+            digest: &Digest,
+        ) -> Result<bool, StorageError> {
+            self.inner.unlink_repo_blob(repo, digest).await
+        }
+        async fn get_repo_blob_membership(
+            &self,
+            repo: &str,
+            digest: &Digest,
+        ) -> Result<Option<crate::storage::RepoBlobMembershipRecord>, StorageError> {
+            self.inner.get_repo_blob_membership(repo, digest).await
+        }
+        async fn list_repo_blob_memberships_page(
+            &self,
+            repo: &str,
+            continuation_token: Option<&str>,
+            page_limit: usize,
+        ) -> Result<
+            (
+                Vec<crate::storage::RepoBlobMembershipRecord>,
+                Option<String>,
+            ),
+            StorageError,
+        > {
+            self.inner
+                .list_repo_blob_memberships_page(repo, continuation_token, page_limit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LifecycleJournalStore for TestLifecycleMockStorage {
+        async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
+            self.inner.read_lifecycle_journal(repo).await
+        }
+        async fn write_lifecycle_journal(
+            &self,
+            repo: &str,
+            data: Bytes,
+        ) -> Result<(), StorageError> {
+            self.inner.write_lifecycle_journal(repo, data).await
+        }
+        async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+            self.inner.delete_lifecycle_journal(repo).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryLeaseStore for TestLifecycleMockStorage {
+        async fn acquire_repo_lease(
+            &self,
+            repo: &str,
+            owner_id: &str,
+            lease_id: &str,
+            ttl_secs: u64,
+        ) -> Result<bool, StorageError> {
+            self.inner
+                .acquire_repo_lease(repo, owner_id, lease_id, ttl_secs)
+                .await
+        }
+        async fn renew_repo_lease(
+            &self,
+            repo: &str,
+            owner_id: &str,
+            lease_id: &str,
+            ttl_secs: u64,
+        ) -> Result<bool, StorageError> {
+            self.inner
+                .renew_repo_lease(repo, owner_id, lease_id, ttl_secs)
+                .await
+        }
+        async fn release_repo_lease(
+            &self,
+            repo: &str,
+            owner_id: &str,
+            lease_id: &str,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .release_repo_lease(repo, owner_id, lease_id)
+                .await
+        }
+    }
+
+    fn setup_mock_service(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<TestLifecycleMockStorage>, ManifestLifecycleService) {
+        let fs_root = dir.path().join("data");
+        std::fs::create_dir_all(&fs_root).unwrap();
+
+        let fs_storage = Arc::new(FsStorage::new(fs_root, 50 * 1024 * 1024));
+        let mock_storage = Arc::new(TestLifecycleMockStorage {
+            inner: fs_storage,
+            fail_listing: AtomicBool::new(false),
+            fail_get_manifest: AtomicBool::new(false),
+            corrupt_manifest: AtomicBool::new(false),
+            immediate_cycle: AtomicBool::new(false),
+            multi_cycle: AtomicBool::new(false),
+        });
+        let coordinator = ConsistencyCoordinator::new();
+        let service = ManifestLifecycleService::new(mock_storage.clone(), None, coordinator);
+        (mock_storage, service)
+    }
+
+    fn test_digest(val: &str) -> Digest {
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(val.as_bytes());
+        let hex = hex::encode(hash);
+        Digest::parse(&format!("sha256:{hex}")).expect("valid sha256")
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_fails_on_listing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+        mock.fail_listing.store(true, Ordering::SeqCst);
+
+        let target_blob = test_digest("1");
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await;
+
+        assert!(matches!(
+            res,
+            Err(StorageError::Internal {
+                kind: StorageErrorKind::Backend,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_fails_on_manifest_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+
+        // Put a manifest so listing finds an entry
+        let m_d = test_digest("manifest1");
+        let dummy_manifest = Bytes::from(
+            r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000002","size":2},"layers":[]}"#,
+        );
+        mock.inner
+            .put_manifest("test-repo", &m_d, dummy_manifest)
+            .await
+            .unwrap();
+
+        mock.fail_get_manifest.store(true, Ordering::SeqCst);
+
+        let target_blob = test_digest("target");
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await;
+
+        assert!(matches!(
+            res,
+            Err(StorageError::Internal {
+                kind: StorageErrorKind::Io,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_fails_on_corrupt_manifest_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+
+        let m_d = test_digest("manifest_corrupt");
+        let dummy_manifest = Bytes::from("{}");
+        mock.inner
+            .put_manifest("test-repo", &m_d, dummy_manifest)
+            .await
+            .unwrap();
+
+        mock.corrupt_manifest.store(true, Ordering::SeqCst);
+
+        let target_blob = test_digest("target");
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await;
+
+        assert!(matches!(
+            res,
+            Err(StorageError::Internal {
+                kind: StorageErrorKind::CorruptData,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_detects_immediate_token_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+        mock.immediate_cycle.store(true, Ordering::SeqCst);
+
+        let target_blob = test_digest("target");
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await;
+
+        let err = res.expect_err("cycle must error");
+        assert!(matches!(
+            err,
+            StorageError::Internal {
+                kind: StorageErrorKind::Backend,
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("pagination cycle detected on continuation token 'repeat_token'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_detects_multi_token_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+        mock.multi_cycle.store(true, Ordering::SeqCst);
+
+        let target_blob = test_digest("target");
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await;
+
+        let err = res.expect_err("cycle must error");
+        assert!(matches!(
+            err,
+            StorageError::Internal {
+                kind: StorageErrorKind::Backend,
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("pagination cycle detected on continuation token 'cycle_tok_A'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_returns_true_when_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+
+        let target_blob = test_digest("99");
+        let cfg_digest = test_digest("11");
+        let manifest_bytes = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"digest":"{}","size":2}},"layers":[{{"digest":"{}","size":10}}]}}"#,
+            cfg_digest.as_str(),
+            target_blob.as_str()
+        ));
+        let m_d = test_digest("manifest_target");
+        mock.inner
+            .put_manifest("test-repo", &m_d, manifest_bytes)
+            .await
+            .unwrap();
+
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await
+            .unwrap();
+
+        assert!(res);
+    }
+
+    #[tokio::test]
+    async fn test_is_blob_referenced_returns_false_when_unreferenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+
+        let other_blob = test_digest("22");
+        let cfg_digest = test_digest("11");
+        let manifest_bytes = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"digest":"{}","size":2}},"layers":[{{"digest":"{}","size":10}}]}}"#,
+            cfg_digest.as_str(),
+            other_blob.as_str()
+        ));
+        let m_d = test_digest("manifest_other");
+        mock.inner
+            .put_manifest("test-repo", &m_d, manifest_bytes)
+            .await
+            .unwrap();
+
+        let target_blob = test_digest("target_unreferenced");
+        let res = service
+            .is_blob_referenced_in_repo("test-repo", &target_blob)
+            .await
+            .unwrap();
+
+        assert!(!res);
     }
 }

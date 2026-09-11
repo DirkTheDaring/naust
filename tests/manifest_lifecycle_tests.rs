@@ -3534,3 +3534,1115 @@ async fn test_public_api_manifest_publication_compatibility() {
         assert!(matches!(res, Err(PublishManifestError::InvalidManifest(_))));
     }
 }
+// ------------------------------------------------------------------------------------------------
+// Lifecycle Reference-Discovery Hardening & Partial-Progress Integration Tests
+// ------------------------------------------------------------------------------------------------
+
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+#[derive(Clone)]
+struct LifecycleFaultStorage {
+    inner: Arc<FsStorage>,
+    fail_manifest_listing: Arc<AtomicBool>,
+    fail_listing_after_n: Arc<AtomicUsize>,
+    fail_manifest_get: Arc<AtomicBool>,
+    fail_manifest_get_target: Arc<StdMutex<Option<Digest>>>,
+    corrupt_manifest_get: Arc<AtomicBool>,
+    corrupt_manifest_get_target: Arc<StdMutex<Option<Digest>>>,
+    token_cycle_immediate: Arc<AtomicBool>,
+    token_cycle_multi: Arc<AtomicBool>,
+}
+
+impl LifecycleFaultStorage {
+    fn new(inner: Arc<FsStorage>) -> Self {
+        Self {
+            inner,
+            fail_manifest_listing: Arc::new(AtomicBool::new(false)),
+            fail_listing_after_n: Arc::new(AtomicUsize::new(0)),
+            fail_manifest_get: Arc::new(AtomicBool::new(false)),
+            fail_manifest_get_target: Arc::new(StdMutex::new(None)),
+            corrupt_manifest_get: Arc::new(AtomicBool::new(false)),
+            corrupt_manifest_get_target: Arc::new(StdMutex::new(None)),
+            token_cycle_immediate: Arc::new(AtomicBool::new(false)),
+            token_cycle_multi: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl registry_rust::storage::UploadSessionStorage for LifecycleFaultStorage {}
+
+#[async_trait::async_trait]
+impl RepositoryBlobMembershipStorage for LifecycleFaultStorage {
+    async fn link_repo_blob(&self, record: &RepoBlobMembershipRecord) -> Result<(), StorageError> {
+        self.inner.link_repo_blob(record).await
+    }
+
+    async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
+        self.inner.unlink_repo_blob(repo, digest).await
+    }
+
+    async fn get_repo_blob_membership(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<Option<RepoBlobMembershipRecord>, StorageError> {
+        self.inner.get_repo_blob_membership(repo, digest).await
+    }
+
+    async fn list_repo_blob_memberships_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<RepoBlobMembershipRecord>, Option<String>), StorageError> {
+        self.inner
+            .list_repo_blob_memberships_page(repo, continuation_token, limit)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl registry_rust::storage::GcStorage for LifecycleFaultStorage {
+    fn gc_strategy(&self) -> registry_rust::storage::GcStorageStrategy {
+        registry_rust::storage::GcStorage::gc_strategy(&self.inner)
+    }
+
+    async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
+        registry_rust::storage::GcStorage::check_bucket_versioning_for_gc(&self.inner).await
+    }
+
+    async fn list_cas_blobs_page(
+        &self,
+        cursor: Option<&registry_rust::storage::GcCursor>,
+        limit: usize,
+    ) -> Result<registry_rust::storage::GcBlobPage, StorageError> {
+        registry_rust::storage::GcStorage::list_cas_blobs_page(&self.inner, cursor, limit).await
+    }
+
+    async fn quarantine_blob(
+        &self,
+        permit: &registry_rust::storage::GcMutationPermit<'_>,
+        digest: &Digest,
+        version: &registry_rust::storage::BlobObjectVersion,
+    ) -> Result<registry_rust::storage::GcQuarantineResult, StorageError> {
+        registry_rust::storage::GcStorage::quarantine_blob(&self.inner, permit, digest, version)
+            .await
+    }
+
+    async fn restore_quarantined_blob(
+        &self,
+        permit: &registry_rust::storage::GcMutationPermit<'_>,
+        digest: &Digest,
+    ) -> Result<Option<u64>, StorageError> {
+        registry_rust::storage::GcStorage::restore_quarantined_blob(&self.inner, permit, digest)
+            .await
+    }
+
+    async fn quarantined_blob_version(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<registry_rust::storage::BlobObjectVersion>, StorageError> {
+        registry_rust::storage::GcStorage::quarantined_blob_version(&self.inner, digest).await
+    }
+
+    async fn delete_blob_conditional(
+        &self,
+        permit: &registry_rust::storage::GcMutationPermit<'_>,
+        digest: &Digest,
+        version: Option<&registry_rust::storage::BlobObjectVersion>,
+    ) -> Result<registry_rust::storage::GcDeleteResult, StorageError> {
+        registry_rust::storage::GcStorage::delete_blob_conditional(
+            &self.inner,
+            permit,
+            digest,
+            version,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Storage for LifecycleFaultStorage {
+    fn kind(&self) -> &'static str {
+        "lifecycle-fault-storage"
+    }
+
+    async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+        Storage::list_repositories(&self.inner).await
+    }
+
+    async fn repo_timestamps(
+        &self,
+        name: &str,
+    ) -> Result<registry_rust::storage::RepoTimestamps, StorageError> {
+        Storage::repo_timestamps(&self.inner, name).await
+    }
+
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        Storage::is_storage_empty(&self.inner).await
+    }
+
+    async fn head_blob(
+        &self,
+        digest: &Digest,
+    ) -> Result<registry_rust::storage::BlobMeta, StorageError> {
+        Storage::head_blob(&self.inner, digest).await
+    }
+
+    async fn open_blob(
+        &self,
+        digest: &Digest,
+    ) -> Result<
+        (
+            registry_rust::storage::BlobMeta,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+        ),
+        StorageError,
+    > {
+        Storage::open_blob(&self.inner, digest).await
+    }
+
+    async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
+        Storage::resolve_tag(&self.inner, name, tag).await
+    }
+
+    async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+        Storage::list_tags(&self.inner, name).await
+    }
+
+    async fn head_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<registry_rust::storage::ManifestMeta, StorageError> {
+        Storage::head_manifest(&self.inner, name, digest).await
+    }
+
+    async fn get_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<(registry_rust::storage::ManifestMeta, Bytes), StorageError> {
+        if self.fail_manifest_get.load(AtomicOrdering::SeqCst) {
+            if let Ok(guard) = self.fail_manifest_get_target.lock() {
+                if guard.as_ref().map(|d| d == digest).unwrap_or(false) {
+                    return Err(StorageError::io("simulated manifest read I/O error"));
+                }
+            }
+        }
+        if self.corrupt_manifest_get.load(AtomicOrdering::SeqCst) {
+            if let Ok(guard) = self.corrupt_manifest_get_target.lock() {
+                if guard.as_ref().map(|d| d == digest).unwrap_or(false) {
+                    return Ok((
+                        registry_rust::storage::ManifestMeta {
+                            size: 7,
+                            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                        },
+                        Bytes::from("{corrupt"),
+                    ));
+                }
+            }
+        }
+        Storage::get_manifest(&self.inner, name, digest).await
+    }
+
+    async fn put_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+        bytes: Bytes,
+    ) -> Result<registry_rust::storage::ManifestMeta, StorageError> {
+        Storage::put_manifest(&self.inner, name, digest, bytes).await
+    }
+
+    async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
+        Storage::set_tag(&self.inner, name, tag, digest).await
+    }
+
+    async fn mutate_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        digest: &Digest,
+        policy: registry_rust::storage::TagMutationPolicy,
+    ) -> Result<registry_rust::storage::TagMutation, StorageError> {
+        Storage::mutate_tag(&self.inner, name, tag, digest, policy).await
+    }
+
+    async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
+        Storage::delete_tag(&self.inner, name, tag).await
+    }
+
+    async fn list_manifest_digests_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+        if self.fail_manifest_listing.load(AtomicOrdering::SeqCst) {
+            return Err(StorageError::backend("simulated manifest listing error"));
+        }
+        let threshold = self.fail_listing_after_n.load(AtomicOrdering::SeqCst);
+        if threshold > 0 {
+            if threshold == 1 {
+                return Err(StorageError::backend(
+                    "simulated threshold manifest listing error",
+                ));
+            }
+            self.fail_listing_after_n
+                .store(threshold - 1, AtomicOrdering::SeqCst);
+        }
+        if self.token_cycle_immediate.load(AtomicOrdering::SeqCst) {
+            let (page, _) = Storage::list_manifest_digests_page(
+                &self.inner,
+                repo,
+                continuation_token,
+                page_limit,
+            )
+            .await?;
+            return Ok((page, Some("repeat_token".to_string())));
+        }
+        if self.token_cycle_multi.load(AtomicOrdering::SeqCst) {
+            let (page, _) = Storage::list_manifest_digests_page(
+                &self.inner,
+                repo,
+                continuation_token,
+                page_limit,
+            )
+            .await?;
+            let next_tok = match continuation_token {
+                None => Some("token_A".to_string()),
+                Some("token_A") => Some("token_B".to_string()),
+                Some("token_B") => Some("token_A".to_string()),
+                Some(other) => Some(other.to_string()),
+            };
+            return Ok((page, next_tok));
+        }
+        Storage::list_manifest_digests_page(&self.inner, repo, continuation_token, page_limit).await
+    }
+
+    async fn list_tags_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+        Storage::list_tags_page(&self.inner, repo, continuation_token, page_limit).await
+    }
+
+    async fn list_referrers_page(
+        &self,
+        repo: &str,
+        subject: &Digest,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<
+        (
+            Vec<registry_rust::storage::ReferrerDescriptor>,
+            Option<String>,
+        ),
+        StorageError,
+    > {
+        Storage::list_referrers_page(&self.inner, repo, subject, continuation_token, page_limit)
+            .await
+    }
+
+    async fn get_tag_with_version(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<(Digest, String)>, StorageError> {
+        Storage::get_tag_with_version(&self.inner, repo, tag).await
+    }
+
+    async fn delete_tag_conditional(
+        &self,
+        repo: &str,
+        tag: &str,
+        expected_version: Option<&str>,
+    ) -> Result<ConditionalDeleteResult, StorageError> {
+        Storage::delete_tag_conditional(&self.inner, repo, tag, expected_version).await
+    }
+
+    async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
+        Storage::read_lifecycle_journal(&self.inner, repo).await
+    }
+
+    async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
+        Storage::write_lifecycle_journal(&self.inner, repo, data).await
+    }
+
+    async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+        Storage::delete_lifecycle_journal(&self.inner, repo).await
+    }
+
+    async fn acquire_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        Storage::acquire_repo_lease(&self.inner, repo, owner_id, lease_id, ttl_secs).await
+    }
+
+    async fn renew_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        Storage::renew_repo_lease(&self.inner, repo, owner_id, lease_id, ttl_secs).await
+    }
+
+    async fn release_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+    ) -> Result<(), StorageError> {
+        Storage::release_repo_lease(&self.inner, repo, owner_id, lease_id).await
+    }
+
+    async fn create_upload(&self) -> Result<registry_rust::storage::UploadMeta, StorageError> {
+        Storage::create_upload(&self.inner).await
+    }
+
+    async fn upload_status(
+        &self,
+        uuid: &str,
+    ) -> Result<registry_rust::storage::UploadMeta, StorageError> {
+        Storage::upload_status(&self.inner, uuid).await
+    }
+
+    async fn append_upload(
+        &self,
+        uuid: &str,
+        chunk: Bytes,
+    ) -> Result<registry_rust::storage::UploadMeta, StorageError> {
+        Storage::append_upload(&self.inner, uuid, chunk).await
+    }
+
+    async fn finalize_upload(
+        &self,
+        uuid: &str,
+        digest: &Digest,
+    ) -> Result<registry_rust::storage::BlobMeta, StorageError> {
+        Storage::finalize_upload(&self.inner, uuid, digest).await
+    }
+
+    async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
+        Storage::abort_upload(&self.inner, uuid).await
+    }
+
+    async fn list_referrers(
+        &self,
+        name: &str,
+        subject: &Digest,
+    ) -> Result<Vec<registry_rust::storage::ReferrerDescriptor>, StorageError> {
+        Storage::list_referrers(&self.inner, name, subject).await
+    }
+
+    async fn add_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        descriptor: registry_rust::storage::ReferrerDescriptor,
+    ) -> Result<(), StorageError> {
+        Storage::add_referrer(&self.inner, name, subject, descriptor).await
+    }
+
+    async fn remove_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        referrer: &Digest,
+    ) -> Result<(), StorageError> {
+        Storage::remove_referrer(&self.inner, name, subject, referrer).await
+    }
+
+    async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
+        Storage::delete_manifest(&self.inner, name, digest).await
+    }
+}
+
+registry_rust::impl_storage_ports!(LifecycleFaultStorage);
+registry_rust::impl_gc_storage_port!(LifecycleFaultStorage);
+
+async fn setup_fault_service(
+    dir: &tempfile::TempDir,
+) -> (
+    Arc<LifecycleFaultStorage>,
+    Arc<BlobRefIndex>,
+    ManifestLifecycleService,
+) {
+    let fs_root = dir.path().join("data");
+    let ref_idx_path = dir.path().join("ref-index");
+    std::fs::create_dir_all(&fs_root).unwrap();
+    std::fs::create_dir_all(&ref_idx_path).unwrap();
+
+    let base_storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(base_storage));
+    let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
+    ref_index.rebuild(&fault_storage).await.unwrap();
+
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let service =
+        ManifestLifecycleService::new(fault_storage.clone(), Some(ref_index.clone()), coordinator);
+
+    (fault_storage, ref_index, service)
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_fails_on_listing_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-listing-err";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    storage
+        .fail_manifest_listing
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("evict must fail when manifest listing fails");
+    assert!(matches!(err, ManifestLifecycleError::Storage(_)));
+
+    // Sequential cleanup invariants:
+    // Candidate membership must not be unlinked
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Journal must be retained at ProxyManifestDeleted phase
+    let journal_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must exist");
+    let journal: LifecycleJournalRecord = serde_json::from_slice(&journal_bytes).unwrap();
+    assert_eq!(journal.phase, LifecyclePhase::ProxyManifestDeleted);
+    // CAS payload preserved
+    assert!(storage.head_blob(&layer).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_fails_on_manifest_read_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-read-err";
+
+    let config1 = write_test_blob(&storage, repo, b"cfg1").await;
+    let layer1 = write_test_blob(&storage, repo, b"layer1").await;
+    let pr1 = RepoBlobMembershipRecord::try_new_proxy(repo, layer1.clone()).unwrap();
+    storage.link_repo_blob(&pr1).await.unwrap();
+
+    let config2 = write_test_blob(&storage, repo, b"cfg2").await;
+    let layer2 = write_test_blob(&storage, repo, b"layer2").await;
+    let pr2 = RepoBlobMembershipRecord::try_new_proxy(repo, layer2.clone()).unwrap();
+    storage.link_repo_blob(&pr2).await.unwrap();
+
+    let (m1_bytes, m1_d) = create_manifest_json(&config1, &layer1);
+    let (m2_bytes, m2_d) = create_manifest_json(&config2, &layer2);
+
+    let ev1 = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m1_bytes.clone(),
+        None,
+        true,
+        m1_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev1).await.unwrap();
+
+    let ev2 = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v2",
+        m2_bytes.clone(),
+        None,
+        true,
+        m2_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev2).await.unwrap();
+
+    // Inject read failure targeting only m2 during discovery traversal
+    *storage.fail_manifest_get_target.lock().unwrap() = Some(m2_d.clone());
+    storage
+        .fail_manifest_get
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m1_d)
+        .await;
+    let err = res.expect_err("evict must fail when reading other manifest fails");
+    assert!(matches!(err, ManifestLifecycleError::Storage(_)));
+
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let journal_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must exist");
+    let journal: LifecycleJournalRecord = serde_json::from_slice(&journal_bytes).unwrap();
+    assert_eq!(journal.phase, LifecyclePhase::ProxyManifestDeleted);
+    assert!(storage.head_blob(&layer1).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_fails_on_corrupt_manifest_parse_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-parse-err";
+
+    let config1 = write_test_blob(&storage, repo, b"cfg1").await;
+    let layer1 = write_test_blob(&storage, repo, b"layer1").await;
+    let pr1 = RepoBlobMembershipRecord::try_new_proxy(repo, layer1.clone()).unwrap();
+    storage.link_repo_blob(&pr1).await.unwrap();
+
+    let config2 = write_test_blob(&storage, repo, b"cfg2").await;
+    let layer2 = write_test_blob(&storage, repo, b"layer2").await;
+    let pr2 = RepoBlobMembershipRecord::try_new_proxy(repo, layer2.clone()).unwrap();
+    storage.link_repo_blob(&pr2).await.unwrap();
+
+    let (m1_bytes, m1_d) = create_manifest_json(&config1, &layer1);
+    let (m2_bytes, m2_d) = create_manifest_json(&config2, &layer2);
+
+    let ev1 = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m1_bytes.clone(),
+        None,
+        true,
+        m1_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev1).await.unwrap();
+
+    let ev2 = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v2",
+        m2_bytes.clone(),
+        None,
+        true,
+        m2_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev2).await.unwrap();
+
+    // Inject corrupt manifest payload targeting only m2 during discovery traversal
+    *storage.corrupt_manifest_get_target.lock().unwrap() = Some(m2_d.clone());
+    storage
+        .corrupt_manifest_get
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m1_d)
+        .await;
+    let err = res.expect_err("must fail on corrupt refs");
+    assert!(matches!(
+        err,
+        ManifestLifecycleError::Storage(StorageError::Internal {
+            kind: registry_rust::storage::StorageErrorKind::CorruptData,
+            ..
+        })
+    ));
+
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let journal_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must exist");
+    let journal: LifecycleJournalRecord = serde_json::from_slice(&journal_bytes).unwrap();
+    assert_eq!(journal.phase, LifecyclePhase::ProxyManifestDeleted);
+    assert!(storage.head_blob(&layer1).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_detects_immediate_token_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-imm-cycle";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    storage
+        .token_cycle_immediate
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("must fail on immediate pagination cycle");
+    match err {
+        ManifestLifecycleError::Storage(StorageError::Internal { message, .. }) => {
+            assert!(message.contains("pagination cycle detected"));
+        }
+        other => panic!("expected Storage error with cycle detection, got {other:?}"),
+    }
+
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let journal_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must exist");
+    let journal: LifecycleJournalRecord = serde_json::from_slice(&journal_bytes).unwrap();
+    assert_eq!(journal.phase, LifecyclePhase::ProxyManifestDeleted);
+    assert!(storage.head_blob(&layer).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_detects_multi_token_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-multi-cycle";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    storage
+        .token_cycle_multi
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("must fail on multi-token pagination cycle");
+    match err {
+        ManifestLifecycleError::Storage(StorageError::Internal { message, .. }) => {
+            assert!(message.contains("pagination cycle detected"));
+        }
+        other => panic!("expected Storage error with cycle detection, got {other:?}"),
+    }
+
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let journal_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must exist");
+    let journal: LifecycleJournalRecord = serde_json::from_slice(&journal_bytes).unwrap();
+    assert_eq!(journal.phase, LifecyclePhase::ProxyManifestDeleted);
+    assert!(storage.head_blob(&layer).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_success_referenced_vs_unreferenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-ref-success";
+
+    let shared_blob = write_test_blob(&storage, repo, b"shared-blob").await;
+    let unique_blob = write_test_blob(&storage, repo, b"unique-blob").await;
+    let other_blob = write_test_blob(&storage, repo, b"other-blob").await;
+
+    let pr_shared = RepoBlobMembershipRecord::try_new_proxy(repo, shared_blob.clone()).unwrap();
+    let pr_unique = RepoBlobMembershipRecord::try_new_proxy(repo, unique_blob.clone()).unwrap();
+    let pr_other = RepoBlobMembershipRecord::try_new_proxy(repo, other_blob.clone()).unwrap();
+    storage.link_repo_blob(&pr_shared).await.unwrap();
+    storage.link_repo_blob(&pr_unique).await.unwrap();
+    storage.link_repo_blob(&pr_other).await.unwrap();
+
+    let (m1_bytes, m1_d) = create_manifest_json(&shared_blob, &unique_blob);
+    let (m2_bytes, m2_d) = create_manifest_json(&shared_blob, &other_blob);
+
+    let ev1 = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m1_bytes.clone(),
+        None,
+        true,
+        m1_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev1).await.unwrap();
+
+    let ev2 = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v2",
+        m2_bytes.clone(),
+        None,
+        true,
+        m2_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev2).await.unwrap();
+
+    // Evict m1:
+    // shared_blob is referenced by m2 -> NOT unlinked
+    // unique_blob is unreferenced -> unlinked
+    let evict_res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m1_d)
+        .await
+        .unwrap();
+
+    assert_eq!(evict_res.memberships_unlinked, 1);
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &shared_blob)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &unique_blob)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // CAS payloads must remain intact in CAS storage
+    assert!(storage.head_blob(&shared_blob).await.is_ok());
+    assert!(storage.head_blob(&unique_blob).await.is_ok());
+
+    // Journal must be cleanly removed upon complete eviction
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_with_parsed_refs_fails_and_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-rec-parsed-err";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let pr_cfg = RepoBlobMembershipRecord::try_new_proxy(repo, config.clone()).unwrap();
+    let pr_layer = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&pr_cfg).await.unwrap();
+    storage.link_repo_blob(&pr_layer).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-parsed-op-1".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: Some("v1".to_string()),
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage
+        .fail_manifest_listing
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err =
+        res.expect_err("recovery must propagate listing error from is_blob_referenced_in_repo");
+    assert!(matches!(err, ManifestLifecycleError::Storage(_)));
+
+    // Sequential cleanup verification:
+    // Neither blob membership was unlinked
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &config)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Journal remains present on disk
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // CAS payload preserved
+    assert!(storage.head_blob(&layer).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_recovery_fallback_membership_scan_fails_and_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-rec-fallback-err";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let pr_cfg = RepoBlobMembershipRecord::try_new_proxy(repo, config.clone()).unwrap();
+    let pr_layer = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&pr_cfg).await.unwrap();
+    storage.link_repo_blob(&pr_layer).await.unwrap();
+
+    let target_manifest_digest = sha256_digest(b"non-existent-manifest");
+
+    // Manifest is not in storage -> refs is None, triggers fallback membership scan
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-fallback-op-1".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: target_manifest_digest,
+        target_reference: Some("v1".to_string()),
+        phase: LifecyclePhase::ProxyManifestDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage
+        .fail_manifest_listing
+        .store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err(
+        "fallback recovery must propagate listing error from is_blob_referenced_in_repo",
+    );
+    assert!(matches!(err, ManifestLifecycleError::Storage(_)));
+
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &config)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(storage.head_blob(&layer).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_partial_cleanup_then_failure_then_successful_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/test-partial-cleanup";
+
+    let layer_a = write_test_blob(&storage, repo, b"layer-a").await;
+    let layer_b = write_test_blob(&storage, repo, b"layer-b").await;
+    let pr_a = RepoBlobMembershipRecord::try_new_proxy(repo, layer_a.clone()).unwrap();
+    let pr_b = RepoBlobMembershipRecord::try_new_proxy(repo, layer_b.clone()).unwrap();
+    storage.link_repo_blob(&pr_a).await.unwrap();
+    storage.link_repo_blob(&pr_b).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&layer_a, &layer_b);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "partial-op-1".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: Some("v1".to_string()),
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    // Step 1: Simulate partial cleanup.
+    // layer_a is checked -> unreferenced -> unlinked!
+    // Then listing for layer_b fails on threshold = 2!
+    storage
+        .fail_listing_after_n
+        .store(2, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("must fail when listing layer_b");
+    assert!(matches!(err, ManifestLifecycleError::Storage(_)));
+
+    // Sequential cleanup verification:
+    // 1. Earlier unlinks are preserved (not rolled back):
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_a)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // 2. Candidate that encountered error is NOT unlinked:
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_b)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // 3. Journal remains on disk:
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // 4. CAS payloads are both untouched:
+    assert!(storage.head_blob(&layer_a).await.is_ok());
+    assert!(storage.head_blob(&layer_b).await.is_ok());
+
+    // Step 2: Retry recovery after fault is cleared!
+    storage
+        .fail_listing_after_n
+        .store(0, AtomicOrdering::SeqCst);
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    // Final state verification:
+    // Both layer_a and layer_b are unlinked
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_a)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &layer_b)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // CAS payloads still preserved
+    assert!(storage.head_blob(&layer_a).await.is_ok());
+    assert!(storage.head_blob(&layer_b).await.is_ok());
+    // Journal was cleanly deleted
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
