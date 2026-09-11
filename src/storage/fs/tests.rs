@@ -1960,10 +1960,9 @@ async fn test_list_cas_blobs_for_gc_malformed_blob_filename_is_corrupt_data() {
     let invalid_file = shard_dir.join(invalid_filename);
     std::fs::write(&invalid_file, b"test content").unwrap();
 
-    let expected_message = format!(
-        "malformed blob file name in CAS shard {}: {invalid_filename}",
-        shard_dir.display()
-    );
+    // Contained listing identifies the shard by its 2-char prefix rather than host path
+    let expected_message =
+        format!("malformed blob file name in CAS shard {shard_name}: {invalid_filename}");
 
     let res = storage.list_cas_blobs_page(None, 10).await;
     assert!(res.is_err());
@@ -2003,7 +2002,7 @@ async fn test_blocking_task_join_error_is_internal_invariant() {
 }
 
 #[tokio::test]
-async fn test_list_cas_blobs_for_gc_io_error_is_io() {
+async fn test_list_cas_blobs_for_gc_non_directory_root_is_corrupt_data() {
     use crate::storage::GcStorage;
 
     let root = tmp_fs_root();
@@ -2014,18 +2013,19 @@ async fn test_list_cas_blobs_for_gc_io_error_is_io() {
     let cas_root_file = blobs_dir.join("sha256");
     std::fs::write(&cas_root_file, b"not a directory").unwrap();
 
-    let raw_io_err = tokio::fs::read_dir(&cas_root_file).await.unwrap_err();
-    let expected_message = format!("read_dir {}: {raw_io_err}", cas_root_file.display());
+    // Under the approved cutover, an intermediate or final non-directory component
+    // maps to StorageErrorKind::CorruptData rather than legacy generic Io.
+    let expected_message = "target path is not a directory: Some(\"blobs/sha256\")";
 
     let res = storage.list_cas_blobs_page(None, 10).await;
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(
         err.internal_kind(),
-        Some(crate::storage::StorageErrorKind::Io),
-        "Filesystem read_dir failure during GC blob listing must classify as Io"
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "Non-directory CAS root component must classify as CorruptData"
     );
-    assert_eq!(err.message(), Some(expected_message.as_str()));
+    assert_eq!(err.message(), Some(expected_message));
     assert_eq!(
         err.to_string(),
         format!("internal error: {expected_message}")
@@ -3081,36 +3081,34 @@ async fn test_list_cas_blobs_missing_or_empty_root_returns_empty_page() {
 }
 
 #[tokio::test]
-async fn test_list_cas_blobs_initial_metadata_error_suppression() {
-    use crate::storage::GcStorage;
+async fn test_list_cas_blobs_initial_metadata_error_not_suppressed() {
+    use crate::storage::{GcStorage, StorageError, StorageErrorKind};
 
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage-root");
     std::fs::create_dir_all(&root).expect("create storage root");
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
 
-    // Make 'blobs' a regular file so metadata("blobs/sha256") fails with NotADirectory (ENOTDIR)
+    // Make 'blobs' a regular file so contained openat2("blobs/sha256") fails with NotADirectory (ENOTDIR)
     let blobs_file = root.join("blobs");
     std::fs::write(&blobs_file, b"not-a-directory").expect("write blobs as file");
-    let cas_root = blobs_file.join("sha256");
 
-    // Verify actual raw error kind from tokio::fs::metadata
-    let raw_err = tokio::fs::metadata(&cas_root)
-        .await
-        .expect_err("metadata on path through regular file must fail");
-    assert_eq!(
-        raw_err.kind(),
-        std::io::ErrorKind::NotADirectory,
-        "raw error kind must be NotADirectory on Linux"
-    );
-
-    // Assert current listing behavior: the error is suppressed into an empty page
-    let page = storage
+    // Under production cutover authorization, initial non-directory errors are NO LONGER
+    // suppressed into an empty page; they fail closed with StorageErrorKind::CorruptData.
+    let err = storage
         .list_cas_blobs_page(None, 100)
         .await
-        .expect("initial metadata error must be suppressed into empty page");
-    assert!(page.items.is_empty());
-    assert_eq!(page.next_cursor, None);
+        .expect_err("initial non-directory error must fail closed with CorruptData");
+    match err {
+        StorageError::Internal { kind, .. } => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::CorruptData,
+                "initial NotADirectory must map to CorruptData"
+            );
+        }
+        other => panic!("expected StorageErrorKind::CorruptData, got {other:?}"),
+    }
 
     drop(storage);
     drop(fixture);
@@ -3463,6 +3461,8 @@ async fn test_list_cas_blobs_symlink_resolution_through_ancestor_paths() {
     }
 
     // Case B: 'blobs' directory is a symlink pointing to an external directory
+    // Under descriptor containment (openat2 with RESOLVE_NO_SYMLINKS), symlinks beneath
+    // the root descriptor are rejected with StorageErrorKind::Io.
     {
         let root_b = fixture.path().join("root_b");
         std::fs::create_dir_all(&root_b).expect("create root_b");
@@ -3474,16 +3474,22 @@ async fn test_list_cas_blobs_symlink_resolution_through_ancestor_paths() {
         symlink(&target_blobs, root_b.join("blobs")).expect("symlink blobs dir");
 
         let storage = FsStorage::new(root_b, 1024 * 1024);
-        let page = storage
+        let err = storage
             .list_cas_blobs_page(None, 10)
             .await
-            .expect("listing through symlinked blobs dir succeeds");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].digest.hex(), hex);
+            .expect_err("listing through symlinked blobs dir must fail closed with Io");
+        match err {
+            crate::storage::StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, crate::storage::StorageErrorKind::Io);
+            }
+            other => panic!("expected StorageErrorKind::Io, got {other:?}"),
+        }
         drop(storage);
     }
 
     // Case C: 'blobs/sha256' is a symlink pointing to an external CAS root
+    // Under descriptor containment (openat2 with RESOLVE_NO_SYMLINKS), symlinks beneath
+    // the root descriptor are rejected with StorageErrorKind::Io.
     {
         let root_c = fixture.path().join("root_c");
         let blobs_dir = root_c.join("blobs");
@@ -3495,12 +3501,16 @@ async fn test_list_cas_blobs_symlink_resolution_through_ancestor_paths() {
         symlink(&target_cas_c, blobs_dir.join("sha256")).expect("symlink blobs/sha256 dir");
 
         let storage = FsStorage::new(root_c, 1024 * 1024);
-        let page = storage
+        let err = storage
             .list_cas_blobs_page(None, 10)
             .await
-            .expect("listing through symlinked blobs/sha256 dir succeeds");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].digest.hex(), hex);
+            .expect_err("listing through symlinked blobs/sha256 dir must fail closed with Io");
+        match err {
+            crate::storage::StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, crate::storage::StorageErrorKind::Io);
+            }
+            other => panic!("expected StorageErrorKind::Io, got {other:?}"),
+        }
         drop(storage);
     }
 
@@ -3547,6 +3557,139 @@ async fn test_list_cas_blobs_deterministic_inter_page_mutation_no_snapshot() {
     assert_eq!(page2.items.len(), 2);
     assert_eq!(page2.items[0].digest.hex(), hex_88);
     assert_eq!(page2.items[1].digest.hex(), hex_ff);
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_shared_reader_allocation_pointer_equality() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Verify byte-for-byte that FsStorage.reader and read_adapter share the exact same Arc
+    assert!(
+        std::sync::Arc::ptr_eq(storage.reader(), storage.read_adapter().reader()),
+        "FsStorage.reader and read_adapter must share the identical Arc<FsMetadataReader>"
+    );
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_fs_storage_list_cas_blobs_page_production_delegation() {
+    use crate::storage::GcStorage;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let hex = "0a00000000000000000000000000000000000000000000000000000000000001";
+    put_cas_blob_file(&root, hex, b"production-delegation-payload");
+
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let page = storage
+        .list_cas_blobs_page(None, 10)
+        .await
+        .expect("production listing must succeed");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].digest.hex(), hex);
+    assert_eq!(
+        page.items[0].size,
+        b"production-delegation-payload".len() as u64
+    );
+    assert_eq!(page.next_cursor, None);
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_fs_storage_list_cas_blobs_page_custom_budgets_exhaustion() {
+    use crate::storage::{StorageError, StorageErrorKind};
+    use storage_fs::DirEnumerationLimits;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    put_cas_blob_file(
+        &root,
+        "0a00000000000000000000000000000000000000000000000000000000000001",
+        b"blob 1",
+    );
+    put_cas_blob_file(
+        &root,
+        "0b00000000000000000000000000000000000000000000000000000000000002",
+        b"blob 2",
+    );
+
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Root budget max_entries = 1, but there are 2 shards (0a and 0b)
+    let small_root_budget = super::listing::FsListingBudgets::new(
+        DirEnumerationLimits::new(1, 1024),
+        DirEnumerationLimits::new(100, 1024 * 1024),
+    );
+
+    let err = storage
+        .list_cas_blobs_page_with_budgets(None, 10, small_root_budget)
+        .await
+        .expect_err("exceeding root budget must fail closed with Backend");
+    match err {
+        StorageError::Internal { kind, message } => {
+            assert_eq!(kind, StorageErrorKind::Backend);
+            assert!(message.contains("enumeration resource limit exceeded"));
+        }
+        other => panic!("expected Backend, got {other:?}"),
+    }
+
+    drop(storage);
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn test_cas_blob_traverser_over_real_fs_storage() {
+    use crate::blob_gc::traverser::CasBlobTraverser;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+
+    let hexes = [
+        "0a00000000000000000000000000000000000000000000000000000000000001",
+        "0a00000000000000000000000000000000000000000000000000000000000002",
+        "0b00000000000000000000000000000000000000000000000000000000000001",
+        "0c00000000000000000000000000000000000000000000000000000000000001",
+        "0c00000000000000000000000000000000000000000000000000000000000002",
+    ];
+
+    for hex in &hexes {
+        put_cas_blob_file(&root, hex, hex.as_bytes());
+    }
+
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Run CasBlobTraverser with batch size 2 over production FsStorage
+    let mut traverser = CasBlobTraverser::new(&storage, 2);
+
+    let batch1 = traverser.next_batch().await.unwrap().expect("batch 1");
+    assert_eq!(batch1.len(), 2);
+    assert_eq!(batch1[0].digest.hex(), hexes[0]);
+    assert_eq!(batch1[1].digest.hex(), hexes[1]);
+
+    let batch2 = traverser.next_batch().await.unwrap().expect("batch 2");
+    assert_eq!(batch2.len(), 2);
+    assert_eq!(batch2[0].digest.hex(), hexes[2]);
+    assert_eq!(batch2[1].digest.hex(), hexes[3]);
+
+    let batch3 = traverser.next_batch().await.unwrap().expect("batch 3");
+    assert_eq!(batch3.len(), 1);
+    assert_eq!(batch3[0].digest.hex(), hexes[4]);
+
+    let batch4 = traverser.next_batch().await.unwrap();
+    assert!(
+        batch4.is_none(),
+        "traversal must terminate at end of repository"
+    );
 
     drop(storage);
     drop(fixture);

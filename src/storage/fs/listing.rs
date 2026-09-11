@@ -1,4 +1,4 @@
-//! Test-only registry CAS listing integration seam using the committed
+//! Production filesystem CAS listing module for `registry-rust` using extracted
 //! `storage-fs` directory enumeration (`FsMetadataReader::enumerate_dir`) and
 //! contained file metadata inspection (`FsMetadataReader::inspect_file_metadata`).
 //!
@@ -57,8 +57,8 @@
 //! - **Quality Gates**: All established quality gates (O-03, O-04, O-05, O-06, O-13, O-15, O-16, D-06)
 //!   remain OPEN.
 //!
-//! # Execution Constraints
-//! This module is strictly test-only (`#[cfg(test)]`). No production caller may invoke this seam.
+//! # Execution Boundaries
+//! This module serves as the production CAS listing implementation for `FsStorage::list_cas_blobs_page`.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -77,7 +77,7 @@ use crate::storage::{
 /// Enables exercising both the concrete [`storage_fs::FsMetadataReader`] and deterministic
 /// recording fakes for failure injection.
 #[async_trait]
-pub trait CasDirEnumerator: Send + Sync {
+pub(crate) trait CasDirEnumerator: Send + Sync {
     /// Enumerates a directory relative to the storage root descriptor.
     async fn enumerate_dir(
         &self,
@@ -91,13 +91,13 @@ pub trait CasDirEnumerator: Send + Sync {
 /// Enables exercising both the concrete [`storage_fs::FsMetadataReader`] and deterministic
 /// recording fakes for metadata inspection and failure injection.
 #[async_trait]
-pub trait CasMetadataInspector: Send + Sync {
+pub(crate) trait CasMetadataInspector: Send + Sync {
     /// Inspects metadata of a regular file beneath the storage root descriptor.
     async fn inspect_file_metadata(&self, key: &ObjectKey) -> Result<FsFileMetadata, ReadError>;
 }
 
 /// Combined trait for sources providing both directory enumeration and metadata inspection.
-pub trait CasListingSource: CasDirEnumerator + CasMetadataInspector {}
+pub(crate) trait CasListingSource: CasDirEnumerator + CasMetadataInspector {}
 impl<T: CasDirEnumerator + CasMetadataInspector + ?Sized> CasListingSource for T {}
 
 #[async_trait]
@@ -318,6 +318,7 @@ impl FsListingBudgets {
     pub const DEFAULT_SHARD_MAX_NAME_BYTES: usize = 8 * 1024 * 1024; // 8,388,608
 
     /// Constructs a new budget pair with distinct root and shard enumeration limits.
+    #[allow(dead_code)]
     pub fn new(root: DirEnumerationLimits, shard: DirEnumerationLimits) -> Self {
         Self { root, shard }
     }
@@ -361,7 +362,7 @@ impl Default for FsListingBudgets {
 /// - Substituted symlinks or non-regular objects fail closed with typed errors.
 /// - Exact-full-page returns `Some(next_cursor)`; subsequent terminal page returns `None`.
 /// - Budget exhaustion fails closed immediately without partial results.
-pub async fn list_cas_blobs_page_seam(
+pub(crate) async fn list_cas_blobs_page_impl(
     source: &(impl CasListingSource + ?Sized),
     cursor: Option<&GcCursor>,
     limit: usize,
@@ -421,10 +422,15 @@ pub async fn list_cas_blobs_page_seam(
             StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string())
         })?;
 
-        let shard_entries = source
-            .enumerate_dir(Some(&shard_key), budgets.shard)
-            .await
-            .map_err(translate_dir_error)?;
+        let shard_entries = match source.enumerate_dir(Some(&shard_key), budgets.shard).await {
+            Ok(entries) => entries,
+            Err(FsDirError::NotFound { .. }) => {
+                return Err(StorageError::io(format!(
+                    "CAS shard directory disappeared during listing: {p2}"
+                )));
+            }
+            Err(err) => return Err(translate_dir_error(err)),
+        };
 
         let mut file_names = Vec::new();
         for ent in shard_entries {
@@ -491,6 +497,17 @@ pub async fn list_cas_blobs_page_seam(
         items: candidates,
         next_cursor,
     })
+}
+
+/// Backwards-compatible seam forwarder for tests calling `list_cas_blobs_page_seam`.
+#[cfg(test)]
+pub(crate) async fn list_cas_blobs_page_seam(
+    source: &(impl CasListingSource + ?Sized),
+    cursor: Option<&GcCursor>,
+    limit: usize,
+    budgets: FsListingBudgets,
+) -> Result<GcBlobPage, StorageError> {
+    list_cas_blobs_page_impl(source, cursor, limit, budgets).await
 }
 
 #[cfg(test)]
@@ -1846,10 +1863,13 @@ mod tests {
             std::fs::write(dir.join(hex), content).expect("write blob file");
         }
 
-        /// Narrow wrapper intercepting metadata inspection to inject deterministic filesystem mutations.
+        /// Narrow wrapper intercepting directory enumeration and metadata inspection
+        /// to inject deterministic filesystem mutations.
         struct InterceptingListingWrapper<'a, T: CasListingSource + ?Sized> {
             inner: &'a T,
             on_before_inspect: Mutex<Option<Box<dyn FnMut(&ObjectKey) + Send + Sync + 'a>>>,
+            on_before_enumerate:
+                Mutex<Option<Box<dyn FnMut(Option<&ObjectKey>) + Send + Sync + 'a>>>,
         }
 
         impl<'a, T: CasListingSource + ?Sized> InterceptingListingWrapper<'a, T> {
@@ -1857,6 +1877,18 @@ mod tests {
                 Self {
                     inner,
                     on_before_inspect: Mutex::new(Some(Box::new(hook))),
+                    on_before_enumerate: Mutex::new(None),
+                }
+            }
+
+            fn with_enumerate_hook(
+                inner: &'a T,
+                hook: impl FnMut(Option<&ObjectKey>) + Send + Sync + 'a,
+            ) -> Self {
+                Self {
+                    inner,
+                    on_before_inspect: Mutex::new(None),
+                    on_before_enumerate: Mutex::new(Some(Box::new(hook))),
                 }
             }
         }
@@ -1868,6 +1900,9 @@ mod tests {
                 target: Option<&ObjectKey>,
                 limits: DirEnumerationLimits,
             ) -> Result<Vec<DirEntry>, FsDirError> {
+                if let Some(ref mut hook) = *self.on_before_enumerate.lock().unwrap() {
+                    hook(target);
+                }
                 self.inner.enumerate_dir(target, limits).await
             }
         }
@@ -2689,6 +2724,157 @@ mod tests {
             // This replacement observation does not constitute an identity or snapshot guarantee.
             drop(original_held_file);
         }
+
+        #[tokio::test]
+        async fn test_real_fs_shard_disappearance_returns_io() {
+            let (_fixture, root) = create_test_root();
+            let hex = "0a00000000000000000000000000000000000000000000000000000000000001";
+            put_blob(&root, hex, b"blob in disappearing shard");
+
+            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
+            let shard_disk_path = root.join("blobs").join("sha256").join("0a");
+
+            let wrapper = InterceptingListingWrapper::with_enumerate_hook(&reader, move |target| {
+                if let Some(k) = target {
+                    if k.as_str() == "blobs/sha256/0a" {
+                        std::fs::remove_dir_all(&shard_disk_path)
+                            .expect("fixture failure: remove shard dir before enumeration");
+                    }
+                }
+            });
+
+            let err = list_cas_blobs_page_impl(&wrapper, None, 10, default_test_budget())
+                .await
+                .expect_err("shard disappeared before enumeration must fail closed with Io");
+            match err {
+                StorageError::Internal { kind, message } => {
+                    assert_eq!(kind, StorageErrorKind::Io);
+                    assert!(message.contains("CAS shard directory disappeared during listing: 0a"));
+                }
+                other => panic!("expected StorageErrorKind::Io, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_real_fs_initial_final_component_not_a_directory_corrupt_data() {
+            let (_fixture, root) = create_test_root();
+            let blobs_dir = root.join("blobs");
+            std::fs::create_dir_all(&blobs_dir).expect("create blobs dir");
+            std::fs::write(blobs_dir.join("sha256"), b"not-a-directory")
+                .expect("write sha256 file");
+
+            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
+            let err = list_cas_blobs_page_impl(&reader, None, 10, default_test_budget())
+                .await
+                .expect_err("final non-directory component must fail closed with CorruptData");
+            match err {
+                StorageError::Internal { kind, .. } => {
+                    assert_eq!(kind, StorageErrorKind::CorruptData);
+                }
+                other => panic!("expected StorageErrorKind::CorruptData, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+        async fn test_real_fs_initial_permission_denied_not_suppressed() {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } == 0 {
+                panic!(
+                    "ineffective permissions: test running as root (UID 0) bypasses DAC permissions"
+                );
+            }
+            let (fixture, root) = create_test_root();
+            let cas_dir = root.join("blobs").join("sha256");
+            std::fs::create_dir_all(&cas_dir).expect("create cas dir");
+            let original_perms = std::fs::metadata(&cas_dir)
+                .expect("get original cas dir metadata")
+                .permissions();
+
+            struct PermGuard<'a> {
+                path: &'a Path,
+                original_perms: std::fs::Permissions,
+            }
+            impl<'a> Drop for PermGuard<'a> {
+                fn drop(&mut self) {
+                    if let Err(e) = std::fs::set_permissions(self.path, self.original_perms.clone())
+                    {
+                        if !std::thread::panicking() {
+                            panic!("failed to restore permissions on {:?}: {e}", self.path);
+                        } else {
+                            eprintln!(
+                                "failed to restore permissions during unwind on {:?}: {e}",
+                                self.path
+                            );
+                        }
+                    }
+                }
+            }
+
+            let guard = PermGuard {
+                path: &cas_dir,
+                original_perms: original_perms.clone(),
+            };
+            std::fs::set_permissions(&cas_dir, std::fs::Permissions::from_mode(0o000))
+                .expect("set permissions 0o000");
+
+            // Fail clearly if permissions are ineffective in this execution environment
+            if std::fs::read_dir(&cas_dir).is_ok() {
+                panic!("ineffective permissions: read_dir succeeded on directory with mode 0o000");
+            }
+
+            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
+            let res = list_cas_blobs_page_impl(&reader, None, 10, default_test_budget()).await;
+
+            let err = res.expect_err("permission denied on CAS root must fail closed");
+            match err {
+                StorageError::Internal { kind, .. } => {
+                    assert_eq!(kind, StorageErrorKind::PermissionDenied);
+                }
+                other => panic!("expected StorageErrorKind::PermissionDenied, got {other:?}"),
+            }
+
+            drop(reader);
+            drop(guard);
+
+            // Verify restoration succeeded on the normal path
+            let restored_perms = std::fs::metadata(&cas_dir)
+                .expect("get metadata after restore")
+                .permissions();
+            assert_eq!(
+                restored_perms.mode() & 0o777,
+                original_perms.mode() & 0o777,
+                "permissions must be restored on normal path"
+            );
+            fixture.close().expect("fixture cleanup must succeed");
+        }
+
+        #[tokio::test]
+        async fn test_real_fs_budget_limits_shard_entries() {
+            let (_fixture, root) = create_test_root();
+            let hex1 = "0a00000000000000000000000000000000000000000000000000000000000001";
+            let hex2 = "0a00000000000000000000000000000000000000000000000000000000000002";
+            put_blob(&root, hex1, b"blob 1");
+            put_blob(&root, hex2, b"blob 2");
+
+            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
+            let budget = FsListingBudgets::new(
+                DirEnumerationLimits::new(10, 1024),
+                DirEnumerationLimits::new(1, 1024 * 1024),
+            );
+
+            let err = list_cas_blobs_page_impl(&reader, None, 10, budget)
+                .await
+                .expect_err("exceeding shard max_entries must fail closed with Backend");
+            match err {
+                StorageError::Internal { kind, message } => {
+                    assert_eq!(kind, StorageErrorKind::Backend);
+                    assert!(message.contains("enumeration resource limit exceeded"));
+                    assert!(message.contains("MaxEntries"));
+                }
+                other => panic!("expected StorageErrorKind::Backend, got {other:?}"),
+            }
+        }
     }
 
     // ========================================================================
@@ -2926,6 +3112,121 @@ mod tests {
                 GcPaginationError::CursorCycle(c) => assert_eq!(c, format!("sha256:{hex1}")),
                 other => panic!("expected CursorCycle, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fake_shard_disappearance_returns_io() {
+        let fake = RecordingFakeDirEnumerator::new();
+        let root_key = cas_key("blobs/sha256");
+        let shard_0a = cas_key("blobs/sha256/0a");
+
+        fake.script(
+            Some(root_key.clone()),
+            Ok(vec![DirEntry::new("0a".into(), DirEntryType::Directory)]),
+        );
+        fake.script(
+            Some(shard_0a.clone()),
+            Err(FsDirError::NotFound {
+                path: Some("blobs/sha256/0a".into()),
+            }),
+        );
+
+        let err = list_cas_blobs_page_impl(&fake, None, 10, default_test_budget())
+            .await
+            .expect_err("missing shard directory must fail with Io");
+        match err {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Io);
+                assert!(message.contains("CAS shard directory disappeared during listing: 0a"));
+            }
+            other => panic!("expected StorageErrorKind::Io, got {other:?}"),
+        }
+        assert_eq!(fake.called_targets(), vec![Some(root_key), Some(shard_0a)]);
+    }
+
+    #[test]
+    fn test_fake_raw_enotdir_inspection_maps_corrupt_data() {
+        let err = ReadError::backend_with_source(
+            "underlying ENOTDIR failure",
+            Box::new(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+        );
+        let mapped = translate_inspect_error(err);
+        match mapped {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::CorruptData);
+                assert!(message.contains("Not a directory"));
+            }
+            other => panic!("expected StorageErrorKind::CorruptData, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fake_runtime_missing_and_join_failed_maps_backend() {
+        // 1. Genuine RuntimeMissing: captured on a std::thread outside any tokio runtime
+        let get_runtime_missing = || {
+            std::thread::spawn(|| tokio::runtime::Handle::try_current().unwrap_err())
+                .join()
+                .expect("thread join")
+        };
+
+        let dir_err = FsDirError::RuntimeMissing(get_runtime_missing());
+        let mapped_dir = translate_dir_error(dir_err);
+        match mapped_dir {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Backend);
+                assert!(message.contains("tokio runtime missing"));
+            }
+            other => panic!("expected Backend, got {other:?}"),
+        }
+
+        let meta_err = storage_fs::FsMetadataError::RuntimeMissing(get_runtime_missing());
+        let read_err =
+            ReadError::backend_with_source("metadata runtime missing", Box::new(meta_err));
+        let mapped_meta = translate_inspect_error(read_err);
+        match mapped_meta {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Backend);
+                assert!(message.contains("tokio runtime missing"));
+            }
+            other => panic!("expected Backend, got {other:?}"),
+        }
+
+        // 2. Genuine TaskJoinFailed: captured by joining panicked tasks
+        // Directory TaskJoinFailed fixture
+        let genuine_join_error_dir = tokio::task::spawn(async {
+            panic!("simulated panic for genuine JoinError fixture (dir)");
+        })
+        .await
+        .unwrap_err();
+
+        let dir_join_err = FsDirError::TaskJoinFailed(genuine_join_error_dir);
+        let mapped_join_dir = translate_dir_error(dir_join_err);
+        match mapped_join_dir {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Backend);
+                assert!(message.contains("blocking enumeration task join failed"));
+            }
+            other => panic!("expected Backend, got {other:?}"),
+        }
+
+        // Metadata TaskJoinFailed fixture
+        let genuine_join_error_meta = tokio::task::spawn(async {
+            panic!("simulated panic for genuine JoinError fixture (meta)");
+        })
+        .await
+        .unwrap_err();
+
+        let meta_join_err = storage_fs::FsMetadataError::TaskJoinFailed(genuine_join_error_meta);
+        let read_err_join =
+            ReadError::backend_with_source("metadata task join failed", Box::new(meta_join_err));
+        let mapped_join_meta = translate_inspect_error(read_err_join);
+        match mapped_join_meta {
+            StorageError::Internal { kind, message } => {
+                assert_eq!(kind, StorageErrorKind::Backend);
+                assert!(message.contains("blocking metadata task join failed"));
+            }
+            other => panic!("expected Backend, got {other:?}"),
         }
     }
 }

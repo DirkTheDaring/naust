@@ -1,8 +1,8 @@
 use super::upload_session::*;
 use super::{
-    BlobMeta, BlobObjectVersion, GcBlobCandidate, GcBlobPage, GcCursor, GcDeleteResult,
-    GcQuarantineResult, GcStorage, GcStorageStrategy, ManifestMeta, ReferrerDescriptor,
-    RepoTimestamps, Storage, StorageError, ensure_dir,
+    BlobMeta, BlobObjectVersion, GcBlobPage, GcCursor, GcDeleteResult, GcQuarantineResult,
+    GcStorage, GcStorageStrategy, ManifestMeta, ReferrerDescriptor, RepoTimestamps, Storage,
+    StorageError, ensure_dir,
 };
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
@@ -193,6 +193,7 @@ pub struct FsStorage {
     upload_hashes: Vec<Mutex<std::collections::HashMap<String, SerializableSha256>>>,
     referrer_locks: Vec<Mutex<()>>,
     repo_locks: std::sync::Mutex<std::collections::HashMap<String, std::fs::File>>,
+    reader: std::sync::Arc<storage_fs::FsMetadataReader>,
     read_adapter: std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>>,
 }
 
@@ -204,8 +205,9 @@ impl FsStorage {
         reader
             .probe_capability()
             .map_err(read_adapter::map_fs_startup_error)?;
+        let reader = std::sync::Arc::new(reader);
         let read_adapter = std::sync::Arc::new(read_adapter::FsBlobCasReadAdapter::new(
-            std::sync::Arc::new(reader),
+            std::sync::Arc::clone(&reader),
         ));
 
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
@@ -222,6 +224,7 @@ impl FsStorage {
             upload_hashes,
             referrer_locks,
             repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            reader,
             read_adapter,
         })
     }
@@ -238,6 +241,23 @@ impl FsStorage {
         &self,
     ) -> &std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>> {
         &self.read_adapter
+    }
+
+    /// Returns a reference to the shared root metadata reader.
+    #[cfg(test)]
+    pub(crate) fn reader(&self) -> &std::sync::Arc<storage_fs::FsMetadataReader> {
+        &self.reader
+    }
+
+    /// Internal test helper to list CAS blobs with explicitly injected listing budgets.
+    #[cfg(test)]
+    pub(crate) async fn list_cas_blobs_page_with_budgets(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+        budgets: listing::FsListingBudgets,
+    ) -> Result<GcBlobPage, StorageError> {
+        listing::list_cas_blobs_page_impl(self.reader.as_ref(), cursor, limit, budgets).await
     }
 
     /// Computes the repository root directory for a validated canonical repository identity.
@@ -3350,144 +3370,13 @@ impl GcStorage for FsStorage {
         cursor: Option<&GcCursor>,
         limit: usize,
     ) -> Result<GcBlobPage, StorageError> {
-        let max_limit = 1000;
-        let limit = limit.min(max_limit).max(1);
-        let root = self.root.join("blobs").join("sha256");
-
-        if tokio::fs::metadata(&root).await.is_err() {
-            return Ok(GcBlobPage {
-                items: Vec::new(),
-                next_cursor: None,
-            });
-        }
-
-        let cursor_str = cursor.map(|c| c.0.as_str());
-
-        let mut prefix_dirs = Vec::new();
-        let mut rd = tokio::fs::read_dir(&root)
-            .await
-            .map_err(|e| StorageError::io(format!("read_dir {}: {e}", root.display())))?;
-        while let Some(ent) = rd
-            .next_entry()
-            .await
-            .map_err(|e| StorageError::io(format!("read_dir entry in {}: {e}", root.display())))?
-        {
-            let ft = ent.file_type().await.map_err(|e| {
-                StorageError::io(format!("file_type for {}: {e}", ent.path().display()))
-            })?;
-            let fname = ent.file_name();
-            let name = fname.to_str().ok_or_else(|| {
-                StorageError::corrupt_data(format!(
-                    "malformed non-utf8 entry in CAS root: {}",
-                    ent.path().display()
-                ))
-            })?;
-
-            if !ft.is_dir() {
-                return Err(StorageError::corrupt_data(format!(
-                    "malformed non-directory entry in CAS prefix directory root: {}",
-                    ent.path().display()
-                )));
-            }
-
-            if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(StorageError::corrupt_data(format!(
-                    "malformed 2-char prefix directory name in CAS root: {name}"
-                )));
-            }
-            prefix_dirs.push(name.to_ascii_lowercase());
-        }
-        prefix_dirs.sort();
-
-        let mut candidates = Vec::new();
-        let mut next_cursor = None;
-
-        'outer: for p2 in prefix_dirs {
-            let dir_path = root.join(&p2);
-            let mut entries = Vec::new();
-            let mut rd = tokio::fs::read_dir(&dir_path)
-                .await
-                .map_err(|e| StorageError::io(format!("read_dir {}: {e}", dir_path.display())))?;
-            while let Some(ent) = rd.next_entry().await.map_err(|e| {
-                StorageError::io(format!("read_dir entry in {}: {e}", dir_path.display()))
-            })? {
-                let ft = ent.file_type().await.map_err(|e| {
-                    StorageError::io(format!("file_type for {}: {e}", ent.path().display()))
-                })?;
-                let fname = ent.file_name();
-                let name = fname.to_str().ok_or_else(|| {
-                    StorageError::corrupt_data(format!(
-                        "malformed non-utf8 blob filename in {}: {}",
-                        dir_path.display(),
-                        ent.path().display()
-                    ))
-                })?;
-
-                if !ft.is_file() {
-                    return Err(StorageError::corrupt_data(format!(
-                        "malformed non-file entry in CAS shard directory {}: {}",
-                        dir_path.display(),
-                        name
-                    )));
-                }
-
-                if name.len() != 64
-                    || !name.to_ascii_lowercase().starts_with(&p2)
-                    || !name.chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    return Err(StorageError::corrupt_data(format!(
-                        "malformed blob file name in CAS shard {}: {}",
-                        dir_path.display(),
-                        name
-                    )));
-                }
-                entries.push(name.to_ascii_lowercase());
-            }
-            entries.sort();
-
-            for hex in entries {
-                let digest_str = format!("sha256:{hex}");
-                if let Some(c) = cursor_str {
-                    if digest_str.as_str() <= c {
-                        continue;
-                    }
-                }
-
-                let path = dir_path.join(&hex);
-                let meta = tokio::fs::metadata(&path)
-                    .await
-                    .map_err(|e| StorageError::io(format!("metadata {}: {e}", path.display())))?;
-                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                let size = meta.len();
-                let mtime_secs = modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let version = BlobObjectVersion(format!("{mtime_secs}:{size}"));
-                let digest = Digest::parse(&digest_str).map_err(|e| {
-                    StorageError::internal_invariant(format!(
-                        "failed to parse digest from hex {hex}: {e}"
-                    ))
-                })?;
-
-                candidates.push(GcBlobCandidate {
-                    digest,
-                    size,
-                    last_modified: modified,
-                    version,
-                });
-
-                if candidates.len() >= limit {
-                    next_cursor = Some(GcCursor(digest_str));
-                    break 'outer;
-                }
-            }
-        }
-
-        Ok(GcBlobPage {
-            items: candidates,
-            next_cursor,
-        })
+        listing::list_cas_blobs_page_impl(
+            self.reader.as_ref(),
+            cursor,
+            limit,
+            listing::FsListingBudgets::default(),
+        )
+        .await
     }
 
     async fn quarantine_blob(
@@ -3701,6 +3590,5 @@ mod metadata_seam;
 #[path = "fs/payload_seam.rs"]
 mod payload_seam;
 
-#[cfg(test)]
-#[path = "fs/listing_seam.rs"]
-mod listing_seam;
+#[path = "fs/listing.rs"]
+pub(crate) mod listing;
