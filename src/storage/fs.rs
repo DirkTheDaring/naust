@@ -3564,3 +3564,7 @@ pub(crate) mod listing;
 
 #[path = "fs/manifest.rs"]
 pub(crate) mod manifest;
+
+#[cfg(test)]
+#[path = "fs/manifest_listing.rs"]
+pub(crate) mod manifest_listing;
