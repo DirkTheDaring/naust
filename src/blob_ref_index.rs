@@ -91,6 +91,13 @@ fn encode_repo_membership_prefix(digest: &Digest) -> Vec<u8> {
     prefix
 }
 
+#[derive(Debug, Default)]
+struct DiscoveredRepoData {
+    roots: Vec<Digest>,
+    edges: Vec<(Vec<u8>, Vec<u8>)>,
+    tags: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 impl BlobRefIndex {
     pub fn open(path: PathBuf) -> Result<Self, RefIndexError> {
         let db = sled::open(path)?;
@@ -488,6 +495,10 @@ impl BlobRefIndex {
         storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
     ) -> Result<(), RefIndexError> {
+        // Phase 1: Read-only storage discovery (all-or-nothing; zero index mutations on error)
+        let staged = Self::discover_repo_manifests_and_tags(storage, repo).await?;
+
+        // Phase 2: Index application (performs sled operations, no backend I/O)
         // 1. Remove all existing tags for this repo from the index.
         let prefix = tag_prefix(repo);
         let existing_tags: Vec<Vec<u8>> = self
@@ -500,40 +511,148 @@ impl BlobRefIndex {
             let _ = self.tag_to_root.remove(k);
         }
 
-        // 2. Bounded pagination of ALL stored manifests in this repo (stored manifests are roots)
-        let mut manifest_token: Option<String> = None;
-        loop {
-            let (manifests, next_tok) = storage
-                .list_manifest_digests_page(repo, manifest_token.as_deref(), 128)
-                .await?;
-            for digest in manifests {
-                self.inc_root_count(digest.as_str().as_bytes())?;
-                self.ingest_root(storage, repo, &digest).await?;
-            }
-            match next_tok {
-                Some(tok) => manifest_token = Some(tok),
-                None => break,
-            }
+        // 2. Increment root counts and apply DAG edges for discovered manifests.
+        // Root occurrence order and multiplicity are preserved; count inflation on repeated
+        // successful syncs remains unresolved in this narrow slice and is explicitly documented.
+        for digest in staged.roots {
+            self.inc_root_count(digest.as_str().as_bytes())?;
+        }
+        for (child, parent) in staged.edges {
+            self.add_parent(&child, &parent)?;
         }
 
-        // 3. Bounded pagination of tags in this repo (tags map alias -> digest)
-        let mut tag_token: Option<String> = None;
-        loop {
-            let (tags, next_tok) = storage
-                .list_tags_page(repo, tag_token.as_deref(), 128)
-                .await?;
-            for (tag, digest) in tags {
-                self.tag_to_root
-                    .insert(tag_key(repo, &tag), digest.as_str().as_bytes())?;
-            }
-            match next_tok {
-                Some(tok) => tag_token = Some(tok),
-                None => break,
-            }
+        // 3. Insert discovered tags into tag_to_root
+        for (tag_k, digest_bytes) in staged.tags {
+            self.tag_to_root.insert(tag_k, digest_bytes.as_slice())?;
         }
 
         self.db.flush()?;
         Ok(())
+    }
+
+    async fn discover_repo_manifests_and_tags(
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
+        repo: &str,
+    ) -> Result<DiscoveredRepoData, RefIndexError> {
+        let mut roots: Vec<Digest> = Vec::new();
+        let mut edges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut tags: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        // 1. Enumerate all stored manifests in this repo with token cycle detection.
+        // Memory growth across distinct continuation tokens and staged data remains unbounded
+        // in this slice; arbitrary page caps are deliberately deferred.
+        let mut manifest_token: Option<String> = None;
+        let mut seen_manifest_tokens: HashSet<String> = HashSet::new();
+
+        loop {
+            let (manifests, next_tok) = storage
+                .list_manifest_digests_page(repo, manifest_token.as_deref(), 128)
+                .await?;
+
+            for digest in manifests {
+                roots.push(digest.clone());
+
+                // Perform recursive DAG discovery for this root.
+                // Traversal queue, visited set, and refs_cache are scoped per root, preserving
+                // exact ingest_root semantics and key identity (digest.hex().to_string()).
+                let mut queue: VecDeque<Digest> = VecDeque::new();
+                queue.push_back(digest.clone());
+
+                let mut visited: HashSet<String> = HashSet::new();
+                let mut refs_cache: HashMap<String, Option<crate::manifest_refs::ManifestRefs>> =
+                    HashMap::new();
+
+                while let Some(cur_digest) = queue.pop_front() {
+                    if !visited.insert(cur_digest.hex().to_string()) {
+                        continue;
+                    }
+
+                    let digest_hex = cur_digest.hex().to_string();
+                    let refs = if let Some(v) = refs_cache.get(&digest_hex) {
+                        match v.clone() {
+                            Some(r) => r,
+                            None => continue,
+                        }
+                    } else {
+                        let (_meta, bytes) = match storage.get_manifest(repo, &cur_digest).await {
+                            Ok(v) => v,
+                            // Tolerated NotFound: preserve existing semantics where missing roots or
+                            // child manifests are cached as absent and skipped without failing discovery.
+                            Err(StorageError::NotFound) => {
+                                refs_cache.insert(digest_hex, None);
+                                continue;
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
+
+                        let parsed = parse_manifest_refs(&bytes)?;
+                        refs_cache.insert(digest_hex, Some(parsed.clone()));
+                        parsed
+                    };
+
+                    // child blob -> parent manifest
+                    for child_blob in refs.blob_references() {
+                        edges.push((
+                            child_blob.as_str().as_bytes().to_vec(),
+                            cur_digest.as_str().as_bytes().to_vec(),
+                        ));
+                    }
+
+                    // child manifest -> parent manifest
+                    // The parent edge to the child manifest is retained even if the child manifest
+                    // is subsequently found to be missing from storage.
+                    for child_manifest in refs.manifest_references() {
+                        edges.push((
+                            child_manifest.as_str().as_bytes().to_vec(),
+                            cur_digest.as_str().as_bytes().to_vec(),
+                        ));
+                        queue.push_back(child_manifest.clone());
+                    }
+                }
+            }
+
+            match next_tok {
+                Some(tok) => {
+                    if !seen_manifest_tokens.insert(tok.clone()) {
+                        return Err(StorageError::backend(format!(
+                            "pagination cycle detected on continuation token '{tok}' in repository '{repo}'"
+                        ))
+                        .into());
+                    }
+                    manifest_token = Some(tok);
+                }
+                None => break,
+            }
+        }
+
+        // 2. Enumerate tags in this repo with independent token cycle detection
+        let mut tag_token: Option<String> = None;
+        let mut seen_tag_tokens: HashSet<String> = HashSet::new();
+
+        loop {
+            let (page_tags, next_tok) = storage
+                .list_tags_page(repo, tag_token.as_deref(), 128)
+                .await?;
+
+            for (tag, digest) in page_tags {
+                tags.push((tag_key(repo, &tag), digest.as_str().as_bytes().to_vec()));
+            }
+
+            match next_tok {
+                Some(tok) => {
+                    if !seen_tag_tokens.insert(tok.clone()) {
+                        return Err(StorageError::backend(format!(
+                            "pagination cycle detected on continuation token '{tok}' in repository '{repo}'"
+                        ))
+                        .into());
+                    }
+                    tag_token = Some(tok);
+                }
+                None => break,
+            }
+        }
+
+        Ok(DiscoveredRepoData { roots, edges, tags })
     }
 
     pub async fn sync_repo_tags(
@@ -877,6 +996,12 @@ mod tests {
         repos: Mutex<HashSet<String>>,
         tags: Mutex<HashMap<String, HashMap<String, Digest>>>,
         manifests: Mutex<HashMap<(String, String), Bytes>>,
+        manifest_pages:
+            Mutex<HashMap<String, Vec<Result<(Vec<Digest>, Option<String>), StorageError>>>>,
+        tag_pages: Mutex<
+            HashMap<String, Vec<Result<(Vec<(String, Digest)>, Option<String>), StorageError>>>,
+        >,
+        manifest_faults: Mutex<HashMap<(String, String), StorageError>>,
     }
 
     impl MockStorage {
@@ -917,6 +1042,39 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert((repo.to_string(), digest.as_str().to_string()), bytes);
+        }
+
+        fn queue_manifest_page(
+            &self,
+            repo: &str,
+            page: Result<(Vec<Digest>, Option<String>), StorageError>,
+        ) {
+            self.manifest_pages
+                .lock()
+                .unwrap()
+                .entry(repo.to_string())
+                .or_default()
+                .push(page);
+        }
+
+        fn queue_tag_page(
+            &self,
+            repo: &str,
+            page: Result<(Vec<(String, Digest)>, Option<String>), StorageError>,
+        ) {
+            self.tag_pages
+                .lock()
+                .unwrap()
+                .entry(repo.to_string())
+                .or_default()
+                .push(page);
+        }
+
+        fn inject_manifest_fault(&self, repo: &str, digest: &Digest, err: StorageError) {
+            self.manifest_faults
+                .lock()
+                .unwrap()
+                .insert((repo.to_string(), digest.as_str().to_string()), err);
         }
     }
 
@@ -1001,6 +1159,14 @@ mod tests {
             name: &str,
             digest: &Digest,
         ) -> Result<(crate::storage::ManifestMeta, Bytes), StorageError> {
+            if let Some(err) = self
+                .manifest_faults
+                .lock()
+                .unwrap()
+                .remove(&(name.to_string(), digest.as_str().to_string()))
+            {
+                return Err(err);
+            }
             let key = (name.to_string(), digest.as_str().to_string());
             let bytes = self
                 .manifests
@@ -1054,6 +1220,11 @@ mod tests {
             _continuation_token: Option<&str>,
             _page_limit: usize,
         ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+            if let Some(queue) = self.manifest_pages.lock().unwrap().get_mut(repo) {
+                if !queue.is_empty() {
+                    return queue.remove(0);
+                }
+            }
             let mut res = Vec::new();
             for (r, d_str) in self.manifests.lock().unwrap().keys() {
                 if r == repo {
@@ -1071,6 +1242,11 @@ mod tests {
             _continuation_token: Option<&str>,
             _page_limit: usize,
         ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+            if let Some(queue) = self.tag_pages.lock().unwrap().get_mut(repo) {
+                if !queue.is_empty() {
+                    return queue.remove(0);
+                }
+            }
             let mut res = Vec::new();
             if let Some(tags_map) = self.tags.lock().unwrap().get(repo) {
                 for (t, d) in tags_map {
@@ -1703,6 +1879,621 @@ mod tests {
         // Not referenced by any manifest and not pinned -> GC eligible
         assert!(!idx.is_blob_pinned(&digest, now).unwrap());
         assert!(!idx.is_blob_referenced(&digest).unwrap());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn snapshot_tree(tree: &sled::Tree) -> Vec<(Vec<u8>, Vec<u8>)> {
+        tree.iter()
+            .map(|r| r.expect("iter"))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_first_page_manifest_listing_failure_preserves_populated_index() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let other_repo = "org/other";
+        let r1 = d('1');
+        let r_other = d('9');
+
+        mock.set_tag_sync(repo, "t1", &r1);
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('2'), &d('3')));
+
+        mock.set_tag_sync(other_repo, "t_other", &r_other);
+        mock.put_manifest_bytes(other_repo, &r_other, image_manifest(&d('4'), &d('5')));
+
+        // Populate initial index
+        idx.sync_repo_manifests_and_tags(&storage, other_repo)
+            .await
+            .expect("sync other");
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("sync repo");
+
+        let tags_before = snapshot_tree(&idx.tag_to_root);
+        let roots_before = snapshot_tree(&idx.root_counts);
+        let edges_before = snapshot_tree(&idx.rev_edges);
+        let meta_before = snapshot_tree(&idx.meta);
+
+        // Inject first-page manifest listing error
+        mock.queue_manifest_page(
+            repo,
+            Err(StorageError::backend("injected manifest page 1 failure")),
+        );
+
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("should fail");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("injected manifest page 1 failure"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // Verify byte-for-byte preservation across all trees
+        assert_eq!(snapshot_tree(&idx.tag_to_root), tags_before);
+        assert_eq!(snapshot_tree(&idx.root_counts), roots_before);
+        assert_eq!(snapshot_tree(&idx.rev_edges), edges_before);
+        assert_eq!(snapshot_tree(&idx.meta), meta_before);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_later_page_manifest_listing_failure_preserves_index() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let r1 = d('1');
+        let r2 = d('2');
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('3'), &d('4')));
+        mock.put_manifest_bytes(repo, &r2, image_manifest(&d('5'), &d('6')));
+
+        mock.queue_manifest_page(repo, Ok((vec![r1.clone()], Some("page2".to_string()))));
+        mock.queue_manifest_page(
+            repo,
+            Err(StorageError::backend("injected manifest page 2 failure")),
+        );
+
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("should fail on page 2");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("injected manifest page 2 failure"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // r1 was on page 1, but must NOT have been incremented in root_counts
+        assert!(
+            !idx.root_counts
+                .contains_key(r1.as_str().as_bytes())
+                .unwrap()
+        );
+        assert!(
+            !idx.root_counts
+                .contains_key(r2.as_str().as_bytes())
+                .unwrap()
+        );
+        assert_eq!(snapshot_tree(&idx.rev_edges), Vec::new());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_root_and_recursive_child_read_and_parse_failures() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        // 1. Root read failure
+        let repo1 = "org/repo1";
+        let r1 = d('1');
+        mock.put_manifest_bytes(repo1, &r1, image_manifest(&d('3'), &d('4')));
+        mock.inject_manifest_fault(repo1, &r1, StorageError::backend("root read error"));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo1)
+            .await
+            .expect_err("root read fail");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("root read error"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !idx.root_counts
+                .contains_key(r1.as_str().as_bytes())
+                .unwrap()
+        );
+
+        // 2. Root parse failure
+        let repo2 = "org/repo2";
+        let r2 = d('2');
+        mock.put_manifest_bytes(repo2, &r2, bytes("invalid manifest json".to_string()));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo2)
+            .await
+            .expect_err("root parse fail");
+        match err {
+            RefIndexError::ManifestParse(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !idx.root_counts
+                .contains_key(r2.as_str().as_bytes())
+                .unwrap()
+        );
+
+        // 3. Recursive child read failure
+        let repo3 = "org/repo3";
+        let r3 = d('3');
+        let child3 = d('c');
+        mock.put_manifest_bytes(repo3, &r3, index_manifest(&child3));
+        mock.inject_manifest_fault(repo3, &child3, StorageError::backend("child read error"));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo3)
+            .await
+            .expect_err("child read fail");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("child read error"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !idx.root_counts
+                .contains_key(r3.as_str().as_bytes())
+                .unwrap()
+        );
+        assert_eq!(snapshot_tree(&idx.rev_edges), Vec::new());
+
+        // 4. Recursive child parse failure
+        let repo4 = "org/repo4";
+        let r4 = d('4');
+        let child4 = d('d');
+        mock.put_manifest_bytes(repo4, &r4, index_manifest(&child4));
+        mock.put_manifest_bytes(repo4, &child4, bytes("invalid child json".to_string()));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo4)
+            .await
+            .expect_err("child parse fail");
+        match err {
+            RefIndexError::ManifestParse(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !idx.root_counts
+                .contains_key(r4.as_str().as_bytes())
+                .unwrap()
+        );
+        assert_eq!(snapshot_tree(&idx.rev_edges), Vec::new());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_first_and_later_tag_page_failures_preserve_index() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let r1 = d('1');
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('2'), &d('3')));
+
+        // Case A: First tag page failure
+        mock.queue_tag_page(repo, Err(StorageError::backend("tag page 1 failure")));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("tag page 1 fail");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("tag page 1 failure"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !idx.root_counts
+                .contains_key(r1.as_str().as_bytes())
+                .unwrap()
+        );
+        assert_eq!(snapshot_tree(&idx.tag_to_root), Vec::new());
+
+        // Case B: Later tag page failure
+        mock.queue_tag_page(
+            repo,
+            Ok((
+                vec![("t1".to_string(), r1.clone())],
+                Some("page2".to_string()),
+            )),
+        );
+        mock.queue_tag_page(repo, Err(StorageError::backend("tag page 2 failure")));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("tag page 2 fail");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("tag page 2 failure"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            !idx.root_counts
+                .contains_key(r1.as_str().as_bytes())
+                .unwrap()
+        );
+        assert_eq!(snapshot_tree(&idx.tag_to_root), Vec::new());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_token_cycles_detected_in_both_pagination_streams() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let r1 = d('1');
+        let r2 = d('2');
+        let r3 = d('3');
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('a'), &d('b')));
+        mock.put_manifest_bytes(repo, &r2, image_manifest(&d('c'), &d('d')));
+        mock.put_manifest_bytes(repo, &r3, image_manifest(&d('e'), &d('f')));
+
+        // 1. Manifest immediate cycle: tok_a -> tok_a
+        mock.queue_manifest_page(repo, Ok((vec![r1.clone()], Some("tok_a".to_string()))));
+        mock.queue_manifest_page(repo, Ok((vec![r2.clone()], Some("tok_a".to_string()))));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("immediate cycle");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("pagination cycle detected on continuation token 'tok_a' in repository 'org/repo'"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(snapshot_tree(&idx.root_counts), Vec::new());
+
+        // 2. Manifest multi-token cycle: tok_1 -> tok_2 -> tok_1
+        mock.queue_manifest_page(repo, Ok((vec![r1.clone()], Some("tok_1".to_string()))));
+        mock.queue_manifest_page(repo, Ok((vec![r2.clone()], Some("tok_2".to_string()))));
+        mock.queue_manifest_page(repo, Ok((vec![r3.clone()], Some("tok_1".to_string()))));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("multi cycle");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("pagination cycle detected on continuation token 'tok_1' in repository 'org/repo'"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(snapshot_tree(&idx.root_counts), Vec::new());
+
+        // 3. Tag immediate cycle: tag_tok_a -> tag_tok_a
+        mock.queue_tag_page(
+            repo,
+            Ok((
+                vec![("t1".to_string(), r1.clone())],
+                Some("tag_tok_a".to_string()),
+            )),
+        );
+        mock.queue_tag_page(
+            repo,
+            Ok((
+                vec![("t2".to_string(), r2.clone())],
+                Some("tag_tok_a".to_string()),
+            )),
+        );
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("tag immediate cycle");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("pagination cycle detected on continuation token 'tag_tok_a' in repository 'org/repo'"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(snapshot_tree(&idx.tag_to_root), Vec::new());
+
+        // 4. Tag multi-token cycle: tag_tok_1 -> tag_tok_2 -> tag_tok_1
+        mock.queue_tag_page(
+            repo,
+            Ok((
+                vec![("t1".to_string(), r1.clone())],
+                Some("tag_tok_1".to_string()),
+            )),
+        );
+        mock.queue_tag_page(
+            repo,
+            Ok((
+                vec![("t2".to_string(), r2.clone())],
+                Some("tag_tok_2".to_string()),
+            )),
+        );
+        mock.queue_tag_page(
+            repo,
+            Ok((
+                vec![("t3".to_string(), r3.clone())],
+                Some("tag_tok_1".to_string()),
+            )),
+        );
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("tag multi cycle");
+        match err {
+            RefIndexError::Storage(err) => {
+                assert!(err.to_string().contains("pagination cycle detected on continuation token 'tag_tok_1' in repository 'org/repo'"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(snapshot_tree(&idx.tag_to_root), Vec::new());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_tolerates_missing_root_and_missing_child_retaining_parent_edges() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let missing_root = d('1');
+        let parent_root = d('2');
+        let missing_child = d('3');
+
+        // missing_root is in manifest listing but get_manifest returns NotFound
+        mock.queue_manifest_page(
+            repo,
+            Ok((vec![missing_root.clone(), parent_root.clone()], None)),
+        );
+
+        // parent_root references missing_child
+        mock.put_manifest_bytes(repo, &parent_root, index_manifest(&missing_child));
+        // missing_child is NOT put into manifests -> get_manifest returns NotFound
+
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("should tolerate NotFound roots and children");
+
+        // Tolerated NotFound root is counted in root_counts matching existing line 510 behavior
+        assert!(
+            idx.root_counts
+                .contains_key(missing_root.as_str().as_bytes())
+                .unwrap()
+        );
+        assert!(
+            idx.root_counts
+                .contains_key(parent_root.as_str().as_bytes())
+                .unwrap()
+        );
+
+        // The parent edge to missing_child is retained even though missing_child was absent
+        let parents_raw = idx
+            .rev_edges
+            .get(missing_child.as_str().as_bytes())
+            .unwrap()
+            .expect("parent edge retained");
+        let parents = decode_parent_list(&parents_raw).expect("decode");
+        assert_eq!(parents, vec![parent_root.as_str().to_string()]);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_successful_recursive_dag_and_tag_sync() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .expect("meta");
+        idx.meta.insert(META_STATE, META_STATE_READY).expect("meta");
+
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let root_index = d('a');
+        let child_manifest = d('b');
+        let config = d('c');
+        let layer = d('d');
+
+        mock.set_tag_sync(repo, "latest", &root_index);
+        mock.put_manifest_bytes(repo, &root_index, index_manifest(&child_manifest));
+        mock.put_manifest_bytes(repo, &child_manifest, image_manifest(&config, &layer));
+
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("successful sync");
+
+        assert!(
+            idx.root_counts
+                .contains_key(root_index.as_str().as_bytes())
+                .unwrap()
+        );
+        let tag_val = idx
+            .tag_to_root
+            .get(tag_key(repo, "latest"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag_val.as_ref(), root_index.as_str().as_bytes());
+
+        // Reverse edges are navigable and blobs are reachable
+        assert!(idx.is_blob_referenced(&layer).expect("layer reachable"));
+        assert!(idx.is_blob_referenced(&config).expect("config reachable"));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_repeated_success_count_behavior_documented() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let r1 = d('1');
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('2'), &d('3')));
+
+        // Run 1: count becomes 1
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("run 1");
+        let count1 = decode_u64(
+            &idx.root_counts
+                .get(r1.as_str().as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(count1, 1);
+
+        // Run 2: existing behavior increments count to 2
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("run 2");
+        let count2 = decode_u64(
+            &idx.root_counts
+                .get(r1.as_str().as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(count2, 2);
+
+        // Run 3: count increments to 3
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("run 3");
+        let count3 = decode_u64(
+            &idx.root_counts
+                .get(r1.as_str().as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(count3, 3);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_failure_followed_by_success_matches_single_success_from_identical_state()
+     {
+        let path_a = temp_index_path();
+        let path_b = temp_index_path();
+        let idx_a = BlobRefIndex::open(path_a.clone()).expect("open a");
+        let idx_b = BlobRefIndex::open(path_b.clone()).expect("open b");
+
+        let mock_a = Arc::new(MockStorage::new());
+        let mock_b = Arc::new(MockStorage::new());
+
+        let repo = "org/repo";
+        let r1 = d('1');
+        let r2 = d('2');
+        mock_a.set_tag_sync(repo, "v1", &r1);
+        mock_a.put_manifest_bytes(repo, &r1, image_manifest(&d('3'), &d('4')));
+        mock_a.put_manifest_bytes(repo, &r2, image_manifest(&d('5'), &d('6')));
+
+        mock_b.set_tag_sync(repo, "v1", &r1);
+        mock_b.put_manifest_bytes(repo, &r1, image_manifest(&d('3'), &d('4')));
+        mock_b.put_manifest_bytes(repo, &r2, image_manifest(&d('5'), &d('6')));
+
+        // Path A: clean single success
+        idx_a
+            .sync_repo_manifests_and_tags(&mock_a, repo)
+            .await
+            .expect("sync a");
+
+        // Path B: failure on page 2, followed by clean success
+        mock_b.queue_manifest_page(repo, Ok((vec![r1.clone()], Some("page2".to_string()))));
+        mock_b.queue_manifest_page(repo, Err(StorageError::backend("transient page 2 error")));
+        idx_b
+            .sync_repo_manifests_and_tags(&mock_b, repo)
+            .await
+            .expect_err("expected failure");
+
+        // Now run successful sync on path B
+        idx_b
+            .sync_repo_manifests_and_tags(&mock_b, repo)
+            .await
+            .expect("retry b success");
+
+        // Compare all trees: identical state
+        assert_eq!(
+            snapshot_tree(&idx_a.tag_to_root),
+            snapshot_tree(&idx_b.tag_to_root)
+        );
+        assert_eq!(
+            snapshot_tree(&idx_a.root_counts),
+            snapshot_tree(&idx_b.root_counts)
+        );
+        assert_eq!(
+            snapshot_tree(&idx_a.rev_edges),
+            snapshot_tree(&idx_b.rev_edges)
+        );
+
+        let _ = std::fs::remove_dir_all(path_a);
+        let _ = std::fs::remove_dir_all(path_b);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_rebuild_failure_retains_building_state() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let repo = "org/repo";
+        let r1 = d('1');
+        mock.set_tag_sync(repo, "latest", &r1);
+        mock.put_manifest_bytes(repo, &r1, image_manifest(&d('2'), &d('3')));
+
+        // Initial rebuild succeeds -> READY
+        idx.rebuild(&storage).await.expect("initial rebuild");
+        idx.check_health().expect("healthy");
+
+        // Second rebuild encounters discovery failure
+        mock.queue_manifest_page(repo, Err(StorageError::backend("storage unavailable")));
+        idx.rebuild(&storage).await.expect_err("rebuild fails");
+
+        // State remains BUILDING; health check fails
+        let state = idx.meta.get(META_STATE).unwrap().unwrap();
+        assert_eq!(state.as_ref(), META_STATE_BUILDING);
+
+        let err = idx.check_health().expect_err("should be corrupt/building");
+        match err {
+            RefIndexError::Corrupt(msg) => {
+                assert!(msg.contains("index not ready (previous rebuild incomplete?)"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(path);
     }
