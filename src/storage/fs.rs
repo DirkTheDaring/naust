@@ -3700,3 +3700,7 @@ mod metadata_seam;
 #[cfg(test)]
 #[path = "fs/payload_seam.rs"]
 mod payload_seam;
+
+#[cfg(test)]
+#[path = "fs/listing_seam.rs"]
+mod listing_seam;
