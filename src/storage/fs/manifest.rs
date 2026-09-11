@@ -1,4 +1,4 @@
-//! Test-only contained filesystem manifest read integration seam for `registry-rust`.
+//! Contained filesystem manifest read implementation for `registry-rust`.
 //!
 //! # Architectural Ownership Boundaries
 //! - `storage-core`: Defines domain-neutral contracts ([`storage_core::ObjectPayloadReader`],
@@ -22,14 +22,14 @@
 //!   repository validity, and canonical repository validation does not replace containment checks.
 //!
 //! # Observation Semantics, Buffering, and Lack of Snapshot Guarantees
-//! - **Full Read Buffering**: Both [`head_manifest_seam`] and [`get_manifest_seam`] read the full manifest payload
-//!   into memory because `mediaType` is dynamically parsed from the JSON body (`detect_manifest_media_type`).
+//! - **Full Read Buffering**: Both [`head_manifest_impl`] and [`get_manifest_impl`] read the full manifest payload
+//!   into memory because `mediaType` is dynamically parsed from the JSON body ([`detect_manifest_media_type`]).
 //! - **Unbounded Resource Concern**: Manifests are currently buffered into memory without an enforcement limit.
-//!   This is recorded as an unresolved resource concern for future production cutover.
+//!   This is recorded as an operational limitation.
 //! - **No Snapshot Isolation**: Reading metadata followed by reading payload does not guarantee snapshot consistency
 //!   under concurrent mutations. Files are not immutable merely because their filename is a digest.
 //! - **No Digest Verification**: Existing production behavior does not compute a hash over read bytes to verify
-//!   against the requested digest; this seam strictly preserves that behavior.
+//!   against the requested digest; this implementation strictly preserves that behavior.
 
 use crate::registry::digest::Digest;
 use crate::storage::{ManifestMeta, StorageError};
@@ -94,13 +94,6 @@ pub(crate) fn manifest_key(repo: &str, digest: &Digest) -> Result<ObjectKey, Sto
 
 /// Detects the media type of a manifest payload using existing registry conventions.
 ///
-/// NOTE: This function duplicates [`super::FsStorage::detect_manifest_media_type`].
-/// It is retained as a test-only copy because [`super::FsStorage::detect_manifest_media_type`] is
-/// an instance method requiring an allocated `&FsStorage` instance, and modifying production
-/// `FsStorage` methods or extracting shared helpers is outside the authorized scope of this
-/// test-only slice. Direct parity is verified against `FsStorage::detect_manifest_media_type`
-/// in `test_parity_with_fs_storage_detect_manifest_media_type`.
-///
 /// Parses JSON looking for a top-level string `"mediaType"`.
 /// - If present and string: returns the specified media type.
 /// - If missing, non-string, or the JSON is a scalar: defaults to `"application/vnd.oci.image.manifest.v1+json"`.
@@ -121,7 +114,7 @@ pub(crate) fn detect_manifest_media_type(bytes: &[u8]) -> Result<String, Storage
 /// - Drains the stream to completion.
 /// - Derives `ManifestMeta.size` from the bytes actually read, not acquisition metadata.
 /// - Returns [`ManifestMeta`] and the complete payload [`bytes::Bytes`].
-pub(crate) async fn get_manifest_seam(
+pub(crate) async fn get_manifest_impl(
     reader: &(impl ObjectPayloadReader + ?Sized),
     repo: &str,
     digest: &Digest,
@@ -153,19 +146,18 @@ pub(crate) async fn get_manifest_seam(
 /// - Drains the stream to completion to parse media type and validate JSON structure.
 /// - Derives `ManifestMeta.size` from the bytes actually read.
 /// - Discards the payload bytes and returns [`ManifestMeta`].
-pub(crate) async fn head_manifest_seam(
+pub(crate) async fn head_manifest_impl(
     reader: &(impl ObjectPayloadReader + ?Sized),
     repo: &str,
     digest: &Digest,
 ) -> Result<ManifestMeta, StorageError> {
-    let (meta, _bytes) = get_manifest_seam(reader, repo, digest).await?;
+    let (meta, _bytes) = get_manifest_impl(reader, repo, digest).await?;
     Ok(meta)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::fs::FsStorage;
     use async_trait::async_trait;
     use std::collections::{HashMap, VecDeque};
     use std::pin::Pin;
@@ -343,7 +335,7 @@ mod tests {
         reader.script(key.clone(), Ok(mock_payload(manifest_bytes)));
 
         // 1. HEAD invocation
-        let head_res = head_manifest_seam(&reader, "library/busybox", &digest)
+        let head_res = head_manifest_impl(&reader, "library/busybox", &digest)
             .await
             .expect("head succeeds");
         assert_eq!(reader.calls(), vec![key.clone()]);
@@ -353,7 +345,7 @@ mod tests {
         );
 
         // 2. GET invocation
-        let (get_res, payload) = get_manifest_seam(&reader, "library/busybox", &digest)
+        let (get_res, payload) = get_manifest_impl(&reader, "library/busybox", &digest)
             .await
             .expect("get succeeds");
         assert_eq!(reader.calls(), vec![key.clone(), key]);
@@ -385,7 +377,7 @@ mod tests {
         );
 
         // HEAD must derive size from consumed bytes, ignoring bogus metadata size
-        let head_meta = head_manifest_seam(&reader, "myrepo", &digest)
+        let head_meta = head_manifest_impl(&reader, "myrepo", &digest)
             .await
             .unwrap();
         assert_eq!(
@@ -394,7 +386,7 @@ mod tests {
         );
 
         // GET must derive size from consumed bytes, ignoring bogus metadata size
-        let (get_meta, payload) = get_manifest_seam(&reader, "myrepo", &digest).await.unwrap();
+        let (get_meta, payload) = get_manifest_impl(&reader, "myrepo", &digest).await.unwrap();
         assert_eq!(
             get_meta.size, actual_size,
             "GET size must match actual stream bytes, not bogus metadata"
@@ -416,7 +408,7 @@ mod tests {
                 br#"{"mediaType":"application/vnd.custom.manifest.v1+json"}"#.to_vec(),
             )),
         );
-        let m1 = head_manifest_seam(&reader, "repo", &digest).await.unwrap();
+        let m1 = head_manifest_impl(&reader, "repo", &digest).await.unwrap();
         assert_eq!(m1.media_type, "application/vnd.custom.manifest.v1+json");
 
         // 2. Missing mediaType -> OCI default fallback
@@ -424,7 +416,7 @@ mod tests {
             key.clone(),
             Ok(mock_payload(br#"{"schemaVersion":2}"#.to_vec())),
         );
-        let m2 = head_manifest_seam(&reader, "repo", &digest).await.unwrap();
+        let m2 = head_manifest_impl(&reader, "repo", &digest).await.unwrap();
         assert_eq!(m2.media_type, "application/vnd.oci.image.manifest.v1+json");
 
         // 3. Non-string mediaType (integer 42) -> OCI default fallback
@@ -432,7 +424,7 @@ mod tests {
             key.clone(),
             Ok(mock_payload(br#"{"mediaType":42}"#.to_vec())),
         );
-        let m3 = head_manifest_seam(&reader, "repo", &digest).await.unwrap();
+        let m3 = head_manifest_impl(&reader, "repo", &digest).await.unwrap();
         assert_eq!(m3.media_type, "application/vnd.oci.image.manifest.v1+json");
 
         // 4. Scalar JSON -> OCI default fallback
@@ -440,12 +432,12 @@ mod tests {
             key.clone(),
             Ok(mock_payload(br#""a bare json string""#.to_vec())),
         );
-        let m4 = head_manifest_seam(&reader, "repo", &digest).await.unwrap();
+        let m4 = head_manifest_impl(&reader, "repo", &digest).await.unwrap();
         assert_eq!(m4.media_type, "application/vnd.oci.image.manifest.v1+json");
 
         // 5. Empty payload (0 bytes) -> CorruptData
         reader.script(key.clone(), Ok(mock_payload(Vec::new())));
-        let err_empty = head_manifest_seam(&reader, "repo", &digest)
+        let err_empty = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_empty {
@@ -460,7 +452,7 @@ mod tests {
             key.clone(),
             Ok(mock_payload(b"this is definitely not json".to_vec())),
         );
-        let err_malformed = head_manifest_seam(&reader, "repo", &digest)
+        let err_malformed = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_malformed {
@@ -481,7 +473,7 @@ mod tests {
         // 1. NotFound (verify for HEAD and GET)
         reader.script(key.clone(), Err(ReadError::not_found(key.clone())));
         let calls_before = reader.recorded_calls().len();
-        let err_nf = head_manifest_seam(&reader, "repo", &digest)
+        let err_nf = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         assert!(matches!(err_nf, StorageError::NotFound));
@@ -493,7 +485,7 @@ mod tests {
 
         reader.script(key.clone(), Err(ReadError::not_found(key.clone())));
         let calls_before = reader.recorded_calls().len();
-        let err_nf_get = get_manifest_seam(&reader, "repo", &digest)
+        let err_nf_get = get_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         assert!(matches!(err_nf_get, StorageError::NotFound));
@@ -506,7 +498,7 @@ mod tests {
         // 2. PermissionDenied -> StorageErrorKind::Io (verify for HEAD and GET)
         reader.script(key.clone(), Err(ReadError::permission_denied(key.clone())));
         let calls_before = reader.recorded_calls().len();
-        let err_perm = head_manifest_seam(&reader, "repo", &digest)
+        let err_perm = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_perm {
@@ -523,7 +515,7 @@ mod tests {
 
         reader.script(key.clone(), Err(ReadError::permission_denied(key.clone())));
         let calls_before = reader.recorded_calls().len();
-        let err_perm_get = get_manifest_seam(&reader, "repo", &digest)
+        let err_perm_get = get_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_perm_get {
@@ -551,7 +543,7 @@ mod tests {
             )),
         );
         let calls_before = reader.recorded_calls().len();
-        let err_res = head_manifest_seam(&reader, "repo", &digest)
+        let err_res = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_res {
@@ -567,89 +559,63 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parity_with_fs_storage_detect_manifest_media_type() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(temp.path().to_path_buf(), 1024 * 1024);
-
-        let cases: &[(&[u8], &str)] = &[
+    #[test]
+    fn test_detect_manifest_media_type_direct() {
+        let cases: &[(&[u8], Result<&str, crate::storage::StorageErrorKind>)] = &[
             (
                 br#"{"schemaVersion":2,"mediaType":"application/vnd.custom.v1+json"}"#,
-                "custom mediaType",
+                Ok("application/vnd.custom.v1+json"),
             ),
             (
                 br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}"#,
-                "docker schema2 mediaType",
+                Ok("application/vnd.docker.distribution.manifest.v2+json"),
             ),
             (
                 br#"{"schemaVersion":2}"#,
-                "missing mediaType (OCI default)",
+                Ok("application/vnd.oci.image.manifest.v1+json"),
             ),
             (
                 br#"{"mediaType":42}"#,
-                "non-string mediaType (OCI default)",
+                Ok("application/vnd.oci.image.manifest.v1+json"),
             ),
             (
                 br#""a scalar json string""#,
-                "scalar string JSON (OCI default)",
+                Ok("application/vnd.oci.image.manifest.v1+json"),
             ),
             (
                 br#"12345"#,
-                "scalar number JSON (OCI default)",
+                Ok("application/vnd.oci.image.manifest.v1+json"),
             ),
             (
                 b"",
-                "empty 0-byte payload",
+                Err(crate::storage::StorageErrorKind::CorruptData),
             ),
             (
                 b"not valid json at all",
-                "malformed non-JSON payload",
+                Err(crate::storage::StorageErrorKind::CorruptData),
             ),
             (
                 b"{incomplete json",
-                "truncated JSON payload",
+                Err(crate::storage::StorageErrorKind::CorruptData),
             ),
         ];
 
-        for (bytes, label) in cases {
-            let seam_res = detect_manifest_media_type(bytes);
-            let prod_res = storage.detect_manifest_media_type(bytes).await;
-
-            match (seam_res, prod_res) {
-                (Ok(seam_val), Ok(prod_val)) => {
+        for (bytes, expected) in cases {
+            let res = detect_manifest_media_type(bytes);
+            match (expected, res) {
+                (Ok(expected_mt), Ok(actual_mt)) => {
+                    assert_eq!(*expected_mt, actual_mt.as_str());
+                }
+                (Err(expected_kind), Err(actual_err)) => {
                     assert_eq!(
-                        seam_val, prod_val,
-                        "parity mismatch for success case: {label}"
+                        Some(*expected_kind),
+                        actual_err.internal_kind(),
+                        "expected error kind mismatch for payload: {:?}",
+                        std::str::from_utf8(bytes)
                     );
                 }
-                (Err(seam_err), Err(prod_err)) => match (seam_err, prod_err) {
-                    (
-                        StorageError::Internal {
-                            kind: seam_kind,
-                            message: seam_msg,
-                        },
-                        StorageError::Internal {
-                            kind: prod_kind,
-                            message: prod_msg,
-                        },
-                    ) => {
-                        assert_eq!(
-                            seam_kind, prod_kind,
-                            "parity mismatch for error kind: {label}"
-                        );
-                        assert_eq!(
-                            seam_msg, prod_msg,
-                            "parity mismatch for error diagnostic message: {label}"
-                        );
-                    }
-                    (seam_other, prod_other) => {
-                        panic!(
-                            "unexpected error shape mismatch for {label}: seam={seam_other:?}, prod={prod_other:?}"
-                        );
-                    }
-                },
-                (seam, prod) => {
-                    panic!("outcome mismatch for {label}: seam={seam:?}, prod={prod:?}");
+                (exp, act) => {
+                    panic!("outcome mismatch: expected {exp:?}, got {act:?}");
                 }
             }
         }
@@ -678,7 +644,7 @@ mod tests {
         reader.script(key.clone(), Ok(payload_get));
 
         let calls_before = reader.recorded_calls().len();
-        let err_get = get_manifest_seam(&reader, "repo", &digest)
+        let err_get = get_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         assert_eq!(
@@ -707,7 +673,7 @@ mod tests {
         reader.script(key.clone(), Ok(payload_head));
 
         let calls_before = reader.recorded_calls().len();
-        let err_head = head_manifest_seam(&reader, "repo", &digest)
+        let err_head = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         assert_eq!(
@@ -749,7 +715,7 @@ mod tests {
                 Box::new(rt_missing),
             )),
         );
-        let err_rt = head_manifest_seam(&reader, "repo", &digest)
+        let err_rt = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_rt {
@@ -775,7 +741,7 @@ mod tests {
                 Box::new(task_join_err),
             )),
         );
-        let err_join = head_manifest_seam(&reader, "repo", &digest)
+        let err_join = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_join {
@@ -796,7 +762,7 @@ mod tests {
                 Box::new(syscall_err),
             )),
         );
-        let err_syscall = head_manifest_seam(&reader, "repo", &digest)
+        let err_syscall = head_manifest_impl(&reader, "repo", &digest)
             .await
             .unwrap_err();
         match err_syscall {
@@ -813,7 +779,7 @@ mod tests {
         let digest =
             test_digest("1111111111111111111111111111111111111111111111111111111111111111");
 
-        let res = get_manifest_seam(&reader, "../../escape", &digest).await;
+        let res = get_manifest_impl(&reader, "../../escape", &digest).await;
         assert!(matches!(res, Err(StorageError::InvalidRepoName(_))));
         assert!(
             reader.calls().is_empty(),
@@ -864,7 +830,7 @@ mod tests {
             let d1 = test_digest(hex1);
             write_manifest_file(&root, "single_repo", hex1, manifest_bytes);
 
-            let (get_meta1, payload1) = get_manifest_seam(&reader, "single_repo", &d1)
+            let (get_meta1, payload1) = get_manifest_impl(&reader, "single_repo", &d1)
                 .await
                 .expect("get succeeds");
             assert_eq!(get_meta1.size, manifest_bytes.len() as u64);
@@ -874,7 +840,7 @@ mod tests {
             );
             assert_eq!(payload1.as_ref(), manifest_bytes);
 
-            let head_meta1 = head_manifest_seam(&reader, "single_repo", &d1)
+            let head_meta1 = head_manifest_impl(&reader, "single_repo", &d1)
                 .await
                 .expect("head succeeds");
             assert_eq!(head_meta1, get_meta1);
@@ -884,13 +850,13 @@ mod tests {
             let d2 = test_digest(hex2);
             write_manifest_file(&root, "org/team/sub/app", hex2, manifest_bytes);
 
-            let (get_meta2, payload2) = get_manifest_seam(&reader, "org/team/sub/app", &d2)
+            let (get_meta2, payload2) = get_manifest_impl(&reader, "org/team/sub/app", &d2)
                 .await
                 .expect("nested repo get succeeds");
             assert_eq!(get_meta2.size, manifest_bytes.len() as u64);
             assert_eq!(payload2.as_ref(), manifest_bytes);
 
-            let head_meta2 = head_manifest_seam(&reader, "org/team/sub/app", &d2)
+            let head_meta2 = head_manifest_impl(&reader, "org/team/sub/app", &d2)
                 .await
                 .expect("nested repo head succeeds");
             assert_eq!(head_meta2, get_meta2);
@@ -909,7 +875,7 @@ mod tests {
             let d256 = test_digest(hex256);
             write_manifest_file(&root, repo, hex256, manifest_bytes);
 
-            let (meta256, p256) = get_manifest_seam(&reader, repo, &d256).await.unwrap();
+            let (meta256, p256) = get_manifest_impl(&reader, repo, &d256).await.unwrap();
             assert_eq!(meta256.size, manifest_bytes.len() as u64);
             assert_eq!(p256.as_ref(), manifest_bytes);
 
@@ -918,7 +884,7 @@ mod tests {
             let d512 = Digest::parse(&format!("sha512:{hex512}")).expect("valid sha512");
             write_manifest_file(&root, repo, hex512, manifest_bytes);
 
-            let (meta512, p512) = get_manifest_seam(&reader, repo, &d512).await.unwrap();
+            let (meta512, p512) = get_manifest_impl(&reader, repo, &d512).await.unwrap();
             assert_eq!(meta512.size, manifest_bytes.len() as u64);
             assert_eq!(p512.as_ref(), manifest_bytes);
         }
@@ -930,14 +896,14 @@ mod tests {
             let d = test_digest("3434343434343434343434343434343434343434343434343434343434343434");
 
             // 1. Missing repository directory
-            let err_repo = get_manifest_seam(&reader, "missing_repo", &d)
+            let err_repo = get_manifest_impl(&reader, "missing_repo", &d)
                 .await
                 .unwrap_err();
             assert!(matches!(err_repo, StorageError::NotFound));
 
             // 2. Missing manifest file in existing repo
             std::fs::create_dir_all(root.join("repos/existing_repo/manifests")).unwrap();
-            let err_file = get_manifest_seam(&reader, "existing_repo", &d)
+            let err_file = get_manifest_impl(&reader, "existing_repo", &d)
                 .await
                 .unwrap_err();
             assert!(matches!(err_file, StorageError::NotFound));
@@ -968,7 +934,7 @@ mod tests {
             symlink(&outside_file, &symlink_file).unwrap();
 
             let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-            let err_sym = get_manifest_seam(&reader, "sym_repo", &digest)
+            let err_sym = get_manifest_impl(&reader, "sym_repo", &digest)
                 .await
                 .unwrap_err();
             match err_sym {
@@ -992,7 +958,7 @@ mod tests {
             std::fs::write(outside_manifests.join(hex), secret_content).unwrap();
             symlink(&outside_manifests, repo_dir.join("manifests")).unwrap();
 
-            let err_dir_sym = get_manifest_seam(&reader, "dir_sym_repo", &digest)
+            let err_dir_sym = get_manifest_impl(&reader, "dir_sym_repo", &digest)
                 .await
                 .unwrap_err();
             match err_dir_sym {
@@ -1014,7 +980,7 @@ mod tests {
             let dir_as_manifest = root.join("repos/dir_repo/manifests").join(hex);
             std::fs::create_dir_all(&dir_as_manifest).unwrap();
 
-            let err = get_manifest_seam(&reader, "dir_repo", &digest)
+            let err = get_manifest_impl(&reader, "dir_repo", &digest)
                 .await
                 .unwrap_err();
             match err {
@@ -1047,7 +1013,7 @@ mod tests {
             write_manifest_file(&root, "pinned_repo", hex, content_b);
 
             // Seam read through pinned reader must observe content A from renamed directory!
-            let (meta, payload) = get_manifest_seam(&reader, "pinned_repo", &digest)
+            let (meta, payload) = get_manifest_impl(&reader, "pinned_repo", &digest)
                 .await
                 .expect("seam read succeeds via pinned root");
             assert_eq!(meta.media_type, "application/vnd.manifest.a+json");
@@ -1106,7 +1072,7 @@ mod tests {
                     panic!("ineffective permissions: read succeeded under mode 0o000");
                 }
 
-                let err = get_manifest_seam(&reader, "perm_repo", &digest)
+                let err = get_manifest_impl(&reader, "perm_repo", &digest)
                     .await
                     .unwrap_err();
                 match err {

@@ -4134,8 +4134,6 @@ async fn test_manifest_read_unvalidated_caller_path_traversal_gap() {
     let digest = Digest::parse(&format!("sha256:{hex}")).expect("valid digest");
 
     // Construct a path that escapes root/repos via dot-dot traversal
-    // In legacy code: root.join("repos").join("../../escaped_repo").join("manifests").join(hex)
-    // resolves to fixture.path().join("escaped_repo/manifests/<hex>")
     let repos_dir = root.join("repos");
     std::fs::create_dir_all(&repos_dir).expect("create repos dir");
     let escaped_target_dir = fixture.path().join("escaped_repo").join("manifests");
@@ -4145,29 +4143,109 @@ async fn test_manifest_read_unvalidated_caller_path_traversal_gap() {
 
     let traversal_repo_input = "../../escaped_repo";
 
-    // Legacy behavior: manifest_path does unvalidated Path::join, allowing escape if target file exists!
-    let legacy_head_res = storage.head_manifest(traversal_repo_input, &digest).await;
+    // Contained production behavior: manifest_key strictly rejects dot-dot segments with InvalidRepoName
+    let head_res = storage.head_manifest(traversal_repo_input, &digest).await;
     assert!(
-        legacy_head_res.is_ok(),
-        "Legacy manifest_path unvalidated join allows path traversal escape: {legacy_head_res:?}"
+        matches!(head_res, Err(StorageError::InvalidRepoName(_))),
+        "head_manifest must reject '..' traversal with InvalidRepoName: got {head_res:?}"
     );
 
-    let legacy_get_res = storage.get_manifest(traversal_repo_input, &digest).await;
+    let get_res = storage.get_manifest(traversal_repo_input, &digest).await;
     assert!(
-        legacy_get_res.is_ok(),
-        "Legacy manifest_path unvalidated join allows get_manifest traversal escape"
+        matches!(get_res, Err(StorageError::InvalidRepoName(_))),
+        "get_manifest must reject '..' traversal with InvalidRepoName: got {get_res:?}"
     );
 
-    // Proposed relative ObjectKey: strictly rejects dot-dot segments
-    let proposed_key_str = format!("repos/{traversal_repo_input}/manifests/{hex}");
-    let key_res = storage_core::ObjectKey::parse(&proposed_key_str);
+    // Also verify that ManifestReader port forwarding rejects '..' traversal with InvalidRepoName
+    let port_head_res = <FsStorage as crate::storage::ports::ManifestReader>::head_manifest(
+        &storage,
+        traversal_repo_input,
+        &digest,
+    )
+    .await;
     assert!(
-        matches!(
-            key_res,
-            Err(storage_core::error::ObjectKeyError::DotDotSegment)
-        ),
-        "Proposed ObjectKey must reject dot-dot traversal: got {key_res:?}"
+        matches!(port_head_res, Err(StorageError::InvalidRepoName(_))),
+        "ManifestReader::head_manifest must reject '..' traversal with InvalidRepoName: got {port_head_res:?}"
     );
+
+    let port_get_res = <FsStorage as crate::storage::ports::ManifestReader>::get_manifest(
+        &storage,
+        traversal_repo_input,
+        &digest,
+    )
+    .await;
+    assert!(
+        matches!(port_get_res, Err(StorageError::InvalidRepoName(_))),
+        "ManifestReader::get_manifest must reject '..' traversal with InvalidRepoName: got {port_get_res:?}"
+    );
+
+    // Focused production-path checks for pre-composition rejection cases:
+    let unsafe_repo_inputs = &[
+        ("", "empty repository name"),
+        ("/leading_slash", "leading slash"),
+        ("trailing_slash/", "trailing slash"),
+        ("back\\slash", "backslash"),
+        ("repo\0nul", "embedded NUL"),
+        ("repo\x1fcontrol", "ASCII control character"),
+        ("double//slash", "repeated slashes"),
+        ("dot/./segment", "single dot segment"),
+    ];
+
+    for (unsafe_repo, desc) in unsafe_repo_inputs {
+        let head_err = storage
+            .head_manifest(unsafe_repo, &digest)
+            .await
+            .expect_err(&format!("head_manifest must reject {desc}"));
+        assert!(
+            matches!(head_err, StorageError::InvalidRepoName(_)),
+            "head_manifest must return InvalidRepoName for {desc}: got {head_err:?}"
+        );
+
+        let get_err = storage
+            .get_manifest(unsafe_repo, &digest)
+            .await
+            .expect_err(&format!("get_manifest must reject {desc}"));
+        assert!(
+            matches!(get_err, StorageError::InvalidRepoName(_)),
+            "get_manifest must return InvalidRepoName for {desc}: got {get_err:?}"
+        );
+    }
+
+    // Preserved acceptance of C:/repo on Linux:
+    // When repo is "C:/repo", manifest_key composes "repos/C:/repo/manifests/<hex>".
+    // On Linux, this is a valid relative path with a colon-bearing segment.
+    #[cfg(target_os = "linux")]
+    {
+        // 1. Missing C:/repo manifests returns NotFound, proving manifest_key accepted it
+        let missing_digest = Digest::parse(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("valid digest");
+        let missing_c_head = storage.head_manifest("C:/repo", &missing_digest).await;
+        assert!(
+            matches!(missing_c_head, Err(StorageError::NotFound)),
+            "head_manifest for non-existent C:/repo must return NotFound on Linux (not InvalidRepoName): got {missing_c_head:?}"
+        );
+
+        // 2. Existing C:/repo manifest succeeds and reads content
+        put_manifest_file(&root, "C:/repo", &hex, manifest_bytes);
+        let c_head = storage
+            .head_manifest("C:/repo", &digest)
+            .await
+            .expect("head_manifest for C:/repo must succeed on Linux");
+        assert_eq!(c_head.size, manifest_bytes.len() as u64);
+        assert_eq!(
+            c_head.media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+
+        let (c_get_meta, c_payload) = storage
+            .get_manifest("C:/repo", &digest)
+            .await
+            .expect("get_manifest for C:/repo must succeed on Linux");
+        assert_eq!(c_get_meta, c_head);
+        assert_eq!(c_payload.as_ref(), manifest_bytes);
+    }
 }
 
 #[tokio::test]
@@ -4196,17 +4274,29 @@ async fn test_manifest_read_containment_symlink_traversal() {
     let symlink_file = manifests_dir.join(&hex);
     symlink(&outside_file, &symlink_file).expect("create symlink to outside file");
 
-    // Legacy behavior: tokio::fs::read follows the symlink outside root
+    // Contained behavior: openat2 resolution rejection fails closed with StorageErrorKind::Io
     let head_sym_outside = storage.head_manifest(repo, &digest).await;
-    assert!(
-        head_sym_outside.is_ok(),
-        "Legacy head_manifest follows symlinks outside root"
-    );
+    match head_sym_outside {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "External symlink must be rejected with StorageErrorKind::Io"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for external symlink, got {other:?}"),
+    }
     let get_sym_outside = storage.get_manifest(repo, &digest).await;
-    assert!(
-        get_sym_outside.is_ok(),
-        "Legacy get_manifest follows symlinks outside root"
-    );
+    match get_sym_outside {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "External symlink must be rejected with StorageErrorKind::Io"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for external symlink, got {other:?}"),
+    }
 
     // Scenario 2: Manifest file is a symlink pointing inside storage root
     std::fs::remove_file(&symlink_file).expect("remove symlink 1");
@@ -4215,9 +4305,27 @@ async fn test_manifest_read_containment_symlink_traversal() {
     symlink(&inside_target, &symlink_file).expect("create symlink inside root");
 
     let head_sym_inside = storage.head_manifest(repo, &digest).await;
-    assert!(head_sym_inside.is_ok());
+    match head_sym_inside {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "Internal symlink must be rejected with StorageErrorKind::Io"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for internal symlink, got {other:?}"),
+    }
     let get_sym_inside = storage.get_manifest(repo, &digest).await;
-    assert!(get_sym_inside.is_ok());
+    match get_sym_inside {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "Internal symlink must be rejected with StorageErrorKind::Io"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for internal symlink, got {other:?}"),
+    }
 
     // Scenario 3: Intermediate manifests directory is a symlink to an outside directory
     let repo_outside_manifests = root.join("repos").join("repo_sym_dir");
@@ -4231,31 +4339,132 @@ async fn test_manifest_read_containment_symlink_traversal() {
     symlink(&outside_manifests_dir, &symlink_manifests_dir).expect("symlink manifests dir");
 
     let head_dir_sym = storage.head_manifest("repo_sym_dir", &digest).await;
-    assert!(
-        head_dir_sym.is_ok(),
-        "Legacy head_manifest traverses intermediate directory symlink outside root"
-    );
+    match head_dir_sym {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "Ancestor directory symlink must be rejected with StorageErrorKind::Io"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for ancestor symlink, got {other:?}"),
+    }
     let get_dir_sym = storage.get_manifest("repo_sym_dir", &digest).await;
-    assert!(
-        get_dir_sym.is_ok(),
-        "Legacy get_manifest traverses intermediate directory symlink outside root"
-    );
+    match get_dir_sym {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "Ancestor directory symlink must be rejected with StorageErrorKind::Io"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for ancestor symlink, got {other:?}"),
+    }
 
-    // Scenario 4: Dangling symlink fails with NotFound
+    // Scenario 4: Dangling symlink fails closed with Io (openat2 resolution rejection overrides NotFound)
     std::fs::remove_file(&symlink_file).expect("remove symlink");
     let nonexistent_target = root.join("nonexistent_target_file");
     symlink(&nonexistent_target, &symlink_file).expect("create dangling symlink");
 
     let head_dangling = storage.head_manifest(repo, &digest).await;
-    assert!(
-        matches!(head_dangling, Err(StorageError::NotFound)),
-        "Dangling symlink produces ENOENT which maps to NotFound: got {head_dangling:?}"
-    );
+    match head_dangling {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "Dangling symlink must produce StorageErrorKind::Io (ResolutionRejected overrides NotFound)"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for dangling symlink, got {other:?}"),
+    }
     let get_dangling = storage.get_manifest(repo, &digest).await;
+    match get_dangling {
+        Err(StorageError::Internal { kind, .. }) => {
+            assert_eq!(
+                kind,
+                StorageErrorKind::Io,
+                "Dangling symlink must produce StorageErrorKind::Io (ResolutionRejected overrides NotFound)"
+            );
+        }
+        other => panic!("expected StorageErrorKind::Io for dangling symlink, got {other:?}"),
+    }
+
+    // Genuine missing paths (without a rejected symlink) remain NotFound:
+    let missing_digest =
+        Digest::parse("sha256:baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("valid digest");
+    let genuine_missing_head = storage.head_manifest(repo, &missing_digest).await;
     assert!(
-        matches!(get_dangling, Err(StorageError::NotFound)),
-        "Dangling symlink produces ENOENT which maps to NotFound: got {get_dangling:?}"
+        matches!(genuine_missing_head, Err(StorageError::NotFound)),
+        "Genuine missing path must return NotFound: got {genuine_missing_head:?}"
     );
+    let genuine_missing_get = storage.get_manifest(repo, &missing_digest).await;
+    assert!(
+        matches!(genuine_missing_get, Err(StorageError::NotFound)),
+        "Genuine missing path must return NotFound: got {genuine_missing_get:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_manifest_read_production_pinned_root_across_rename() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let renamed_root = fixture.path().join("storage-root-renamed");
+
+    let repo = "pinned_repo";
+    let content_a = br#"{"schemaVersion": 2, "mediaType": "application/vnd.manifest.a+json"}"#;
+    let hex_a = hex_sha256(content_a);
+    let digest_a = Digest::parse(&format!("sha256:{hex_a}")).expect("valid digest");
+
+    // Put manifest A in root before storage initialization
+    put_manifest_file(&root, repo, &hex_a, content_a);
+
+    // Initialize production FsStorage (opens shared reader pinned to root descriptor)
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Rename root to renamed_root
+    std::fs::rename(&root, &renamed_root).expect("rename storage root");
+
+    // Recreate the old pathname with distinguishable content B under the same repo & digest
+    let content_b = br#"{"schemaVersion": 2, "mediaType": "application/vnd.manifest.b+json"}"#;
+    put_manifest_file(&root, repo, &hex_a, content_b);
+
+    // 1. Production head_manifest must observe content A via pinned reader
+    let head_meta = storage
+        .head_manifest(repo, &digest_a)
+        .await
+        .expect("head_manifest succeeds through pinned reader");
+    assert_eq!(head_meta.media_type, "application/vnd.manifest.a+json");
+    assert_eq!(head_meta.size, content_a.len() as u64);
+
+    // 2. Production get_manifest must observe content A bytes via pinned reader
+    let (get_meta, payload) = storage
+        .get_manifest(repo, &digest_a)
+        .await
+        .expect("get_manifest succeeds through pinned reader");
+    assert_eq!(get_meta.media_type, "application/vnd.manifest.a+json");
+    assert_eq!(get_meta.size, content_a.len() as u64);
+    assert_eq!(payload.as_ref(), content_a);
+
+    // 3. Port forwarding through ManifestReader must also observe content A
+    let port_head_meta = <FsStorage as crate::storage::ports::ManifestReader>::head_manifest(
+        &storage, repo, &digest_a,
+    )
+    .await
+    .expect("port head_manifest succeeds through pinned reader");
+    assert_eq!(port_head_meta.media_type, "application/vnd.manifest.a+json");
+    assert_eq!(port_head_meta.size, content_a.len() as u64);
+
+    let (port_get_meta, port_payload) =
+        <FsStorage as crate::storage::ports::ManifestReader>::get_manifest(
+            &storage, repo, &digest_a,
+        )
+        .await
+        .expect("port get_manifest succeeds through pinned reader");
+    assert_eq!(port_get_meta.media_type, "application/vnd.manifest.a+json");
+    assert_eq!(port_get_meta.size, content_a.len() as u64);
+    assert_eq!(port_payload.as_ref(), content_a);
 }
 
 #[tokio::test]

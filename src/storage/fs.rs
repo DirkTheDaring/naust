@@ -484,13 +484,7 @@ impl FsStorage {
     }
 
     async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|err| StorageError::corrupt_data(err.to_string()))?;
-        let media_type = value
-            .get("mediaType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("application/vnd.oci.image.manifest.v1+json");
-        Ok(media_type.to_string())
+        manifest::detect_manifest_media_type(bytes)
     }
 
     async fn list_tag_files(&self, name: &str) -> Result<Vec<PathBuf>, StorageError> {
@@ -841,19 +835,7 @@ impl Storage for FsStorage {
         name: &str,
         digest: &Digest,
     ) -> Result<ManifestMeta, StorageError> {
-        let path = self.manifest_path(name, digest);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        let media_type = self.detect_manifest_media_type(&bytes).await?;
-        Ok(ManifestMeta {
-            size: bytes.len() as u64,
-            media_type,
-        })
+        manifest::head_manifest_impl(self.reader.as_ref(), name, digest).await
     }
 
     async fn get_manifest(
@@ -861,20 +843,7 @@ impl Storage for FsStorage {
         name: &str,
         digest: &Digest,
     ) -> Result<(ManifestMeta, bytes::Bytes), StorageError> {
-        let path = self.manifest_path(name, digest);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        let media_type = self.detect_manifest_media_type(&bytes).await?;
-        let meta = ManifestMeta {
-            size: bytes.len() as u64,
-            media_type,
-        };
-        Ok((meta, bytes::Bytes::from(bytes)))
+        manifest::get_manifest_impl(self.reader.as_ref(), name, digest).await
     }
 
     async fn put_manifest(
@@ -3593,6 +3562,5 @@ mod payload_seam;
 #[path = "fs/listing.rs"]
 pub(crate) mod listing;
 
-#[cfg(test)]
-#[path = "fs/manifest_seam.rs"]
-mod manifest_seam;
+#[path = "fs/manifest.rs"]
+pub(crate) mod manifest;
