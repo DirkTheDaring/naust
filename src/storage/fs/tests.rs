@@ -3694,3 +3694,674 @@ async fn test_cas_blob_traverser_over_real_fs_storage() {
     drop(storage);
     drop(fixture);
 }
+
+// --- Filesystem Manifest Read Characterization Tests (head_manifest & get_manifest) ---
+
+fn put_manifest_file(root: &Path, repo: &str, hex: &str, content: &[u8]) {
+    let path = root.join("repos").join(repo).join("manifests").join(hex);
+    write_file(&path, content);
+}
+
+#[tokio::test]
+async fn test_manifest_read_representative_valid_oci_manifest() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let repo = "testrepo";
+    let manifest_bytes = br#"{
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "size": 0
+        },
+        "layers": []
+    }"#;
+    let hex = hex_sha256(manifest_bytes);
+    let digest = Digest::parse(&format!("sha256:{hex}")).expect("valid digest");
+    put_manifest_file(&root, repo, &hex, manifest_bytes);
+
+    // 1. Characterize head_manifest via Storage
+    let meta = storage
+        .head_manifest(repo, &digest)
+        .await
+        .expect("head_manifest must succeed for valid manifest");
+    assert_eq!(meta.size, manifest_bytes.len() as u64);
+    assert_eq!(
+        meta.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+
+    // 2. Characterize get_manifest via Storage
+    let (get_meta, payload) = storage
+        .get_manifest(repo, &digest)
+        .await
+        .expect("get_manifest must succeed for valid manifest");
+    assert_eq!(get_meta.size, manifest_bytes.len() as u64);
+    assert_eq!(
+        get_meta.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+    assert_eq!(get_meta, meta);
+    assert_eq!(payload.as_ref(), manifest_bytes);
+    assert_eq!(payload.len() as u64, get_meta.size);
+
+    // 3. Characterize identical behavior through ManifestReader port trait
+    let port_meta = <FsStorage as crate::storage::ports::ManifestReader>::head_manifest(
+        &storage, repo, &digest,
+    )
+    .await
+    .expect("ManifestReader::head_manifest must succeed");
+    assert_eq!(port_meta, meta);
+
+    let (port_get_meta, port_payload) =
+        <FsStorage as crate::storage::ports::ManifestReader>::get_manifest(&storage, repo, &digest)
+            .await
+            .expect("ManifestReader::get_manifest must succeed");
+    assert_eq!(port_get_meta, meta);
+    assert_eq!(port_payload, payload);
+}
+
+#[tokio::test]
+async fn test_manifest_read_media_type_detection_variants() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "testrepo";
+
+    // Variant 1: Explicit custom mediaType string
+    let custom_json =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.custom.manifest.v1+json"}"#;
+    let hex1 = hex_sha256(custom_json);
+    let d1 = Digest::parse(&format!("sha256:{hex1}")).expect("digest 1");
+    put_manifest_file(&root, repo, &hex1, custom_json);
+
+    let meta1 = storage.head_manifest(repo, &d1).await.unwrap();
+    assert_eq!(meta1.media_type, "application/vnd.custom.manifest.v1+json");
+    let (get_meta1, _) = storage.get_manifest(repo, &d1).await.unwrap();
+    assert_eq!(
+        get_meta1.media_type,
+        "application/vnd.custom.manifest.v1+json"
+    );
+
+    // Variant 2: Missing mediaType field in valid JSON object -> falls back to OCI manifest default
+    let missing_media_json = br#"{"schemaVersion": 2, "layers": []}"#;
+    let hex2 = hex_sha256(missing_media_json);
+    let d2 = Digest::parse(&format!("sha256:{hex2}")).expect("digest 2");
+    put_manifest_file(&root, repo, &hex2, missing_media_json);
+
+    let meta2 = storage.head_manifest(repo, &d2).await.unwrap();
+    assert_eq!(
+        meta2.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+    let (get_meta2, _) = storage.get_manifest(repo, &d2).await.unwrap();
+    assert_eq!(
+        get_meta2.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+
+    // Variant 3: Non-string mediaType value (e.g. integer 42) -> falls back to OCI default
+    let non_string_json = br#"{"schemaVersion": 2, "mediaType": 42}"#;
+    let hex3 = hex_sha256(non_string_json);
+    let d3 = Digest::parse(&format!("sha256:{hex3}")).expect("digest 3");
+    put_manifest_file(&root, repo, &hex3, non_string_json);
+
+    let meta3 = storage.head_manifest(repo, &d3).await.unwrap();
+    assert_eq!(
+        meta3.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+    let (get_meta3, _) = storage.get_manifest(repo, &d3).await.unwrap();
+    assert_eq!(
+        get_meta3.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+
+    // Variant 4: Valid JSON but not an object (e.g. top-level string or array) -> falls back to OCI default without error
+    let scalar_json = br#""just a json string""#;
+    let hex4 = hex_sha256(scalar_json);
+    let d4 = Digest::parse(&format!("sha256:{hex4}")).expect("digest 4");
+    put_manifest_file(&root, repo, &hex4, scalar_json);
+
+    let meta4 = storage.head_manifest(repo, &d4).await.unwrap();
+    assert_eq!(
+        meta4.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+    let (get_meta4, payload4) = storage.get_manifest(repo, &d4).await.unwrap();
+    assert_eq!(
+        get_meta4.media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+    assert_eq!(payload4.as_ref(), scalar_json);
+}
+
+#[tokio::test]
+async fn test_manifest_read_empty_and_malformed_payloads_classify_as_corrupt_data() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "testrepo";
+
+    // Case 1: Empty file (0 bytes) -> serde_json EOF error classified as CorruptData
+    let empty_bytes = b"";
+    let hex_empty = hex_sha256(empty_bytes);
+    let d_empty = Digest::parse(&format!("sha256:{hex_empty}")).expect("digest empty");
+    put_manifest_file(&root, repo, &hex_empty, empty_bytes);
+
+    let head_err1 = storage.head_manifest(repo, &d_empty).await.unwrap_err();
+    match head_err1 {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected StorageErrorKind::CorruptData for empty payload, got: {other:?}"),
+    }
+
+    let get_err1 = storage.get_manifest(repo, &d_empty).await.unwrap_err();
+    match get_err1 {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected StorageErrorKind::CorruptData for empty payload, got: {other:?}"),
+    }
+
+    // Case 2: Malformed non-JSON payload -> classified as CorruptData
+    let malformed_bytes = b"<html><head><title>502 Bad Gateway</title></head></html>";
+    let hex_malformed = hex_sha256(malformed_bytes);
+    let d_malformed = Digest::parse(&format!("sha256:{hex_malformed}")).expect("digest malformed");
+    put_manifest_file(&root, repo, &hex_malformed, malformed_bytes);
+
+    let head_err2 = storage.head_manifest(repo, &d_malformed).await.unwrap_err();
+    match head_err2 {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => {
+            panic!("expected StorageErrorKind::CorruptData for malformed json, got: {other:?}")
+        }
+    }
+
+    let get_err2 = storage.get_manifest(repo, &d_malformed).await.unwrap_err();
+    match get_err2 {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => {
+            panic!("expected StorageErrorKind::CorruptData for malformed json, got: {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_manifest_read_missing_paths_return_not_found() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .expect("valid digest");
+
+    // Case 1: Entire repository directory absent
+    let err_missing_repo_head = storage
+        .head_manifest("nonexistent_repo", &digest)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing_repo_head, StorageError::NotFound));
+
+    let err_missing_repo_get = storage
+        .get_manifest("nonexistent_repo", &digest)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing_repo_get, StorageError::NotFound));
+
+    // Case 2: Repository directory exists, but manifests/ subdirectory is absent
+    let repo_dir = root.join("repos").join("existing_repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+    let err_missing_manifests_head = storage
+        .head_manifest("existing_repo", &digest)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing_manifests_head, StorageError::NotFound));
+
+    let err_missing_manifests_get = storage
+        .get_manifest("existing_repo", &digest)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing_manifests_get, StorageError::NotFound));
+
+    // Case 3: manifests/ directory exists, but the manifest digest file is absent
+    let manifests_dir = repo_dir.join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    let err_missing_file_head = storage
+        .head_manifest("existing_repo", &digest)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing_file_head, StorageError::NotFound));
+
+    let err_missing_file_get = storage
+        .get_manifest("existing_repo", &digest)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing_file_get, StorageError::NotFound));
+}
+
+#[tokio::test]
+async fn test_manifest_read_nondirectory_components_return_io() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let digest =
+        Digest::parse("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .expect("valid digest");
+
+    // Case 1: Repository component is a regular file instead of a directory
+    let repos_dir = root.join("repos");
+    std::fs::create_dir_all(&repos_dir).expect("create repos dir");
+    let repo_file = repos_dir.join("file_repo");
+    write_file(&repo_file, b"not a dir");
+
+    let err_repo_file_head = storage
+        .head_manifest("file_repo", &digest)
+        .await
+        .unwrap_err();
+    match err_repo_file_head {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!("expected StorageErrorKind::Io for ENOTDIR on repo, got: {other:?}"),
+    }
+    let err_repo_file_get = storage
+        .get_manifest("file_repo", &digest)
+        .await
+        .unwrap_err();
+    match err_repo_file_get {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!("expected StorageErrorKind::Io for ENOTDIR on repo, got: {other:?}"),
+    }
+
+    // Case 2: manifests component is a regular file instead of a directory
+    let repo2_dir = repos_dir.join("repo_with_file_manifests");
+    std::fs::create_dir_all(&repo2_dir).expect("create repo2 dir");
+    let manifests_file = repo2_dir.join("manifests");
+    write_file(&manifests_file, b"not a dir");
+
+    let err_manifests_file_head = storage
+        .head_manifest("repo_with_file_manifests", &digest)
+        .await
+        .unwrap_err();
+    match err_manifests_file_head {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for ENOTDIR on manifests dir, got: {other:?}")
+        }
+    }
+    let err_manifests_file_get = storage
+        .get_manifest("repo_with_file_manifests", &digest)
+        .await
+        .unwrap_err();
+    match err_manifests_file_get {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for ENOTDIR on manifests dir, got: {other:?}")
+        }
+    }
+
+    // Case 3: Target manifest path is a directory instead of a regular file
+    let repo3_manifests = repos_dir.join("repo3").join("manifests");
+    std::fs::create_dir_all(&repo3_manifests).expect("create repo3 manifests dir");
+    let target_as_dir = repo3_manifests.join(digest.hex());
+    std::fs::create_dir_all(&target_as_dir).expect("create dir at manifest path");
+
+    let err_target_dir_head = storage.head_manifest("repo3", &digest).await.unwrap_err();
+    match err_target_dir_head {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!("expected StorageErrorKind::Io for directory-as-manifest, got: {other:?}"),
+    }
+    let err_target_dir_get = storage.get_manifest("repo3", &digest).await.unwrap_err();
+    match err_target_dir_get {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!("expected StorageErrorKind::Io for directory-as-manifest, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_manifest_read_repository_naming_single_and_multisegment() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+    let hex = hex_sha256(manifest_bytes);
+    let digest = Digest::parse(&format!("sha256:{hex}")).expect("valid digest");
+
+    let test_repos = [
+        "alpine",
+        "library/ubuntu",
+        "org/team/sub/service",
+        "a/b/c/d/e",
+    ];
+
+    for repo in &test_repos {
+        put_manifest_file(&root, repo, &hex, manifest_bytes);
+
+        // Verify head_manifest and get_manifest succeed
+        let head_res = storage.head_manifest(repo, &digest).await;
+        assert!(
+            head_res.is_ok(),
+            "head_manifest failed for repo '{repo}': {head_res:?}"
+        );
+
+        let get_res = storage.get_manifest(repo, &digest).await;
+        assert!(
+            get_res.is_ok(),
+            "get_manifest failed for repo '{repo}': {get_res:?}"
+        );
+
+        // Compare with proposed relative ObjectKey representation
+        let key_str = format!("repos/{repo}/manifests/{hex}");
+        let obj_key = storage_core::ObjectKey::parse(&key_str);
+        assert!(
+            obj_key.is_ok(),
+            "ObjectKey::parse failed for '{key_str}': {obj_key:?}"
+        );
+        assert_eq!(obj_key.unwrap().as_str(), key_str);
+    }
+}
+
+#[tokio::test]
+async fn test_manifest_read_supported_digest_algorithms_and_filename_forms() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = "algo_repo";
+
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+
+    // 1. SHA-256 (64-char hex)
+    let hex256 = hex_sha256(manifest_bytes);
+    assert_eq!(hex256.len(), 64);
+    let d256 = Digest::parse(&format!("sha256:{hex256}")).expect("valid sha256");
+    put_manifest_file(&root, repo, &hex256, manifest_bytes);
+
+    let head256 = storage
+        .head_manifest(repo, &d256)
+        .await
+        .expect("head sha256");
+    assert_eq!(head256.size, manifest_bytes.len() as u64);
+    let (get256, _) = storage.get_manifest(repo, &d256).await.expect("get sha256");
+    assert_eq!(get256.size, manifest_bytes.len() as u64);
+
+    // 2. SHA-512 (128-char hex)
+    use sha2::Digest as ShaDigest;
+    let mut hasher512 = sha2::Sha512::new();
+    hasher512.update(manifest_bytes);
+    let hex512 = hex::encode(hasher512.finalize());
+    assert_eq!(hex512.len(), 128);
+    let d512 = Digest::parse(&format!("sha512:{hex512}")).expect("valid sha512");
+    put_manifest_file(&root, repo, &hex512, manifest_bytes);
+
+    let head512 = storage
+        .head_manifest(repo, &d512)
+        .await
+        .expect("head sha512");
+    assert_eq!(head512.size, manifest_bytes.len() as u64);
+    let (get512, _) = storage.get_manifest(repo, &d512).await.expect("get sha512");
+    assert_eq!(get512.size, manifest_bytes.len() as u64);
+
+    // Filename form invariant: raw hex string in manifests/ directory without algorithm prefix
+    let path256 = root
+        .join("repos")
+        .join(repo)
+        .join("manifests")
+        .join(&hex256);
+    let path512 = root
+        .join("repos")
+        .join(repo)
+        .join("manifests")
+        .join(&hex512);
+    assert!(path256.is_file());
+    assert!(path512.is_file());
+}
+
+#[tokio::test]
+async fn test_manifest_read_unvalidated_caller_path_traversal_gap() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+    let hex = hex_sha256(manifest_bytes);
+    let digest = Digest::parse(&format!("sha256:{hex}")).expect("valid digest");
+
+    // Construct a path that escapes root/repos via dot-dot traversal
+    // In legacy code: root.join("repos").join("../../escaped_repo").join("manifests").join(hex)
+    // resolves to fixture.path().join("escaped_repo/manifests/<hex>")
+    let repos_dir = root.join("repos");
+    std::fs::create_dir_all(&repos_dir).expect("create repos dir");
+    let escaped_target_dir = fixture.path().join("escaped_repo").join("manifests");
+    std::fs::create_dir_all(&escaped_target_dir).expect("create escaped dir");
+    let escaped_file = escaped_target_dir.join(&hex);
+    write_file(&escaped_file, manifest_bytes);
+
+    let traversal_repo_input = "../../escaped_repo";
+
+    // Legacy behavior: manifest_path does unvalidated Path::join, allowing escape if target file exists!
+    let legacy_head_res = storage.head_manifest(traversal_repo_input, &digest).await;
+    assert!(
+        legacy_head_res.is_ok(),
+        "Legacy manifest_path unvalidated join allows path traversal escape: {legacy_head_res:?}"
+    );
+
+    let legacy_get_res = storage.get_manifest(traversal_repo_input, &digest).await;
+    assert!(
+        legacy_get_res.is_ok(),
+        "Legacy manifest_path unvalidated join allows get_manifest traversal escape"
+    );
+
+    // Proposed relative ObjectKey: strictly rejects dot-dot segments
+    let proposed_key_str = format!("repos/{traversal_repo_input}/manifests/{hex}");
+    let key_res = storage_core::ObjectKey::parse(&proposed_key_str);
+    assert!(
+        matches!(
+            key_res,
+            Err(storage_core::error::ObjectKeyError::DotDotSegment)
+        ),
+        "Proposed ObjectKey must reject dot-dot traversal: got {key_res:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_manifest_read_containment_symlink_traversal() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let outside = fixture.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let repo = "symlink_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+    let hex = hex_sha256(manifest_bytes);
+    let digest = Digest::parse(&format!("sha256:{hex}")).expect("valid digest");
+
+    // Scenario 1: Manifest file is a symlink pointing to an outside file
+    let outside_file = outside.join("external_manifest.json");
+    write_file(&outside_file, manifest_bytes);
+    let symlink_file = manifests_dir.join(&hex);
+    symlink(&outside_file, &symlink_file).expect("create symlink to outside file");
+
+    // Legacy behavior: tokio::fs::read follows the symlink outside root
+    let head_sym_outside = storage.head_manifest(repo, &digest).await;
+    assert!(
+        head_sym_outside.is_ok(),
+        "Legacy head_manifest follows symlinks outside root"
+    );
+    let get_sym_outside = storage.get_manifest(repo, &digest).await;
+    assert!(
+        get_sym_outside.is_ok(),
+        "Legacy get_manifest follows symlinks outside root"
+    );
+
+    // Scenario 2: Manifest file is a symlink pointing inside storage root
+    std::fs::remove_file(&symlink_file).expect("remove symlink 1");
+    let inside_target = root.join("repos").join(repo).join("inside_target.json");
+    write_file(&inside_target, manifest_bytes);
+    symlink(&inside_target, &symlink_file).expect("create symlink inside root");
+
+    let head_sym_inside = storage.head_manifest(repo, &digest).await;
+    assert!(head_sym_inside.is_ok());
+    let get_sym_inside = storage.get_manifest(repo, &digest).await;
+    assert!(get_sym_inside.is_ok());
+
+    // Scenario 3: Intermediate manifests directory is a symlink to an outside directory
+    let repo_outside_manifests = root.join("repos").join("repo_sym_dir");
+    std::fs::create_dir_all(&repo_outside_manifests).expect("create repo_sym_dir");
+    let outside_manifests_dir = outside.join("manifests_store");
+    std::fs::create_dir_all(&outside_manifests_dir).expect("create outside manifests store");
+    let outside_manifest_file = outside_manifests_dir.join(&hex);
+    write_file(&outside_manifest_file, manifest_bytes);
+
+    let symlink_manifests_dir = repo_outside_manifests.join("manifests");
+    symlink(&outside_manifests_dir, &symlink_manifests_dir).expect("symlink manifests dir");
+
+    let head_dir_sym = storage.head_manifest("repo_sym_dir", &digest).await;
+    assert!(
+        head_dir_sym.is_ok(),
+        "Legacy head_manifest traverses intermediate directory symlink outside root"
+    );
+    let get_dir_sym = storage.get_manifest("repo_sym_dir", &digest).await;
+    assert!(
+        get_dir_sym.is_ok(),
+        "Legacy get_manifest traverses intermediate directory symlink outside root"
+    );
+
+    // Scenario 4: Dangling symlink fails with NotFound
+    std::fs::remove_file(&symlink_file).expect("remove symlink");
+    let nonexistent_target = root.join("nonexistent_target_file");
+    symlink(&nonexistent_target, &symlink_file).expect("create dangling symlink");
+
+    let head_dangling = storage.head_manifest(repo, &digest).await;
+    assert!(
+        matches!(head_dangling, Err(StorageError::NotFound)),
+        "Dangling symlink produces ENOENT which maps to NotFound: got {head_dangling:?}"
+    );
+    let get_dangling = storage.get_manifest(repo, &digest).await;
+    assert!(
+        matches!(get_dangling, Err(StorageError::NotFound)),
+        "Dangling symlink produces ENOENT which maps to NotFound: got {get_dangling:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_manifest_read_permission_denied_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let repo = "perm_repo";
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+    let hex = hex_sha256(manifest_bytes);
+    let digest = Digest::parse(&format!("sha256:{hex}")).expect("valid digest");
+    put_manifest_file(&root, repo, &hex, manifest_bytes);
+
+    let manifest_path = root.join("repos").join(repo).join("manifests").join(&hex);
+    let orig_perms = std::fs::metadata(&manifest_path)
+        .expect("metadata")
+        .permissions();
+
+    struct ScopedPermReset<'a> {
+        path: &'a Path,
+        original_permissions: std::fs::Permissions,
+    }
+
+    impl<'a> Drop for ScopedPermReset<'a> {
+        fn drop(&mut self) {
+            if let Err(err) = std::fs::set_permissions(self.path, self.original_permissions.clone())
+            {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "ScopedPermReset: failed to restore permissions on {:?} during unwinding: {err}",
+                        self.path
+                    );
+                } else {
+                    panic!(
+                        "ScopedPermReset: failed to restore permissions on {:?}: {err}",
+                        self.path
+                    );
+                }
+            }
+        }
+    }
+
+    {
+        // Install guard BEFORE permissions are restricted
+        let _guard = ScopedPermReset {
+            path: &manifest_path,
+            original_permissions: orig_perms.clone(),
+        };
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000))
+            .expect("set mode 0o000");
+
+        // Fail fast if permissions are ineffective (e.g. running under root UID 0)
+        if std::fs::read(&manifest_path).is_ok() {
+            panic!("ineffective permissions: std::fs::read succeeded under mode 0o000");
+        }
+
+        let head_err = storage.head_manifest(repo, &digest).await.unwrap_err();
+        match head_err {
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(
+                    kind,
+                    StorageErrorKind::Io,
+                    "PermissionDenied maps to StorageErrorKind::Io"
+                );
+            }
+            StorageError::NotFound => panic!("Permission denied must NOT map to NotFound"),
+            other => panic!("expected StorageErrorKind::Io, got: {other:?}"),
+        }
+
+        let get_err = storage.get_manifest(repo, &digest).await.unwrap_err();
+        match get_err {
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(
+                    kind,
+                    StorageErrorKind::Io,
+                    "PermissionDenied maps to StorageErrorKind::Io"
+                );
+            }
+            StorageError::NotFound => panic!("Permission denied must NOT map to NotFound"),
+            other => panic!("expected StorageErrorKind::Io, got: {other:?}"),
+        }
+    }
+
+    // On normal path, verify restored permissions against saved original permissions
+    let restored_perms = std::fs::metadata(&manifest_path)
+        .expect("metadata after permission restore")
+        .permissions();
+    assert_eq!(
+        restored_perms.mode(),
+        orig_perms.mode(),
+        "restored permission bits must match saved original permissions"
+    );
+    assert!(
+        std::fs::read(&manifest_path).is_ok(),
+        "permissions must be restored and file readable after guard drop"
+    );
+
+    // Drop storage handles before checking fixture cleanup
+    drop(storage);
+    fixture
+        .close()
+        .expect("fixture directory close must succeed");
+}
