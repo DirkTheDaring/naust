@@ -1,13 +1,11 @@
-//! Test-only contained manifest-reference collection seam for filesystem GC.
+//! Contained manifest-reference collection for filesystem GC.
 //!
-//! # Experimental Scope and Authorization
+//! # Architecture and Scope
 //!
-//! This module implements an experimental, test-only reference collection seam
-//! for filesystem garbage collection reachability in `registry-rust`. Authorization
-//! covers this test-only experiment; it does **not** authorize production cutover.
-//!
-//! The production GC routing in `src/blob_gc/policy.rs` and catalog discovery in
-//! `src/storage/fs.rs` remain 100% unchanged. This seam has no production caller.
+//! This module implements contained manifest reference collection for filesystem
+//! garbage collection reachability in `registry-rust`. It enumerates terminal directories
+//! discovered by [`super::repo_discovery::discover_manifest_dirs_impl`], reads manifest payloads
+//! using the pinned root descriptor via [`storage_fs::FsMetadataReader`], and extracts protected digests.
 //!
 //! # Contract and Topology
 //!
@@ -27,9 +25,8 @@
 
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::sync::Arc;
-use storage_core::{ObjectKey, ObjectPayload, ObjectPayloadReader, ReadError};
-use storage_fs::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError, FsMetadataError};
+use storage_core::{ObjectKey, ObjectPayloadReader, ReadError};
+use storage_fs::{DirEntryType, DirEnumerationLimits, FsDirError, FsMetadataError};
 use tokio::io::AsyncReadExt;
 
 use crate::manifest_refs::parse_manifest_refs;
@@ -48,9 +45,9 @@ impl<T> ManifestRefReader for T where
 {
 }
 
-/// Caller-supplied test limits for manifest reference collection.
+/// Caller-supplied limits for manifest reference collection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ManifestReferenceTestLimits {
+pub(crate) struct ManifestReferenceLimits {
     /// Maximum directory enumeration calls across all terminal directories.
     pub max_terminal_dir_enumerations: usize,
     /// Per-directory limits passed to each `reader.enumerate_dir` call.
@@ -63,11 +60,30 @@ pub(crate) struct ManifestReferenceTestLimits {
     pub max_total_references: usize,
     /// Maximum cumulative logical path and digest bytes retained.
     pub max_retained_logical_bytes: usize,
-    /// Optional ceiling on single manifest payload size (test-only).
+    /// Optional ceiling on single manifest payload size.
     pub max_manifest_payload_bytes: Option<u64>,
 }
 
-impl ManifestReferenceTestLimits {
+/// Backward compatibility alias for test code.
+#[allow(dead_code)]
+pub(crate) type ManifestReferenceTestLimits = ManifestReferenceLimits;
+
+impl Default for ManifestReferenceLimits {
+    fn default() -> Self {
+        Self {
+            max_terminal_dir_enumerations: 10_000,
+            per_dir_limits: DirEnumerationLimits::new(10_000, 1_500_000),
+            max_total_manifest_entries: 250_000,
+            max_manifests_read: 50_000,
+            max_total_references: 250_000,
+            max_retained_logical_bytes: 32 * 1024 * 1024,
+            max_manifest_payload_bytes: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ManifestReferenceLimits {
     /// Returns liberal limits suitable for functional unit and integration tests.
     pub fn test_default() -> Self {
         Self {
@@ -345,7 +361,7 @@ where
 pub(crate) async fn collect_manifest_references_impl<R>(
     reader: &R,
     terminal_dirs: &[ObjectKey],
-    limits: ManifestReferenceTestLimits,
+    limits: ManifestReferenceLimits,
 ) -> Result<ManifestReferenceObservationSet, StorageError>
 where
     R: ManifestRefReader + ?Sized,
@@ -506,8 +522,8 @@ where
 /// the exact same reader instance.
 pub(crate) async fn collect_manifest_references_end_to_end<R>(
     reader: &R,
-    discovery_limits: super::repo_discovery::DiscoveryTestLimits,
-    ref_limits: ManifestReferenceTestLimits,
+    discovery_limits: super::repo_discovery::DiscoveryLimits,
+    ref_limits: ManifestReferenceLimits,
 ) -> Result<ManifestReferenceObservationSet, StorageError>
 where
     R: ManifestRefReader + ?Sized,
@@ -523,8 +539,9 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::ffi::OsString;
     use std::pin::Pin;
-    use std::sync::Mutex;
-    use storage_core::{ObjectMetadata, ObjectStream};
+    use std::sync::{Arc, Mutex};
+    use storage_core::{ObjectMetadata, ObjectPayload, ObjectStream};
+    use storage_fs::DirEntry;
     use tokio::io::AsyncRead;
 
     /// Deterministic recording fake reader for discovery, enumeration, and payload opening.

@@ -2943,6 +2943,11 @@ mod tests {
         ) -> Result<crate::storage::GcDeleteResult, StorageError> {
             panic!("test-only read-only seam bridge: delete_blob_conditional must not be called")
         }
+        async fn discover_manifest_references(
+            &self,
+        ) -> Result<Option<std::collections::HashSet<Digest>>, StorageError> {
+            Ok(None)
+        }
     }
 
     #[tokio::test]
@@ -3043,6 +3048,11 @@ mod tests {
             _: Option<&BlobObjectVersion>,
         ) -> Result<crate::storage::GcDeleteResult, StorageError> {
             panic!("read-only")
+        }
+        async fn discover_manifest_references(
+            &self,
+        ) -> Result<Option<std::collections::HashSet<Digest>>, StorageError> {
+            Ok(None)
         }
     }
 

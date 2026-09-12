@@ -4,7 +4,7 @@ pub mod validation;
 
 pub use policy::{
     AgeEligibility, BlobGcPolicy, GcPolicyError, PolicyContext, build_manifest_protected_set,
-    build_manifest_protected_set_fs, check_candidate_age,
+    check_candidate_age,
 };
 pub use traverser::{CasBlobTraverser, GcPaginationError};
 pub(crate) use validation::execute_guarded_gc_deletion;
@@ -877,7 +877,15 @@ mod tests {
         .await
         .unwrap();
 
-        let protected = build_manifest_protected_set_fs(fs_root).await.unwrap();
+        let cfg = crate::config::Config::from_env().unwrap();
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            fs_root.to_path_buf(),
+            50 * 1024 * 1024,
+        ));
+
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
         assert!(
             protected.contains(
                 "sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -902,8 +910,13 @@ mod tests {
         .await
         .unwrap();
 
-        let err = build_manifest_protected_set_fs(fs_root).await.unwrap_err();
-        assert!(matches!(err, GcPolicyError::ParseManifest { .. }));
+        let err = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GcPolicyError::ManifestDiscovery(ref e) if e.internal_kind() == Some(crate::storage::StorageErrorKind::CorruptData)),
+            "malformed manifest descriptor must fail closed with ManifestDiscovery error; got: {err:?}"
+        );
     }
 
     #[tokio::test]

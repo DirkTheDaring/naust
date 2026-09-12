@@ -1165,6 +1165,12 @@ impl GcStoragePort for FakeGcServiceStorage {
             Ok(GcDeleteResult::NotFound)
         }
     }
+
+    async fn discover_manifest_references(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<Digest>>, StorageError> {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]

@@ -117,6 +117,22 @@ pub struct Config {
     pub fs_manifest_listing_max_entries: usize,
     pub fs_manifest_listing_max_name_bytes: usize,
 
+    pub fs_gc_discovery_max_depth: usize,
+    pub fs_gc_discovery_max_dir_enumerations: usize,
+    pub fs_gc_discovery_max_total_discovery_entries: usize,
+    pub fs_gc_discovery_max_manifest_dirs: usize,
+    pub fs_gc_discovery_max_discovery_retained_path_bytes: usize,
+    pub fs_gc_discovery_intermediate_dir_max_entries: usize,
+    pub fs_gc_discovery_intermediate_dir_max_name_bytes: usize,
+    pub fs_gc_discovery_max_terminal_dir_enumerations: usize,
+    pub fs_gc_discovery_terminal_dir_max_entries: usize,
+    pub fs_gc_discovery_terminal_dir_max_name_bytes: usize,
+    pub fs_gc_discovery_max_total_manifest_entries: usize,
+    pub fs_gc_discovery_max_manifests_read: usize,
+    pub fs_gc_discovery_max_total_references: usize,
+    pub fs_gc_discovery_max_retained_logical_bytes: usize,
+    pub fs_gc_discovery_max_manifest_payload_bytes: Option<u64>,
+
     pub s3_endpoint: Option<String>,
     pub s3_region: Option<String>,
     pub s3_bucket: Option<String>,
@@ -1008,6 +1024,48 @@ struct FileStorageFs {
     manifest_listing_max_entries: Option<usize>,
     #[serde(default)]
     manifest_listing_max_name_bytes: Option<usize>,
+    #[serde(default)]
+    gc: FileStorageFsGc,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileStorageFsGc {
+    #[serde(default)]
+    discovery: FileStorageFsGcDiscovery,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileStorageFsGcDiscovery {
+    #[serde(default)]
+    max_depth: Option<usize>,
+    #[serde(default)]
+    max_dir_enumerations: Option<usize>,
+    #[serde(default)]
+    max_total_discovery_entries: Option<usize>,
+    #[serde(default)]
+    max_manifest_dirs: Option<usize>,
+    #[serde(default)]
+    max_discovery_retained_path_bytes: Option<usize>,
+    #[serde(default)]
+    intermediate_dir_max_entries: Option<usize>,
+    #[serde(default)]
+    intermediate_dir_max_name_bytes: Option<usize>,
+    #[serde(default)]
+    max_terminal_dir_enumerations: Option<usize>,
+    #[serde(default)]
+    terminal_dir_max_entries: Option<usize>,
+    #[serde(default)]
+    terminal_dir_max_name_bytes: Option<usize>,
+    #[serde(default)]
+    max_total_manifest_entries: Option<usize>,
+    #[serde(default)]
+    max_manifests_read: Option<usize>,
+    #[serde(default)]
+    max_total_references: Option<usize>,
+    #[serde(default)]
+    max_retained_logical_bytes: Option<usize>,
+    #[serde(default)]
+    max_manifest_payload_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1499,6 +1557,130 @@ impl Config {
         .or(file_cfg.storage.fs.manifest_listing_max_name_bytes)
         .unwrap_or(crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES);
 
+        let fs_gc_discovery_max_depth = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_DEPTH",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_DEPTH",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_depth)
+        .unwrap_or(32);
+
+        let fs_gc_discovery_max_dir_enumerations = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_DIR_ENUMERATIONS",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_DIR_ENUMERATIONS",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_dir_enumerations)
+        .unwrap_or(10_000);
+
+        let fs_gc_discovery_max_total_discovery_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_TOTAL_DISCOVERY_ENTRIES",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_TOTAL_DISCOVERY_ENTRIES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_total_discovery_entries)
+        .unwrap_or(250_000);
+
+        let fs_gc_discovery_max_manifest_dirs = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_MANIFEST_DIRS",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_MANIFEST_DIRS",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_manifest_dirs)
+        .unwrap_or(10_000);
+
+        let fs_gc_discovery_max_discovery_retained_path_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_DISCOVERY_RETAINED_PATH_BYTES",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_DISCOVERY_RETAINED_PATH_BYTES",
+        ])?
+        .or(file_cfg
+            .storage
+            .fs
+            .gc
+            .discovery
+            .max_discovery_retained_path_bytes)
+        .unwrap_or(10_485_760);
+
+        let fs_gc_discovery_intermediate_dir_max_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__INTERMEDIATE_DIR_MAX_ENTRIES",
+            "REGISTRY_BLOB_GC_DISCOVERY_INTERMEDIATE_DIR_MAX_ENTRIES",
+        ])?
+        .or(file_cfg
+            .storage
+            .fs
+            .gc
+            .discovery
+            .intermediate_dir_max_entries)
+        .unwrap_or(1_000);
+
+        let fs_gc_discovery_intermediate_dir_max_name_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__INTERMEDIATE_DIR_MAX_NAME_BYTES",
+            "REGISTRY_BLOB_GC_DISCOVERY_INTERMEDIATE_DIR_MAX_NAME_BYTES",
+        ])?
+        .or(file_cfg
+            .storage
+            .fs
+            .gc
+            .discovery
+            .intermediate_dir_max_name_bytes)
+        .unwrap_or(100_000);
+
+        let fs_gc_discovery_max_terminal_dir_enumerations = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_TERMINAL_DIR_ENUMERATIONS",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_TERMINAL_DIR_ENUMERATIONS",
+        ])?
+        .or(file_cfg
+            .storage
+            .fs
+            .gc
+            .discovery
+            .max_terminal_dir_enumerations)
+        .unwrap_or(10_000);
+
+        let fs_gc_discovery_terminal_dir_max_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__TERMINAL_DIR_MAX_ENTRIES",
+            "REGISTRY_BLOB_GC_DISCOVERY_TERMINAL_DIR_MAX_ENTRIES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.terminal_dir_max_entries)
+        .unwrap_or(10_000);
+
+        let fs_gc_discovery_terminal_dir_max_name_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__TERMINAL_DIR_MAX_NAME_BYTES",
+            "REGISTRY_BLOB_GC_DISCOVERY_TERMINAL_DIR_MAX_NAME_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.terminal_dir_max_name_bytes)
+        .unwrap_or(1_500_000);
+
+        let fs_gc_discovery_max_total_manifest_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_TOTAL_MANIFEST_ENTRIES",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_TOTAL_MANIFEST_ENTRIES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_total_manifest_entries)
+        .unwrap_or(250_000);
+
+        let fs_gc_discovery_max_manifests_read = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_MANIFESTS_READ",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_MANIFESTS_READ",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_manifests_read)
+        .unwrap_or(50_000);
+
+        let fs_gc_discovery_max_total_references = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_TOTAL_REFERENCES",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_TOTAL_REFERENCES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_total_references)
+        .unwrap_or(250_000);
+
+        let fs_gc_discovery_max_retained_logical_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_RETAINED_LOGICAL_BYTES",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_RETAINED_LOGICAL_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_retained_logical_bytes)
+        .unwrap_or(33_554_432);
+
+        let fs_gc_discovery_max_manifest_payload_bytes = env_u64_opt(&[
+            "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_MANIFEST_PAYLOAD_BYTES",
+            "REGISTRY_BLOB_GC_DISCOVERY_MAX_MANIFEST_PAYLOAD_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.gc.discovery.max_manifest_payload_bytes);
+
         if storage_backend == StorageBackend::Filesystem {
             if fs_manifest_listing_max_entries
                 < crate::storage::fs::manifest_listing::MIN_MANIFEST_LISTING_ENTRIES
@@ -1515,6 +1697,99 @@ impl Config {
                     field: "manifest_listing_max_name_bytes",
                     message: "must be at least 128".to_string(),
                 });
+            }
+
+            if fs_gc_discovery_max_depth < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_depth",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_dir_enumerations < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_dir_enumerations",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_total_discovery_entries < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_total_discovery_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_manifest_dirs < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_manifest_dirs",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_discovery_retained_path_bytes < 65536 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_discovery_retained_path_bytes",
+                    message: "must be at least 65536 bytes".to_string(),
+                });
+            }
+            if fs_gc_discovery_intermediate_dir_max_entries < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.intermediate_dir_max_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_intermediate_dir_max_name_bytes < 128 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.intermediate_dir_max_name_bytes",
+                    message: "must be at least 128 bytes".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_terminal_dir_enumerations < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_terminal_dir_enumerations",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_terminal_dir_max_entries < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.terminal_dir_max_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_terminal_dir_max_name_bytes < 128 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.terminal_dir_max_name_bytes",
+                    message: "must be at least 128 bytes".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_total_manifest_entries < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_total_manifest_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_manifests_read < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_manifests_read",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_total_references < 1 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_total_references",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_gc_discovery_max_retained_logical_bytes < 131072 {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_retained_logical_bytes",
+                    message: "must be at least 131072 bytes".to_string(),
+                });
+            }
+            if let Some(ceiling) = fs_gc_discovery_max_manifest_payload_bytes {
+                if ceiling < 1024 || ceiling == u64::MAX {
+                    return Err(ConfigError::InvalidValue {
+                        field: "storage.fs.gc.discovery.max_manifest_payload_bytes",
+                        message: "must be at least 1024 and less than u64::MAX".to_string(),
+                    });
+                }
             }
         }
 
@@ -2344,6 +2619,21 @@ impl Config {
             fs_root,
             fs_manifest_listing_max_entries,
             fs_manifest_listing_max_name_bytes,
+            fs_gc_discovery_max_depth,
+            fs_gc_discovery_max_dir_enumerations,
+            fs_gc_discovery_max_total_discovery_entries,
+            fs_gc_discovery_max_manifest_dirs,
+            fs_gc_discovery_max_discovery_retained_path_bytes,
+            fs_gc_discovery_intermediate_dir_max_entries,
+            fs_gc_discovery_intermediate_dir_max_name_bytes,
+            fs_gc_discovery_max_terminal_dir_enumerations,
+            fs_gc_discovery_terminal_dir_max_entries,
+            fs_gc_discovery_terminal_dir_max_name_bytes,
+            fs_gc_discovery_max_total_manifest_entries,
+            fs_gc_discovery_max_manifests_read,
+            fs_gc_discovery_max_total_references,
+            fs_gc_discovery_max_retained_logical_bytes,
+            fs_gc_discovery_max_manifest_payload_bytes,
             s3_endpoint,
             s3_region,
             s3_bucket,

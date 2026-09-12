@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 use std::{pin::Pin, sync::Arc};
 use thiserror::Error;
@@ -331,6 +331,10 @@ pub trait GcStorage: Send + Sync {
     fn gc_strategy(&self) -> GcStorageStrategy {
         GcStorageStrategy::FilesystemQuarantine
     }
+
+    /// Discovers manifest references beneath the storage root if supported natively.
+    /// Required trait method without default implementation.
+    async fn discover_manifest_references(&self) -> Result<Option<HashSet<Digest>>, StorageError>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -598,6 +602,9 @@ impl<T: ?Sized + GcStorage + Send + Sync> GcStorage for Arc<T> {
     fn gc_strategy(&self) -> GcStorageStrategy {
         (**self).gc_strategy()
     }
+    async fn discover_manifest_references(&self) -> Result<Option<HashSet<Digest>>, StorageError> {
+        (**self).discover_manifest_references().await
+    }
 }
 
 #[async_trait]
@@ -833,10 +840,35 @@ pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, 
                 config.fs_manifest_listing_max_entries,
                 config.fs_manifest_listing_max_name_bytes,
             );
-            let fs_storage = fs::FsStorage::try_new_with_limits(
+            let discovery_limits = fs::repo_discovery::DiscoveryLimits {
+                max_depth: config.fs_gc_discovery_max_depth,
+                max_dir_enumerations: config.fs_gc_discovery_max_dir_enumerations,
+                max_total_entries: config.fs_gc_discovery_max_total_discovery_entries,
+                max_manifest_dirs: config.fs_gc_discovery_max_manifest_dirs,
+                max_retained_path_bytes: config.fs_gc_discovery_max_discovery_retained_path_bytes,
+                per_dir_limits: storage_fs::DirEnumerationLimits::new(
+                    config.fs_gc_discovery_intermediate_dir_max_entries,
+                    config.fs_gc_discovery_intermediate_dir_max_name_bytes,
+                ),
+            };
+            let ref_limits = fs::manifest_refs::ManifestReferenceLimits {
+                max_terminal_dir_enumerations: config.fs_gc_discovery_max_terminal_dir_enumerations,
+                per_dir_limits: storage_fs::DirEnumerationLimits::new(
+                    config.fs_gc_discovery_terminal_dir_max_entries,
+                    config.fs_gc_discovery_terminal_dir_max_name_bytes,
+                ),
+                max_total_manifest_entries: config.fs_gc_discovery_max_total_manifest_entries,
+                max_manifests_read: config.fs_gc_discovery_max_manifests_read,
+                max_total_references: config.fs_gc_discovery_max_total_references,
+                max_retained_logical_bytes: config.fs_gc_discovery_max_retained_logical_bytes,
+                max_manifest_payload_bytes: config.fs_gc_discovery_max_manifest_payload_bytes,
+            };
+            let fs_storage = fs::FsStorage::try_new_with_gc_limits(
                 config.fs_root.clone(),
                 config.max_upload_bytes,
                 limits,
+                discovery_limits,
+                ref_limits,
             )?;
             Ok(StorageWiring::from_backend(Arc::new(fs_storage)))
         }

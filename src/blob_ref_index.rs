@@ -1085,7 +1085,16 @@ mod tests {
     impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for MockStorage {}
 
     #[async_trait]
-    impl crate::storage::GcStorage for MockStorage {}
+    impl crate::storage::GcStorage for MockStorage {
+        async fn discover_manifest_references(
+            &self,
+        ) -> Result<
+            Option<std::collections::HashSet<crate::registry::digest::Digest>>,
+            crate::storage::StorageError,
+        > {
+            Ok(None)
+        }
+    }
 
     #[async_trait]
     impl Storage for MockStorage {

@@ -5741,8 +5741,9 @@ async fn test_repo_discovery_reserved_leaf_names_excluded_and_gc_divergence() {
         "list_repositories skips all reserved directory names (tags, manifests, referrers, blobs, meta); expected empty, got: {repos:?}"
     );
 
-    // Assert build_manifest_protected_set_fs behavior:
-    let protected = crate::blob_gc::policy::build_manifest_protected_set_fs(&root)
+    // Assert build_manifest_protected_set behavior with contained discovery:
+    let cfg = crate::config::Config::from_env().unwrap();
+    let protected = crate::blob_gc::policy::build_manifest_protected_set(&cfg, &storage)
         .await
         .unwrap();
 
@@ -5865,7 +5866,7 @@ async fn test_repo_discovery_non_utf8_ancestors_skipped_vs_gc_walker() {
     });
     let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
     let hex = hex_sha256(&manifest_bytes);
-    let manifest_digest = format!("sha256:{hex}");
+    let _manifest_digest = format!("sha256:{hex}");
     write_file(&subrepo_manifests.join(&hex), &manifest_bytes);
 
     let repos = storage.list_repositories().await.unwrap();
@@ -5874,20 +5875,14 @@ async fn test_repo_discovery_non_utf8_ancestors_skipped_vs_gc_walker() {
         "list_repositories skips non-UTF-8 ancestor entries"
     );
 
-    let protected = crate::blob_gc::policy::build_manifest_protected_set_fs(&root)
+    // Under contained discovery, non-UTF-8 directory names fail closed with StorageError::corrupt_data (D-06)
+    let cfg = crate::config::Config::from_env().unwrap();
+    let err = crate::blob_gc::policy::build_manifest_protected_set(&cfg, &storage)
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        protected.contains(&manifest_digest),
-        "build_manifest_protected_set_fs descends through non-UTF-8 ancestors and discovers manifest"
-    );
-    assert!(
-        protected.contains(layer_digest),
-        "build_manifest_protected_set_fs protects layer reference beneath non-UTF-8 ancestor"
-    );
-    assert!(
-        protected.contains(config_digest),
-        "build_manifest_protected_set_fs protects config reference beneath non-UTF-8 ancestor"
+        matches!(err, crate::blob_gc::policy::GcPolicyError::ManifestDiscovery(ref e) if e.internal_kind() == Some(crate::storage::StorageErrorKind::CorruptData)),
+        "contained discovery fails closed on non-UTF-8 directory names (D-06); got: {err:?}"
     );
 }
 
@@ -6139,4 +6134,61 @@ async fn test_repo_discovery_root_replacement_vs_repos_replacement() {
         "contained lookup relative to root_fd observes replacement repos/ beneath the same root"
     );
     assert_eq!(page_b2[0].hex(), hex_b2);
+}
+
+#[test]
+fn test_fs_storage_try_new_with_gc_limits_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // 1. Valid default limits succeed
+    assert!(
+        FsStorage::try_new_with_gc_limits(
+            root.clone(),
+            50 * 1024 * 1024,
+            storage_fs::DirEnumerationLimits::new(1000, 100_000),
+            super::repo_discovery::DiscoveryLimits::default(),
+            super::manifest_refs::ManifestReferenceLimits::default(),
+        )
+        .is_ok()
+    );
+
+    // 2. max_depth == 0
+    let mut disc = super::repo_discovery::DiscoveryLimits::default();
+    disc.max_depth = 0;
+    let err = FsStorage::try_new_with_gc_limits(
+        root.clone(),
+        50 * 1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        disc,
+        super::manifest_refs::ManifestReferenceLimits::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("max_depth"));
+
+    // 3. max_manifests_read == 0
+    let mut refs = super::manifest_refs::ManifestReferenceLimits::default();
+    refs.max_manifests_read = 0;
+    let err = FsStorage::try_new_with_gc_limits(
+        root.clone(),
+        50 * 1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        super::repo_discovery::DiscoveryLimits::default(),
+        refs,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("max_manifests_read"));
+
+    // 4. terminal name bytes < 128
+    let mut refs_name = super::manifest_refs::ManifestReferenceLimits::default();
+    refs_name.per_dir_limits = storage_fs::DirEnumerationLimits::new(1000, 64);
+    let err = FsStorage::try_new_with_gc_limits(
+        root.clone(),
+        50 * 1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        super::repo_discovery::DiscoveryLimits::default(),
+        refs_name,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("max_name_bytes"));
 }

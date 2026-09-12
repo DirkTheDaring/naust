@@ -9,6 +9,7 @@ use crate::storage::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::AsyncRead;
@@ -232,6 +233,10 @@ pub trait GcStoragePort: Send + Sync {
         digest: &Digest,
         version: Option<&BlobObjectVersion>,
     ) -> Result<GcDeleteResult, StorageError>;
+
+    /// Port view forwarding native contained manifest reference discovery.
+    /// Required trait method without default implementation.
+    async fn discover_manifest_references(&self) -> Result<Option<HashSet<Digest>>, StorageError>;
 }
 
 /// Dedicated startup and readiness storage capability for whole-registry state inspection.
@@ -690,6 +695,14 @@ macro_rules! impl_gc_storage_port {
                 $crate::storage::GcStorage::delete_blob_conditional(self, permit, digest, version)
                     .await
             }
+            async fn discover_manifest_references(
+                &self,
+            ) -> Result<
+                Option<::std::collections::HashSet<$crate::registry::digest::Digest>>,
+                $crate::storage::StorageError,
+            > {
+                $crate::storage::GcStorage::discover_manifest_references(self).await
+            }
         }
     };
 }
@@ -1018,6 +1031,9 @@ impl<T: ?Sized + GcStoragePort + Send + Sync> GcStoragePort for Arc<T> {
         (**self)
             .delete_blob_conditional(permit, digest, version)
             .await
+    }
+    async fn discover_manifest_references(&self) -> Result<Option<HashSet<Digest>>, StorageError> {
+        (**self).discover_manifest_references().await
     }
 }
 

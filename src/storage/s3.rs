@@ -1432,6 +1432,10 @@ impl GcStorage for S3Storage {
     fn gc_strategy(&self) -> GcStorageStrategy {
         GcStorageStrategy::S3DirectConditional
     }
+
+    async fn discover_manifest_references(&self) -> Result<Option<HashSet<Digest>>, StorageError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]

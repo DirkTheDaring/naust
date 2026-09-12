@@ -3,7 +3,7 @@ use crate::manifest_refs::{ManifestParseError, parse_manifest_refs};
 use crate::registry::digest::Digest;
 use crate::storage;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -91,6 +91,9 @@ pub enum GcPolicyError {
         source: ManifestParseError,
     },
 
+    #[error("contained manifest discovery failed: {0}")]
+    ManifestDiscovery(#[source] crate::storage::StorageError),
+
     #[error("filesystem traversal failed for '{path}': {source}")]
     FsReadDir {
         path: PathBuf,
@@ -164,15 +167,15 @@ impl PolicyContext {
 }
 
 pub async fn build_manifest_protected_set(
-    cfg: &crate::config::Config,
+    _cfg: &crate::config::Config,
     storage: &(impl storage::GcServiceStoragePort + ?Sized),
 ) -> Result<HashSet<String>, GcPolicyError> {
-    if storage.kind() == "fs"
-        && tokio::fs::metadata(&cfg.fs_root.join("repos"))
-            .await
-            .is_ok()
+    if let Some(set) = storage
+        .discover_manifest_references()
+        .await
+        .map_err(GcPolicyError::ManifestDiscovery)?
     {
-        return build_manifest_protected_set_fs(&cfg.fs_root).await;
+        return Ok(set.into_iter().map(|d| d.to_string()).collect());
     }
 
     let repos = storage
@@ -218,84 +221,6 @@ pub async fn build_manifest_protected_set(
                 break;
             }
             cursor = next_cursor;
-        }
-    }
-
-    Ok(protected)
-}
-
-pub async fn build_manifest_protected_set_fs(
-    fs_root: &Path,
-) -> Result<HashSet<String>, GcPolicyError> {
-    let repos_root = fs_root.join("repos");
-    let mut stack: Vec<PathBuf> = vec![repos_root];
-    let mut protected: HashSet<String> = HashSet::new();
-
-    while let Some(dir) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&dir).await {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(GcPolicyError::FsReadDir { path: dir, source }),
-        };
-
-        while let Ok(Some(ent)) = rd.next_entry().await {
-            let ft = match ent.file_type().await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let path = ent.path();
-
-            if ft.is_dir() {
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if name == "manifests" {
-                    let mut md = match tokio::fs::read_dir(&path).await {
-                        Ok(d) => d,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(source) => {
-                            return Err(GcPolicyError::FsReadDir { path, source });
-                        }
-                    };
-                    while let Ok(Some(m)) = md.next_entry().await {
-                        let mft = match m.file_type().await {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        };
-                        if !mft.is_file() {
-                            continue;
-                        }
-                        let mp = m.path();
-                        let hex = match mp.file_name().and_then(|s| s.to_str()) {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                            continue;
-                        }
-                        let digest = format!("sha256:{hex}");
-                        protected.insert(digest.clone());
-
-                        let bytes = match tokio::fs::read(&mp).await {
-                            Ok(b) => b,
-                            Err(source) => {
-                                return Err(GcPolicyError::FsReadManifest { path: mp, source });
-                            }
-                        };
-                        let refs = parse_manifest_refs(&bytes).map_err(|source| {
-                            GcPolicyError::ParseManifest {
-                                repository: "fs".to_string(),
-                                digest: digest.clone(),
-                                source,
-                            }
-                        })?;
-                        for r in refs.all_references() {
-                            protected.insert(r.as_str().to_string());
-                        }
-                    }
-                } else {
-                    stack.push(path);
-                }
-                continue;
-            }
         }
     }
 
@@ -465,40 +390,40 @@ mod tests {
     async fn test_gc_manifest_discovery_missing_and_empty_repository_trees() {
         let temp = tempfile::tempdir().unwrap();
         let fs_root = temp.path();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.fs_root = fs_root.to_path_buf();
 
         // 1. Missing repos directory completely
-        let protected_missing = build_manifest_protected_set_fs(fs_root).await.unwrap();
+        let storage = FsStorage::new(fs_root.to_path_buf(), 10 * 1024 * 1024);
+        let protected_missing = build_manifest_protected_set(&cfg, &storage).await.unwrap();
         assert!(protected_missing.is_empty());
 
         // 2. Empty repos directory
         let repos = fs_root.join("repos");
         tokio::fs::create_dir_all(&repos).await.unwrap();
-        let protected_empty_repos = build_manifest_protected_set_fs(fs_root).await.unwrap();
+        let protected_empty_repos = build_manifest_protected_set(&cfg, &storage).await.unwrap();
         assert!(protected_empty_repos.is_empty());
 
         // 3. Repo directory with no manifests/ directory
         tokio::fs::create_dir_all(repos.join("empty-repo"))
             .await
             .unwrap();
-        let protected_no_manifests = build_manifest_protected_set_fs(fs_root).await.unwrap();
+        let protected_no_manifests = build_manifest_protected_set(&cfg, &storage).await.unwrap();
         assert!(protected_no_manifests.is_empty());
 
         // 4. manifests/ directory exists but is completely empty
         tokio::fs::create_dir_all(repos.join("empty-repo").join("manifests"))
             .await
             .unwrap();
-        let protected_empty_manifests = build_manifest_protected_set_fs(fs_root).await.unwrap();
+        let protected_empty_manifests = build_manifest_protected_set(&cfg, &storage).await.unwrap();
         assert!(protected_empty_manifests.is_empty());
     }
 
     #[tokio::test]
-    async fn test_gc_manifest_discovery_sha256_canonical_vs_sha512_skipped() {
+    async fn test_gc_manifest_discovery_sha256_and_sha512_protected() {
         let temp = tempfile::tempdir().unwrap();
-        let manifests_dir = temp
-            .path()
-            .join("repos")
-            .join("dual-repo")
-            .join("manifests");
+        let fs_root = temp.path();
+        let manifests_dir = fs_root.join("repos").join("dual-repo").join("manifests");
         tokio::fs::create_dir_all(&manifests_dir).await.unwrap();
 
         // Valid 64-character lowercase hex SHA-256 manifest
@@ -525,17 +450,19 @@ mod tests {
         .await
         .unwrap();
 
-        let protected = build_manifest_protected_set_fs(temp.path()).await.unwrap();
+        let storage = FsStorage::new(fs_root.to_path_buf(), 10 * 1024 * 1024);
+        let mut cfg = Config::from_env().unwrap();
+        cfg.fs_root = fs_root.to_path_buf();
+        let protected = build_manifest_protected_set(&cfg, &storage).await.unwrap();
 
-        // SHA-256 manifest and all referenced blobs MUST be protected
+        // Both SHA-256 and SHA-512 manifests and their referenced blobs MUST be protected
         assert!(protected.contains(&format!("sha256:{sha256_hex}")));
         assert!(protected.contains(sha256_cfg));
         assert!(protected.contains(sha256_layer));
 
-        // SHA-512 manifest is SKIPPED by fs walker (hex.len() == 128 != 64)
-        assert!(!protected.contains(&format!("sha512:{sha512_hex}")));
-        assert!(!protected.contains(sha512_cfg));
-        assert!(!protected.contains(sha512_layer));
+        assert!(protected.contains(&format!("sha512:{sha512_hex}")));
+        assert!(protected.contains(sha512_cfg));
+        assert!(protected.contains(sha512_layer));
     }
 
     #[tokio::test]
@@ -594,15 +521,18 @@ mod tests {
             .await
             .unwrap();
 
-        let protected = build_manifest_protected_set_fs(temp.path()).await.unwrap();
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
 
         assert!(!protected.contains(prefixed));
         assert!(!protected.contains(&format!("sha256:{prefixed}")));
         assert!(!protected.contains(&format!("sha256:{malformed}")));
 
-        // Uppercase was accepted and inserted as uppercase digest string
-        assert!(protected.contains(&format!("sha256:{uppercase}")));
-        // But lowercase counterpart does not match due to case sensitivity
+        // Contained discovery enforces lowercase hex [0-9a-f] (D-08), skipping uppercase hex
+        assert!(!protected.contains(&format!("sha256:{uppercase}")));
         assert!(!protected.contains(&format!("sha256:{}", uppercase.to_lowercase())));
     }
 
@@ -649,7 +579,11 @@ mod tests {
         .await
         .unwrap();
 
-        let protected = build_manifest_protected_set_fs(temp.path()).await.unwrap();
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
 
         assert!(protected.contains(&format!("sha256:{hex_deep}")));
         assert!(protected.contains(cfg_deep));
@@ -695,11 +629,15 @@ mod tests {
             .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         std::os::unix::fs::symlink(&real_manifest_path, &symlink_manifest_path).unwrap();
 
-        let protected = build_manifest_protected_set_fs(temp.path()).await.unwrap();
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
 
-        // Symlink directory is skipped: ft.is_dir() is false on directory symlink
+        // Symlink directory is skipped by contained traversal
         assert!(!protected.contains(&format!("sha256:{hex_target}")));
-        // Symlink file is skipped: mft.is_file() is false on file symlink
+        // Symlink file is skipped by contained file open
         assert!(
             !protected.contains(
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -733,8 +671,12 @@ mod tests {
         let link_root = temp.path().join("link_root");
         std::os::unix::fs::symlink(&real_data, &link_root).unwrap();
 
-        // Calling build_manifest_protected_set_fs with the symlinked root traverses successfully
-        let protected = build_manifest_protected_set_fs(&link_root).await.unwrap();
+        // Initial root symlink is resolved at initialization; contained discovery then traverses real_data
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(link_root.clone(), 50 * 1024 * 1024));
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
         assert!(protected.contains(&format!("sha256:{hex}")));
         assert!(protected.contains(cfg_d));
         assert!(protected.contains(layer_d));
@@ -767,7 +709,11 @@ mod tests {
             .await
             .unwrap();
 
-        let protected = build_manifest_protected_set_fs(temp.path()).await.unwrap();
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
         assert!(protected.contains(&format!("sha256:{hex}")));
         assert!(protected.contains(cfg_d));
         assert!(protected.contains(layer_d));
@@ -783,18 +729,21 @@ mod tests {
             .join("manifests");
         tokio::fs::create_dir_all(&manifests).await.unwrap();
 
-        // Case A: Corrupted JSON content -> GcPolicyError::ParseManifest
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+
+        // Case A: Corrupted JSON content -> GcPolicyError::ManifestDiscovery(corrupt_data)
         let corrupt_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         tokio::fs::write(manifests.join(corrupt_hex), b"{not-valid-json")
             .await
             .unwrap();
 
-        let err = build_manifest_protected_set_fs(temp.path())
+        let err = build_manifest_protected_set(&cfg, storage.as_ref())
             .await
             .unwrap_err();
         assert!(
-            matches!(err, GcPolicyError::ParseManifest { ref repository, ref digest, .. }
-                if repository == "fs" && digest == &format!("sha256:{corrupt_hex}"))
+            matches!(err, GcPolicyError::ManifestDiscovery(ref e) if e.internal_kind() == Some(crate::storage::StorageErrorKind::CorruptData)),
+            "corrupted manifest JSON must fail closed with ManifestDiscovery error; got: {err:?}"
         );
 
         // Remove corrupt file
@@ -802,7 +751,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Case B: Manifest with unparseable/invalid digest in descriptor -> GcPolicyError::ParseManifest
+        // Case B: Manifest with unparseable/invalid digest in descriptor -> GcPolicyError::ManifestDiscovery(corrupt_data)
         let invalid_desc_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let invalid_desc_json = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
@@ -814,10 +763,13 @@ mod tests {
             .await
             .unwrap();
 
-        let err = build_manifest_protected_set_fs(temp.path())
+        let err = build_manifest_protected_set(&cfg, storage.as_ref())
             .await
             .unwrap_err();
-        assert!(matches!(err, GcPolicyError::ParseManifest { .. }));
+        assert!(
+            matches!(err, GcPolicyError::ManifestDiscovery(ref e) if e.internal_kind() == Some(crate::storage::StorageErrorKind::CorruptData)),
+            "invalid digest in manifest must fail closed with ManifestDiscovery error; got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -842,7 +794,9 @@ mod tests {
             .expect("must capture original file permissions");
         std::fs::set_permissions(&unreadable_path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let read_res = build_manifest_protected_set_fs(temp.path()).await;
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+        let read_res = build_manifest_protected_set(&cfg, storage.as_ref()).await;
         let err = read_res.expect_err("unreadable manifest must fail closed");
 
         guard
@@ -850,18 +804,15 @@ mod tests {
             .expect("explicit permission restoration must succeed");
 
         match err {
-            GcPolicyError::FsReadManifest {
-                ref path,
-                ref source,
-            } => {
-                assert_eq!(path, &unreadable_path);
-                assert_eq!(
-                    source.kind(),
-                    std::io::ErrorKind::PermissionDenied,
-                    "underlying error must be PermissionDenied, got: {source:?}"
+            GcPolicyError::ManifestDiscovery(ref storage_err) => {
+                assert!(
+                    storage_err.to_string().contains("Permission")
+                        || format!("{storage_err:?}").contains("PermissionDenied")
+                        || format!("{storage_err:?}").contains("Os { code: 13"),
+                    "underlying error must reflect permission denied, got: {storage_err:?}"
                 );
             }
-            other => panic!("expected FsReadManifest, got: {other:?}"),
+            other => panic!("expected ManifestDiscovery, got: {other:?}"),
         }
     }
 
@@ -877,7 +828,9 @@ mod tests {
             .expect("must capture original directory permissions");
         std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let res = build_manifest_protected_set_fs(temp.path()).await;
+        let cfg = Config::from_env().unwrap();
+        let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
+        let res = build_manifest_protected_set(&cfg, storage.as_ref()).await;
         let err = res.expect_err("unreadable directory must fail closed");
 
         guard
@@ -885,18 +838,15 @@ mod tests {
             .expect("explicit permission restoration must succeed");
 
         match err {
-            GcPolicyError::FsReadDir {
-                ref path,
-                ref source,
-            } => {
-                assert_eq!(path, &unreadable_dir);
-                assert_eq!(
-                    source.kind(),
-                    std::io::ErrorKind::PermissionDenied,
-                    "underlying error must be PermissionDenied, got: {source:?}"
+            GcPolicyError::ManifestDiscovery(ref storage_err) => {
+                assert!(
+                    storage_err.to_string().contains("Permission")
+                        || format!("{storage_err:?}").contains("PermissionDenied")
+                        || format!("{storage_err:?}").contains("Os { code: 13"),
+                    "underlying error must reflect permission denied, got: {storage_err:?}"
                 );
             }
-            other => panic!("expected FsReadDir, got: {other:?}"),
+            other => panic!("expected ManifestDiscovery, got: {other:?}"),
         }
     }
 
@@ -923,7 +873,7 @@ mod tests {
             digests.push(format!("sha256:{hex}"));
         }
 
-        // Configure FsStorage with restrictive limit of max_entries = 1
+        // Configure FsStorage with restrictive listing limit of max_entries = 1
         let storage = Arc::new(
             FsStorage::try_new_with_limits(
                 fs_root.clone(),
@@ -933,7 +883,7 @@ mod tests {
             .unwrap(),
         );
 
-        // FsStorage reader obeys max_entries = 1 and rejects enumeration exceeding budget
+        // FsStorage listing obeys max_entries = 1 and rejects enumeration exceeding budget
         let err = storage
             .list_manifest_digests_page("budget-repo", None, 10)
             .await
@@ -943,12 +893,15 @@ mod tests {
             "contained reader must enforce configured directory budget limit = 1"
         );
 
-        // BUT the filesystem discovery bypass ignores storage limits completely and discovers all 5 manifests
-        let protected = build_manifest_protected_set_fs(&fs_root).await.unwrap();
+        // Contained GC discovery uses independent GC limits (not public listing limits), discovering all 5 manifests
+        let cfg = Config::from_env().unwrap();
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+            .await
+            .unwrap();
         for d in &digests {
             assert!(
                 protected.contains(d),
-                "fs bypass should discover all manifests regardless of storage limits"
+                "GC discovery uses independent GC budgets rather than listing budgets"
             );
         }
         assert_eq!(
@@ -1002,24 +955,29 @@ mod tests {
         let mut cfg = Config::from_env().unwrap();
         cfg.fs_root = fs_root_b.clone();
 
-        // Divergence: build_manifest_protected_set scans cfg.fs_root (fs_root_b), NOT storage (fs_root_a)
-        let protected_divergent = build_manifest_protected_set(&cfg, storage.as_ref())
+        // Contained discovery operates exclusively on storage's pinned root (fs_root_a),
+        // completely eliminating divergence with cfg.fs_root.
+        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
             .await
             .unwrap();
-        assert!(protected_divergent.contains(&format!("sha256:{hex_b}")));
-        assert!(!protected_divergent.contains(&format!("sha256:{hex_a}")));
+        assert!(
+            protected.contains(&format!("sha256:{hex_a}")),
+            "contained discovery must read storage's pinned root (fs_root_a)"
+        );
+        assert!(
+            !protected.contains(&format!("sha256:{hex_b}")),
+            "contained discovery must not read cfg.fs_root (fs_root_b)"
+        );
 
-        // Now remove repos from fs_root_b
+        // Even if repos in fs_root_b is deleted, discovery on storage still returns repo-a manifests
         tokio::fs::remove_dir_all(fs_root_b.join("repos"))
             .await
             .unwrap();
-
-        // Fallback: metadata(cfg.fs_root.join("repos")) is now Err, so it falls back to storage (fs_root_a)
-        let protected_fallback = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected_after_removal = build_manifest_protected_set(&cfg, storage.as_ref())
             .await
             .unwrap();
-        assert!(protected_fallback.contains(&format!("sha256:{hex_a}")));
-        assert!(!protected_fallback.contains(&format!("sha256:{hex_b}")));
+        assert!(protected_after_removal.contains(&format!("sha256:{hex_a}")));
+        assert!(!protected_after_removal.contains(&format!("sha256:{hex_b}")));
     }
 
     #[tokio::test]
@@ -1052,7 +1010,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("manifest rooted build should have failed"),
         };
-        assert!(matches!(err, GcPolicyError::ParseManifest { .. }));
+        assert!(
+            matches!(err, GcPolicyError::ManifestDiscovery(ref e) if e.internal_kind() == Some(crate::storage::StorageErrorKind::CorruptData)),
+            "manifest rooted build must fail closed with ManifestDiscovery error; got: {err:?}"
+        );
 
         // 2. TagRooted policy does not build manifest protected set, so it succeeds
         assert!(

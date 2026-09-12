@@ -1,14 +1,10 @@
-//! Test-only contained manifest-directory discovery seam for filesystem GC.
+//! Contained manifest-directory discovery for filesystem GC.
 //!
-//! # Experimental Scope and Authorization
+//! # Architecture and Scope
 //!
-//! This module implements an experimental, test-only discovery seam for filesystem
-//! garbage collection reachability in `registry-rust`. Authorization covers this
-//! test-only experiment; it does **not** authorize production cutover.
-//!
-//! The production GC routing in `src/blob_gc/policy.rs` and the repository catalog
-//! discovery in `src/storage/fs.rs` (`FsStorage::list_repositories`) remain 100%
-//! unchanged and continue to operate as before.
+//! This module implements bounded breadth-first manifest-directory discovery for
+//! filesystem garbage collection reachability in `registry-rust`. Traversal executes
+//! beneath the pinned storage root descriptor via [`storage_fs::FsMetadataReader`].
 //!
 //! # Discovery Contract
 //!
@@ -86,12 +82,9 @@ use storage_fs::{DirEntry, DirEnumerationLimits, FsDirError, FsMetadataReader};
 
 use crate::storage::StorageError;
 
-/// Caller-supplied, test-only limits for bounded repository directory discovery.
-///
-/// These limits are provisional and test-only. No production defaults are approved
-/// in this slice.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DiscoveryTestLimits {
+/// Caller-supplied limits for bounded repository directory discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoveryLimits {
     /// Maximum directory depth relative to `repos/` (root `repos/` is depth 0).
     pub max_depth: usize,
     /// Maximum number of directory enumerations performed during the walk.
@@ -106,8 +99,25 @@ pub(crate) struct DiscoveryTestLimits {
     pub per_dir_limits: DirEnumerationLimits,
 }
 
+/// Backward compatibility alias for test code.
+#[allow(dead_code)]
+pub(crate) type DiscoveryTestLimits = DiscoveryLimits;
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 32,
+            max_dir_enumerations: 10_000,
+            max_total_entries: 250_000,
+            max_manifest_dirs: 10_000,
+            max_retained_path_bytes: 10 * 1024 * 1024,
+            per_dir_limits: DirEnumerationLimits::new(1000, 100_000),
+        }
+    }
+}
+
 #[cfg(test)]
-impl DiscoveryTestLimits {
+impl DiscoveryLimits {
     /// Test helper constructing permissive limits suitable for happy-path integration tests.
     pub(crate) fn test_default() -> Self {
         Self {
@@ -306,7 +316,7 @@ fn validate_dir_component(component: &str) -> Result<(), StorageError> {
 /// Enforces all caller-supplied bounds with checked arithmetic and inclusive checks.
 pub(crate) async fn discover_manifest_dirs_impl(
     enumerator: &(impl DiscoveryDirEnumerator + ?Sized),
-    limits: DiscoveryTestLimits,
+    limits: DiscoveryLimits,
 ) -> Result<Vec<ObjectKey>, StorageError> {
     let repos_key = ObjectKey::parse("repos")
         .map_err(|e| StorageError::corrupt_data(format!("invalid root object key: {e}")))?;

@@ -196,23 +196,112 @@ pub struct FsStorage {
     reader: std::sync::Arc<storage_fs::FsMetadataReader>,
     read_adapter: std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>>,
     manifest_listing_limits: storage_fs::DirEnumerationLimits,
+    gc_discovery_limits: repo_discovery::DiscoveryLimits,
+    gc_ref_limits: manifest_refs::ManifestReferenceLimits,
 }
 
 impl FsStorage {
-    pub fn try_new_with_limits(
+    /// Crate-visible constructor enforcing complete limit validation.
+    pub(crate) fn try_new_with_gc_limits(
         root: PathBuf,
         max_upload_bytes: u64,
-        limits: storage_fs::DirEnumerationLimits,
+        manifest_listing_limits: storage_fs::DirEnumerationLimits,
+        gc_discovery_limits: repo_discovery::DiscoveryLimits,
+        gc_ref_limits: manifest_refs::ManifestReferenceLimits,
     ) -> Result<Self, StorageError> {
-        if limits.max_entries() < manifest_listing::MIN_MANIFEST_LISTING_ENTRIES {
+        // 1. Validate manifest listing limits
+        if manifest_listing_limits.max_entries() < manifest_listing::MIN_MANIFEST_LISTING_ENTRIES {
             return Err(StorageError::configuration(
                 "manifest_listing_max_entries must be at least 1",
             ));
         }
-        if limits.max_total_name_bytes() < manifest_listing::MIN_MANIFEST_LISTING_NAME_BYTES {
+        if manifest_listing_limits.max_total_name_bytes()
+            < manifest_listing::MIN_MANIFEST_LISTING_NAME_BYTES
+        {
             return Err(StorageError::configuration(
                 "manifest_listing_max_name_bytes must be at least 128",
             ));
+        }
+
+        // 2. Validate GC discovery limits
+        if gc_discovery_limits.max_depth < 1 {
+            return Err(StorageError::configuration(
+                "gc discovery max_depth must be at least 1",
+            ));
+        }
+        if gc_discovery_limits.max_dir_enumerations < 1 {
+            return Err(StorageError::configuration(
+                "gc discovery max_dir_enumerations must be at least 1",
+            ));
+        }
+        if gc_discovery_limits.max_total_entries < 1 {
+            return Err(StorageError::configuration(
+                "gc discovery max_total_entries must be at least 1",
+            ));
+        }
+        if gc_discovery_limits.max_manifest_dirs < 1 {
+            return Err(StorageError::configuration(
+                "gc discovery max_manifest_dirs must be at least 1",
+            ));
+        }
+        if gc_discovery_limits.max_retained_path_bytes < 65_536 {
+            return Err(StorageError::configuration(
+                "gc discovery max_retained_path_bytes must be at least 65536",
+            ));
+        }
+        if gc_discovery_limits.per_dir_limits.max_entries() < 1 {
+            return Err(StorageError::configuration(
+                "gc discovery intermediate_dir_max_entries must be at least 1",
+            ));
+        }
+        if gc_discovery_limits.per_dir_limits.max_total_name_bytes() < 128 {
+            return Err(StorageError::configuration(
+                "gc discovery intermediate_dir_max_name_bytes must be at least 128",
+            ));
+        }
+
+        // 3. Validate GC reference collection limits
+        if gc_ref_limits.max_terminal_dir_enumerations < 1 {
+            return Err(StorageError::configuration(
+                "gc ref max_terminal_dir_enumerations must be at least 1",
+            ));
+        }
+        if gc_ref_limits.per_dir_limits.max_entries() < 1 {
+            return Err(StorageError::configuration(
+                "gc ref terminal_dir_max_entries must be at least 1",
+            ));
+        }
+        if gc_ref_limits.per_dir_limits.max_total_name_bytes() < 128 {
+            return Err(StorageError::configuration(
+                "gc ref terminal_dir_max_name_bytes must be at least 128",
+            ));
+        }
+        if gc_ref_limits.max_total_manifest_entries < 1 {
+            return Err(StorageError::configuration(
+                "gc ref max_total_manifest_entries must be at least 1",
+            ));
+        }
+        if gc_ref_limits.max_manifests_read < 1 {
+            return Err(StorageError::configuration(
+                "gc ref max_manifests_read must be at least 1",
+            ));
+        }
+        if gc_ref_limits.max_total_references < 1 {
+            return Err(StorageError::configuration(
+                "gc ref max_total_references must be at least 1",
+            ));
+        }
+        if gc_ref_limits.max_retained_logical_bytes < 131_072 {
+            return Err(StorageError::configuration(
+                "gc ref max_retained_logical_bytes must be at least 131072",
+            ));
+        }
+        if let Some(ceiling) = gc_ref_limits.max_manifest_payload_bytes {
+            if ceiling < 1024 || ceiling == u64::MAX {
+                return Err(StorageError::configuration(
+                    "gc ref max_manifest_payload_bytes must be >= 1024 and < u64::MAX",
+                ));
+            }
         }
 
         ensure_dir(&root)?;
@@ -242,8 +331,24 @@ impl FsStorage {
             repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reader,
             read_adapter,
-            manifest_listing_limits: limits,
+            manifest_listing_limits,
+            gc_discovery_limits,
+            gc_ref_limits,
         })
+    }
+
+    pub fn try_new_with_limits(
+        root: PathBuf,
+        max_upload_bytes: u64,
+        limits: storage_fs::DirEnumerationLimits,
+    ) -> Result<Self, StorageError> {
+        Self::try_new_with_gc_limits(
+            root,
+            max_upload_bytes,
+            limits,
+            repo_discovery::DiscoveryLimits::default(),
+            manifest_refs::ManifestReferenceLimits::default(),
+        )
     }
 
     pub fn try_new(root: PathBuf, max_upload_bytes: u64) -> Result<Self, StorageError> {
@@ -3557,6 +3662,18 @@ impl GcStorage for FsStorage {
     fn gc_strategy(&self) -> GcStorageStrategy {
         GcStorageStrategy::FilesystemQuarantine
     }
+
+    async fn discover_manifest_references(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<Digest>>, StorageError> {
+        let obs = manifest_refs::collect_manifest_references_end_to_end(
+            self.reader.as_ref(),
+            self.gc_discovery_limits,
+            self.gc_ref_limits.clone(),
+        )
+        .await?;
+        Ok(Some(obs.protected_digests))
+    }
 }
 
 #[cfg(test)]
@@ -3587,10 +3704,12 @@ pub(crate) mod manifest;
 #[path = "fs/manifest_listing.rs"]
 pub(crate) mod manifest_listing;
 
-#[cfg(test)]
 #[path = "fs/repo_discovery.rs"]
-mod repo_discovery;
+pub(crate) mod repo_discovery;
+
+#[path = "fs/manifest_refs.rs"]
+pub(crate) mod manifest_refs;
 
 #[cfg(test)]
-#[path = "fs/manifest_refs_seam.rs"]
-mod manifest_refs_seam;
+#[allow(unused_imports)]
+pub(crate) use manifest_refs as manifest_refs_seam;

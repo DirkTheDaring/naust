@@ -289,6 +289,12 @@ impl GcStorage for HookedStorage {
         }
         res
     }
+
+    async fn discover_manifest_references(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<Digest>>, StorageError> {
+        self.inner.discover_manifest_references().await
+    }
 }
 
 #[async_trait::async_trait]
@@ -533,6 +539,410 @@ impl Storage for HookedStorage {
 registry_rust::impl_storage_ports!(HookedStorage);
 registry_rust::impl_gc_storage_port!(HookedStorage);
 
+use registry_rust::storage::fs::FsStorage;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+#[derive(Clone)]
+pub struct LifecycleFaultStorage {
+    pub inner: Arc<FsStorage>,
+    pub fail_manifest_listing: Arc<AtomicBool>,
+    pub fail_listing_after_n: Arc<AtomicUsize>,
+    pub fail_manifest_get: Arc<AtomicBool>,
+    pub fail_manifest_get_target: Arc<StdMutex<Option<Digest>>>,
+    pub corrupt_manifest_get: Arc<AtomicBool>,
+    pub corrupt_manifest_get_target: Arc<StdMutex<Option<Digest>>>,
+    pub token_cycle_immediate: Arc<AtomicBool>,
+    pub token_cycle_multi: Arc<AtomicBool>,
+}
+
+impl LifecycleFaultStorage {
+    pub fn new(inner: Arc<FsStorage>) -> Self {
+        Self {
+            inner,
+            fail_manifest_listing: Arc::new(AtomicBool::new(false)),
+            fail_listing_after_n: Arc::new(AtomicUsize::new(0)),
+            fail_manifest_get: Arc::new(AtomicBool::new(false)),
+            fail_manifest_get_target: Arc::new(StdMutex::new(None)),
+            corrupt_manifest_get: Arc::new(AtomicBool::new(false)),
+            corrupt_manifest_get_target: Arc::new(StdMutex::new(None)),
+            token_cycle_immediate: Arc::new(AtomicBool::new(false)),
+            token_cycle_multi: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl UploadSessionStorage for LifecycleFaultStorage {}
+
+#[async_trait::async_trait]
+impl RepositoryBlobMembershipStorage for LifecycleFaultStorage {
+    async fn link_repo_blob(&self, record: &RepoBlobMembershipRecord) -> Result<(), StorageError> {
+        self.inner.link_repo_blob(record).await
+    }
+
+    async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
+        self.inner.unlink_repo_blob(repo, digest).await
+    }
+
+    async fn get_repo_blob_membership(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<Option<RepoBlobMembershipRecord>, StorageError> {
+        self.inner.get_repo_blob_membership(repo, digest).await
+    }
+
+    async fn list_repo_blob_memberships_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<RepoBlobMembershipRecord>, Option<String>), StorageError> {
+        self.inner
+            .list_repo_blob_memberships_page(repo, continuation_token, limit)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl GcStorage for LifecycleFaultStorage {
+    fn gc_strategy(&self) -> GcStorageStrategy {
+        GcStorage::gc_strategy(&self.inner)
+    }
+
+    async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
+        GcStorage::check_bucket_versioning_for_gc(&self.inner).await
+    }
+
+    async fn list_cas_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        GcStorage::list_cas_blobs_page(&self.inner, cursor, limit).await
+    }
+
+    async fn quarantine_blob(
+        &self,
+        permit: &GcMutationPermit<'_>,
+        digest: &Digest,
+        version: &BlobObjectVersion,
+    ) -> Result<GcQuarantineResult, StorageError> {
+        GcStorage::quarantine_blob(&self.inner, permit, digest, version).await
+    }
+
+    async fn restore_quarantined_blob(
+        &self,
+        permit: &GcMutationPermit<'_>,
+        digest: &Digest,
+    ) -> Result<Option<u64>, StorageError> {
+        GcStorage::restore_quarantined_blob(&self.inner, permit, digest).await
+    }
+
+    async fn quarantined_blob_version(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<BlobObjectVersion>, StorageError> {
+        GcStorage::quarantined_blob_version(&self.inner, digest).await
+    }
+
+    async fn delete_blob_conditional(
+        &self,
+        permit: &GcMutationPermit<'_>,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        GcStorage::delete_blob_conditional(&self.inner, permit, digest, version).await
+    }
+
+    async fn discover_manifest_references(
+        &self,
+    ) -> Result<Option<std::collections::HashSet<Digest>>, StorageError> {
+        GcStorage::discover_manifest_references(&self.inner).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Storage for LifecycleFaultStorage {
+    fn kind(&self) -> &'static str {
+        "lifecycle-fault-storage"
+    }
+
+    async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+        Storage::list_repositories(&self.inner).await
+    }
+
+    async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
+        Storage::repo_timestamps(&self.inner, name).await
+    }
+
+    async fn is_storage_empty(&self) -> Result<bool, StorageError> {
+        Storage::is_storage_empty(&self.inner).await
+    }
+
+    async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
+        Storage::head_blob(&self.inner, digest).await
+    }
+
+    async fn open_blob(
+        &self,
+        digest: &Digest,
+    ) -> Result<(BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
+        Storage::open_blob(&self.inner, digest).await
+    }
+
+    async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
+        Storage::resolve_tag(&self.inner, name, tag).await
+    }
+
+    async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+        Storage::list_tags(&self.inner, name).await
+    }
+
+    async fn head_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<ManifestMeta, StorageError> {
+        Storage::head_manifest(&self.inner, name, digest).await
+    }
+
+    async fn get_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+    ) -> Result<(ManifestMeta, Bytes), StorageError> {
+        if self.fail_manifest_get.load(AtomicOrdering::SeqCst) {
+            if let Ok(guard) = self.fail_manifest_get_target.lock() {
+                if guard.as_ref().map(|d| d == digest).unwrap_or(false) {
+                    return Err(StorageError::io("simulated manifest read I/O error"));
+                }
+            }
+        }
+        if self.corrupt_manifest_get.load(AtomicOrdering::SeqCst) {
+            if let Ok(guard) = self.corrupt_manifest_get_target.lock() {
+                if guard.as_ref().map(|d| d == digest).unwrap_or(false) {
+                    return Ok((
+                        ManifestMeta {
+                            size: 7,
+                            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                        },
+                        Bytes::from("{corrupt"),
+                    ));
+                }
+            }
+        }
+        Storage::get_manifest(&self.inner, name, digest).await
+    }
+
+    async fn put_manifest(
+        &self,
+        name: &str,
+        digest: &Digest,
+        bytes: Bytes,
+    ) -> Result<ManifestMeta, StorageError> {
+        Storage::put_manifest(&self.inner, name, digest, bytes).await
+    }
+
+    async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
+        Storage::set_tag(&self.inner, name, tag, digest).await
+    }
+
+    async fn mutate_tag(
+        &self,
+        name: &str,
+        tag: &str,
+        digest: &Digest,
+        policy: TagMutationPolicy,
+    ) -> Result<TagMutation, StorageError> {
+        Storage::mutate_tag(&self.inner, name, tag, digest, policy).await
+    }
+
+    async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
+        Storage::delete_tag(&self.inner, name, tag).await
+    }
+
+    async fn list_manifest_digests_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+        if self.fail_manifest_listing.load(AtomicOrdering::SeqCst) {
+            return Err(StorageError::backend("simulated manifest listing error"));
+        }
+        let threshold = self.fail_listing_after_n.load(AtomicOrdering::SeqCst);
+        if threshold > 0 {
+            if threshold == 1 {
+                return Err(StorageError::backend(
+                    "simulated threshold manifest listing error",
+                ));
+            }
+            self.fail_listing_after_n
+                .store(threshold - 1, AtomicOrdering::SeqCst);
+        }
+        if self.token_cycle_immediate.load(AtomicOrdering::SeqCst) {
+            let (page, _) = Storage::list_manifest_digests_page(
+                &self.inner,
+                repo,
+                continuation_token,
+                page_limit,
+            )
+            .await?;
+            return Ok((page, Some("repeat_token".to_string())));
+        }
+        if self.token_cycle_multi.load(AtomicOrdering::SeqCst) {
+            let (page, _) = Storage::list_manifest_digests_page(
+                &self.inner,
+                repo,
+                continuation_token,
+                page_limit,
+            )
+            .await?;
+            let next_tok = match continuation_token {
+                None => Some("token_A".to_string()),
+                Some("token_A") => Some("token_B".to_string()),
+                Some("token_B") => Some("token_A".to_string()),
+                Some(other) => Some(other.to_string()),
+            };
+            return Ok((page, next_tok));
+        }
+        Storage::list_manifest_digests_page(&self.inner, repo, continuation_token, page_limit).await
+    }
+
+    async fn list_tags_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+        Storage::list_tags_page(&self.inner, repo, continuation_token, page_limit).await
+    }
+
+    async fn list_referrers_page(
+        &self,
+        repo: &str,
+        subject: &Digest,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError> {
+        Storage::list_referrers_page(&self.inner, repo, subject, continuation_token, page_limit)
+            .await
+    }
+
+    async fn get_tag_with_version(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<(Digest, String)>, StorageError> {
+        Storage::get_tag_with_version(&self.inner, repo, tag).await
+    }
+
+    async fn delete_tag_conditional(
+        &self,
+        repo: &str,
+        tag: &str,
+        expected_version: Option<&str>,
+    ) -> Result<ConditionalDeleteResult, StorageError> {
+        Storage::delete_tag_conditional(&self.inner, repo, tag, expected_version).await
+    }
+
+    async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
+        Storage::read_lifecycle_journal(&self.inner, repo).await
+    }
+
+    async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
+        Storage::write_lifecycle_journal(&self.inner, repo, data).await
+    }
+
+    async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+        Storage::delete_lifecycle_journal(&self.inner, repo).await
+    }
+
+    async fn acquire_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        Storage::acquire_repo_lease(&self.inner, repo, owner_id, lease_id, ttl_secs).await
+    }
+
+    async fn renew_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, StorageError> {
+        Storage::renew_repo_lease(&self.inner, repo, owner_id, lease_id, ttl_secs).await
+    }
+
+    async fn release_repo_lease(
+        &self,
+        repo: &str,
+        owner_id: &str,
+        lease_id: &str,
+    ) -> Result<(), StorageError> {
+        Storage::release_repo_lease(&self.inner, repo, owner_id, lease_id).await
+    }
+
+    async fn create_upload(&self) -> Result<UploadMeta, StorageError> {
+        Storage::create_upload(&self.inner).await
+    }
+
+    async fn upload_status(&self, uuid: &str) -> Result<UploadMeta, StorageError> {
+        Storage::upload_status(&self.inner, uuid).await
+    }
+
+    async fn append_upload(&self, uuid: &str, chunk: Bytes) -> Result<UploadMeta, StorageError> {
+        Storage::append_upload(&self.inner, uuid, chunk).await
+    }
+
+    async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError> {
+        Storage::finalize_upload(&self.inner, uuid, digest).await
+    }
+
+    async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
+        Storage::abort_upload(&self.inner, uuid).await
+    }
+
+    async fn list_referrers(
+        &self,
+        name: &str,
+        subject: &Digest,
+    ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
+        Storage::list_referrers(&self.inner, name, subject).await
+    }
+
+    async fn add_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        descriptor: ReferrerDescriptor,
+    ) -> Result<(), StorageError> {
+        Storage::add_referrer(&self.inner, name, subject, descriptor).await
+    }
+
+    async fn remove_referrer(
+        &self,
+        name: &str,
+        subject: &Digest,
+        referrer: &Digest,
+    ) -> Result<(), StorageError> {
+        Storage::remove_referrer(&self.inner, name, subject, referrer).await
+    }
+
+    async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
+        Storage::delete_manifest(&self.inner, name, digest).await
+    }
+}
+
+registry_rust::impl_storage_ports!(LifecycleFaultStorage);
+registry_rust::impl_gc_storage_port!(LifecycleFaultStorage);
+
 #[allow(dead_code)]
 pub fn tmp_dir(prefix: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));
@@ -557,6 +967,21 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         fs_root,
         fs_manifest_listing_max_entries: 10_000,
         fs_manifest_listing_max_name_bytes: 1_500_000,
+        fs_gc_discovery_max_depth: 32,
+        fs_gc_discovery_max_dir_enumerations: 10_000,
+        fs_gc_discovery_max_total_discovery_entries: 250_000,
+        fs_gc_discovery_max_manifest_dirs: 10_000,
+        fs_gc_discovery_max_discovery_retained_path_bytes: 10 * 1024 * 1024,
+        fs_gc_discovery_intermediate_dir_max_entries: 10_000,
+        fs_gc_discovery_intermediate_dir_max_name_bytes: 1_500_000,
+        fs_gc_discovery_max_terminal_dir_enumerations: 10_000,
+        fs_gc_discovery_terminal_dir_max_entries: 10_000,
+        fs_gc_discovery_terminal_dir_max_name_bytes: 1_500_000,
+        fs_gc_discovery_max_total_manifest_entries: 250_000,
+        fs_gc_discovery_max_manifests_read: 50_000,
+        fs_gc_discovery_max_total_references: 250_000,
+        fs_gc_discovery_max_retained_logical_bytes: 32 * 1024 * 1024,
+        fs_gc_discovery_max_manifest_payload_bytes: None,
         s3_endpoint: None,
         s3_region: None,
         s3_bucket: None,
