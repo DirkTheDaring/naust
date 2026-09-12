@@ -6192,3 +6192,715 @@ fn test_fs_storage_try_new_with_gc_limits_validation() {
     .unwrap_err();
     assert!(err.to_string().contains("max_name_bytes"));
 }
+
+// --- Filesystem Tag Read Characterization Tests (resolve_tag & get_tag_with_version) ---
+
+#[tokio::test]
+async fn test_tag_read_missing_tag_and_missing_repository() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // 1. Missing repository directory
+    let res_resolve = storage.resolve_tag("missing-repo", "missing-tag").await;
+    assert!(matches!(res_resolve, Err(StorageError::NotFound)));
+
+    let res_version = storage
+        .get_tag_with_version("missing-repo", "missing-tag")
+        .await
+        .unwrap();
+    assert_eq!(res_version, None);
+
+    // 2. Existing repository with tags/ directory, but missing tag file
+    let repo_dir = root.join("repos").join("existing-repo").join("tags");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    let res_resolve = storage.resolve_tag("existing-repo", "missing-tag").await;
+    assert!(matches!(res_resolve, Err(StorageError::NotFound)));
+
+    let res_version = storage
+        .get_tag_with_version("existing-repo", "missing-tag")
+        .await
+        .unwrap();
+    assert_eq!(res_version, None);
+}
+
+#[tokio::test]
+async fn test_tag_read_valid_sha256_and_sha512_with_and_without_newline() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+
+    // 1. SHA-256 with newline
+    let hex256 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let bytes256_nl = format!("sha256:{hex256}\n").into_bytes();
+    write_file(&tags_dir.join("tag256_nl"), &bytes256_nl);
+
+    let d = storage.resolve_tag("myrepo", "tag256_nl").await.unwrap();
+    assert_eq!(d.as_str(), format!("sha256:{hex256}"));
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "tag256_nl")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v, d);
+    assert_eq!(v, hex_sha256(&bytes256_nl));
+
+    // 2. SHA-256 without newline
+    let bytes256_raw = format!("sha256:{hex256}").into_bytes();
+    write_file(&tags_dir.join("tag256_raw"), &bytes256_raw);
+
+    let d = storage.resolve_tag("myrepo", "tag256_raw").await.unwrap();
+    assert_eq!(d.as_str(), format!("sha256:{hex256}"));
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "tag256_raw")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v, d);
+    assert_eq!(v, hex_sha256(&bytes256_raw));
+
+    // 3. SHA-512 with newline
+    let hex512 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let bytes512_nl = format!("sha512:{hex512}\n").into_bytes();
+    write_file(&tags_dir.join("tag512_nl"), &bytes512_nl);
+
+    let d = storage.resolve_tag("myrepo", "tag512_nl").await.unwrap();
+    assert_eq!(d.as_str(), format!("sha512:{hex512}"));
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "tag512_nl")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v, d);
+    assert_eq!(v, hex_sha256(&bytes512_nl));
+
+    // 4. SHA-512 without newline
+    let bytes512_raw = format!("sha512:{hex512}").into_bytes();
+    write_file(&tags_dir.join("tag512_raw"), &bytes512_raw);
+
+    let d = storage.resolve_tag("myrepo", "tag512_raw").await.unwrap();
+    assert_eq!(d.as_str(), format!("sha512:{hex512}"));
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "tag512_raw")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v, d);
+    assert_eq!(v, hex_sha256(&bytes512_raw));
+}
+
+#[tokio::test]
+async fn test_tag_read_whitespace_tabs_crlf_and_substantial_padding() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    let hex = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    // 1. Leading/trailing spaces, tabs, CRLF
+    let bytes_crlf = format!("  \t \r\n sha256:{hex} \r\n\t  \n").into_bytes();
+    write_file(&tags_dir.join("tag_crlf"), &bytes_crlf);
+
+    let d = storage.resolve_tag("myrepo", "tag_crlf").await.unwrap();
+    assert_eq!(d.hex(), hex);
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "tag_crlf")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v, d);
+    assert_eq!(v, hex_sha256(&bytes_crlf));
+
+    // 2. Substantial whitespace padding exceeding 256 bytes
+    let pad_before = " ".repeat(300);
+    let pad_after = " ".repeat(300);
+    let bytes_padded = format!("{pad_before}sha256:{hex}\n{pad_after}").into_bytes();
+    assert!(bytes_padded.len() > 600, "padding must exceed 256 bytes");
+    write_file(&tags_dir.join("tag_padded"), &bytes_padded);
+
+    let d = storage.resolve_tag("myrepo", "tag_padded").await.unwrap();
+    assert_eq!(d.hex(), hex);
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "tag_padded")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v, d);
+    assert_eq!(v, hex_sha256(&bytes_padded));
+}
+
+#[tokio::test]
+async fn test_tag_read_empty_malformed_digest_and_invalid_utf8() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+
+    // 1. Empty content (0 bytes)
+    write_file(&tags_dir.join("tag_empty"), b"");
+    let err_resolve = storage
+        .resolve_tag("myrepo", "tag_empty")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_resolve, StorageError::NotFound),
+        "empty tag content maps to NotFound in resolve_tag"
+    );
+
+    let err_version = storage
+        .get_tag_with_version("myrepo", "tag_empty")
+        .await
+        .unwrap_err();
+    match err_version {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected StorageErrorKind::CorruptData, got {other:?}"),
+    }
+
+    // 2. Malformed digest text
+    write_file(&tags_dir.join("tag_malformed"), b"not-a-valid-digest\n");
+    let err_resolve = storage
+        .resolve_tag("myrepo", "tag_malformed")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_resolve, StorageError::NotFound),
+        "malformed digest maps to NotFound in resolve_tag"
+    );
+
+    let err_version = storage
+        .get_tag_with_version("myrepo", "tag_malformed")
+        .await
+        .unwrap_err();
+    match err_version {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected StorageErrorKind::CorruptData, got {other:?}"),
+    }
+
+    // 3. Invalid UTF-8 sequence
+    let invalid_utf8_bytes = b"\xff\xfe\xfd";
+    write_file(&tags_dir.join("tag_invalid_utf8"), invalid_utf8_bytes);
+
+    // resolve_tag uses tokio::fs::read_to_string -> fails with std::io::ErrorKind::InvalidData -> StorageErrorKind::Io
+    let err_resolve = storage
+        .resolve_tag("myrepo", "tag_invalid_utf8")
+        .await
+        .unwrap_err();
+    match err_resolve {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for read_to_string invalid UTF-8, got {other:?}")
+        }
+    }
+
+    // get_tag_with_version uses from_utf8_lossy -> Digest::parse fails -> StorageErrorKind::CorruptData
+    let err_version = storage
+        .get_tag_with_version("myrepo", "tag_invalid_utf8")
+        .await
+        .unwrap_err();
+    match err_version {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected StorageErrorKind::CorruptData, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_tag_read_version_hashes_raw_byte_sensitivity() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    let hex = "5555555555555555555555555555555555555555555555555555555555555555";
+
+    let c1 = format!("sha256:{hex}\n").into_bytes();
+    let c2 = format!("sha256:{hex}").into_bytes();
+    let c3 = format!("sha256:{hex}\r\n").into_bytes();
+    let c4 = format!("  sha256:{hex}\n").into_bytes();
+
+    write_file(&tags_dir.join("t1"), &c1);
+    write_file(&tags_dir.join("t2"), &c2);
+    write_file(&tags_dir.join("t3"), &c3);
+    write_file(&tags_dir.join("t4"), &c4);
+
+    let (d1, v1) = storage
+        .get_tag_with_version("myrepo", "t1")
+        .await
+        .unwrap()
+        .unwrap();
+    let (d2, v2) = storage
+        .get_tag_with_version("myrepo", "t2")
+        .await
+        .unwrap()
+        .unwrap();
+    let (d3, v3) = storage
+        .get_tag_with_version("myrepo", "t3")
+        .await
+        .unwrap()
+        .unwrap();
+    let (d4, v4) = storage
+        .get_tag_with_version("myrepo", "t4")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // All 4 parse to the exact same logical Digest
+    assert_eq!(d1, d2);
+    assert_eq!(d2, d3);
+    assert_eq!(d3, d4);
+    assert_eq!(d1.hex(), hex);
+
+    // But all 4 produce pairwise distinct version strings because hasher hashes raw bytes
+    assert_ne!(
+        v1, v2,
+        "newline vs no newline must produce different versions"
+    );
+    assert_ne!(v1, v3, "LF vs CRLF must produce different versions");
+    assert_ne!(v1, v4, "plain vs padded must produce different versions");
+    assert_ne!(v2, v3);
+    assert_ne!(v2, v4);
+    assert_ne!(v3, v4);
+
+    // Re-reading identical content produces identical version
+    let (_, v1_again) = storage
+        .get_tag_with_version("myrepo", "t1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v1, v1_again);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_tag_read_controlled_symlinks() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("storage-root");
+    let ext_dir = fixture.path().join("external-dir");
+    std::fs::create_dir_all(&ext_dir).unwrap();
+
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex_internal = "6666666666666666666666666666666666666666666666666666666666666666";
+    let hex_external = "7777777777777777777777777777777777777777777777777777777777777777";
+    let hex_ancestor = "8888888888888888888888888888888888888888888888888888888888888888";
+
+    // 1. Final tag symlink targeting inside the fixture storage root
+    let target_file = tags_dir.join("real_tag");
+    write_file(&target_file, format!("sha256:{hex_internal}\n").as_bytes());
+    std::os::unix::fs::symlink(&target_file, tags_dir.join("symlink_internal")).unwrap();
+
+    let d = storage
+        .resolve_tag("myrepo", "symlink_internal")
+        .await
+        .unwrap();
+    assert_eq!(
+        d.hex(),
+        hex_internal,
+        "resolve_tag follows internal symlink"
+    );
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "symlink_internal")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v.hex(), hex_internal);
+    assert_eq!(v, hex_sha256(format!("sha256:{hex_internal}\n").as_bytes()));
+
+    // 2. Final tag symlink targeting a sibling directory outside that root but inside the temporary fixture
+    let ext_file = ext_dir.join("ext_tag_file");
+    write_file(&ext_file, format!("sha256:{hex_external}\n").as_bytes());
+    std::os::unix::fs::symlink(&ext_file, tags_dir.join("symlink_external")).unwrap();
+
+    let d_ext = storage
+        .resolve_tag("myrepo", "symlink_external")
+        .await
+        .unwrap();
+    assert_eq!(
+        d_ext.hex(),
+        hex_external,
+        "ambient read_to_string follows symlink outside storage root"
+    );
+    let (d_ext_v, v_ext) = storage
+        .get_tag_with_version("myrepo", "symlink_external")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_ext_v.hex(), hex_external);
+    assert_eq!(
+        v_ext,
+        hex_sha256(format!("sha256:{hex_external}\n").as_bytes())
+    );
+
+    // 3. Ancestor directory symlink (symlinked tags/ directory)
+    let ext_tags_dir = ext_dir.join("external_tags");
+    std::fs::create_dir_all(&ext_tags_dir).unwrap();
+    write_file(
+        &ext_tags_dir.join("ancestor_tag"),
+        format!("sha256:{hex_ancestor}\n").as_bytes(),
+    );
+
+    let repo_ancestor_dir = root.join("repos").join("ancestor_repo");
+    std::fs::create_dir_all(&repo_ancestor_dir).unwrap();
+    std::os::unix::fs::symlink(&ext_tags_dir, repo_ancestor_dir.join("tags")).unwrap();
+
+    let d_anc = storage
+        .resolve_tag("ancestor_repo", "ancestor_tag")
+        .await
+        .unwrap();
+    assert_eq!(
+        d_anc.hex(),
+        hex_ancestor,
+        "ambient read_to_string follows ancestor tags/ symlink"
+    );
+    let (d_anc_v, _) = storage
+        .get_tag_with_version("ancestor_repo", "ancestor_tag")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_anc_v.hex(), hex_ancestor);
+
+    // 4. Dangling symlink
+    std::os::unix::fs::symlink(
+        ext_dir.join("non_existent_target"),
+        tags_dir.join("dangling_symlink"),
+    )
+    .unwrap();
+    let res_resolve = storage.resolve_tag("myrepo", "dangling_symlink").await;
+    assert!(
+        matches!(res_resolve, Err(StorageError::NotFound)),
+        "dangling symlink maps to NotFound in resolve_tag"
+    );
+    let res_version = storage
+        .get_tag_with_version("myrepo", "dangling_symlink")
+        .await
+        .unwrap();
+    assert_eq!(
+        res_version, None,
+        "dangling symlink maps to None in get_tag_with_version"
+    );
+}
+
+#[tokio::test]
+async fn test_tag_read_directory_in_place_of_file() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+
+    // Directory in place of a tag file
+    let dir_tag_path = tags_dir.join("dir_tag");
+    std::fs::create_dir_all(&dir_tag_path).unwrap();
+
+    let err_resolve = storage.resolve_tag("myrepo", "dir_tag").await.unwrap_err();
+    match err_resolve {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for directory read_to_string, got {other:?}")
+        }
+    }
+
+    let err_version = storage
+        .get_tag_with_version("myrepo", "dir_tag")
+        .await
+        .unwrap_err();
+    match err_version {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!("expected StorageErrorKind::Io for directory read, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_tag_read_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    let tag_file = tags_dir.join("perm_tag");
+    write_file(
+        &tag_file,
+        b"sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+    );
+
+    let orig_perms = std::fs::metadata(&tag_file).unwrap().permissions();
+
+    struct ScopedPermReset<'a> {
+        path: &'a std::path::Path,
+        original_permissions: std::fs::Permissions,
+    }
+    impl<'a> Drop for ScopedPermReset<'a> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, self.original_permissions.clone());
+        }
+    }
+
+    {
+        let _guard = ScopedPermReset {
+            path: &tag_file,
+            original_permissions: orig_perms.clone(),
+        };
+        std::fs::set_permissions(&tag_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        match std::fs::read(&tag_file) {
+            Ok(_) => panic!("ineffective permissions: read succeeded under mode 0o000"),
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        let err_resolve = storage.resolve_tag("myrepo", "perm_tag").await.unwrap_err();
+        match err_resolve {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageErrorKind::Io for permission denial, got {other:?}"),
+        }
+
+        let err_version = storage
+            .get_tag_with_version("myrepo", "perm_tag")
+            .await
+            .unwrap_err();
+        match err_version {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageErrorKind::Io for permission denial, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_tag_read_path_component_and_traversal_cases() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let hex = "9999999999999999999999999999999999999999999999999999999999999999";
+
+    // 1. Carefully scoped traversal input: target placed in parent repos/ directory
+    // When tags/ directory exists, tag_path("myrepo", "../outside.txt") evaluates to
+    // root/repos/myrepo/tags/../outside.txt, traversing through '..' back to root/repos/myrepo/outside.txt
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+    let outside_file = root.join("repos").join("myrepo").join("outside.txt");
+    write_file(&outside_file, format!("sha256:{hex}\n").as_bytes());
+
+    let d = storage
+        .resolve_tag("myrepo", "../outside.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        d.hex(),
+        hex,
+        "ambient tag_path joins unchecked '..' component"
+    );
+    let (d_v, v) = storage
+        .get_tag_with_version("myrepo", "../outside.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_v.hex(), hex);
+    assert_eq!(v, hex_sha256(format!("sha256:{hex}\n").as_bytes()));
+
+    // 2. Subdirectory component in tag: "sub/nested_tag"
+    let nested_file = root
+        .join("repos")
+        .join("myrepo")
+        .join("tags")
+        .join("sub")
+        .join("nested_tag");
+    write_file(&nested_file, format!("sha256:{hex}\n").as_bytes());
+
+    let d_sub = storage
+        .resolve_tag("myrepo", "sub/nested_tag")
+        .await
+        .unwrap();
+    assert_eq!(
+        d_sub.hex(),
+        hex,
+        "ambient tag_path joins slash subdirectories"
+    );
+    let (d_sub_v, _) = storage
+        .get_tag_with_version("myrepo", "sub/nested_tag")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_sub_v.hex(), hex);
+
+    // 3. Controlled repository-argument traversal case for both read methods
+    // When repos/ directory exists, tag_path("../sibling_repo", "mytag") evaluates to
+    // root/repos/../sibling_repo/tags/mytag -> root/sibling_repo/tags/mytag
+    let sibling_tag_file = root.join("sibling_repo").join("tags").join("mytag");
+    write_file(&sibling_tag_file, format!("sha256:{hex}\n").as_bytes());
+
+    let d_repo = storage
+        .resolve_tag("../sibling_repo", "mytag")
+        .await
+        .unwrap();
+    assert_eq!(
+        d_repo.hex(),
+        hex,
+        "ambient tag_path joins unchecked '..' in repository argument"
+    );
+    let (d_repo_v, v_repo) = storage
+        .get_tag_with_version("../sibling_repo", "mytag")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_repo_v.hex(), hex);
+    assert_eq!(v_repo, hex_sha256(format!("sha256:{hex}\n").as_bytes()));
+}
+
+#[tokio::test]
+async fn test_tag_read_sequential_root_replacement_observed_tree() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root_path = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root_path).unwrap();
+
+    let storage = FsStorage::new(root_path.clone(), 1024 * 1024);
+
+    let hex_orig = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex_repl = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    // 1. Initial tag write
+    write_file(
+        &root_path
+            .join("repos")
+            .join("myrepo")
+            .join("tags")
+            .join("latest"),
+        format!("sha256:{hex_orig}\n").as_bytes(),
+    );
+
+    let d_orig = storage.resolve_tag("myrepo", "latest").await.unwrap();
+    assert_eq!(d_orig.hex(), hex_orig);
+    let (d_orig_v, v_orig) = storage
+        .get_tag_with_version("myrepo", "latest")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_orig_v.hex(), hex_orig);
+    assert_eq!(
+        v_orig,
+        hex_sha256(format!("sha256:{hex_orig}\n").as_bytes())
+    );
+
+    // 2. Sequential root directory replacement: rename root to root_old, and recreate fresh directory at root_path
+    let root_old = fixture.path().join("storage-root-old");
+    std::fs::rename(&root_path, &root_old).unwrap();
+    std::fs::create_dir_all(&root_path).unwrap();
+
+    write_file(
+        &root_path
+            .join("repos")
+            .join("myrepo")
+            .join("tags")
+            .join("latest"),
+        format!("sha256:{hex_repl}\n").as_bytes(),
+    );
+
+    // 3. Ambient resolve_tag and get_tag_with_version use string PathBuf join on self.root;
+    // they resolve the NEW directory currently at root_path
+    let d_observed = storage.resolve_tag("myrepo", "latest").await.unwrap();
+    assert_eq!(
+        d_observed.hex(),
+        hex_repl,
+        "ambient resolve_tag observes replacement pathname tree, demonstrating lack of root pinning"
+    );
+    let (d_observed_v, v_observed) = storage
+        .get_tag_with_version("myrepo", "latest")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        d_observed_v.hex(),
+        hex_repl,
+        "ambient get_tag_with_version observes replacement digest"
+    );
+    assert_eq!(
+        v_observed,
+        hex_sha256(format!("sha256:{hex_repl}\n").as_bytes()),
+        "ambient get_tag_with_version computes version from replacement bytes"
+    );
+}
+
+#[tokio::test]
+async fn test_tag_conditional_delete_version_precondition_role() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    let c1 = format!("sha256:{hex1}\n").into_bytes();
+    let tag_file = tags_dir.join("mytag");
+    write_file(&tag_file, &c1);
+
+    // 1. Observe initial tag version
+    let (d1, v1) = storage
+        .get_tag_with_version("myrepo", "mytag")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d1.hex(), hex1);
+    assert_eq!(v1, hex_sha256(&c1));
+
+    // 2. Case A: Changed bytes cause expected PreconditionFailed and preserve replacement
+    let c2 = format!("sha256:{hex2}\n").into_bytes();
+    write_file(&tag_file, &c2);
+
+    let del_res = storage
+        .delete_tag_conditional("myrepo", "mytag", Some(&v1))
+        .await
+        .unwrap();
+
+    let v2 = hex_sha256(&c2);
+    assert_eq!(
+        del_res,
+        crate::storage::ConditionalDeleteResult::PreconditionFailed {
+            current_version: Some(v2.clone())
+        },
+        "changed bytes must cause PreconditionFailed"
+    );
+    assert!(
+        tag_file.exists(),
+        "replacement tag file must be preserved on disk"
+    );
+    assert_eq!(std::fs::read(&tag_file).unwrap(), c2);
+
+    // 3. Case B: Changed whitespace (same parsed digest) also causes PreconditionFailed
+    let c2_no_nl = format!("sha256:{hex2}").into_bytes();
+    write_file(&tag_file, &c2_no_nl);
+
+    let del_res_ws = storage
+        .delete_tag_conditional("myrepo", "mytag", Some(&v2))
+        .await
+        .unwrap();
+
+    let v2_no_nl = hex_sha256(&c2_no_nl);
+    assert_eq!(
+        del_res_ws,
+        crate::storage::ConditionalDeleteResult::PreconditionFailed {
+            current_version: Some(v2_no_nl.clone())
+        },
+        "whitespace changes cause PreconditionFailed because version hashes raw bytes"
+    );
+
+    // 4. Case C: Deletion succeeds with matching expected version
+    let del_success = storage
+        .delete_tag_conditional("myrepo", "mytag", Some(&v2_no_nl))
+        .await
+        .unwrap();
+    assert_eq!(
+        del_success,
+        crate::storage::ConditionalDeleteResult::Deleted
+    );
+    assert!(
+        !tag_file.exists(),
+        "tag file must be unlinked after successful deletion"
+    );
+
+    // 5. Case D: Identical byte content produces same version; version does not detect intervening write
+    write_file(&tag_file, &c1);
+    let (_, v1_recreated) = storage
+        .get_tag_with_version("myrepo", "mytag")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        v1_recreated, v1,
+        "identical byte content produces identical version hash; version does not detect replacement if bytes match"
+    );
+}
