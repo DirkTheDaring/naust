@@ -7087,3 +7087,966 @@ async fn test_fs_storage_tag_read_production_contract_and_entry_points() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_tag_listing_missing_and_empty_directories() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // 1. Missing repository: list_tags yields StorageError::NotFound, but list_tags_page yields Ok(([], None))
+    let res_list = storage.list_tags("nonexistent-repo").await;
+    assert!(
+        matches!(res_list, Err(StorageError::NotFound)),
+        "list_tags on missing repo must return StorageError::NotFound, got: {res_list:?}"
+    );
+
+    let res_page = storage
+        .list_tags_page("nonexistent-repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_page,
+        (Vec::new(), None),
+        "list_tags_page on missing repo returns empty page without error"
+    );
+
+    // 2. Repository exists, but tags/ directory does not:
+    let repo_dir = root.join("repos").join("existing-no-tags");
+    std::fs::create_dir_all(repo_dir.join("manifests")).unwrap();
+
+    let res_no_tags = storage.list_tags("existing-no-tags").await.unwrap();
+    assert!(
+        res_no_tags.is_empty(),
+        "list_tags on repo without tags dir returns empty list"
+    );
+
+    let res_page_no_tags = storage
+        .list_tags_page("existing-no-tags", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_page_no_tags,
+        (Vec::new(), None),
+        "list_tags_page on repo without tags dir returns empty page"
+    );
+
+    // 3. tags/ directory exists but is empty:
+    let empty_tags_dir = root.join("repos").join("empty-tags-repo").join("tags");
+    std::fs::create_dir_all(&empty_tags_dir).unwrap();
+
+    let res_empty = storage.list_tags("empty-tags-repo").await.unwrap();
+    assert!(
+        res_empty.is_empty(),
+        "list_tags on empty tags directory returns empty list"
+    );
+
+    let res_page_empty = storage
+        .list_tags_page("empty-tags-repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        res_page_empty,
+        (Vec::new(), None),
+        "list_tags_page on empty tags directory returns empty page"
+    );
+}
+
+#[tokio::test]
+async fn test_tag_listing_valid_sha256_and_sha512_formats() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let hex512 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    write_file(
+        &tags_dir.join("tag-sha256"),
+        format!("sha256:{hex256}\n").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("tag-sha512"),
+        format!("sha512:{hex512}\n").as_bytes(),
+    );
+
+    let tags = storage.list_tags("myrepo").await.unwrap();
+    assert_eq!(tags, vec!["tag-sha256", "tag-sha512"]);
+
+    let (page, next_tok) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(next_tok, None);
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].0, "tag-sha256");
+    assert_eq!(page[0].1.as_str(), format!("sha256:{hex256}"));
+    assert_eq!(page[1].0, "tag-sha512");
+    assert_eq!(page[1].1.as_str(), format!("sha512:{hex512}"));
+}
+
+#[tokio::test]
+async fn test_tag_listing_whitespace_tabs_crlf_and_substantial_padding() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(
+        &tags_dir.join("t1-clean"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("t2-crlf"),
+        format!("\r\n  sha256:{hex}\r\n").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("t3-tabs"),
+        format!("\t\tsha256:{hex}\t\n").as_bytes(),
+    );
+    let mut padded = Vec::new();
+    padded.extend(b"\n");
+    padded.extend(vec![b' '; 1024]);
+    padded.extend(format!("sha256:{hex}").as_bytes());
+    padded.extend(vec![b' '; 512]);
+    padded.extend(b"\n");
+    write_file(&tags_dir.join("t4-padded"), &padded);
+
+    let tags = storage.list_tags("myrepo").await.unwrap();
+    assert_eq!(tags, vec!["t1-clean", "t2-crlf", "t3-tabs", "t4-padded"]);
+
+    let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(page.len(), 4);
+    for (_name, digest) in page {
+        assert_eq!(digest.as_str(), format!("sha256:{hex}"));
+    }
+}
+
+#[tokio::test]
+async fn test_tag_listing_empty_malformed_and_invalid_utf8_taxonomy() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex = "2222222222222222222222222222222222222222222222222222222222222222";
+    write_file(
+        &tags_dir.join("tag-valid"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+    write_file(&tags_dir.join("tag-empty"), b"");
+    write_file(&tags_dir.join("tag-malformed"), b"not-a-digest\n");
+    write_file(
+        &tags_dir.join("tag-bad-hex"),
+        b"sha256:zzzz000000000000000000000000000000000000000000000000000000000000\n",
+    );
+    write_file(&tags_dir.join("tag-invalid-utf8"), &[0xff, 0xfe, 0xfd]);
+
+    // 1. list_tags returns ALL names without inspecting file contents
+    let tags = storage.list_tags("myrepo").await.unwrap();
+    assert_eq!(
+        tags,
+        vec![
+            "tag-bad-hex",
+            "tag-empty",
+            "tag-invalid-utf8",
+            "tag-malformed",
+            "tag-valid"
+        ]
+    );
+
+    // 2. list_tags_page silently drops corrupt, empty, and non-UTF8 files
+    let (page, next_tok) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(next_tok, None);
+    assert_eq!(
+        page.len(),
+        1,
+        "list_tags_page must silently omit unparsable and empty files"
+    );
+    assert_eq!(page[0].0, "tag-valid");
+    assert_eq!(page[0].1.hex(), hex);
+}
+
+#[tokio::test]
+async fn test_tag_listing_dotfiles_locks_temps_and_nested_directories() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex = "3333333333333333333333333333333333333333333333333333333333333333";
+    write_file(
+        &tags_dir.join("normal-tag"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join(".hidden-tag"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+    write_file(&tags_dir.join(".lock.normal-tag"), b"lock-meta");
+    write_file(
+        &tags_dir.join(".tmp.upload.123"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("non-dot-temp.upload"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+
+    // Create a nested subdirectory inside tags/
+    std::fs::create_dir_all(tags_dir.join("nested-dir")).unwrap();
+
+    // 1. list_tags filters out dotfiles, but INCLUDES subdirectories!
+    let tags = storage.list_tags("myrepo").await.unwrap();
+    assert_eq!(
+        tags,
+        vec!["nested-dir", "non-dot-temp.upload", "normal-tag"],
+        "list_tags includes non-dot directories because it does not validate file_type"
+    );
+
+    // 2. list_tags_page filters out dotfiles, and drops nested-dir because read_to_string fails (EISDIR)
+    let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(
+        page.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["non-dot-temp.upload", "normal-tag"],
+        "list_tags_page drops directories due to read_to_string error suppression"
+    );
+}
+
+#[tokio::test]
+async fn test_tag_listing_non_utf8_filenames() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let tags_dir = root.join("repos").join("myrepo").join("tags");
+        std::fs::create_dir_all(&tags_dir).unwrap();
+
+        let hex = "4444444444444444444444444444444444444444444444444444444444444444";
+        write_file(
+            &tags_dir.join("valid-tag"),
+            format!("sha256:{hex}").as_bytes(),
+        );
+
+        let invalid_os_str = std::ffi::OsStr::from_bytes(b"invalid-\xff-tag");
+        let invalid_path = tags_dir.join(invalid_os_str);
+        std::fs::write(&invalid_path, format!("sha256:{hex}").as_bytes()).unwrap();
+
+        // Both list_tags and list_tags_page filter entries via file_name().to_str(),
+        // so invalid UTF-8 filenames return None and are silently skipped.
+        let tags = storage.list_tags("myrepo").await.unwrap();
+        assert_eq!(tags, vec!["valid-tag"]);
+
+        let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "valid-tag");
+    }
+}
+
+#[tokio::test]
+async fn test_tag_listing_path_traversal_and_structural_inputs() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let hex = "9999999999999999999999999999999999999999999999999999999999999999";
+
+    // 1. Populated Traversal Fixture:
+    // Create repos/target_repo/tags/target_tag
+    let target_tags = root.join("repos").join("target_repo").join("tags");
+    std::fs::create_dir_all(&target_tags).unwrap();
+    write_file(
+        &target_tags.join("target_tag"),
+        format!("sha256:{hex}\n").as_bytes(),
+    );
+
+    // Create repos/dummy_dir
+    let dummy_dir = root.join("repos").join("dummy_dir");
+    std::fs::create_dir_all(&dummy_dir).unwrap();
+
+    // Querying with repo name "dummy_dir/../target_repo" resolves ambiently to repos/target_repo/tags
+    let listed = storage.list_tags("dummy_dir/../target_repo").await.unwrap();
+    assert_eq!(
+        listed,
+        vec!["target_tag"],
+        "demonstrates that path traversal input actually resolves to target_repo"
+    );
+
+    let (page, _) = storage
+        .list_tags_page("dummy_dir/../target_repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, "target_tag");
+
+    // 2. Nested multi-segment repository input:
+    let nested_tags = root
+        .join("repos")
+        .join("org")
+        .join("team")
+        .join("nested_repo")
+        .join("tags");
+    std::fs::create_dir_all(&nested_tags).unwrap();
+    write_file(
+        &nested_tags.join("nested_tag"),
+        format!("sha256:{hex}\n").as_bytes(),
+    );
+
+    let nested_list = storage.list_tags("org/team/nested_repo").await.unwrap();
+    assert_eq!(nested_list, vec!["nested_tag"]);
+    let (nested_page, _) = storage
+        .list_tags_page("org/team/nested_repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(nested_page.len(), 1);
+    assert_eq!(nested_page[0].0, "nested_tag");
+
+    // 3. Absolute path input:
+    // Path::join with an absolute path replaces self.root entirely:
+    // self.root.join("repos").join("/tmp/.../abs_repo") -> PathBuf::from("/tmp/.../abs_repo")
+    let abs_fixture = tempfile::tempdir().unwrap();
+    let abs_tags = abs_fixture.path().join("tags");
+    std::fs::create_dir_all(&abs_tags).unwrap();
+    write_file(
+        &abs_tags.join("abs_tag"),
+        format!("sha256:{hex}\n").as_bytes(),
+    );
+
+    let abs_repo_str = abs_fixture.path().to_str().unwrap();
+    let abs_list = storage.list_tags(abs_repo_str).await.unwrap();
+    assert_eq!(
+        abs_list,
+        vec!["abs_tag"],
+        "demonstrates that absolute path input bypasses self.root entirely"
+    );
+    let (abs_page, _) = storage
+        .list_tags_page(abs_repo_str, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(abs_page.len(), 1);
+    assert_eq!(abs_page[0].0, "abs_tag");
+
+    // 4. Invalid inputs:
+    // Empty repository name "": resolves to self.root.join("repos").join("tags").
+    // Because self.root.join("repos") exists, metadata succeeds, and missing repos/tags yields Ok(vec![])!
+    let empty_res = storage.list_tags("").await.unwrap();
+    assert!(
+        empty_res.is_empty(),
+        "empty repo name resolves to repos/tags and returns Ok([]) when tags dir is absent"
+    );
+    let empty_page = storage.list_tags_page("", None, 10).await.unwrap();
+    assert_eq!(empty_page, (Vec::new(), None));
+
+    // Absent traversal path "../absent":
+    let absent_res = storage.list_tags("../absent").await;
+    assert!(matches!(absent_res, Err(StorageError::NotFound)));
+    let absent_page = storage.list_tags_page("../absent", None, 10).await.unwrap();
+    assert_eq!(absent_page, (Vec::new(), None));
+}
+
+#[tokio::test]
+async fn test_tag_listing_controlled_symlinks() {
+    #[cfg(unix)]
+    {
+        let root = tmp_fs_root();
+        let outside = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let tags_dir = root.join("repos").join("myrepo").join("tags");
+        std::fs::create_dir_all(&tags_dir).unwrap();
+
+        let hex_in = "5555555555555555555555555555555555555555555555555555555555555555";
+        let hex_out = "6666666666666666666666666666666666666666666666666666666666666666";
+        write_file(
+            &tags_dir.join("real-tag"),
+            format!("sha256:{hex_in}\n").as_bytes(),
+        );
+        write_file(
+            &outside.join("target-ext"),
+            format!("sha256:{hex_out}\n").as_bytes(),
+        );
+
+        // 1. Internal symlink
+        std::os::unix::fs::symlink(tags_dir.join("real-tag"), tags_dir.join("sym-internal"))
+            .unwrap();
+
+        // 2. External symlink escaping storage root
+        std::os::unix::fs::symlink(outside.join("target-ext"), tags_dir.join("sym-external"))
+            .unwrap();
+
+        // 3. Dangling symlink
+        std::os::unix::fs::symlink(
+            tags_dir.join("nonexistent-target"),
+            tags_dir.join("sym-dangling"),
+        )
+        .unwrap();
+
+        // Observation on list_tags:
+        // Reads directory entries without following or reading content; all 3 symlinks are returned!
+        let tags = storage.list_tags("myrepo").await.unwrap();
+        assert_eq!(
+            tags,
+            vec!["real-tag", "sym-dangling", "sym-external", "sym-internal"]
+        );
+
+        // Observation on list_tags_page:
+        // Uses tokio::fs::read_to_string(&path) which follows symlinks:
+        // - sym-internal is followed and returned.
+        // - sym-external is followed outside the root and returned (uncontained read leak!).
+        // - sym-dangling fails read_to_string with ENOENT and is silently omitted.
+        let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].0, "real-tag");
+        assert_eq!(page[0].1.hex(), hex_in);
+        assert_eq!(page[1].0, "sym-external");
+        assert_eq!(page[1].1.hex(), hex_out);
+        assert_eq!(page[2].0, "sym-internal");
+        assert_eq!(page[2].1.hex(), hex_in);
+
+        // 4. Ancestor directory symlink:
+        let sym_repo_dir = root.join("repos").join("sym-repo");
+        std::fs::create_dir_all(&sym_repo_dir).unwrap();
+        std::os::unix::fs::symlink(&tags_dir, sym_repo_dir.join("tags")).unwrap();
+
+        let sym_repo_tags = storage.list_tags("sym-repo").await.unwrap();
+        assert_eq!(
+            sym_repo_tags, tags,
+            "list_tags follows directory symlink to tags"
+        );
+
+        let (sym_repo_page, _) = storage.list_tags_page("sym-repo", None, 10).await.unwrap();
+        assert_eq!(
+            sym_repo_page, page,
+            "list_tags_page follows directory symlink to tags"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_tag_listing_non_regular_objects() {
+    // Tests directory-entry behavior in tags/ directory.
+    // NOTE: FIFO, device node, and Unix socket behavior is not experimentally verified by this test.
+    // While reading a FIFO may block depending on opening flags and reader/writer presence,
+    // unconditional indefinite blocking is not claimed as verified.
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex = "7777777777777777777777777777777777777777777777777777777777777777";
+    write_file(
+        &tags_dir.join("regular-tag"),
+        format!("sha256:{hex}").as_bytes(),
+    );
+    std::fs::create_dir_all(tags_dir.join("dir-entry")).unwrap();
+
+    // list_tags includes non-regular entries (checks entry names only, not file types)
+    let tags = storage.list_tags("myrepo").await.unwrap();
+    assert_eq!(tags, vec!["dir-entry", "regular-tag"]);
+
+    // list_tags_page silently excludes directories because read_to_string returns EISDIR
+    let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, "regular-tag");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_tag_listing_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("permrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex = "8888888888888888888888888888888888888888888888888888888888888888";
+    let readable_file = tags_dir.join("readable_tag");
+    write_file(&readable_file, format!("sha256:{hex}\n").as_bytes());
+
+    let unreadable_file = tags_dir.join("unreadable_tag");
+    write_file(&unreadable_file, format!("sha256:{hex}\n").as_bytes());
+
+    struct ScopedPermReset<'a> {
+        path: &'a std::path::Path,
+        original_permissions: std::fs::Permissions,
+    }
+    impl<'a> Drop for ScopedPermReset<'a> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, self.original_permissions.clone());
+        }
+    }
+
+    let orig_file_perms = std::fs::metadata(&unreadable_file).unwrap().permissions();
+    let orig_dir_perms = std::fs::metadata(&tags_dir).unwrap().permissions();
+
+    // 1. File permission case: directory remains accessible, individual tag file is unreadable (0o000)
+    {
+        let _file_guard = ScopedPermReset {
+            path: &unreadable_file,
+            original_permissions: orig_file_perms.clone(),
+        };
+        std::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Verify the target file genuinely produces PermissionDenied on read
+        match std::fs::read(&unreadable_file) {
+            Ok(_) => panic!("ineffective file permissions: read succeeded under mode 0o000"),
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        // list_tags only reads directory entries, so it returns both tag names
+        let tags = storage.list_tags("permrepo").await.unwrap();
+        assert_eq!(tags, vec!["readable_tag", "unreadable_tag"]);
+
+        // list_tags_page attempts read_to_string on each file; unreadable_tag fails and is silently omitted
+        let (page, _) = storage.list_tags_page("permrepo", None, 10).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "readable_tag");
+    }
+
+    // 2. Directory permission case: tags directory itself is unreadable (0o000)
+    {
+        let _dir_guard = ScopedPermReset {
+            path: &tags_dir,
+            original_permissions: orig_dir_perms.clone(),
+        };
+        std::fs::set_permissions(&tags_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Verify the directory genuinely produces PermissionDenied on read_dir
+        match std::fs::read_dir(&tags_dir) {
+            Ok(_) => {
+                panic!("ineffective directory permissions: read_dir succeeded under mode 0o000")
+            }
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        // Both list_tags and list_tags_page encounter Io error during read_dir and fail
+        let res_list = storage.list_tags("permrepo").await;
+        match res_list {
+            Err(StorageError::Internal { kind, .. }) => {
+                assert_eq!(kind, StorageErrorKind::Io);
+            }
+            other => {
+                panic!(
+                    "expected StorageErrorKind::Io on permission denied in list_tags, got {other:?}"
+                )
+            }
+        }
+
+        let res_page = storage.list_tags_page("permrepo", None, 10).await;
+        match res_page {
+            Err(StorageError::Internal { kind, .. }) => {
+                assert_eq!(kind, StorageErrorKind::Io);
+            }
+            other => panic!(
+                "expected StorageErrorKind::Io on permission denied in list_tags_page, got {other:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_tag_listing_pagination_boundaries_cursors_and_zero_limit() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex = "8888888888888888888888888888888888888888888888888888888888888888";
+    for tag_name in ["t1", "t2", "t3", "t4", "t5"] {
+        write_file(&tags_dir.join(tag_name), format!("sha256:{hex}").as_bytes());
+    }
+
+    // 1. Page 1 (limit 2, token None)
+    let (p1, tok1) = storage.list_tags_page("myrepo", None, 2).await.unwrap();
+    assert_eq!(
+        p1.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t1", "t2"]
+    );
+    assert_eq!(tok1, Some("t2".to_string()));
+
+    // 2. Page 2 (limit 2, token "t2")
+    let (p2, tok2) = storage
+        .list_tags_page("myrepo", tok1.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p2.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t3", "t4"]
+    );
+    assert_eq!(tok2, Some("t4".to_string()));
+
+    // 3. Page 3 (limit 2, token "t4")
+    let (p3, tok3) = storage
+        .list_tags_page("myrepo", tok2.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p3.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t5"]
+    );
+    assert_eq!(tok3, None, "terminal page must have None next_token");
+
+    // 4. Terminal cursor query (token "t5")
+    let (p_term, tok_term) = storage
+        .list_tags_page("myrepo", Some("t5"), 2)
+        .await
+        .unwrap();
+    assert!(p_term.is_empty());
+    assert_eq!(tok_term, None);
+
+    // 5. Missing cursor anchor: token between t2 and t3 ("t2.5")
+    let (p_anchor, tok_anchor) = storage
+        .list_tags_page("myrepo", Some("t2.5"), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p_anchor.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t3", "t4"]
+    );
+    assert_eq!(tok_anchor, Some("t4".to_string()));
+
+    // 6. Token before all tags ("000")
+    let (p_early, tok_early) = storage
+        .list_tags_page("myrepo", Some("000"), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p_early.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t1", "t2"]
+    );
+    assert_eq!(tok_early, Some("t2".to_string()));
+
+    // 7. Token after all tags ("zzz")
+    let (p_late, tok_late) = storage
+        .list_tags_page("myrepo", Some("zzz"), 2)
+        .await
+        .unwrap();
+    assert!(p_late.is_empty());
+    assert_eq!(tok_late, None);
+
+    // 8. Raw lexical handling with structurally unusual tokens (no token validation or schema check):
+    // Empty string token "": lexicographically before "t1", starts at index 0
+    let (p_empty, tok_empty) = storage.list_tags_page("myrepo", Some(""), 2).await.unwrap();
+    assert_eq!(
+        p_empty.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t1", "t2"]
+    );
+    assert_eq!(tok_empty, Some("t2".to_string()));
+
+    // Token with slash "t2/nested/slash": '/' (ASCII 47) < '3' (ASCII 51), lands between t2 and t3
+    let (p_slash, tok_slash) = storage
+        .list_tags_page("myrepo", Some("t2/nested/slash"), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p_slash.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t3", "t4"]
+    );
+    assert_eq!(tok_slash, Some("t4".to_string()));
+
+    // Token with space and emoji "t2 🏷️": space (ASCII 32) < '3' (ASCII 51), lands between t2 and t3
+    let (p_emoji, tok_emoji) = storage
+        .list_tags_page("myrepo", Some("t2 🏷️"), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p_emoji.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t3", "t4"]
+    );
+    assert_eq!(tok_emoji, Some("t4".to_string()));
+
+    // Token with embedded null byte "t2\0suffix": null (ASCII 0) < '3' (ASCII 51), lands between t2 and t3
+    let (p_null, tok_null) = storage
+        .list_tags_page("myrepo", Some("t2\0suffix"), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p_null.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t3", "t4"]
+    );
+    assert_eq!(tok_null, Some("t4".to_string()));
+
+    // Oversized 10KB token "t4" + 10,000 'z's: lexicographically between "t4" and "t5"
+    let long_token = "t4".to_string() + &"z".repeat(10_000);
+    let (p_long, tok_long) = storage
+        .list_tags_page("myrepo", Some(&long_token), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p_long.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t5"]
+    );
+    assert_eq!(tok_long, None);
+
+    // High ASCII token "~end": lexicographically after all tags
+    let (p_high, tok_high) = storage
+        .list_tags_page("myrepo", Some("~end"), 2)
+        .await
+        .unwrap();
+    assert!(p_high.is_empty());
+    assert_eq!(tok_high, None);
+
+    // 9. Zero page limit
+    let (p_zero, tok_zero) = storage.list_tags_page("myrepo", None, 0).await.unwrap();
+    assert!(p_zero.is_empty());
+    assert_eq!(tok_zero, None);
+
+    // 10. Oversized page limit
+    let (p_over, tok_over) = storage.list_tags_page("myrepo", None, 100).await.unwrap();
+    assert_eq!(p_over.len(), 5);
+    assert_eq!(tok_over, None);
+}
+
+#[tokio::test]
+async fn test_tag_listing_deterministic_mutations_between_pages() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex_v1 = "9999999999999999999999999999999999999999999999999999999999999999";
+    for tag_name in ["t1", "t2", "t3", "t4"] {
+        write_file(
+            &tags_dir.join(tag_name),
+            format!("sha256:{hex_v1}").as_bytes(),
+        );
+    }
+
+    // Call page 1
+    let (p1, tok1) = storage.list_tags_page("myrepo", None, 2).await.unwrap();
+    assert_eq!(
+        p1.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t1", "t2"]
+    );
+    assert_eq!(tok1, Some("t2".to_string()));
+
+    // Mutation 1: Insert tag "t2.5" between t2 and t3
+    write_file(
+        &tags_dir.join("t2.5"),
+        format!("sha256:{hex_v1}").as_bytes(),
+    );
+
+    // Page 2 using tok1 ("t2") observes the newly inserted "t2.5"!
+    let (p2, tok2) = storage
+        .list_tags_page("myrepo", tok1.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p2.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t2.5", "t3"]
+    );
+    assert_eq!(tok2, Some("t3".to_string()));
+
+    // Mutation 2: Remove the cursor tag "t3"
+    std::fs::remove_file(tags_dir.join("t3")).unwrap();
+
+    // Page 3 using tok2 ("t3") uses binary_search Err insertion point to find "t4"
+    let (p3, tok3) = storage
+        .list_tags_page("myrepo", tok2.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        p3.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t4"]
+    );
+    assert_eq!(tok3, None);
+
+    // Mutation 3: Modify target digest of t4
+    let hex_v2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    write_file(&tags_dir.join("t4"), format!("sha256:{hex_v2}").as_bytes());
+
+    // Querying with token "t2.5" observes the updated digest of t4!
+    let (p_mod, _) = storage
+        .list_tags_page("myrepo", Some("t2.5"), 10)
+        .await
+        .unwrap();
+    assert_eq!(p_mod.len(), 1);
+    assert_eq!(p_mod[0].0, "t4");
+    assert_eq!(p_mod[0].1.hex(), hex_v2);
+}
+
+#[tokio::test]
+async fn test_tag_listing_root_replacement_divergence() {
+    let temp_fixture = tempfile::tempdir().unwrap();
+    let root = temp_fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let storage = FsStorage::try_new(root.clone(), 1024 * 1024).expect("storage init");
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex_tree_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let raw_bytes_tree_a = format!("sha256:{hex_tree_a}\n").into_bytes();
+    write_file(&tags_dir.join("tag-tree-a"), &raw_bytes_tree_a);
+
+    // Compute expected original raw byte SHA-256 version hash:
+    let expected_version_tree_a = {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&raw_bytes_tree_a);
+        hex::encode(hasher.finalize())
+    };
+
+    // Initial observations: both contained reads and ambient listing observe Tree A
+    assert_eq!(
+        storage
+            .resolve_tag("myrepo", "tag-tree-a")
+            .await
+            .unwrap()
+            .hex(),
+        hex_tree_a
+    );
+    let (v_d, v_ver) = storage
+        .get_tag_with_version("myrepo", "tag-tree-a")
+        .await
+        .unwrap()
+        .expect("tag-tree-a must exist in Tree A");
+    assert_eq!(v_d.hex(), hex_tree_a);
+    assert_eq!(
+        v_ver, expected_version_tree_a,
+        "version hashes original raw bytes"
+    );
+
+    assert_eq!(
+        storage.list_tags("myrepo").await.unwrap(),
+        vec!["tag-tree-a"]
+    );
+    let (page_a, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(page_a.len(), 1);
+    assert_eq!(page_a[0].0, "tag-tree-a");
+
+    // Replace root directory sequentially:
+    // Rename root to root-old, create brand new root directory at original path
+    let root_old = temp_fixture.path().join("storage-root-old");
+    std::fs::rename(&root, &root_old).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let new_tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&new_tags_dir).unwrap();
+    let hex_tree_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    write_file(
+        &new_tags_dir.join("tag-tree-b"),
+        format!("sha256:{hex_tree_b}\n").as_bytes(),
+    );
+
+    // 1. Contained tag reads resolve via the pinned descriptor (openat2 on root_fd) -> observe Tree A!
+    let d_read = storage.resolve_tag("myrepo", "tag-tree-a").await.unwrap();
+    assert_eq!(
+        d_read.hex(),
+        hex_tree_a,
+        "contained resolve_tag observes pinned Tree A"
+    );
+
+    let ver_tree_a = storage
+        .get_tag_with_version("myrepo", "tag-tree-a")
+        .await
+        .unwrap()
+        .expect("get_tag_with_version observes pinned Tree A");
+    assert_eq!(ver_tree_a.0.hex(), hex_tree_a);
+    assert_eq!(
+        ver_tree_a.1, expected_version_tree_a,
+        "contained get_tag_with_version maintains bit-exact version against pinned Tree A"
+    );
+
+    let d_missing = storage.resolve_tag("myrepo", "tag-tree-b").await;
+    assert!(
+        matches!(d_missing, Err(StorageError::NotFound)),
+        "contained resolve_tag does not observe tag-tree-b because it is not in pinned Tree A"
+    );
+
+    let ver_missing = storage
+        .get_tag_with_version("myrepo", "tag-tree-b")
+        .await
+        .unwrap();
+    assert_eq!(
+        ver_missing, None,
+        "contained get_tag_with_version returns None for tag-tree-b because it is not in pinned Tree A"
+    );
+
+    // 2. Ambient tag listing operations resolve via self.root.join(...) -> observe Tree B!
+    let tags_listed = storage.list_tags("myrepo").await.unwrap();
+    assert_eq!(
+        tags_listed,
+        vec!["tag-tree-b"],
+        "ambient list_tags observes replacement Tree B at root pathname"
+    );
+
+    let (page_b, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    assert_eq!(
+        page_b.len(),
+        1,
+        "ambient list_tags_page observes replacement Tree B at root pathname"
+    );
+    assert_eq!(page_b[0].0, "tag-tree-b");
+    assert_eq!(page_b[0].1.hex(), hex_tree_b);
+}
+
+#[tokio::test]
+async fn test_tag_listing_ignores_configured_manifest_enumeration_limits() {
+    let root = tmp_fs_root();
+    // Construct storage with restrictive DirEnumerationLimits: max_entries = 1, max_total_name_bytes = 128
+    let storage = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1, 128),
+    )
+    .unwrap();
+
+    let repo = "limited-repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&manifests_dir).unwrap();
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    let hex3 = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    // 1. Demonstrate the effect of configured limits on the intended manifest-listing operation:
+    // With 2 manifests, exceeding max_entries = 1 causes an explicit Backend error
+    write_file(&manifests_dir.join(hex1), b"manifest-1");
+    write_file(&manifests_dir.join(hex2), b"manifest-2");
+
+    let err_manifests = storage
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .expect_err("manifest listing must fail when exceeding configured max_entries = 1");
+    assert_eq!(
+        err_manifests.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(
+        err_manifests
+            .to_string()
+            .contains("enumeration resource limit exceeded")
+    );
+
+    // 2. Characterize tag-listing behavior under the same configured limits:
+    // Create 3 tags (exceeding max_entries = 1 and max_total_name_bytes = 128)
+    write_file(
+        &tags_dir.join("tag-1"),
+        format!("sha256:{hex1}\n").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("tag-2"),
+        format!("sha256:{hex2}\n").as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("tag-3"),
+        format!("sha256:{hex3}\n").as_bytes(),
+    );
+
+    // list_tags is completely unbounded and does NOT enforce or consult manifest_listing_limits
+    let tags = storage
+        .list_tags(repo)
+        .await
+        .expect("list_tags ignores manifest listing limits");
+    assert_eq!(tags, vec!["tag-1", "tag-2", "tag-3"]);
+
+    // list_tags_page is also completely unconstrained by manifest_listing_limits
+    let (page, next_tok) = storage
+        .list_tags_page(repo, None, 10)
+        .await
+        .expect("list_tags_page ignores manifest listing limits");
+    assert_eq!(page.len(), 3);
+    assert_eq!(next_tok, None);
+}
