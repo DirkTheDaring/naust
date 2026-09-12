@@ -2497,4 +2497,166 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(path);
     }
+
+    #[tokio::test]
+    async fn test_sync_repo_real_fs_promoted_listing_failure_preserves_populated_index() {
+        use crate::storage::fs::FsStorage;
+
+        let index_dir = temp_index_path();
+        let idx = BlobRefIndex::open(index_dir.clone()).expect("open index");
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .expect("set schema");
+        idx.meta
+            .insert(META_STATE, META_STATE_READY)
+            .expect("set state");
+
+        let storage_dir = tempfile::tempdir().expect("create storage dir");
+        let root = storage_dir.path().join("storage-root");
+        // Distinctive limit of 1 entry to induce promoted-listing failure
+        let storage = FsStorage::try_new_with_limits(
+            root.clone(),
+            1024 * 1024,
+            storage_fs::DirEnumerationLimits::new(1, 100_000),
+        )
+        .expect("create fs storage");
+
+        let unaffected_repo = "unaffected/repo";
+        let target_repo = "target/repo";
+
+        let r_unaff = d('a');
+        let b_unaff = d('1');
+        let m_unaff = image_manifest(&b_unaff, &d('2'));
+
+        let r_target_1 = d('b');
+        let b_target_1 = d('3');
+        let m_target_1 = image_manifest(&b_target_1, &d('4'));
+
+        // Write initial valid manifests and tags
+        storage
+            .put_manifest(unaffected_repo, &r_unaff, m_unaff)
+            .await
+            .expect("put unaffected manifest");
+        storage
+            .set_tag(unaffected_repo, "latest", &r_unaff)
+            .await
+            .expect("set unaffected tag");
+
+        storage
+            .put_manifest(target_repo, &r_target_1, m_target_1)
+            .await
+            .expect("put target manifest 1");
+        storage
+            .set_tag(target_repo, "v1", &r_target_1)
+            .await
+            .expect("set target tag 1");
+
+        // Populate initial index for both repositories
+        idx.sync_repo_manifests_and_tags(&storage, unaffected_repo)
+            .await
+            .expect("sync unaffected repo");
+        idx.sync_repo_manifests_and_tags(&storage, target_repo)
+            .await
+            .expect("sync target repo");
+
+        // Verify initial index is populated across roots, edges, and tags
+        assert!(
+            !snapshot_tree(&idx.tag_to_root).is_empty(),
+            "tag_to_root must not be empty"
+        );
+        assert!(
+            !snapshot_tree(&idx.root_counts).is_empty(),
+            "root_counts must not be empty"
+        );
+        assert!(
+            !snapshot_tree(&idx.rev_edges).is_empty(),
+            "rev_edges must not be empty"
+        );
+        assert!(
+            idx.is_blob_referenced(&b_unaff).expect("check b_unaff"),
+            "unaffected blob must be referenced"
+        );
+        assert!(
+            idx.is_blob_referenced(&b_target_1)
+                .expect("check b_target_1"),
+            "target blob must be referenced"
+        );
+
+        // Snapshot all sled trees before triggering failure
+        let tags_before = snapshot_tree(&idx.tag_to_root);
+        let roots_before = snapshot_tree(&idx.root_counts);
+        let edges_before = snapshot_tree(&idx.rev_edges);
+        let pins_before = snapshot_tree(&idx.pins);
+        let memberships_before = snapshot_tree(&idx.repo_memberships);
+        let meta_before = snapshot_tree(&idx.meta);
+
+        // Add a second manifest to target_repo, exceeding the configured limit of 1 entry
+        let r_target_2 = d('c');
+        let b_target_2 = d('5');
+        let m_target_2 = image_manifest(&b_target_2, &d('6'));
+        storage
+            .put_manifest(target_repo, &r_target_2, m_target_2)
+            .await
+            .expect("put target manifest 2");
+
+        // Synchronizing target_repo must encounter promoted-listing budget exhaustion
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, target_repo)
+            .await
+            .expect_err("sync must fail due to limit exceeded in real FsStorage");
+
+        match err {
+            RefIndexError::Storage(storage_err) => {
+                assert!(
+                    storage_err
+                        .to_string()
+                        .contains("enumeration resource limit exceeded"),
+                    "expected budget exhaustion error, got: {storage_err:?}"
+                );
+            }
+            other => panic!("expected RefIndexError::Storage, got {other:?}"),
+        }
+
+        // Verify byte-for-byte preservation across all sled trees
+        assert_eq!(
+            snapshot_tree(&idx.tag_to_root),
+            tags_before,
+            "tag_to_root must be byte-for-byte preserved"
+        );
+        assert_eq!(
+            snapshot_tree(&idx.root_counts),
+            roots_before,
+            "root_counts must be byte-for-byte preserved"
+        );
+        assert_eq!(
+            snapshot_tree(&idx.rev_edges),
+            edges_before,
+            "rev_edges must be byte-for-byte preserved"
+        );
+        assert_eq!(
+            snapshot_tree(&idx.pins),
+            pins_before,
+            "pins must be byte-for-byte preserved"
+        );
+        assert_eq!(
+            snapshot_tree(&idx.repo_memberships),
+            memberships_before,
+            "repo_memberships must be byte-for-byte preserved"
+        );
+        assert_eq!(
+            snapshot_tree(&idx.meta),
+            meta_before,
+            "meta must be byte-for-byte preserved"
+        );
+
+        // Verify unaffected repository data and target repository data remain referenced and index remains healthy
+        assert!(idx.is_blob_referenced(&b_unaff).expect("check b_unaff"));
+        assert!(
+            idx.is_blob_referenced(&b_target_1)
+                .expect("check b_target_1")
+        );
+        idx.check_health().expect("check_health must succeed");
+
+        let _ = std::fs::remove_dir_all(index_dir);
+    }
 }

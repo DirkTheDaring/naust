@@ -4719,19 +4719,19 @@ async fn test_manifest_listing_filename_interpretation_variants() {
     let raw_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     write_file(&manifests_dir.join(raw_sha256), b"{}");
 
-    // 2. Raw 128-hex SHA-512 filename -> NOT listed! (silently ignored because sha256:{hex} fails len, and no colon)
+    // 2. Raw 128-hex SHA-512 filename -> discovered by contained manifest listing!
     let raw_sha512 = "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555";
     write_file(&manifests_dir.join(raw_sha512), b"{}");
 
-    // 3. Algorithm-prefixed filename: sha256:<hex> -> parsed as sha256:<hex>
+    // 3. Algorithm-prefixed filename: sha256:<hex> -> skipped (not canonical raw hex)
     let prefixed_sha256 = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     write_file(&manifests_dir.join(prefixed_sha256), b"{}");
 
-    // 4. Algorithm-prefixed filename: sha512:<hex> -> parsed as sha512:<hex>
+    // 4. Algorithm-prefixed filename: sha512:<hex> -> skipped (not canonical raw hex)
     let prefixed_sha512 = "sha512:66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666";
     write_file(&manifests_dir.join(prefixed_sha512), b"{}");
 
-    // 5. Uppercase SHA-256 filename -> parsed and normalized to lowercase
+    // 5. Uppercase SHA-256 filename -> skipped (must be lowercase ascii hex)
     let upper_sha256 = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
     write_file(&manifests_dir.join(upper_sha256), b"{}");
 
@@ -4753,20 +4753,17 @@ async fn test_manifest_listing_filename_interpretation_variants() {
 
     // Verify raw sha256 was included
     assert!(as_strings.contains(&format!("sha256:{raw_sha256}")));
-    // Verify raw sha512 was NOT included (architectural limitation of list_manifest_digests_page)
-    assert!(
-        !as_strings.iter().any(|s| s.contains(raw_sha512)),
-        "raw 128-hex SHA-512 files are unexpectedly ignored by list_manifest_digests_page"
-    );
-    // Verify prefixed sha256 was included
-    assert!(as_strings.contains(&prefixed_sha256.to_string()));
-    // Verify prefixed sha512 was included
-    assert!(as_strings.contains(&prefixed_sha512.to_string()));
-    // Verify uppercase sha256 was included and normalized to lowercase
-    assert!(as_strings.contains(&format!("sha256:{}", upper_sha256.to_lowercase())));
+    // Verify raw sha512 was included (discovered by contained manifest listing)
+    assert!(as_strings.contains(&format!("sha512:{raw_sha512}")));
+    // Verify prefixed sha256 was skipped
+    assert!(!as_strings.contains(&prefixed_sha256.to_string()));
+    // Verify prefixed sha512 was skipped
+    assert!(!as_strings.contains(&prefixed_sha512.to_string()));
+    // Verify uppercase sha256 was skipped
+    assert!(!as_strings.contains(&format!("sha256:{}", upper_sha256.to_lowercase())));
 
-    // Total listed count is 4 (raw_sha256, prefixed_sha256, prefixed_sha512, upper_sha256)
-    assert_eq!(digests.len(), 4);
+    // Total listed count is 2 (raw_sha256 and raw_sha512)
+    assert_eq!(digests.len(), 2);
 }
 
 #[tokio::test]
@@ -4778,7 +4775,7 @@ async fn test_manifest_listing_duplicate_digest_filenames_not_deduplicated() {
     let manifests_dir = root.join("repos").join(repo).join("manifests");
     std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
 
-    // Write raw hex and prefixed hex that resolve to the same Digest
+    // Write raw hex and prefixed hex
     let hex = "1212121212121212121212121212121212121212121212121212121212121212";
     write_file(&manifests_dir.join(hex), b"{}");
     write_file(&manifests_dir.join(format!("sha256:{hex}")), b"{}");
@@ -4788,9 +4785,9 @@ async fn test_manifest_listing_duplicate_digest_filenames_not_deduplicated() {
         .await
         .unwrap();
 
-    // Listing does NOT deduplicate: both entries are returned!
-    assert_eq!(digests.len(), 2);
-    assert_eq!(digests[0], digests[1]);
+    // Contained listing deduplicates and only recognizes canonical raw hex: 1 digest returned
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0].as_str(), format!("sha256:{hex}"));
 }
 
 #[tokio::test]
@@ -4901,9 +4898,9 @@ async fn test_manifest_listing_mixed_algorithm_sorting_and_cursor_mismatch() {
     let manifests_dir = root.join("repos").join(repo).join("manifests");
     std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
 
-    // Item B: SHA-512 with hex starting with "1111..."
+    // Item B: SHA-512 with hex starting with "1111..." (raw hex filename)
     let hex_b = "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
-    write_file(&manifests_dir.join(format!("sha512:{hex_b}")), b"{}");
+    write_file(&manifests_dir.join(hex_b), b"{}");
 
     // Item C: SHA-256 with hex starting with "2222..."
     let hex_c = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -4913,7 +4910,7 @@ async fn test_manifest_listing_mixed_algorithm_sorting_and_cursor_mismatch() {
     let hex_a = "8888888888888888888888888888888888888888888888888888888888888888";
     write_file(&manifests_dir.join(hex_a), b"{}");
 
-    // 1. Establish deterministic ordering facts:
+    // 1. Establish deterministic ordering:
     // In a single unpaginated listing (limit 10), all entries are returned.
     let (all_items, token) = storage
         .list_manifest_digests_page(repo, None, 10)
@@ -4922,26 +4919,17 @@ async fn test_manifest_listing_mixed_algorithm_sorting_and_cursor_mismatch() {
     assert_eq!(all_items.len(), 3);
     assert_eq!(token, None);
 
-    // Assert the exact returned hex ordering: all_digests is sorted by hex() ascending
-    assert_eq!(all_items[0].hex(), hex_b);
-    assert_eq!(all_items[1].hex(), hex_c);
-    assert_eq!(all_items[2].hex(), hex_a);
-    assert!(all_items[0].hex() < all_items[1].hex());
-    assert!(all_items[1].hex() < all_items[2].hex());
+    // Contained listing sorts by Digest::cmp (algorithm ascending, then hex ascending):
+    // sha256:2222... < sha256:8888... < sha512:1111...
+    assert_eq!(all_items[0].as_str(), format!("sha256:{hex_c}"));
+    assert_eq!(all_items[1].as_str(), format!("sha256:{hex_a}"));
+    assert_eq!(all_items[2].as_str(), format!("sha512:{hex_b}"));
+    assert!(all_items[0] < all_items[1]);
+    assert!(all_items[1] < all_items[2]);
 
-    // Assert the mismatch with canonical digest-string (as_str()) ordering:
-    // In canonical string form ("<algo>:<hex>"), "sha512:1111..." is GREATER than "sha256:2222...".
-    // Therefore, an array sorted by hex() is NOT partitioned with respect to as_str().
-    assert_eq!(all_items[0].as_str(), format!("sha512:{hex_b}"));
-    assert_eq!(all_items[1].as_str(), format!("sha256:{hex_c}"));
-    assert!(
-        all_items[0].as_str() > all_items[1].as_str(),
-        "canonical string ordering must disagree with raw hex ordering on mixed algorithms"
-    );
-
-    // 2. Exercise a bounded observation run across pagination.
-    // Explicitly record termination cause, collected digests, and omissions without
-    // asserting that an incidental failure must occur.
+    // 2. Exercise pagination across items.
+    // Because the slice is sorted by Digest::cmp and continuation tokens use string comparison
+    // matching Digest's algorithm-first order, binary search finds each item without mismatch or omission.
     const MAX_PAGINATION_STEPS: usize = 5;
     let mut collected: Vec<Digest> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -4978,26 +4966,17 @@ async fn test_manifest_listing_mixed_algorithm_sorting_and_cursor_mismatch() {
         }
     }
 
-    // Determine omitted digests relative to the unpaginated result
     let omitted: Vec<String> = all_items
         .iter()
         .filter(|d| !collected.contains(d))
         .map(|d| d.as_str())
         .collect();
 
-    println!(
-        "Mixed-algorithm pagination observation:\n  \
-         Steps executed: {step_count}\n  \
-         Termination reason: {termination_reason}\n  \
-         Collected count: {}\n  \
-         Collected digests: {:?}\n  \
-         Omitted count: {}\n  \
-         Omitted digests: {:?}",
-        collected.len(),
-        collected.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
-        omitted.len(),
-        omitted
-    );
+    assert_eq!(step_count, 3);
+    assert_eq!(termination_reason, "no continuation token");
+    assert_eq!(omitted.len(), 0);
+    assert_eq!(collected.len(), 3);
+    assert_eq!(collected, all_items);
 }
 
 #[tokio::test]
@@ -5041,15 +5020,11 @@ async fn test_manifest_listing_entry_types_unfiltered() {
         .await
         .unwrap();
 
-    // CHARACTERIZATION FINDING:
-    // list_manifest_digests_page does NOT check entry file types!
-    // Regular files, directories, valid symlinks, and dangling symlinks are all listed!
+    // Contained listing checks entry file types: only Regular files are listed.
+    // Directories, valid symlinks, and dangling symlinks are skipped!
     let listed_hexes: Vec<String> = digests.iter().map(|d| d.hex().to_string()).collect();
-    assert_eq!(listed_hexes.len(), 4);
-    assert!(listed_hexes.contains(&hex_reg.to_string()));
-    assert!(listed_hexes.contains(&hex_dir.to_string()));
-    assert!(listed_hexes.contains(&hex_sym.to_string()));
-    assert!(listed_hexes.contains(&hex_dangling.to_string()));
+    assert_eq!(listed_hexes.len(), 1);
+    assert_eq!(listed_hexes[0], hex_reg);
 }
 
 #[tokio::test]
@@ -5073,12 +5048,9 @@ async fn test_manifest_listing_symlinked_manifests_and_ancestors() {
     write_file(&outside_manifests1.join(hex1), b"{}");
     symlink(&outside_manifests1, repo1_dir.join("manifests")).expect("symlink manifests dir");
 
-    let (digests1, _) = storage
-        .list_manifest_digests_page(repo1, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(digests1.len(), 1);
-    assert_eq!(digests1[0].hex(), hex1);
+    let res1 = storage.list_manifest_digests_page(repo1, None, 10).await;
+    let err1 = res1.expect_err("symlinked manifests dir must fail closed");
+    assert_eq!(err1.internal_kind(), Some(StorageErrorKind::Io));
 
     // Case 2: Ancestor repo directory is a symlink to outside directory
     let outside_repo2 = outside.join("ext_repo2");
@@ -5091,12 +5063,11 @@ async fn test_manifest_listing_symlinked_manifests_and_ancestors() {
     std::fs::create_dir_all(&repos_dir).expect("create repos dir");
     symlink(&outside_repo2, repos_dir.join("sym_ancestor_repo")).expect("symlink repo ancestor");
 
-    let (digests2, _) = storage
+    let res2 = storage
         .list_manifest_digests_page("sym_ancestor_repo", None, 10)
-        .await
-        .unwrap();
-    assert_eq!(digests2.len(), 1);
-    assert_eq!(digests2[0].hex(), hex2);
+        .await;
+    let err2 = res2.expect_err("symlinked ancestor dir must fail closed");
+    assert_eq!(err2.internal_kind(), Some(StorageErrorKind::Io));
 }
 
 #[tokio::test]
@@ -5111,35 +5082,30 @@ async fn test_manifest_listing_path_traversal_and_absolute_paths() {
     let hex_escaped = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     write_file(&escaped_manifests.join(hex_escaped), b"{}");
 
-    // Ensure root/repos exists so Path::join can traverse
+    // Ensure root/repos exists
     std::fs::create_dir_all(root.join("repos")).expect("create repos dir");
 
-    // Path traversal input: "../../escaped_repo" escapes root/repos via Path::join!
-    let (digests, _) = storage
+    // Path traversal input: "../../escaped_repo" fails closed with InvalidRepoName
+    let res_traversal = storage
         .list_manifest_digests_page("../../escaped_repo", None, 10)
-        .await
-        .unwrap();
-    assert_eq!(
-        digests.len(),
-        1,
-        "Legacy list_manifest_digests_page permits dot-dot path traversal escape"
-    );
-    assert_eq!(digests[0].hex(), hex_escaped);
+        .await;
+    match res_traversal {
+        Err(StorageError::InvalidRepoName(msg)) => {
+            assert!(msg.contains("path traversal attempt") || msg.contains(".."));
+        }
+        other => panic!("expected InvalidRepoName error, got: {other:?}"),
+    }
 
-    // Absolute path input: Path::join on absolute path discards root.join("repos")
-    // Target is <escaped_dir_path>/manifests:
+    // Absolute path input fails closed with InvalidRepoName
     let escaped_dir_path = fixture.path().join("escaped_repo");
     let abs_repo_input = escaped_dir_path.to_str().unwrap();
-    let (digests_abs, _) = storage
+    let res_abs = storage
         .list_manifest_digests_page(abs_repo_input, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(
-        digests_abs.len(),
-        1,
-        "Legacy list_manifest_digests_page permits absolute path redirection"
-    );
-    assert_eq!(digests_abs[0].hex(), hex_escaped);
+        .await;
+    match res_abs {
+        Err(StorageError::InvalidRepoName(_)) => {}
+        other => panic!("expected InvalidRepoName error, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -5155,22 +5121,19 @@ async fn test_manifest_listing_component_wrong_type_suppressed() {
     std::fs::create_dir_all(&repo1_dir).expect("create repo1 dir");
     write_file(&repo1_dir.join("manifests"), b"regular file, not a dir");
 
-    // read_dir returns ENOTDIR, but list_manifest_digests_page suppresses it with if let Ok
     let res1 = storage
         .list_manifest_digests_page("file_manifests_repo", None, 10)
-        .await
-        .expect("ENOTDIR is suppressed and returns empty page");
-    assert_eq!(res1.0.len(), 0);
-    assert_eq!(res1.1, None);
+        .await;
+    let err1 = res1.expect_err("ENOTDIR on manifests component must fail closed");
+    assert_eq!(err1.internal_kind(), Some(StorageErrorKind::CorruptData));
 
     // Case 2: repo component itself is a regular file instead of a directory
     write_file(&repos_dir.join("file_repo"), b"regular file, not a dir");
     let res2 = storage
         .list_manifest_digests_page("file_repo", None, 10)
-        .await
-        .expect("repo as file is suppressed and returns empty page");
-    assert_eq!(res2.0.len(), 0);
-    assert_eq!(res2.1, None);
+        .await;
+    let err2 = res2.expect_err("repo as file must fail closed with ENOTDIR");
+    assert_eq!(err2.internal_kind(), Some(StorageErrorKind::CorruptData));
 }
 
 #[tokio::test]
@@ -5235,13 +5198,14 @@ async fn test_manifest_listing_permission_denied_ignored() {
             ),
         }
 
-        // list_manifest_digests_page: read_dir error (PermissionDenied) is SILENTLY SUPPRESSED
-        let res = storage
-            .list_manifest_digests_page(repo, None, 10)
-            .await
-            .expect("PermissionDenied on read_dir is suppressed and returns empty page");
-        assert_eq!(res.0.len(), 0);
-        assert_eq!(res.1, None);
+        // list_manifest_digests_page: fails closed with StorageErrorKind::PermissionDenied
+        let res = storage.list_manifest_digests_page(repo, None, 10).await;
+        let err =
+            res.expect_err("PermissionDenied on readdir must fail closed with PermissionDenied");
+        assert_eq!(
+            err.internal_kind(),
+            Some(StorageErrorKind::PermissionDenied)
+        );
     }
 
     let restored_perms = std::fs::metadata(&manifests_dir).unwrap().permissions();
@@ -5310,4 +5274,270 @@ async fn test_manifest_listing_manifest_reader_port_forwarding() {
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].hex(), hex1);
     assert_eq!(tok, Some(format!("sha256:{hex1}")));
+}
+
+#[tokio::test]
+async fn test_manifest_listing_constructor_validation() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+
+    // 1. try_new_with_limits validates max_entries >= 1
+    let err_entries = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(0, 1_500_000),
+    )
+    .expect_err("entries = 0 must fail constructor validation");
+    assert_eq!(
+        err_entries.internal_kind(),
+        Some(StorageErrorKind::Configuration)
+    );
+    assert!(
+        err_entries
+            .to_string()
+            .contains("manifest_listing_max_entries must be at least 1")
+    );
+
+    // 2. try_new_with_limits validates max_total_name_bytes >= 128
+    let err_bytes = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(10_000, 127),
+    )
+    .expect_err("name_bytes = 127 must fail constructor validation");
+    assert_eq!(
+        err_bytes.internal_kind(),
+        Some(StorageErrorKind::Configuration)
+    );
+    assert!(
+        err_bytes
+            .to_string()
+            .contains("manifest_listing_max_name_bytes must be at least 128")
+    );
+
+    // 3. Valid limits succeed
+    let storage_custom = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(500, 50_000),
+    )
+    .expect("valid limits succeed");
+    assert_eq!(storage_custom.manifest_listing_limits().max_entries(), 500);
+    assert_eq!(
+        storage_custom
+            .manifest_listing_limits()
+            .max_total_name_bytes(),
+        50_000
+    );
+
+    // 4. Default constructor supplies approved defaults
+    let storage_default =
+        FsStorage::try_new(root.clone(), 1024 * 1024).expect("default constructor succeeds");
+    assert_eq!(
+        storage_default.manifest_listing_limits().max_entries(),
+        10_000
+    );
+    assert_eq!(
+        storage_default
+            .manifest_listing_limits()
+            .max_total_name_bytes(),
+        1_500_000
+    );
+}
+
+#[tokio::test]
+async fn test_manifest_listing_exact_entry_boundary() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let repo = "boundary_entry_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    write_file(&manifests_dir.join(hex1), b"{}");
+    write_file(&manifests_dir.join(hex2), b"{}");
+
+    // Limits with exactly 2 entries: enumeration of 2 entries succeeds
+    let storage2 = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(2, 1_500_000),
+    )
+    .unwrap();
+    let (items, _) = storage2
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+
+    // Limits with 1 entry: enumeration of 2 entries exceeds limit -> returns Backend error
+    let storage1 = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1, 1_500_000),
+    )
+    .unwrap();
+    let err = storage1
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .expect_err("exceeding entry limit fails");
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err.to_string()
+            .contains("enumeration resource limit exceeded")
+    );
+}
+
+#[tokio::test]
+async fn test_manifest_listing_exact_name_byte_boundary_including_128_byte_sha512() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    let repo = "boundary_bytes_repo";
+    let manifests_dir = root.join("repos").join(repo).join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests dir");
+
+    // 128-byte SHA-512 filename
+    let hex_512 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert_eq!(hex_512.len(), 128);
+    write_file(&manifests_dir.join(hex_512), b"{}");
+
+    // Exactly 128 name bytes limit: single 128-byte filename fits!
+    let storage128 = FsStorage::try_new_with_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(100, 128),
+    )
+    .unwrap();
+    let (items, _) = storage128
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].as_str(), format!("sha512:{hex_512}"));
+
+    // Add another file (64 bytes): cumulative bytes = 192 > 128 -> limit exceeded!
+    let hex_256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    write_file(&manifests_dir.join(hex_256), b"{}");
+
+    let err = storage128
+        .list_manifest_digests_page(repo, None, 10)
+        .await
+        .expect_err("exceeding name bytes limit fails");
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err.to_string()
+            .contains("enumeration resource limit exceeded")
+    );
+}
+
+#[tokio::test]
+async fn test_manifest_listing_shared_reader_and_startup_offload() {
+    let fixture = tempfile::tempdir().expect("create test fixture");
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).expect("create storage root");
+
+    // 1. Verify shared reader pointer equality:
+    // FsStorage.reader() and FsStorage.read_adapter().reader() share the identical Arc<FsMetadataReader>,
+    // and list_manifest_digests_page delegates directly to list_manifest_digests_page_impl using self.reader.as_ref().
+    let storage = FsStorage::try_new(root.clone(), 1024 * 1024).expect("storage init");
+    assert!(
+        std::sync::Arc::ptr_eq(storage.reader(), storage.read_adapter().reader()),
+        "FsStorage.reader and read_adapter must share the identical Arc<FsMetadataReader>"
+    );
+
+    // 2. Verify async startup factory offload via tokio::task::spawn_blocking:
+    // Factory execution must occur off the calling async worker thread.
+    let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+    let calling_thread_id = std::thread::current().id();
+    let worker_tx = std::sync::Mutex::new(Some(worker_tx));
+
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    config.max_upload_bytes = 1024 * 1024;
+    // Configure distinctive small limit of 1 entry to verify it governs listing
+    config.fs_manifest_listing_max_entries = 1;
+    config.fs_manifest_listing_max_name_bytes = 100_000;
+
+    let wiring =
+        crate::storage::storage_wiring_try_from_config_async_with_factory(&config, move |cfg| {
+            let current_id = std::thread::current().id();
+            if let Some(tx) = worker_tx.lock().unwrap().take() {
+                let _ = tx.send(current_id);
+            }
+            crate::storage::storage_wiring_try_from_config(cfg)
+        })
+        .await
+        .expect("startup offload factory succeeds");
+
+    let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+    assert_ne!(
+        calling_thread_id, construction_thread_id,
+        "filesystem storage construction must execute off the calling async worker thread via spawn_blocking"
+    );
+    assert_eq!(wiring.backend_kind(), "fs");
+
+    // 3. Demonstrate configured limits govern listing through primary storage wiring:
+    let primary_reader = wiring.manifest_reader();
+    let primary_repo = "primary_limit_repo";
+    let primary_manifests_dir = root.join("repos").join(primary_repo).join("manifests");
+    std::fs::create_dir_all(&primary_manifests_dir).expect("create primary manifests dir");
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(&primary_manifests_dir.join(hex1), b"{}");
+
+    // Exactly 1 entry <= max_entries(1) -> succeeds
+    let (page, _) = primary_reader
+        .list_manifest_digests_page(primary_repo, None, 10)
+        .await
+        .expect("listing 1 entry within limit succeeds");
+    assert_eq!(page.len(), 1);
+
+    // 2 entries > max_entries(1) -> fails closed with StorageErrorKind::Backend
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    write_file(&primary_manifests_dir.join(hex2), b"{}");
+    let err = primary_reader
+        .list_manifest_digests_page(primary_repo, None, 10)
+        .await
+        .expect_err("exceeding max_entries limit on primary storage must fail");
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err.to_string()
+            .contains("enumeration resource limit exceeded")
+    );
+
+    // 4. Demonstrate configured limits govern listing through filesystem proxy-cache wiring:
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    proxy_cfg.fs_manifest_listing_max_entries = 1;
+    proxy_cfg.fs_manifest_listing_max_name_bytes = 100_000;
+
+    let proxy_storage =
+        crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None).unwrap();
+    let proxy_repo = "proxy_limit_repo";
+    let proxy_manifests_dir = cache_root.join("repos").join(proxy_repo).join("manifests");
+    std::fs::create_dir_all(&proxy_manifests_dir).expect("create proxy manifests dir");
+
+    write_file(&proxy_manifests_dir.join(hex1), b"{}");
+    let (proxy_page, _) = proxy_storage
+        .as_manifest_reader()
+        .list_manifest_digests_page(proxy_repo, None, 10)
+        .await
+        .expect("proxy listing 1 entry within limit succeeds");
+    assert_eq!(proxy_page.len(), 1);
+
+    write_file(&proxy_manifests_dir.join(hex2), b"{}");
+    let proxy_err = proxy_storage
+        .as_manifest_reader()
+        .list_manifest_digests_page(proxy_repo, None, 10)
+        .await
+        .expect_err("exceeding max_entries limit on proxy cache storage must fail");
+    assert_eq!(proxy_err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        proxy_err
+            .to_string()
+            .contains("enumeration resource limit exceeded")
+    );
 }

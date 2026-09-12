@@ -4646,3 +4646,138 @@ async fn test_partial_cleanup_then_failure_then_successful_recovery() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn test_manifest_listing_lifecycle_error_propagation_on_promoted_listing_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs_root = dir.path().join("data");
+    let ref_idx_path = dir.path().join("ref-index");
+    std::fs::create_dir_all(&fs_root).unwrap();
+    std::fs::create_dir_all(&ref_idx_path).unwrap();
+
+    // Configure real FsStorage with distinctive max_entries = 1
+    let storage = Arc::new(
+        FsStorage::try_new_with_limits(
+            fs_root.clone(),
+            50 * 1024 * 1024,
+            storage_fs::DirEnumerationLimits::new(1, 100_000),
+        )
+        .expect("create fs storage with limits"),
+    );
+    let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
+    ref_index.rebuild(&storage).await.unwrap();
+
+    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let service =
+        ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
+
+    let repo = "library/lifecycle-listing-limit";
+
+    let shared_blob = write_test_blob(&storage, repo, b"shared-blob-content").await;
+    let unique_blob = write_test_blob(&storage, repo, b"unique-blob-content").await;
+    let other_blob = write_test_blob(&storage, repo, b"other-blob-content").await;
+
+    let pr_shared = RepoBlobMembershipRecord::try_new_proxy(repo, shared_blob.clone()).unwrap();
+    let pr_unique = RepoBlobMembershipRecord::try_new_proxy(repo, unique_blob.clone()).unwrap();
+    let pr_other = RepoBlobMembershipRecord::try_new_proxy(repo, other_blob.clone()).unwrap();
+    storage.link_repo_blob(&pr_shared).await.unwrap();
+    storage.link_repo_blob(&pr_unique).await.unwrap();
+    storage.link_repo_blob(&pr_other).await.unwrap();
+
+    let (m1_bytes, m1_d) = create_manifest_json(&shared_blob, &unique_blob);
+    let (m2_bytes, m2_d) = create_manifest_json(&shared_blob, &other_blob);
+    let (m3_bytes, m3_d) = create_manifest_json(&other_blob, &unique_blob);
+
+    let ev1 =
+        ProxyPublicationEvidence::new_for_test(repo, "v1", m1_bytes, None, true, m1_d.clone());
+    service.publish_proxy_cached_manifest(ev1).await.unwrap();
+
+    let ev2 =
+        ProxyPublicationEvidence::new_for_test(repo, "v2", m2_bytes, None, true, m2_d.clone());
+    service.publish_proxy_cached_manifest(ev2).await.unwrap();
+
+    let ev3 =
+        ProxyPublicationEvidence::new_for_test(repo, "v3", m3_bytes, None, true, m3_d.clone());
+    service.publish_proxy_cached_manifest(ev3).await.unwrap();
+
+    // Evict m1:
+    // 1. Storage deletes m1 manifest file
+    // 2. Journal updates to ProxyManifestDeleted
+    // 3. Lifecycle service calls is_blob_referenced_in_repo to discover if remaining manifests reference blobs
+    // 4. Remaining manifests are m2 and m3 (2 entries > limit 1), triggering budget exhaustion
+    let err = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m1_d)
+        .await
+        .expect_err("eviction should fail on promoted listing budget exhaustion");
+
+    // Assert propagated error
+    match err {
+        ManifestLifecycleError::Storage(storage_err) => {
+            assert!(
+                storage_err
+                    .to_string()
+                    .contains("enumeration resource limit exceeded"),
+                "expected budget exhaustion error, got: {storage_err:?}"
+            );
+        }
+        other => panic!("expected ManifestLifecycleError::Storage, got {other:?}"),
+    }
+
+    // Establish the fixture's successful journal persistence before asserting an exact phase
+    let journal_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .expect("journal read must succeed")
+        .expect("journal must be present");
+    let journal: LifecycleJournalRecord =
+        serde_json::from_slice(&journal_bytes).expect("parse journal");
+    assert_eq!(
+        journal.phase,
+        LifecyclePhase::ProxyManifestDeleted,
+        "journal phase must remain at ProxyManifestDeleted"
+    );
+    assert_eq!(
+        journal.target_digest, m1_d,
+        "journal target digest must match evicted manifest"
+    );
+
+    // Assert preserved candidate membership
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &shared_blob)
+            .await
+            .unwrap()
+            .is_some(),
+        "shared_blob membership must be preserved"
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &unique_blob)
+            .await
+            .unwrap()
+            .is_some(),
+        "unique_blob membership must be preserved on listing failure"
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(repo, &other_blob)
+            .await
+            .unwrap()
+            .is_some(),
+        "other_blob membership must be preserved"
+    );
+
+    // Assert continued CAS metadata accessibility
+    assert!(
+        storage.head_blob(&shared_blob).await.is_ok(),
+        "shared_blob CAS must remain accessible"
+    );
+    assert!(
+        storage.head_blob(&unique_blob).await.is_ok(),
+        "unique_blob CAS must remain accessible"
+    );
+    assert!(
+        storage.head_blob(&other_blob).await.is_ok(),
+        "other_blob CAS must remain accessible"
+    );
+}

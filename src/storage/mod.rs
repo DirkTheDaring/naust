@@ -829,8 +829,15 @@ impl<T: ?Sized + Storage + Send + Sync> Storage for Arc<T> {
 pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, StorageError> {
     match config.storage_backend {
         StorageBackend::Filesystem => {
-            let fs_storage =
-                fs::FsStorage::try_new(config.fs_root.clone(), config.max_upload_bytes)?;
+            let limits = storage_fs::DirEnumerationLimits::new(
+                config.fs_manifest_listing_max_entries,
+                config.fs_manifest_listing_max_name_bytes,
+            );
+            let fs_storage = fs::FsStorage::try_new_with_limits(
+                config.fs_root.clone(),
+                config.max_upload_bytes,
+                limits,
+            )?;
             Ok(StorageWiring::from_backend(Arc::new(fs_storage)))
         }
         StorageBackend::S3 => {
@@ -888,7 +895,12 @@ pub fn proxy_cache_storage_try_from_config(
                     .clone()
                     .unwrap_or_else(|| config.fs_root.join("cache")),
             };
-            let fs_storage = fs::FsStorage::try_new(root, config.max_upload_bytes)?;
+            let limits = storage_fs::DirEnumerationLimits::new(
+                config.fs_manifest_listing_max_entries,
+                config.fs_manifest_listing_max_name_bytes,
+            );
+            let fs_storage =
+                fs::FsStorage::try_new_with_limits(root, config.max_upload_bytes, limits)?;
             Ok(Arc::new(fs_storage))
         }
         StorageBackend::S3 => {

@@ -195,10 +195,26 @@ pub struct FsStorage {
     repo_locks: std::sync::Mutex<std::collections::HashMap<String, std::fs::File>>,
     reader: std::sync::Arc<storage_fs::FsMetadataReader>,
     read_adapter: std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>>,
+    manifest_listing_limits: storage_fs::DirEnumerationLimits,
 }
 
 impl FsStorage {
-    pub fn try_new(root: PathBuf, max_upload_bytes: u64) -> Result<Self, StorageError> {
+    pub fn try_new_with_limits(
+        root: PathBuf,
+        max_upload_bytes: u64,
+        limits: storage_fs::DirEnumerationLimits,
+    ) -> Result<Self, StorageError> {
+        if limits.max_entries() < manifest_listing::MIN_MANIFEST_LISTING_ENTRIES {
+            return Err(StorageError::configuration(
+                "manifest_listing_max_entries must be at least 1",
+            ));
+        }
+        if limits.max_total_name_bytes() < manifest_listing::MIN_MANIFEST_LISTING_NAME_BYTES {
+            return Err(StorageError::configuration(
+                "manifest_listing_max_name_bytes must be at least 128",
+            ));
+        }
+
         ensure_dir(&root)?;
         let reader = storage_fs::FsMetadataReader::open(&root)
             .map_err(read_adapter::map_fs_startup_error)?;
@@ -226,7 +242,16 @@ impl FsStorage {
             repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reader,
             read_adapter,
+            manifest_listing_limits: limits,
         })
+    }
+
+    pub fn try_new(root: PathBuf, max_upload_bytes: u64) -> Result<Self, StorageError> {
+        Self::try_new_with_limits(
+            root,
+            max_upload_bytes,
+            manifest_listing::default_manifest_dir_limits(),
+        )
     }
 
     pub fn new(root: PathBuf, max_upload_bytes: u64) -> Self {
@@ -247,6 +272,32 @@ impl FsStorage {
     #[cfg(test)]
     pub(crate) fn reader(&self) -> &std::sync::Arc<storage_fs::FsMetadataReader> {
         &self.reader
+    }
+
+    /// Returns configured directory enumeration limits for manifest listing.
+    #[cfg(test)]
+    pub(crate) fn manifest_listing_limits(&self) -> storage_fs::DirEnumerationLimits {
+        self.manifest_listing_limits
+    }
+
+    /// Internal test helper to list manifest digests with explicitly injected limits.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn list_manifest_digests_page_with_limits(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+        limits: storage_fs::DirEnumerationLimits,
+    ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+        manifest_listing::list_manifest_digests_page_impl(
+            self.reader.as_ref(),
+            repo,
+            continuation_token,
+            page_limit,
+            limits,
+        )
+        .await
     }
 
     /// Internal test helper to list CAS blobs with explicitly injected listing budgets.
@@ -1003,46 +1054,14 @@ impl Storage for FsStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
-        let manifests_dir = self.root.join("repos").join(repo).join("manifests");
-        if !manifests_dir.exists() {
-            return Ok((Vec::new(), None));
-        }
-
-        let mut all_digests: Vec<Digest> = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(&manifests_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with(".tmp.") || file_name.starts_with(".lock.") {
-                    continue;
-                }
-                if let Ok(d) = Digest::parse(&format!("sha256:{file_name}")) {
-                    all_digests.push(d);
-                } else if let Ok(d) = Digest::parse(&file_name) {
-                    all_digests.push(d);
-                }
-            }
-        }
-        all_digests.sort_by(|a, b| a.hex().cmp(b.hex()));
-
-        let start_idx = if let Some(token) = continuation_token {
-            match all_digests.binary_search_by(|d| d.as_str().as_str().cmp(token)) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            }
-        } else {
-            0
-        };
-
-        let end_idx = (start_idx + page_limit).min(all_digests.len());
-        let page_slice = &all_digests[start_idx..end_idx];
-
-        let next_token = if end_idx < all_digests.len() {
-            page_slice.last().map(|d| d.as_str().to_string())
-        } else {
-            None
-        };
-
-        Ok((page_slice.to_vec(), next_token))
+        manifest_listing::list_manifest_digests_page_impl(
+            self.reader.as_ref(),
+            repo,
+            continuation_token,
+            page_limit,
+            self.manifest_listing_limits,
+        )
+        .await
     }
 
     async fn list_tags_page(
@@ -3565,6 +3584,5 @@ pub(crate) mod listing;
 #[path = "fs/manifest.rs"]
 pub(crate) mod manifest;
 
-#[cfg(test)]
 #[path = "fs/manifest_listing.rs"]
 pub(crate) mod manifest_listing;

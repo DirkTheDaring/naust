@@ -555,6 +555,8 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         anonymous_pull: true,
         storage_backend: StorageBackend::Filesystem,
         fs_root,
+        fs_manifest_listing_max_entries: 10_000,
+        fs_manifest_listing_max_name_bytes: 1_500_000,
         s3_endpoint: None,
         s3_region: None,
         s3_bucket: None,

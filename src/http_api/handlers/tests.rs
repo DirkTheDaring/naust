@@ -576,6 +576,10 @@ fn minimal_config_for_token_tests() -> Config {
         push_implies_delete: false,
         storage_backend: crate::config::StorageBackend::Filesystem,
         fs_root: PathBuf::from("./data"),
+        fs_manifest_listing_max_entries:
+            crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_ENTRIES,
+        fs_manifest_listing_max_name_bytes:
+            crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES,
         s3_endpoint: None,
         s3_region: None,
         s3_bucket: None,

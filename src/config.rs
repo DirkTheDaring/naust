@@ -114,6 +114,8 @@ pub struct Config {
     pub storage_backend: StorageBackend,
 
     pub fs_root: PathBuf,
+    pub fs_manifest_listing_max_entries: usize,
+    pub fs_manifest_listing_max_name_bytes: usize,
 
     pub s3_endpoint: Option<String>,
     pub s3_region: Option<String>,
@@ -1002,6 +1004,10 @@ struct FileStorageRefIndex {
 struct FileStorageFs {
     #[serde(default)]
     root: Option<String>,
+    #[serde(default)]
+    manifest_listing_max_entries: Option<usize>,
+    #[serde(default)]
+    manifest_listing_max_name_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1478,6 +1484,39 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data"));
+
+        let fs_manifest_listing_max_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_ENTRIES",
+            "STORAGE_FS_MANIFEST_LISTING_MAX_ENTRIES",
+        ])?
+        .or(file_cfg.storage.fs.manifest_listing_max_entries)
+        .unwrap_or(crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_ENTRIES);
+
+        let fs_manifest_listing_max_name_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_NAME_BYTES",
+            "STORAGE_FS_MANIFEST_LISTING_MAX_NAME_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.manifest_listing_max_name_bytes)
+        .unwrap_or(crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES);
+
+        if storage_backend == StorageBackend::Filesystem {
+            if fs_manifest_listing_max_entries
+                < crate::storage::fs::manifest_listing::MIN_MANIFEST_LISTING_ENTRIES
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "manifest_listing_max_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_manifest_listing_max_name_bytes
+                < crate::storage::fs::manifest_listing::MIN_MANIFEST_LISTING_NAME_BYTES
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "manifest_listing_max_name_bytes",
+                    message: "must be at least 128".to_string(),
+                });
+            }
+        }
 
         let admin_api_enabled =
             env_bool_opt(&["REGISTRY__ADMIN_API__ENABLED", "ADMIN_API_ENABLED"])?
@@ -2303,6 +2342,8 @@ impl Config {
             anonymous_pull,
             storage_backend,
             fs_root,
+            fs_manifest_listing_max_entries,
+            fs_manifest_listing_max_name_bytes,
             s3_endpoint,
             s3_region,
             s3_bucket,
@@ -3627,6 +3668,289 @@ groups = ["nonexistent_group"]
         assert_eq!(
             parse_cidrs_opt(None, Some(vec![])).unwrap(),
             Vec::<ipnet::IpNet>::new()
+        );
+    }
+
+    fn run_process_isolated<F>(test_name: &str, extra_env: &[(&str, &str)], test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        if std::env::var("REGISTRY_TEST_ISOLATED_CHILD").as_deref() == Ok("1") {
+            test_fn();
+            return;
+        }
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let mut cmd = std::process::Command::new(current_exe);
+        cmd.env_clear();
+        for var in &["PATH", "TMPDIR", "TEMP", "TMP", "HOME"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        cmd.env("REGISTRY_TEST_ISOLATED_CHILD", "1");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.arg("--exact").arg(test_name).arg("--nocapture");
+
+        let output = cmd.output().expect("failed to spawn child test process");
+        if !output.status.success() {
+            panic!(
+                "Process-isolated test '{}' failed in child process:\nSTDOUT:\n{}\nSTDERR:\n{}",
+                test_name,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_defaults() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_defaults",
+            &[],
+            || {
+                let cfg = Config::from_env_with_files(&[]).expect("default config must load");
+                assert_eq!(cfg.fs_manifest_listing_max_entries, 10_000);
+                assert_eq!(cfg.fs_manifest_listing_max_name_bytes, 1_500_000);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_toml_parsing() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_toml_parsing",
+            &[],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+manifest_listing_max_entries = 5000
+manifest_listing_max_name_bytes = 200000
+"#,
+                )
+                .unwrap();
+
+                let cfg = Config::from_env_with_files(&[path]).expect("load config file");
+                assert_eq!(cfg.fs_manifest_listing_max_entries, 5000);
+                assert_eq!(cfg.fs_manifest_listing_max_name_bytes, 200000);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_env_hierarchical_precedence() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_env_hierarchical_precedence",
+            &[
+                (
+                    "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_ENTRIES",
+                    "7000",
+                ),
+                ("STORAGE_FS_MANIFEST_LISTING_MAX_ENTRIES", "6000"),
+                (
+                    "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_NAME_BYTES",
+                    "400000",
+                ),
+                ("STORAGE_FS_MANIFEST_LISTING_MAX_NAME_BYTES", "300000"),
+            ],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+manifest_listing_max_entries = 5000
+manifest_listing_max_name_bytes = 200000
+"#,
+                )
+                .unwrap();
+
+                let res = Config::from_env_with_files(&[path]);
+                let cfg = res.expect("load config with env override");
+                assert_eq!(cfg.fs_manifest_listing_max_entries, 7000);
+                assert_eq!(cfg.fs_manifest_listing_max_name_bytes, 400000);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_env_flat_precedence() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_env_flat_precedence",
+            &[
+                ("STORAGE_FS_MANIFEST_LISTING_MAX_ENTRIES", "6000"),
+                ("STORAGE_FS_MANIFEST_LISTING_MAX_NAME_BYTES", "300000"),
+            ],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+manifest_listing_max_entries = 5000
+manifest_listing_max_name_bytes = 200000
+"#,
+                )
+                .unwrap();
+
+                let res = Config::from_env_with_files(&[path]);
+                let cfg = res.expect("load config with flat env override");
+                assert_eq!(cfg.fs_manifest_listing_max_entries, 6000);
+                assert_eq!(cfg.fs_manifest_listing_max_name_bytes, 300000);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_invalid_lower_bounds_entries() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_invalid_lower_bounds_entries",
+            &[],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+manifest_listing_max_entries = 0
+"#,
+                )
+                .unwrap();
+
+                let err =
+                    Config::from_env_with_files(&[path]).expect_err("should reject entries = 0");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "manifest_listing_max_entries");
+                        assert!(message.contains("must be at least 1"));
+                    }
+                    other => panic!("expected InvalidValue, got: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_invalid_lower_bounds_bytes() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_invalid_lower_bounds_bytes",
+            &[],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+manifest_listing_max_name_bytes = 127
+"#,
+                )
+                .unwrap();
+
+                let err = Config::from_env_with_files(&[path])
+                    .expect_err("should reject name_bytes = 127");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "manifest_listing_max_name_bytes");
+                        assert!(message.contains("must be at least 128"));
+                    }
+                    other => panic!("expected InvalidValue, got: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_malformed_entries() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_malformed_entries",
+            &[("REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_ENTRIES", "abc")],
+            || {
+                let res = Config::from_env_with_files(&[]);
+                match res.expect_err("should fail on malformed entries") {
+                    ConfigError::InvalidEnvValue { key, expected } => {
+                        assert_eq!(key, "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_ENTRIES");
+                        assert_eq!(expected, "unsigned integer");
+                    }
+                    other => panic!("expected InvalidEnvValue, got: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_malformed_name_bytes() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_malformed_name_bytes",
+            &[("STORAGE_FS_MANIFEST_LISTING_MAX_NAME_BYTES", "not_a_number")],
+            || {
+                let res = Config::from_env_with_files(&[]);
+                match res.expect_err("should fail on malformed name bytes") {
+                    ConfigError::InvalidEnvValue { key, expected } => {
+                        assert_eq!(key, "STORAGE_FS_MANIFEST_LISTING_MAX_NAME_BYTES");
+                        assert_eq!(expected, "unsigned integer");
+                    }
+                    other => panic!("expected InvalidEnvValue, got: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_numeric_overflow() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_numeric_overflow",
+            &[(
+                "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_ENTRIES",
+                "999999999999999999999999999999999999999999999999999999999999",
+            )],
+            || {
+                let res = Config::from_env_with_files(&[]);
+                match res.expect_err("should fail on numeric overflow") {
+                    ConfigError::InvalidEnvValue { key, expected } => {
+                        assert_eq!(key, "REGISTRY__STORAGE__FS__MANIFEST_LISTING_MAX_ENTRIES");
+                        assert_eq!(expected, "unsigned integer");
+                    }
+                    other => panic!("expected InvalidEnvValue, got: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_manifest_listing_s3_ignores_fs_bounds() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_manifest_listing_s3_ignores_fs_bounds",
+            &[],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage]
+backend = "s3"
+
+[storage.fs]
+manifest_listing_max_entries = 0
+manifest_listing_max_name_bytes = 50
+"#,
+                )
+                .unwrap();
+
+                let cfg = Config::from_env_with_files(&[path])
+                    .expect("s3 backend should ignore fs bounds");
+                assert_eq!(cfg.storage_backend, StorageBackend::S3);
+            },
         );
     }
 }

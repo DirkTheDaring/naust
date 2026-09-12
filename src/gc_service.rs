@@ -846,6 +846,10 @@ mod tests {
             anonymous_pull: true,
             storage_backend: StorageBackend::Filesystem,
             fs_root,
+            fs_manifest_listing_max_entries:
+                crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_ENTRIES,
+            fs_manifest_listing_max_name_bytes:
+                crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES,
             s3_endpoint: None,
             s3_region: None,
             s3_bucket: None,

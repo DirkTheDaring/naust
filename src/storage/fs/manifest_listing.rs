@@ -4,8 +4,8 @@
 //! beneath the pinned root directory descriptor using `storage_fs::FsMetadataReader`.
 //!
 //! # Architectural Boundaries
-//! - **Test-Only Seam**: This module is scoped under `#[cfg(test)]` as an architectural
-//!   seam. Production `FsStorage::list_manifest_digests_page` remains unmodified in this slice.
+//! - **Production Promotion**: Promoted from test seam into production; delegated to by
+//!   `FsStorage::list_manifest_digests_page`.
 //! - **Descriptor Containment**: Uses Linux `openat2` on the pinned storage root with
 //!   flags `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
 //! - **Fail-Closed Repository Validation**: Enforces path-safety validation before key composition
@@ -15,8 +15,12 @@
 //!   snapshot consistency.
 //!
 //! # Operational Limitations & Environmental Dependencies
-//! - **No Snapshot, Mount, or Hard-Link Isolation**: Listing observes directory entries at enumeration
-//!   time; concurrent additions, removals, or hard-link replacements are not transactionally isolated.
+//! - **Iterative Enumeration, Not a Snapshot**: Directory enumeration observes directory entries as they
+//!   are yielded across iterative `getdents64` system calls, not as a point-in-time or instantaneous snapshot.
+//!   Concurrent additions, removals, unlinks, or moves across enumeration or pagination requests are not
+//!   transactionally isolated.
+//! - **No Mount or Hard-Link Isolation**: Path containment is restricted beneath the root descriptor, but
+//!   nested mounts or hard links beneath the root are not isolated.
 //! - **Non-Guaranteed Subsequent Readability**: Canonical filename alignment does not guarantee that a
 //!   listed digest remains readable or uncorrupted when subsequently read via `get_manifest`.
 //! - **Root Replacement Divergence**: A pinned reader remains attached to the descriptor of the original
@@ -30,8 +34,6 @@
 //!   External seccomp filter actions depend on policy configuration and are not assumed to map uniformly
 //!   to a single errno.
 
-#![cfg(test)]
-
 use async_trait::async_trait;
 use storage_core::ObjectKey;
 use storage_fs::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError};
@@ -39,18 +41,23 @@ use storage_fs::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError};
 use crate::registry::digest::Digest;
 use crate::storage::StorageError;
 
-/// Explicitly provisional test fixture limits for manifest directory enumeration.
-///
-/// NOTE: These values are provisional test fixtures and do not represent approved
-/// production defaults, measured capacity, or guaranteed scale.
-pub const PROVISIONAL_TEST_MAX_MANIFEST_ENTRIES: usize = 10_000;
-pub const PROVISIONAL_TEST_MAX_MANIFEST_NAME_BYTES: usize = 1_500_000;
+/// Approved default maximum directory entries for filesystem manifest enumeration.
+pub const DEFAULT_MANIFEST_LISTING_MAX_ENTRIES: usize = 10_000;
 
-/// Runtime helper to construct provisional test limits.
-pub fn provisional_test_manifest_dir_limits() -> DirEnumerationLimits {
+/// Approved default cumulative raw filename bytes for filesystem manifest enumeration.
+pub const DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES: usize = 1_500_000;
+
+/// Approved lower bound for directory entries (must be >= 1).
+pub const MIN_MANIFEST_LISTING_ENTRIES: usize = 1;
+
+/// Approved lower bound for cumulative raw filename bytes (must be >= 128 to accommodate a 128-byte SHA-512 filename).
+pub const MIN_MANIFEST_LISTING_NAME_BYTES: usize = 128;
+
+/// Returns approved default [`DirEnumerationLimits`] for filesystem manifest enumeration.
+pub fn default_manifest_dir_limits() -> DirEnumerationLimits {
     DirEnumerationLimits::new(
-        PROVISIONAL_TEST_MAX_MANIFEST_ENTRIES,
-        PROVISIONAL_TEST_MAX_MANIFEST_NAME_BYTES,
+        DEFAULT_MANIFEST_LISTING_MAX_ENTRIES,
+        DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES,
     )
 }
 
@@ -846,7 +853,7 @@ mod tests {
     async fn test_manifest_listing_real_fs_missing_and_empty_directories() {
         let (_fixture, root) = create_test_root();
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-        let limits = provisional_test_manifest_dir_limits();
+        let limits = default_manifest_dir_limits();
 
         // Missing repo directory -> empty success
         let (page, tok) =
@@ -878,7 +885,7 @@ mod tests {
     async fn test_manifest_listing_real_fs_canonical_sha256_and_sha512_alignment() {
         let (_fixture, root) = create_test_root();
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-        let limits = provisional_test_manifest_dir_limits();
+        let limits = default_manifest_dir_limits();
 
         let hex256 = "1111111111111111111111111111111111111111111111111111111111111111";
         let hex512 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -924,7 +931,7 @@ mod tests {
     async fn test_manifest_listing_real_fs_filtering_non_regular_and_non_canonical() {
         let (_fixture, root) = create_test_root();
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-        let limits = provisional_test_manifest_dir_limits();
+        let limits = default_manifest_dir_limits();
 
         let hex256 = "2222222222222222222222222222222222222222222222222222222222222222";
         write_manifest_file(&root, "filter_repo", hex256, b"{}");
@@ -987,7 +994,7 @@ mod tests {
     async fn test_manifest_listing_real_fs_wrong_type_and_symlinked_components() {
         let (_fixture, root) = create_test_root();
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-        let limits = provisional_test_manifest_dir_limits();
+        let limits = default_manifest_dir_limits();
 
         // 1. manifests is a regular file, not a directory -> NotADirectory -> CorruptData
         let bad_repo = root.join("repos").join("bad_repo");
@@ -1134,7 +1141,7 @@ mod tests {
 
         // Open reader pinned to original root descriptor
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-        let limits = provisional_test_manifest_dir_limits();
+        let limits = default_manifest_dir_limits();
 
         // Verify initial listing observes hex_orig
         let (page1, _) = list_manifest_digests_page_impl(&reader, "pin_repo", None, 10, limits)
@@ -1164,7 +1171,7 @@ mod tests {
     async fn test_manifest_listing_real_fs_sequential_changes_between_listing_and_reading() {
         let (_fixture, root) = create_test_root();
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-        let limits = provisional_test_manifest_dir_limits();
+        let limits = default_manifest_dir_limits();
 
         let hex = "1111111111111111111111111111111111111111111111111111111111111111";
         write_manifest_file(&root, "seq_repo", hex, b"{}");
@@ -1259,7 +1266,7 @@ mod tests {
             }
 
             let reader = storage_fs::FsMetadataReader::open(&root).expect("open reader");
-            let limits = provisional_test_manifest_dir_limits();
+            let limits = default_manifest_dir_limits();
             let res = list_manifest_digests_page_impl(&reader, repo, None, 10, limits).await;
             match res.expect_err("permission denied must fail closed") {
                 StorageError::Internal { kind, .. } => {
