@@ -1723,14 +1723,13 @@ impl Storage for FsStorage {
         name: &str,
         subject: &Digest,
     ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
-        let path = self.referrers_path(name, subject);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        serde_json::from_slice::<Vec<ReferrerDescriptor>>(&bytes)
-            .map_err(|err| StorageError::io(err.to_string()))
+        referrers_read::read_referrers_contained(
+            self.reader.as_ref(),
+            name,
+            subject,
+            &referrers_read::ReferrersReadLimits::default(),
+        )
+        .await
     }
 
     async fn add_referrer(
@@ -3725,3 +3724,6 @@ pub(crate) mod tag_read;
 
 #[path = "fs/tag_listing.rs"]
 pub(crate) mod tag_listing;
+
+#[path = "fs/referrers_read.rs"]
+pub(crate) mod referrers_read;

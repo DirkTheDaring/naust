@@ -91,7 +91,10 @@ pub(crate) fn tag_key(repo: &str, tag: &str) -> Result<ObjectKey, StorageError> 
     ObjectKey::parse(&key_str).map_err(|e| StorageError::InvalidRepoName(e.to_string()))
 }
 
-fn validate_path_component(component: &str, field_name: &str) -> Result<(), StorageError> {
+pub(crate) fn validate_path_component(
+    component: &str,
+    field_name: &str,
+) -> Result<(), StorageError> {
     if component.is_empty() {
         return Err(StorageError::InvalidRepoName(format!(
             "{field_name} cannot be empty"

@@ -9690,12 +9690,18 @@ mod referrers_read_characterization {
     }
 
     // ------------------------------------------------------------------------
-    // Group 3: Ambient path behavior
+    // Group 3: Contained path behavior (production cutover)
+    //
+    // These tests originally froze the ambient pathname behavior (symlinks
+    // followed, traversal permitted). After the contained referrers read
+    // cutover, `list_referrers` resolves beneath the pinned root descriptor
+    // with symlink rejection and structural repository-name validation, and
+    // the tests freeze the new production contract instead.
     // ------------------------------------------------------------------------
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_ambient_symlink_inside_fixture() {
+    async fn test_contained_symlink_inside_root_rejected() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let subject = Digest::parse(
@@ -9721,20 +9727,27 @@ mod referrers_read_characterization {
         std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
 
-        // Direct read ambiently follows symlink inside fixture
-        let direct = storage.list_referrers("testrepo", &subject).await.unwrap();
-        assert_eq!(direct, vec![desc.clone()]);
+        // Contained read rejects the symlink even though the target is inside the root.
+        let direct_err = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .unwrap_err();
+        match direct_err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected Io on symlink rejection, got {other:?}"),
+        }
 
+        // Paged read continues to suppress the rejection into empty success.
         let paged = storage
             .list_referrers_page("testrepo", &subject, None, 10)
             .await
             .unwrap();
-        assert_eq!(paged, (vec![desc], None));
+        assert_eq!(paged, (vec![], None));
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_ambient_symlink_outside_storage_root() {
+    async fn test_contained_symlink_outside_storage_root_rejected() {
         let fixture = tempfile::tempdir().expect("create test fixture");
         let root = fixture.path().join("storage_root");
         let outside = fixture.path().join("outside_target");
@@ -9765,20 +9778,26 @@ mod referrers_read_characterization {
         std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
 
-        // Direct read ambiently follows symlink outside storage root without containment failure
-        let direct = storage.list_referrers("testrepo", &subject).await.unwrap();
-        assert_eq!(direct, vec![desc.clone()]);
+        // Contained read rejects escape through the file symlink.
+        let direct_err = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .unwrap_err();
+        match direct_err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected Io on symlink escape rejection, got {other:?}"),
+        }
 
         let paged = storage
             .list_referrers_page("testrepo", &subject, None, 10)
             .await
             .unwrap();
-        assert_eq!(paged, (vec![desc], None));
+        assert_eq!(paged, (vec![], None));
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_ambient_directory_symlink() {
+    async fn test_contained_directory_symlink_rejected() {
         let fixture = tempfile::tempdir().expect("create test fixture");
         let root = fixture.path().join("storage_root");
         let outside_dir = fixture.path().join("outside_referrers");
@@ -9805,19 +9824,25 @@ mod referrers_read_characterization {
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::os::unix::fs::symlink(&outside_dir, repo_dir.join("referrers")).unwrap();
 
-        // Ambient read follows directory symlink
-        let direct = storage.list_referrers("testrepo", &subject).await.unwrap();
-        assert_eq!(direct, vec![desc.clone()]);
+        // Contained read rejects the intermediate directory symlink.
+        let direct_err = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .unwrap_err();
+        match direct_err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected Io on directory symlink rejection, got {other:?}"),
+        }
 
         let paged = storage
             .list_referrers_page("testrepo", &subject, None, 10)
             .await
             .unwrap();
-        assert_eq!(paged, (vec![desc], None));
+        assert_eq!(paged, (vec![], None));
     }
 
     #[tokio::test]
-    async fn test_repo_name_path_traversal_storage_boundary() {
+    async fn test_repo_name_path_traversal_rejected_at_storage_boundary() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let subject = Digest::parse(
@@ -9825,10 +9850,9 @@ mod referrers_read_characterization {
         )
         .unwrap();
 
-        // Path constructed by storage: root.join("repos").join("../escaped_repo").join("referrers").join("<hex>.json")
-        // Ensure repos directory exists so that the "repos/.." path component can resolve on filesystem
+        // Plant a file where the legacy ambient path "repos/../escaped_repo/..." resolved,
+        // to prove the contained read no longer reaches it.
         std::fs::create_dir_all(root.join("repos")).unwrap();
-
         let escaped_path = root
             .join("escaped_repo")
             .join("referrers")
@@ -9839,15 +9863,25 @@ mod referrers_read_characterization {
             None,
             None,
         );
-        let json_bytes = serde_json::to_vec(&vec![desc.clone()]).unwrap();
+        let json_bytes = serde_json::to_vec(&vec![desc]).unwrap();
         write_file(&escaped_path, &json_bytes);
 
-        // Direct read with "../escaped_repo" traverses path without containment error
-        let direct = storage
+        // Structural validation rejects the traversal name before any reader call.
+        let direct_err = storage
             .list_referrers("../escaped_repo", &subject)
             .await
+            .unwrap_err();
+        assert!(
+            matches!(direct_err, StorageError::InvalidRepoName(_)),
+            "expected InvalidRepoName for traversal repository name, got {direct_err:?}"
+        );
+
+        // Paged read suppresses the rejection into empty success instead of leaking data.
+        let paged = storage
+            .list_referrers_page("../escaped_repo", &subject, None, 10)
+            .await
             .unwrap();
-        assert_eq!(direct, vec![desc]);
+        assert_eq!(paged, (vec![], None));
     }
 
     // ------------------------------------------------------------------------
@@ -10311,6 +10345,360 @@ mod referrers_read_characterization {
                 assert_eq!(name, "../escape_repo");
             }
             other => panic!("expected InvalidRepoName, got: {other:?}"),
+        }
+    }
+}
+
+/// Mutation-read compatibility and production wiring coverage for the contained
+/// referrers read cutover.
+///
+/// Promoting `FsStorage::list_referrers` to the contained reader is not a
+/// query-only change: `add_referrer`, `remove_referrer`, and `delete_manifest`
+/// (via `remove_referrer`) consume the promoted read. These tests freeze the
+/// mutation-side consequences of the cutover.
+#[cfg(target_os = "linux")]
+mod referrers_contained_mutation_compat {
+    use super::*;
+    use crate::application::ReferrersQueryError;
+    use crate::application::referrers::{ReferrersQueryParams, ReferrersQueryService};
+    use crate::storage::ports::StorageWiring;
+    use crate::storage::{ReferrerDescriptor, StorageErrorKind};
+
+    fn make_descriptor(digest: &str, size: u64) -> ReferrerDescriptor {
+        ReferrerDescriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: digest.to_string(),
+            size,
+            artifact_type: None,
+            annotations: None,
+        }
+    }
+
+    fn subject_sha256() -> Digest {
+        Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap()
+    }
+
+    fn referrers_file_path(root: &Path, repo: &str, subject: &Digest) -> PathBuf {
+        root.join("repos")
+            .join(repo)
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()))
+    }
+
+    /// A tempdir-scoped fixture root so traversal side effects stay inside the fixture.
+    fn fixture_root() -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().expect("create test fixture");
+        let root = fixture.path().join("storage_root");
+        std::fs::create_dir_all(&root).unwrap();
+        (fixture, root)
+    }
+
+    #[tokio::test]
+    async fn test_add_referrer_traversal_rejected_after_ensure_dir_side_effect() {
+        let (fixture, root) = fixture_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = subject_sha256();
+
+        let desc = make_descriptor(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            100,
+        );
+
+        // repos/ must exist so the ambient "repos/.." component can resolve during ensure_dir.
+        std::fs::create_dir_all(root.join("repos")).unwrap();
+
+        let err = storage
+            .add_referrer("../escaped_repo", &subject, desc)
+            .await
+            .expect_err("contained read must reject traversal repository name");
+        assert!(
+            matches!(err, StorageError::InvalidRepoName(_)),
+            "expected InvalidRepoName from add_referrer, got {err:?}"
+        );
+
+        // The rejection happens fail-closed before serialization/writeback: no referrers
+        // file is created at the escaped location.
+        let escaped_file = root
+            .join("escaped_repo")
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()));
+        assert!(
+            !escaped_file.exists(),
+            "no referrers file may be written at the escaped path"
+        );
+
+        // Documented non-rollback: ensure_dir runs before the contained read and its
+        // uncontained directory creation is NOT rolled back by the read rejection.
+        let escaped_dir = root.join("escaped_repo").join("referrers");
+        assert!(
+            escaped_dir.is_dir(),
+            "ensure_dir side effect precedes the contained read rejection and is not rolled back"
+        );
+
+        drop(fixture);
+    }
+
+    #[tokio::test]
+    async fn test_add_referrer_symlinked_file_fails_closed_without_overwrite() {
+        let (fixture, root) = fixture_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = subject_sha256();
+
+        // Symlink the referrers file to an outside target holding valid JSON.
+        let outside_target = fixture.path().join("outside_referrers.json");
+        let planted = serde_json::to_vec(&vec![make_descriptor(
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            300,
+        )])
+        .unwrap();
+        write_file(&outside_target, &planted);
+
+        let link_path = referrers_file_path(&root, "testrepo", &subject);
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside_target, &link_path).unwrap();
+
+        let err = storage
+            .add_referrer(
+                "testrepo",
+                &subject,
+                make_descriptor(
+                    "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                    400,
+                ),
+            )
+            .await
+            .expect_err("contained pre-read must reject the symlinked referrers file");
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected Io on symlink rejection in add_referrer, got {other:?}"),
+        }
+
+        // Fail-closed: neither the symlink nor its target was replaced or rewritten.
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must remain in place"
+        );
+        assert_eq!(
+            std::fs::read(&outside_target).unwrap(),
+            planted,
+            "symlink target bytes must remain unmodified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_referrer_corrupt_existing_file_fails_closed() {
+        let (_fixture, root) = fixture_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = subject_sha256();
+
+        let path = referrers_file_path(&root, "testrepo", &subject);
+        write_file(&path, b"corrupt-not-json");
+
+        let err = storage
+            .add_referrer(
+                "testrepo",
+                &subject,
+                make_descriptor(
+                    "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                    500,
+                ),
+            )
+            .await
+            .expect_err("corrupt existing referrers file must abort add_referrer");
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected Io on corrupt pre-read, got {other:?}"),
+        }
+
+        // The corrupted file must not be overwritten with a fresh single-entry array.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"corrupt-not-json",
+            "corrupt file must remain untouched after fail-closed abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_referrer_symlinked_file_fails_closed() {
+        let (fixture, root) = fixture_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = subject_sha256();
+        let referrer = Digest::parse(
+            "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        )
+        .unwrap();
+
+        let outside_target = fixture.path().join("outside_referrers.json");
+        let planted = serde_json::to_vec(&vec![make_descriptor(&referrer.as_str(), 600)]).unwrap();
+        write_file(&outside_target, &planted);
+
+        let link_path = referrers_file_path(&root, "testrepo", &subject);
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside_target, &link_path).unwrap();
+
+        let err = storage
+            .remove_referrer("testrepo", &subject, &referrer)
+            .await
+            .expect_err("contained pre-read must reject the symlinked referrers file");
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected Io on symlink rejection in remove_referrer, got {other:?}"),
+        }
+
+        // Fail-closed: no unlink and no writeback happened.
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must remain in place"
+        );
+        assert_eq!(
+            std::fs::read(&outside_target).unwrap(),
+            planted,
+            "symlink target bytes must remain unmodified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_swallows_contained_referrer_cleanup_failure() {
+        let (fixture, root) = fixture_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = subject_sha256();
+        let manifest_digest = Digest::parse(
+            "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        )
+        .unwrap();
+
+        // Store a manifest declaring the subject.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": subject.as_str(),
+                "size": 500
+            }
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        storage
+            .put_manifest("testrepo", &manifest_digest, bytes.into())
+            .await
+            .expect("put manifest");
+
+        // Symlink the subject's referrers file so remove_referrer's contained read fails.
+        let outside_target = fixture.path().join("outside_referrers.json");
+        let planted =
+            serde_json::to_vec(&vec![make_descriptor(&manifest_digest.as_str(), 700)]).unwrap();
+        write_file(&outside_target, &planted);
+        let link_path = referrers_file_path(&root, "testrepo", &subject);
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside_target, &link_path).unwrap();
+
+        // delete_manifest ignores the remove_referrer failure and reports success;
+        // the manifest is already removed by then, and the cleanup failure does not
+        // resurrect it.
+        storage
+            .delete_manifest("testrepo", &manifest_digest)
+            .await
+            .expect("delete_manifest suppresses referrer cleanup failure");
+
+        let manifest_path = root
+            .join("repos")
+            .join("testrepo")
+            .join("manifests")
+            .join(manifest_digest.hex());
+        assert!(
+            !manifest_path.exists(),
+            "manifest must be removed despite referrer cleanup failure"
+        );
+
+        // The rejected referrers file remains untouched: stale-cleanup residue is the
+        // documented consequence of the ignored remove_referrer result.
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must remain in place"
+        );
+        assert_eq!(
+            std::fs::read(&outside_target).unwrap(),
+            planted,
+            "symlink target bytes must remain unmodified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_referrers_pinned_root_divergence() {
+        let (fixture, root) = fixture_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = subject_sha256();
+
+        let desc_old = make_descriptor(
+            "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+            800,
+        );
+        write_file(
+            &referrers_file_path(&root, "testrepo", &subject),
+            &serde_json::to_vec(&vec![desc_old.clone()]).unwrap(),
+        );
+
+        let initial = storage.list_referrers("testrepo", &subject).await.unwrap();
+        assert_eq!(initial, vec![desc_old.clone()]);
+
+        // Replace the root pathname with a fresh tree holding different content.
+        let root_old = fixture.path().join("storage_root_old");
+        std::fs::rename(&root, &root_old).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let desc_new = make_descriptor(
+            "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+            900,
+        );
+        write_file(
+            &referrers_file_path(&root, "testrepo", &subject),
+            &serde_json::to_vec(&vec![desc_new]).unwrap(),
+        );
+
+        // Production list_referrers resolves beneath the pinned root descriptor and
+        // continues to observe the originally opened tree, proving contained wiring.
+        let pinned = storage.list_referrers("testrepo", &subject).await.unwrap();
+        assert_eq!(
+            pinned,
+            vec![desc_old],
+            "contained production read must observe the pinned old root"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_caller_symlinked_referrers_fails_closed() {
+        let (fixture, root) = fixture_root();
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let wiring = StorageWiring::from_backend(storage.clone());
+        let service = ReferrersQueryService::new(wiring.referrers_reader());
+        let subject = subject_sha256();
+
+        let outside_target = fixture.path().join("outside_referrers.json");
+        write_file(&outside_target, b"[]");
+        let link_path = referrers_file_path(&root, "validrepo", &subject);
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside_target, &link_path).unwrap();
+
+        // The public query service propagates the containment rejection instead of
+        // serving symlinked content (HTTP handler maps this to HTTP 500).
+        let err = service
+            .query_referrers("validrepo", &subject, ReferrersQueryParams::default(), None)
+            .await
+            .expect_err("symlinked referrers file must fail closed on the public route");
+        match err {
+            ReferrersQueryError::Storage(StorageError::Internal { kind, .. }) => {
+                assert_eq!(kind, StorageErrorKind::Io);
+            }
+            other => panic!("expected Storage(Internal(Io)), got: {other:?}"),
         }
     }
 }
