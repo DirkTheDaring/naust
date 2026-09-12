@@ -3713,3 +3713,7 @@ pub(crate) mod manifest_refs;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use manifest_refs as manifest_refs_seam;
+
+#[cfg(test)]
+#[path = "fs/tag_seam.rs"]
+mod tag_seam;
