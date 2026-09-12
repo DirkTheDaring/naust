@@ -937,9 +937,17 @@ pub async fn compute_protected_blobs(
                     tag_regex,
                     allow_prerelease,
                 } => {
-                    if let Ok(tags) = storage.list_tags(&repo).await
-                        && let Some(latest) =
-                            pick_latest_semver_tag(tags, tag_regex.as_deref(), *allow_prerelease)
+                    let tags = match storage.list_tags(&repo).await {
+                        Ok(tags) => tags,
+                        Err(storage::StorageError::NotFound) => Vec::new(),
+                        Err(e) => {
+                            return Err(format!(
+                                "failed to list tags for repository '{repo}' during proxy gc: {e}"
+                            ));
+                        }
+                    };
+                    if let Some(latest) =
+                        pick_latest_semver_tag(tags, tag_regex.as_deref(), *allow_prerelease)
                     {
                         pinned_tags.push(latest);
                     }
@@ -1539,6 +1547,667 @@ mod tests {
         assert!(
             result.is_err(),
             "compute_protected_blobs must fail when a pinned manifest is unparsable"
+        );
+    }
+
+    use crate::storage::ports::*;
+    use crate::storage::{
+        BlobMeta, ManifestMeta, ReferrerDescriptor, RepoTimestamps, StorageError, StorageErrorKind,
+        UploadMeta,
+    };
+    use bytes::Bytes;
+    use std::sync::Mutex;
+
+    type ListTagsOverride =
+        Box<dyn Fn(&str) -> Option<Result<Vec<String>, StorageError>> + Send + Sync>;
+    type ResolveTagOverride =
+        Box<dyn Fn(&str, &str) -> Option<Result<Digest, StorageError>> + Send + Sync>;
+
+    struct InjectedProxyStorage {
+        inner: Arc<dyn ProxyStoragePort>,
+        list_tags_override: Mutex<Option<ListTagsOverride>>,
+        resolve_tag_override: Mutex<Option<ResolveTagOverride>>,
+    }
+
+    impl InjectedProxyStorage {
+        fn new(inner: Arc<dyn ProxyStoragePort>) -> Self {
+            Self {
+                inner,
+                list_tags_override: Mutex::new(None),
+                resolve_tag_override: Mutex::new(None),
+            }
+        }
+
+        fn set_list_tags_fn<F>(&self, f: F)
+        where
+            F: Fn(&str) -> Option<Result<Vec<String>, StorageError>> + Send + Sync + 'static,
+        {
+            *self.list_tags_override.lock().unwrap() = Some(Box::new(f));
+        }
+
+        fn clear_list_tags_fn(&self) {
+            *self.list_tags_override.lock().unwrap() = None;
+        }
+
+        fn set_resolve_tag_fn<F>(&self, f: F)
+        where
+            F: Fn(&str, &str) -> Option<Result<Digest, StorageError>> + Send + Sync + 'static,
+        {
+            *self.resolve_tag_override.lock().unwrap() = Some(Box::new(f));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TagReader for InjectedProxyStorage {
+        async fn resolve_tag(&self, repo: &str, tag: &str) -> Result<Digest, StorageError> {
+            if let Some(ref cb) = *self.resolve_tag_override.lock().unwrap() {
+                if let Some(res) = cb(repo, tag) {
+                    return res;
+                }
+            }
+            self.inner.as_tag_reader().resolve_tag(repo, tag).await
+        }
+
+        async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
+            if let Some(ref cb) = *self.list_tags_override.lock().unwrap() {
+                if let Some(res) = cb(repo) {
+                    return res;
+                }
+            }
+            self.inner.as_tag_reader().list_tags(repo).await
+        }
+
+        async fn list_tags_page(
+            &self,
+            repo: &str,
+            continuation_token: Option<&str>,
+            limit: usize,
+        ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+            self.inner
+                .as_tag_reader()
+                .list_tags_page(repo, continuation_token, limit)
+                .await
+        }
+
+        async fn get_tag_with_version(
+            &self,
+            repo: &str,
+            tag: &str,
+        ) -> Result<Option<(Digest, String)>, StorageError> {
+            self.inner
+                .as_tag_reader()
+                .get_tag_with_version(repo, tag)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryCatalogReader for InjectedProxyStorage {
+        async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+            self.inner.as_catalog_reader().list_repositories().await
+        }
+
+        async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
+            self.inner.as_catalog_reader().repo_timestamps(name).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManifestReader for InjectedProxyStorage {
+        async fn head_manifest(
+            &self,
+            name: &str,
+            digest: &Digest,
+        ) -> Result<ManifestMeta, StorageError> {
+            self.inner
+                .as_manifest_reader()
+                .head_manifest(name, digest)
+                .await
+        }
+
+        async fn get_manifest(
+            &self,
+            name: &str,
+            digest: &Digest,
+        ) -> Result<(ManifestMeta, Bytes), StorageError> {
+            self.inner
+                .as_manifest_reader()
+                .get_manifest(name, digest)
+                .await
+        }
+
+        async fn list_manifest_digests_page(
+            &self,
+            repo: &str,
+            continuation_token: Option<&str>,
+            page_limit: usize,
+        ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+            self.inner
+                .as_manifest_reader()
+                .list_manifest_digests_page(repo, continuation_token, page_limit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReferrersReader for InjectedProxyStorage {
+        async fn list_referrers(
+            &self,
+            name: &str,
+            subject: &Digest,
+        ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
+            self.inner
+                .as_referrers_reader()
+                .list_referrers(name, subject)
+                .await
+        }
+
+        async fn list_referrers_page(
+            &self,
+            repo: &str,
+            subject: &Digest,
+            continuation_token: Option<&str>,
+            limit: usize,
+        ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError> {
+            self.inner
+                .as_referrers_reader()
+                .list_referrers_page(repo, subject, continuation_token, limit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobCasReader for InjectedProxyStorage {
+        async fn head_blob(&self, digest: &Digest) -> Result<BlobMeta, StorageError> {
+            self.inner.as_blob_reader().head_blob(digest).await
+        }
+
+        async fn open_blob(
+            &self,
+            digest: &Digest,
+        ) -> Result<
+            (
+                BlobMeta,
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            ),
+            StorageError,
+        > {
+            self.inner.as_blob_reader().open_blob(digest).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobCasWriter for InjectedProxyStorage {
+        async fn create_upload(&self) -> Result<UploadMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn upload_status(&self, _uuid: &str) -> Result<UploadMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn append_upload(
+            &self,
+            _uuid: &str,
+            _chunk: Bytes,
+        ) -> Result<UploadMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn finalize_upload(
+            &self,
+            _uuid: &str,
+            _digest: &Digest,
+        ) -> Result<crate::storage::BlobMeta, StorageError> {
+            unimplemented!()
+        }
+        async fn abort_upload(&self, _uuid: &str) -> Result<(), StorageError> {
+            unimplemented!()
+        }
+    }
+
+    impl crate::storage::upload_session::UploadSessionStorage for InjectedProxyStorage {}
+    impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for InjectedProxyStorage {}
+
+    fn create_test_manifest_with_blob(blob_digest: &Digest) -> (Digest, Vec<u8>) {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": 2,
+                "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "size": 100,
+                    "digest": blob_digest.as_str()
+                }
+            ]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &manifest_bytes);
+        let manifest_digest = Digest::parse(&format!(
+            "sha256:{}",
+            hex::encode(sha2::Digest::finalize(hasher))
+        ))
+        .unwrap();
+        (manifest_digest, manifest_bytes)
+    }
+
+    #[tokio::test]
+    async fn test_compute_protected_blobs_propagates_representative_listing_errors() {
+        let (storage, proxy, _temp) = create_test_env();
+        let repo = "library/error-repo";
+
+        let blob_digest = Digest::parse(
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        )
+        .unwrap();
+        let (manifest_digest, manifest_bytes) = create_test_manifest_with_blob(&blob_digest);
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &manifest_digest, Bytes::from(manifest_bytes))
+            .await
+            .unwrap();
+
+        let rules = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: false,
+            },
+        }];
+
+        let test_errors = vec![
+            (
+                StorageError::internal(StorageErrorKind::Io, "disk I/O read failure"),
+                "disk I/O read failure",
+            ),
+            (
+                StorageError::backend("directory entry limit exceeded"),
+                "directory entry limit exceeded",
+            ),
+            (
+                StorageError::internal(
+                    StorageErrorKind::PermissionDenied,
+                    "access denied by system",
+                ),
+                "access denied by system",
+            ),
+        ];
+
+        for (err, needle) in test_errors {
+            let injected = Arc::new(InjectedProxyStorage::new(storage.proxy_storage()));
+            let err_clone = err.clone();
+            injected.set_list_tags_fn(move |_repo| Some(Err(err_clone.clone())));
+
+            let result = compute_protected_blobs(&injected, &rules, &proxy).await;
+            assert!(
+                result.is_err(),
+                "Expected error for {needle}, got {result:?}"
+            );
+            let err_msg = result.unwrap_err();
+            assert!(
+                err_msg.contains(repo),
+                "Error message '{err_msg}' must contain repository context '{repo}'"
+            );
+            assert!(
+                err_msg.contains(needle),
+                "Error message '{err_msg}' must contain error detail '{needle}'"
+            );
+            assert!(
+                err_msg.starts_with(&format!(
+                    "failed to list tags for repository '{repo}' during proxy gc: "
+                )),
+                "Error message '{err_msg}' must follow established format"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compute_protected_blobs_not_found_treated_as_empty_tags() {
+        let (storage, proxy, _temp) = create_test_env();
+        let valid_repo = "library/valid-repo";
+        let missing_repo = "library/missing-repo";
+
+        let blob_digest = Digest::parse(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let (manifest_digest, manifest_bytes) = create_test_manifest_with_blob(&blob_digest);
+
+        storage
+            .manifest_lifecycle()
+            .put_manifest(valid_repo, &manifest_digest, Bytes::from(manifest_bytes))
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .set_tag(valid_repo, "v1.0.0", &manifest_digest)
+            .await
+            .unwrap();
+
+        // Ensure missing_repo is listed by storage.list_repositories()
+        let injected = Arc::new(InjectedProxyStorage::new(storage.proxy_storage()));
+        injected.set_list_tags_fn(move |repo| {
+            if repo == "library/missing-repo" {
+                Some(Err(StorageError::NotFound))
+            } else {
+                None
+            }
+        });
+
+        // We can create a tag in missing-repo and then have list_tags return NotFound
+        storage
+            .manifest_lifecycle()
+            .put_manifest(
+                missing_repo,
+                &manifest_digest,
+                Bytes::from(create_test_manifest_with_blob(&blob_digest).1),
+            )
+            .await
+            .unwrap();
+
+        let rules = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: false,
+            },
+        }];
+
+        let result = compute_protected_blobs(&injected, &rules, &proxy).await;
+        assert!(
+            result.is_ok(),
+            "NotFound must be treated as empty tags and succeed, got {result:?}"
+        );
+        let protected = result.unwrap();
+
+        // Valid repo's blob is protected
+        assert!(
+            protected.contains(blob_digest.hex()),
+            "Blob from valid repository must be protected"
+        );
+        // Root manifest itself is NOT inserted in protected_blobs
+        assert!(
+            !protected.contains(manifest_digest.hex()),
+            "Root manifest itself is not inserted into protected_blobs by collect_protected_blobs_for_manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_protected_blobs_successful_semver_selection_and_contents() {
+        let (storage, proxy, _temp) = create_test_env();
+        let repo = "library/semver-repo";
+
+        let blob_v10 = Digest::parse(
+            "sha256:1010101010101010101010101010101010101010101010101010101010101010",
+        )
+        .unwrap();
+        let blob_v12 = Digest::parse(
+            "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        )
+        .unwrap();
+        let blob_v13_rc1 = Digest::parse(
+            "sha256:1313131313131313131313131313131313131313131313131313131313131313",
+        )
+        .unwrap();
+
+        let (man_v10, bytes_v10) = create_test_manifest_with_blob(&blob_v10);
+        let (man_v12, bytes_v12) = create_test_manifest_with_blob(&blob_v12);
+        let (man_v13, bytes_v13) = create_test_manifest_with_blob(&blob_v13_rc1);
+
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &man_v10, Bytes::from(bytes_v10))
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &man_v12, Bytes::from(bytes_v12))
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &man_v13, Bytes::from(bytes_v13))
+            .await
+            .unwrap();
+
+        storage
+            .manifest_lifecycle()
+            .set_tag(repo, "v1.0.0", &man_v10)
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .set_tag(repo, "v1.2.0", &man_v12)
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .set_tag(repo, "v1.3.0-rc1", &man_v13)
+            .await
+            .unwrap();
+
+        // 1. Without prerelease: selects v1.2.0
+        let rules_no_prerelease = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: false,
+            },
+        }];
+
+        let proxy_cache = storage.proxy_storage();
+        let protected_no_pre = compute_protected_blobs(&proxy_cache, &rules_no_prerelease, &proxy)
+            .await
+            .unwrap();
+        assert!(
+            protected_no_pre.contains(blob_v12.hex()),
+            "v1.2.0 blob must be protected"
+        );
+        assert!(
+            !protected_no_pre.contains(blob_v10.hex()),
+            "v1.0.0 blob must not be protected"
+        );
+        assert!(
+            !protected_no_pre.contains(blob_v13_rc1.hex()),
+            "v1.3.0-rc1 blob must not be protected when allow_prerelease=false"
+        );
+
+        // 2. With prerelease: selects v1.3.0-rc1
+        let rules_with_prerelease = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: true,
+            },
+        }];
+
+        let protected_with_pre =
+            compute_protected_blobs(&proxy_cache, &rules_with_prerelease, &proxy)
+                .await
+                .unwrap();
+        assert!(
+            protected_with_pre.contains(blob_v13_rc1.hex()),
+            "v1.3.0-rc1 blob must be protected when allow_prerelease=true"
+        );
+        assert!(
+            !protected_with_pre.contains(blob_v12.hex()),
+            "v1.2.0 blob not selected when higher prerelease present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_protected_blobs_succeeds_after_fault_clearance() {
+        let (storage, proxy, _temp) = create_test_env();
+        let repo = "library/retry-repo";
+
+        let blob_digest = Digest::parse(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let (man_digest, man_bytes) = create_test_manifest_with_blob(&blob_digest);
+
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &man_digest, Bytes::from(man_bytes))
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .set_tag(repo, "v2.0.0", &man_digest)
+            .await
+            .unwrap();
+
+        let rules = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: false,
+            },
+        }];
+
+        let injected = Arc::new(InjectedProxyStorage::new(storage.proxy_storage()));
+
+        // Invoc 1: inject transient error
+        injected.set_list_tags_fn(|_repo| {
+            Some(Err(StorageError::internal(
+                StorageErrorKind::Io,
+                "transient error",
+            )))
+        });
+        let res1 = compute_protected_blobs(&injected, &rules, &proxy).await;
+        assert!(res1.is_err(), "First call with fault must return error");
+
+        // Clear fault
+        injected.clear_list_tags_fn();
+
+        // Invoc 2: retry succeeds
+        let res2 = compute_protected_blobs(&injected, &rules, &proxy).await;
+        assert!(
+            res2.is_ok(),
+            "Second call after clearance must succeed, got {res2:?}"
+        );
+        let protected = res2.unwrap();
+        assert!(
+            protected.contains(blob_digest.hex()),
+            "Blob must be protected on retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_protected_blobs_resolve_tag_failure_suppression_characterized() {
+        let (storage, proxy, _temp) = create_test_env();
+        let repo = "library/resolve-fault-repo";
+
+        let blob_digest = Digest::parse(
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let (man_digest, man_bytes) = create_test_manifest_with_blob(&blob_digest);
+
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &man_digest, Bytes::from(man_bytes))
+            .await
+            .unwrap();
+        storage
+            .manifest_lifecycle()
+            .set_tag(repo, "v1.0.0", &man_digest)
+            .await
+            .unwrap();
+
+        let rules = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: false,
+            },
+        }];
+
+        let injected = Arc::new(InjectedProxyStorage::new(storage.proxy_storage()));
+        // list_tags succeeds, but resolve_tag fails
+        injected.set_resolve_tag_fn(|_repo, _tag| {
+            Some(Err(StorageError::internal(
+                StorageErrorKind::Io,
+                "resolve tag failed",
+            )))
+        });
+
+        let result = compute_protected_blobs(&injected, &rules, &proxy).await;
+        assert!(
+            result.is_ok(),
+            "Retained limitation: resolve_tag error suppression must result in Ok"
+        );
+        let protected = result.unwrap();
+        assert!(
+            protected.is_empty(),
+            "Protected blobs must be empty because resolve_tag failure was swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_gc_once_propagates_listing_error_before_candidate_scan() {
+        let (storage, proxy, temp) = create_test_env();
+        let repo = "library/error-repo";
+
+        let blob_digest = Digest::parse(
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        )
+        .unwrap();
+        let (manifest_digest, manifest_bytes) = create_test_manifest_with_blob(&blob_digest);
+        storage
+            .manifest_lifecycle()
+            .put_manifest(repo, &manifest_digest, Bytes::from(manifest_bytes))
+            .await
+            .unwrap();
+
+        let rules = vec![crate::config::ProxyRepoRule {
+            match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+            upstream_repo: None,
+            tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+            eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+                tag_regex: None,
+                allow_prerelease: false,
+            },
+        }];
+
+        let injected = Arc::new(InjectedProxyStorage::new(storage.proxy_storage()));
+        injected.set_list_tags_fn(|repo| {
+            Some(Err(StorageError::internal(
+                StorageErrorKind::Io,
+                format!("disk read failure for {repo}"),
+            )))
+        });
+
+        // fs_root without blobs/sha256 directory
+        let nonexistent_fs = temp.path().join("nonexistent_fs_root");
+
+        let arc_storage: Arc<dyn ProxyStoragePort> = injected;
+        let result =
+            proxy_gc_once(&arc_storage, &nonexistent_fs, 1024 * 1024, &rules, &proxy).await;
+
+        assert!(
+            result.is_err(),
+            "proxy_gc_once must propagate error from compute_protected_blobs"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("disk read failure"),
+            "Error message must contain original error details: '{err_msg}'"
         );
     }
 }
