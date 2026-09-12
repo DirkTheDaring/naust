@@ -116,8 +116,14 @@ pub struct Config {
     pub fs_root: PathBuf,
     pub fs_manifest_listing_max_entries: usize,
     pub fs_manifest_listing_max_name_bytes: usize,
+    pub fs_tag_listing_max_entries: usize,
+    pub fs_tag_listing_max_name_bytes: usize,
+    pub fs_tag_listing_repo_probe_max_entries: usize,
+    pub fs_tag_listing_repo_probe_max_name_bytes: usize,
+    pub fs_tag_listing_max_payload_bytes: u64,
 
     pub fs_gc_discovery_max_depth: usize,
+
     pub fs_gc_discovery_max_dir_enumerations: usize,
     pub fs_gc_discovery_max_total_discovery_entries: usize,
     pub fs_gc_discovery_max_manifest_dirs: usize,
@@ -1025,6 +1031,16 @@ struct FileStorageFs {
     #[serde(default)]
     manifest_listing_max_name_bytes: Option<usize>,
     #[serde(default)]
+    tag_listing_max_entries: Option<usize>,
+    #[serde(default)]
+    tag_listing_max_name_bytes: Option<usize>,
+    #[serde(default)]
+    tag_listing_repo_probe_max_entries: Option<usize>,
+    #[serde(default)]
+    tag_listing_repo_probe_max_name_bytes: Option<usize>,
+    #[serde(default)]
+    tag_listing_max_payload_bytes: Option<u64>,
+    #[serde(default)]
     gc: FileStorageFsGc,
 }
 
@@ -1557,6 +1573,41 @@ impl Config {
         .or(file_cfg.storage.fs.manifest_listing_max_name_bytes)
         .unwrap_or(crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES);
 
+        let fs_tag_listing_max_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__TAG_LISTING_MAX_ENTRIES",
+            "STORAGE_FS_TAG_LISTING_MAX_ENTRIES",
+        ])?
+        .or(file_cfg.storage.fs.tag_listing_max_entries)
+        .unwrap_or(crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_ENTRIES);
+
+        let fs_tag_listing_max_name_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__TAG_LISTING_MAX_NAME_BYTES",
+            "STORAGE_FS_TAG_LISTING_MAX_NAME_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.tag_listing_max_name_bytes)
+        .unwrap_or(crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_NAME_BYTES);
+
+        let fs_tag_listing_repo_probe_max_entries = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__TAG_LISTING_REPO_PROBE_MAX_ENTRIES",
+            "STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_ENTRIES",
+        ])?
+        .or(file_cfg.storage.fs.tag_listing_repo_probe_max_entries)
+        .unwrap_or(crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_REPO_PROBE_MAX_ENTRIES);
+
+        let fs_tag_listing_repo_probe_max_name_bytes = env_usize_opt(&[
+            "REGISTRY__STORAGE__FS__TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES",
+            "STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.tag_listing_repo_probe_max_name_bytes)
+        .unwrap_or(crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES);
+
+        let fs_tag_listing_max_payload_bytes = env_u64_opt(&[
+            "REGISTRY__STORAGE__FS__TAG_LISTING_MAX_PAYLOAD_BYTES",
+            "STORAGE_FS_TAG_LISTING_MAX_PAYLOAD_BYTES",
+        ])?
+        .or(file_cfg.storage.fs.tag_listing_max_payload_bytes)
+        .unwrap_or(crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES);
+
         let fs_gc_discovery_max_depth = env_usize_opt(&[
             "REGISTRY__STORAGE__FS__GC__DISCOVERY__MAX_DEPTH",
             "REGISTRY_BLOB_GC_DISCOVERY_MAX_DEPTH",
@@ -1696,6 +1747,47 @@ impl Config {
                 return Err(ConfigError::InvalidValue {
                     field: "manifest_listing_max_name_bytes",
                     message: "must be at least 128".to_string(),
+                });
+            }
+
+            if fs_tag_listing_max_entries < crate::storage::fs::tag_listing::MIN_TAG_LISTING_ENTRIES
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "tag_listing_max_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_tag_listing_max_name_bytes
+                < crate::storage::fs::tag_listing::MIN_TAG_LISTING_NAME_BYTES
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "tag_listing_max_name_bytes",
+                    message: "must be at least 128".to_string(),
+                });
+            }
+            if fs_tag_listing_repo_probe_max_entries
+                < crate::storage::fs::tag_listing::MIN_TAG_LISTING_REPO_PROBE_ENTRIES
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "tag_listing_repo_probe_max_entries",
+                    message: "must be at least 1".to_string(),
+                });
+            }
+            if fs_tag_listing_repo_probe_max_name_bytes
+                < crate::storage::fs::tag_listing::MIN_TAG_LISTING_REPO_PROBE_NAME_BYTES
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "tag_listing_repo_probe_max_name_bytes",
+                    message: "must be at least 64".to_string(),
+                });
+            }
+            if fs_tag_listing_max_payload_bytes
+                < crate::storage::fs::tag_listing::MIN_TAG_LISTING_PAYLOAD_BYTES
+                || fs_tag_listing_max_payload_bytes == u64::MAX
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "tag_listing_max_payload_bytes",
+                    message: "must be at least 256 and less than u64::MAX".to_string(),
                 });
             }
 
@@ -2619,7 +2711,13 @@ impl Config {
             fs_root,
             fs_manifest_listing_max_entries,
             fs_manifest_listing_max_name_bytes,
+            fs_tag_listing_max_entries,
+            fs_tag_listing_max_name_bytes,
+            fs_tag_listing_repo_probe_max_entries,
+            fs_tag_listing_repo_probe_max_name_bytes,
+            fs_tag_listing_max_payload_bytes,
             fs_gc_discovery_max_depth,
+
             fs_gc_discovery_max_dir_enumerations,
             fs_gc_discovery_max_total_discovery_entries,
             fs_gc_discovery_max_manifest_dirs,
@@ -4239,6 +4337,293 @@ manifest_listing_max_name_bytes = 50
 
                 let cfg = Config::from_env_with_files(&[path])
                     .expect("s3 backend should ignore fs bounds");
+                assert_eq!(cfg.storage_backend, StorageBackend::S3);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_defaults() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_defaults",
+            &[],
+            || {
+                let cfg = Config::from_env_with_files(&[]).expect("default config must load");
+                assert_eq!(cfg.fs_tag_listing_max_entries, 10_000);
+                assert_eq!(cfg.fs_tag_listing_max_name_bytes, 1_500_000);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_entries, 64);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_name_bytes, 4_096);
+                assert_eq!(cfg.fs_tag_listing_max_payload_bytes, 1_024);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_toml_parsing() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_toml_parsing",
+            &[],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+tag_listing_max_entries = 5000
+tag_listing_max_name_bytes = 200000
+tag_listing_repo_probe_max_entries = 32
+tag_listing_repo_probe_max_name_bytes = 2048
+tag_listing_max_payload_bytes = 2048
+"#,
+                )
+                .unwrap();
+
+                let cfg = Config::from_env_with_files(&[path]).expect("load config file");
+                assert_eq!(cfg.fs_tag_listing_max_entries, 5000);
+                assert_eq!(cfg.fs_tag_listing_max_name_bytes, 200000);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_entries, 32);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_name_bytes, 2048);
+                assert_eq!(cfg.fs_tag_listing_max_payload_bytes, 2048);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_env_hierarchical_precedence() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_env_hierarchical_precedence",
+            &[
+                ("REGISTRY__STORAGE__FS__TAG_LISTING_MAX_ENTRIES", "7000"),
+                ("STORAGE_FS_TAG_LISTING_MAX_ENTRIES", "6000"),
+                (
+                    "REGISTRY__STORAGE__FS__TAG_LISTING_MAX_NAME_BYTES",
+                    "400000",
+                ),
+                ("STORAGE_FS_TAG_LISTING_MAX_NAME_BYTES", "300000"),
+                (
+                    "REGISTRY__STORAGE__FS__TAG_LISTING_REPO_PROBE_MAX_ENTRIES",
+                    "128",
+                ),
+                ("STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_ENTRIES", "64"),
+                (
+                    "REGISTRY__STORAGE__FS__TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES",
+                    "8192",
+                ),
+                ("STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES", "4096"),
+                (
+                    "REGISTRY__STORAGE__FS__TAG_LISTING_MAX_PAYLOAD_BYTES",
+                    "4096",
+                ),
+                ("STORAGE_FS_TAG_LISTING_MAX_PAYLOAD_BYTES", "2048"),
+            ],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+tag_listing_max_entries = 5000
+tag_listing_max_name_bytes = 200000
+tag_listing_repo_probe_max_entries = 32
+tag_listing_repo_probe_max_name_bytes = 2048
+tag_listing_max_payload_bytes = 1024
+"#,
+                )
+                .unwrap();
+
+                let res = Config::from_env_with_files(&[path]);
+                let cfg = res.expect("load config with env override");
+                assert_eq!(cfg.fs_tag_listing_max_entries, 7000);
+                assert_eq!(cfg.fs_tag_listing_max_name_bytes, 400000);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_entries, 128);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_name_bytes, 8192);
+                assert_eq!(cfg.fs_tag_listing_max_payload_bytes, 4096);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_env_flat_precedence() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_env_flat_precedence",
+            &[
+                ("STORAGE_FS_TAG_LISTING_MAX_ENTRIES", "6000"),
+                ("STORAGE_FS_TAG_LISTING_MAX_NAME_BYTES", "300000"),
+                ("STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_ENTRIES", "50"),
+                ("STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES", "3000"),
+                ("STORAGE_FS_TAG_LISTING_MAX_PAYLOAD_BYTES", "3000"),
+            ],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage.fs]
+tag_listing_max_entries = 5000
+tag_listing_max_name_bytes = 200000
+tag_listing_repo_probe_max_entries = 32
+tag_listing_repo_probe_max_name_bytes = 2048
+tag_listing_max_payload_bytes = 1024
+"#,
+                )
+                .unwrap();
+
+                let res = Config::from_env_with_files(&[path]);
+                let cfg = res.expect("load config with flat env override");
+                assert_eq!(cfg.fs_tag_listing_max_entries, 6000);
+                assert_eq!(cfg.fs_tag_listing_max_name_bytes, 300000);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_entries, 50);
+                assert_eq!(cfg.fs_tag_listing_repo_probe_max_name_bytes, 3000);
+                assert_eq!(cfg.fs_tag_listing_max_payload_bytes, 3000);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_invalid_lower_bounds_entries() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_invalid_lower_bounds_entries",
+            &[("STORAGE_FS_TAG_LISTING_MAX_ENTRIES", "0")],
+            || {
+                let err = Config::from_env_with_files(&[]).expect_err("should reject entries = 0");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "tag_listing_max_entries");
+                        assert!(message.contains("must be at least 1"));
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_invalid_lower_bounds_name_bytes() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_invalid_lower_bounds_name_bytes",
+            &[("STORAGE_FS_TAG_LISTING_MAX_NAME_BYTES", "127")],
+            || {
+                let err =
+                    Config::from_env_with_files(&[]).expect_err("should reject name bytes = 127");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "tag_listing_max_name_bytes");
+                        assert!(message.contains("must be at least 128"));
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_invalid_lower_bounds_probe_entries() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_invalid_lower_bounds_probe_entries",
+            &[("STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_ENTRIES", "0")],
+            || {
+                let err =
+                    Config::from_env_with_files(&[]).expect_err("should reject probe entries = 0");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "tag_listing_repo_probe_max_entries");
+                        assert!(message.contains("must be at least 1"));
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_invalid_lower_bounds_probe_name_bytes() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_invalid_lower_bounds_probe_name_bytes",
+            &[("STORAGE_FS_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES", "63")],
+            || {
+                let err =
+                    Config::from_env_with_files(&[]).expect_err("should reject probe bytes = 63");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "tag_listing_repo_probe_max_name_bytes");
+                        assert!(message.contains("must be at least 64"));
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_invalid_lower_bounds_payload_bytes() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_invalid_lower_bounds_payload_bytes",
+            &[("STORAGE_FS_TAG_LISTING_MAX_PAYLOAD_BYTES", "255")],
+            || {
+                let err = Config::from_env_with_files(&[])
+                    .expect_err("should reject payload bytes = 255");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "tag_listing_max_payload_bytes");
+                        assert!(message.contains("must be at least 256"));
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_invalid_upper_bounds_payload_bytes() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_invalid_upper_bounds_payload_bytes",
+            &[(
+                "STORAGE_FS_TAG_LISTING_MAX_PAYLOAD_BYTES",
+                &u64::MAX.to_string(),
+            )],
+            || {
+                let err = Config::from_env_with_files(&[])
+                    .expect_err("should reject payload bytes = u64::MAX");
+                match err {
+                    ConfigError::InvalidValue { field, message } => {
+                        assert_eq!(field, "tag_listing_max_payload_bytes");
+                        assert!(message.contains("less than u64::MAX"));
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_storage_fs_tag_listing_s3_ignores_fs_bounds() {
+        run_process_isolated(
+            "config::tests::test_config_storage_fs_tag_listing_s3_ignores_fs_bounds",
+            &[],
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(
+                    &path,
+                    r#"
+[storage]
+backend = "s3"
+
+[storage.fs]
+tag_listing_max_entries = 0
+tag_listing_max_name_bytes = 10
+tag_listing_repo_probe_max_entries = 0
+tag_listing_repo_probe_max_name_bytes = 10
+tag_listing_max_payload_bytes = 10
+"#,
+                )
+                .unwrap();
+
+                let cfg = Config::from_env_with_files(&[path])
+                    .expect("s3 backend should ignore fs tag listing bounds");
                 assert_eq!(cfg.storage_backend, StorageBackend::S3);
             },
         );

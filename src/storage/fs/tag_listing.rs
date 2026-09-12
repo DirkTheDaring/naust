@@ -1,18 +1,82 @@
-//! Test-only contained filesystem tag listing seam.
+//! Contained filesystem tag listing implementation.
 //!
 //! Provides descriptor-relative contained tag listing operations (`contained_list_tags_seam`
-//! and `contained_list_tags_page_seam`) for evaluating `storage-fs` and `storage-core`
-//! against `registry-rust` tag listing semantics.
+//! and `contained_list_tags_page_seam`) routing production `FsStorage::list_tags` and
+//! `FsStorage::list_tags_page` through `storage-fs` and `storage-core`.
 //!
 //! # Safety & Containment
-//! This module is compiled exclusively under `#[cfg(test)]`. It performs no production
-//! routing and does not alter production `FsStorage` methods.
+//! Path traversal is prevented through upfront structural path validation and Linux
+//! `openat2` resolution flags (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`)
+//! anchored to the storage root descriptor.
 
 use crate::registry::digest::Digest;
-use crate::storage::{StorageError, StorageErrorKind};
+use crate::storage::StorageError;
 use async_trait::async_trait;
 use storage_core::{ObjectKey, ObjectPayloadReader, ReadError};
 use storage_fs::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError};
+
+/// Default maximum number of tag directory entries to enumerate during tag listing.
+pub const DEFAULT_TAG_LISTING_MAX_ENTRIES: usize = 10_000;
+/// Default maximum cumulative bytes of entry filenames during tag listing.
+pub const DEFAULT_TAG_LISTING_MAX_NAME_BYTES: usize = 1_500_000;
+/// Default maximum number of directory entries to inspect when probing repo existence on tags NotFound.
+pub const DEFAULT_TAG_LISTING_REPO_PROBE_MAX_ENTRIES: usize = 64;
+/// Default maximum cumulative filename bytes when probing repo existence.
+pub const DEFAULT_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES: usize = 4_096;
+/// Default maximum candidate payload size in bytes for paged tag listing.
+pub const DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES: u64 = 1_024;
+
+/// Minimum allowable value for `tag_listing_max_entries`.
+pub const MIN_TAG_LISTING_ENTRIES: usize = 1;
+/// Minimum allowable value for `tag_listing_max_name_bytes` (accommodates a 128-byte tag name).
+pub const MIN_TAG_LISTING_NAME_BYTES: usize = 128;
+/// Minimum allowable value for `tag_listing_repo_probe_max_entries`.
+pub const MIN_TAG_LISTING_REPO_PROBE_ENTRIES: usize = 1;
+/// Minimum allowable value for `tag_listing_repo_probe_max_name_bytes`.
+pub const MIN_TAG_LISTING_REPO_PROBE_NAME_BYTES: usize = 64;
+/// Minimum allowable value for `tag_listing_max_payload_bytes` (accommodates SHA-512 text and whitespace).
+pub const MIN_TAG_LISTING_PAYLOAD_BYTES: u64 = 256;
+
+/// Configured resource limits for contained filesystem tag listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagListingLimits {
+    pub repo_probe_limits: storage_fs::DirEnumerationLimits,
+    pub tags_dir_limits: storage_fs::DirEnumerationLimits,
+    pub payload_limits: super::tag_read::TagReadLimits,
+}
+
+impl Default for TagListingLimits {
+    fn default() -> Self {
+        Self {
+            repo_probe_limits: storage_fs::DirEnumerationLimits::new(
+                DEFAULT_TAG_LISTING_REPO_PROBE_MAX_ENTRIES,
+                DEFAULT_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES,
+            ),
+            tags_dir_limits: storage_fs::DirEnumerationLimits::new(
+                DEFAULT_TAG_LISTING_MAX_ENTRIES,
+                DEFAULT_TAG_LISTING_MAX_NAME_BYTES,
+            ),
+            payload_limits: super::tag_read::TagReadLimits {
+                max_payload_bytes: Some(DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES),
+            },
+        }
+    }
+}
+
+impl TagListingLimits {
+    #[allow(dead_code)]
+    pub fn new(
+        repo_probe_limits: storage_fs::DirEnumerationLimits,
+        tags_dir_limits: storage_fs::DirEnumerationLimits,
+        payload_limits: super::tag_read::TagReadLimits,
+    ) -> Self {
+        Self {
+            repo_probe_limits,
+            tags_dir_limits,
+            payload_limits,
+        }
+    }
+}
 
 /// Test-seam directory enumeration abstraction over contained storage readers.
 #[async_trait]
@@ -336,7 +400,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageErrorKind;
     use std::collections::{HashMap, VecDeque};
+
     use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;

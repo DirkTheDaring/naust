@@ -863,12 +863,26 @@ pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, 
                 max_retained_logical_bytes: config.fs_gc_discovery_max_retained_logical_bytes,
                 max_manifest_payload_bytes: config.fs_gc_discovery_max_manifest_payload_bytes,
             };
-            let fs_storage = fs::FsStorage::try_new_with_gc_limits(
+            let tag_listing_limits = fs::tag_listing::TagListingLimits {
+                repo_probe_limits: storage_fs::DirEnumerationLimits::new(
+                    config.fs_tag_listing_repo_probe_max_entries,
+                    config.fs_tag_listing_repo_probe_max_name_bytes,
+                ),
+                tags_dir_limits: storage_fs::DirEnumerationLimits::new(
+                    config.fs_tag_listing_max_entries,
+                    config.fs_tag_listing_max_name_bytes,
+                ),
+                payload_limits: fs::tag_read::TagReadLimits {
+                    max_payload_bytes: Some(config.fs_tag_listing_max_payload_bytes),
+                },
+            };
+            let fs_storage = fs::FsStorage::try_new_with_all_limits(
                 config.fs_root.clone(),
                 config.max_upload_bytes,
                 limits,
                 discovery_limits,
                 ref_limits,
+                tag_listing_limits,
             )?;
             Ok(StorageWiring::from_backend(Arc::new(fs_storage)))
         }
@@ -931,8 +945,27 @@ pub fn proxy_cache_storage_try_from_config(
                 config.fs_manifest_listing_max_entries,
                 config.fs_manifest_listing_max_name_bytes,
             );
-            let fs_storage =
-                fs::FsStorage::try_new_with_limits(root, config.max_upload_bytes, limits)?;
+            let tag_listing_limits = fs::tag_listing::TagListingLimits {
+                repo_probe_limits: storage_fs::DirEnumerationLimits::new(
+                    config.fs_tag_listing_repo_probe_max_entries,
+                    config.fs_tag_listing_repo_probe_max_name_bytes,
+                ),
+                tags_dir_limits: storage_fs::DirEnumerationLimits::new(
+                    config.fs_tag_listing_max_entries,
+                    config.fs_tag_listing_max_name_bytes,
+                ),
+                payload_limits: fs::tag_read::TagReadLimits {
+                    max_payload_bytes: Some(config.fs_tag_listing_max_payload_bytes),
+                },
+            };
+            let fs_storage = fs::FsStorage::try_new_with_all_limits(
+                root,
+                config.max_upload_bytes,
+                limits,
+                fs::repo_discovery::DiscoveryLimits::default(),
+                fs::manifest_refs::ManifestReferenceLimits::default(),
+                tag_listing_limits,
+            )?;
             Ok(Arc::new(fs_storage))
         }
         StorageBackend::S3 => {

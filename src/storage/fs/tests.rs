@@ -7212,6 +7212,46 @@ async fn test_tag_listing_whitespace_tabs_crlf_and_substantial_padding() {
     let tags = storage.list_tags("myrepo").await.unwrap();
     assert_eq!(tags, vec!["t1-clean", "t2-crlf", "t3-tabs", "t4-padded"]);
 
+    // In contained paged listing, t4-padded exceeds the 1024-byte ceiling and fails closed with CorruptData
+    let paged_err = storage
+        .list_tags_page("myrepo", None, 10)
+        .await
+        .expect_err("t4-padded exceeds 1024-byte payload ceiling");
+    assert_eq!(
+        paged_err.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+    assert!(
+        paged_err
+            .to_string()
+            .contains("stream length exceeds limit of 1024 bytes")
+    );
+
+    // Point reads (resolve_tag and get_tag_with_version) use TagReadLimits::default() (max_payload_bytes: None)
+    // and successfully read t4-padded despite it exceeding the listing ceiling
+    let d_point = storage
+        .resolve_tag("myrepo", "t4-padded")
+        .await
+        .expect("resolve_tag has unbounded payload limit and succeeds");
+    assert_eq!(d_point.hex(), hex);
+
+    let ver_point = storage
+        .get_tag_with_version("myrepo", "t4-padded")
+        .await
+        .expect("get_tag_with_version succeeds")
+        .expect("tag exists");
+    assert_eq!(ver_point.0.hex(), hex);
+
+    // Remove oversized t4-padded and replace with t4-fit within 1024 bytes
+    std::fs::remove_file(tags_dir.join("t4-padded")).unwrap();
+    let mut fit = Vec::new();
+    fit.extend(b"\r\n");
+    fit.extend(vec![b' '; 200]);
+    fit.extend(format!("sha256:{hex}").as_bytes());
+    fit.extend(vec![b' '; 100]);
+    fit.extend(b"\r\n");
+    write_file(&tags_dir.join("t4-fit"), &fit);
+
     let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
     assert_eq!(page.len(), 4);
     for (_name, digest) in page {
@@ -7239,7 +7279,7 @@ async fn test_tag_listing_empty_malformed_and_invalid_utf8_taxonomy() {
     );
     write_file(&tags_dir.join("tag-invalid-utf8"), &[0xff, 0xfe, 0xfd]);
 
-    // 1. list_tags returns ALL names without inspecting file contents
+    // 1. list_tags returns ALL valid filenames without inspecting file contents
     let tags = storage.list_tags("myrepo").await.unwrap();
     assert_eq!(
         tags,
@@ -7252,7 +7292,20 @@ async fn test_tag_listing_empty_malformed_and_invalid_utf8_taxonomy() {
         ]
     );
 
-    // 2. list_tags_page silently drops corrupt, empty, and non-UTF8 files
+    // 2. list_tags_page fails closed with Io error when encountering tag-invalid-utf8
+    let err_page = storage
+        .list_tags_page("myrepo", None, 10)
+        .await
+        .expect_err("invalid UTF-8 payload must fail closed with Io");
+    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Io));
+    assert!(
+        err_page
+            .to_string()
+            .contains("invalid UTF-8 in tag payload")
+    );
+
+    // 3. When invalid UTF-8 file is removed, list_tags_page silently omits corrupt, empty, and unparsable files
+    std::fs::remove_file(tags_dir.join("tag-invalid-utf8")).unwrap();
     let (page, next_tok) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
     assert_eq!(next_tok, None);
     assert_eq!(
@@ -7293,20 +7346,20 @@ async fn test_tag_listing_dotfiles_locks_temps_and_nested_directories() {
     // Create a nested subdirectory inside tags/
     std::fs::create_dir_all(tags_dir.join("nested-dir")).unwrap();
 
-    // 1. list_tags filters out dotfiles, but INCLUDES subdirectories!
+    // 1. In contained listing, list_tags filters out dotfiles AND non-regular entries (nested-dir)
     let tags = storage.list_tags("myrepo").await.unwrap();
     assert_eq!(
         tags,
-        vec!["nested-dir", "non-dot-temp.upload", "normal-tag"],
-        "list_tags includes non-dot directories because it does not validate file_type"
+        vec!["non-dot-temp.upload", "normal-tag"],
+        "contained list_tags excludes non-dot directories because it filters by Regular file type"
     );
 
-    // 2. list_tags_page filters out dotfiles, and drops nested-dir because read_to_string fails (EISDIR)
+    // 2. list_tags_page filters out dotfiles and excludes non-regular entries
     let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
     assert_eq!(
         page.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
         vec!["non-dot-temp.upload", "normal-tag"],
-        "list_tags_page drops directories due to read_to_string error suppression"
+        "contained list_tags_page excludes directories via file type filtering"
     );
 }
 
@@ -7362,20 +7415,18 @@ async fn test_tag_listing_path_traversal_and_structural_inputs() {
     let dummy_dir = root.join("repos").join("dummy_dir");
     std::fs::create_dir_all(&dummy_dir).unwrap();
 
-    // Querying with repo name "dummy_dir/../target_repo" resolves ambiently to repos/target_repo/tags
-    let listed = storage.list_tags("dummy_dir/../target_repo").await.unwrap();
-    assert_eq!(
-        listed,
-        vec!["target_tag"],
-        "demonstrates that path traversal input actually resolves to target_repo"
-    );
+    // 1. Path traversal attempts are rejected upfront with InvalidRepoName
+    let listed_err = storage
+        .list_tags("dummy_dir/../target_repo")
+        .await
+        .expect_err("path traversal in list_tags must fail upfront");
+    assert!(matches!(listed_err, StorageError::InvalidRepoName(_)));
 
-    let (page, _) = storage
+    let page_err = storage
         .list_tags_page("dummy_dir/../target_repo", None, 10)
         .await
-        .unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].0, "target_tag");
+        .expect_err("path traversal in list_tags_page must fail upfront");
+    assert!(matches!(page_err, StorageError::InvalidRepoName(_)));
 
     // 2. Nested multi-segment repository input:
     let nested_tags = root
@@ -7400,8 +7451,7 @@ async fn test_tag_listing_path_traversal_and_structural_inputs() {
     assert_eq!(nested_page[0].0, "nested_tag");
 
     // 3. Absolute path input:
-    // Path::join with an absolute path replaces self.root entirely:
-    // self.root.join("repos").join("/tmp/.../abs_repo") -> PathBuf::from("/tmp/.../abs_repo")
+    // Leading slashes are rejected upfront with InvalidRepoName:
     let abs_fixture = tempfile::tempdir().unwrap();
     let abs_tags = abs_fixture.path().join("tags");
     std::fs::create_dir_all(&abs_tags).unwrap();
@@ -7411,35 +7461,41 @@ async fn test_tag_listing_path_traversal_and_structural_inputs() {
     );
 
     let abs_repo_str = abs_fixture.path().to_str().unwrap();
-    let abs_list = storage.list_tags(abs_repo_str).await.unwrap();
-    assert_eq!(
-        abs_list,
-        vec!["abs_tag"],
-        "demonstrates that absolute path input bypasses self.root entirely"
-    );
-    let (abs_page, _) = storage
+    let abs_list_err = storage
+        .list_tags(abs_repo_str)
+        .await
+        .expect_err("absolute repo path must be rejected with InvalidRepoName");
+    assert!(matches!(abs_list_err, StorageError::InvalidRepoName(_)));
+    let abs_page_err = storage
         .list_tags_page(abs_repo_str, None, 10)
         .await
-        .unwrap();
-    assert_eq!(abs_page.len(), 1);
-    assert_eq!(abs_page[0].0, "abs_tag");
+        .expect_err("absolute repo path must be rejected with InvalidRepoName");
+    assert!(matches!(abs_page_err, StorageError::InvalidRepoName(_)));
 
     // 4. Invalid inputs:
-    // Empty repository name "": resolves to self.root.join("repos").join("tags").
-    // Because self.root.join("repos") exists, metadata succeeds, and missing repos/tags yields Ok(vec![])!
-    let empty_res = storage.list_tags("").await.unwrap();
-    assert!(
-        empty_res.is_empty(),
-        "empty repo name resolves to repos/tags and returns Ok([]) when tags dir is absent"
-    );
-    let empty_page = storage.list_tags_page("", None, 10).await.unwrap();
-    assert_eq!(empty_page, (Vec::new(), None));
+    // Empty repository name "": rejected upfront with InvalidRepoName
+    let empty_res = storage
+        .list_tags("")
+        .await
+        .expect_err("empty repo name must be rejected with InvalidRepoName");
+    assert!(matches!(empty_res, StorageError::InvalidRepoName(_)));
+    let empty_page_err = storage
+        .list_tags_page("", None, 10)
+        .await
+        .expect_err("empty repo name must be rejected with InvalidRepoName");
+    assert!(matches!(empty_page_err, StorageError::InvalidRepoName(_)));
 
-    // Absent traversal path "../absent":
-    let absent_res = storage.list_tags("../absent").await;
-    assert!(matches!(absent_res, Err(StorageError::NotFound)));
-    let absent_page = storage.list_tags_page("../absent", None, 10).await.unwrap();
-    assert_eq!(absent_page, (Vec::new(), None));
+    // Absent traversal path "../absent": rejected upfront with InvalidRepoName
+    let absent_res = storage
+        .list_tags("../absent")
+        .await
+        .expect_err("traversal repo name must be rejected with InvalidRepoName");
+    assert!(matches!(absent_res, StorageError::InvalidRepoName(_)));
+    let absent_page_err = storage
+        .list_tags_page("../absent", None, 10)
+        .await
+        .expect_err("traversal repo name must be rejected with InvalidRepoName");
+    assert!(matches!(absent_page_err, StorageError::InvalidRepoName(_)));
 }
 
 #[tokio::test]
@@ -7478,53 +7534,43 @@ async fn test_tag_listing_controlled_symlinks() {
         )
         .unwrap();
 
-        // Observation on list_tags:
-        // Reads directory entries without following or reading content; all 3 symlinks are returned!
+        // In contained listing:
+        // Reads directory entries filtering by Regular file type; all 3 symlinks are excluded!
         let tags = storage.list_tags("myrepo").await.unwrap();
         assert_eq!(
             tags,
-            vec!["real-tag", "sym-dangling", "sym-external", "sym-internal"]
+            vec!["real-tag"],
+            "contained list_tags excludes symlinks via file_type filtering"
         );
 
-        // Observation on list_tags_page:
-        // Uses tokio::fs::read_to_string(&path) which follows symlinks:
-        // - sym-internal is followed and returned.
-        // - sym-external is followed outside the root and returned (uncontained read leak!).
-        // - sym-dangling fails read_to_string with ENOENT and is silently omitted.
+        // Contained list_tags_page excludes all symlinks:
         let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
-        assert_eq!(page.len(), 3);
+        assert_eq!(page.len(), 1);
         assert_eq!(page[0].0, "real-tag");
         assert_eq!(page[0].1.hex(), hex_in);
-        assert_eq!(page[1].0, "sym-external");
-        assert_eq!(page[1].1.hex(), hex_out);
-        assert_eq!(page[2].0, "sym-internal");
-        assert_eq!(page[2].1.hex(), hex_in);
 
         // 4. Ancestor directory symlink:
         let sym_repo_dir = root.join("repos").join("sym-repo");
         std::fs::create_dir_all(&sym_repo_dir).unwrap();
         std::os::unix::fs::symlink(&tags_dir, sym_repo_dir.join("tags")).unwrap();
 
-        let sym_repo_tags = storage.list_tags("sym-repo").await.unwrap();
-        assert_eq!(
-            sym_repo_tags, tags,
-            "list_tags follows directory symlink to tags"
+        // openat2 resolution with RESOLVE_NO_SYMLINKS rejects directory symlinks
+        let sym_list_res = storage.list_tags("sym-repo").await;
+        assert!(
+            sym_list_res.is_err(),
+            "contained list_tags rejects directory symlinks"
         );
 
-        let (sym_repo_page, _) = storage.list_tags_page("sym-repo", None, 10).await.unwrap();
-        assert_eq!(
-            sym_repo_page, page,
-            "list_tags_page follows directory symlink to tags"
+        let sym_page_res = storage.list_tags_page("sym-repo", None, 10).await;
+        assert!(
+            sym_page_res.is_err(),
+            "contained list_tags_page rejects directory symlinks"
         );
     }
 }
 
 #[tokio::test]
 async fn test_tag_listing_non_regular_objects() {
-    // Tests directory-entry behavior in tags/ directory.
-    // NOTE: FIFO, device node, and Unix socket behavior is not experimentally verified by this test.
-    // While reading a FIFO may block depending on opening flags and reader/writer presence,
-    // unconditional indefinite blocking is not claimed as verified.
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
     let tags_dir = root.join("repos").join("myrepo").join("tags");
@@ -7537,11 +7583,11 @@ async fn test_tag_listing_non_regular_objects() {
     );
     std::fs::create_dir_all(tags_dir.join("dir-entry")).unwrap();
 
-    // list_tags includes non-regular entries (checks entry names only, not file types)
+    // Contained list_tags excludes non-regular entries
     let tags = storage.list_tags("myrepo").await.unwrap();
-    assert_eq!(tags, vec!["dir-entry", "regular-tag"]);
+    assert_eq!(tags, vec!["regular-tag"]);
 
-    // list_tags_page silently excludes directories because read_to_string returns EISDIR
+    // Contained list_tags_page excludes non-regular entries
     let (page, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].0, "regular-tag");
@@ -7596,10 +7642,12 @@ async fn test_tag_listing_permission_denied() {
         let tags = storage.list_tags("permrepo").await.unwrap();
         assert_eq!(tags, vec!["readable_tag", "unreadable_tag"]);
 
-        // list_tags_page attempts read_to_string on each file; unreadable_tag fails and is silently omitted
-        let (page, _) = storage.list_tags_page("permrepo", None, 10).await.unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].0, "readable_tag");
+        // list_tags_page attempts payload acquisition; unreadable_tag fails closed with StorageErrorKind::Io
+        let err_page = storage
+            .list_tags_page("permrepo", None, 10)
+            .await
+            .expect_err("unreadable payload must fail closed with Io");
+        assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Io));
     }
 
     // 2. Directory permission case: tags directory itself is unreadable (0o000)
@@ -7618,15 +7666,15 @@ async fn test_tag_listing_permission_denied() {
             Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
         }
 
-        // Both list_tags and list_tags_page encounter Io error during read_dir and fail
+        // Both list_tags and list_tags_page encounter PermissionDenied during directory enumeration
         let res_list = storage.list_tags("permrepo").await;
         match res_list {
             Err(StorageError::Internal { kind, .. }) => {
-                assert_eq!(kind, StorageErrorKind::Io);
+                assert_eq!(kind, StorageErrorKind::PermissionDenied);
             }
             other => {
                 panic!(
-                    "expected StorageErrorKind::Io on permission denied in list_tags, got {other:?}"
+                    "expected StorageErrorKind::PermissionDenied on permission denied in list_tags, got {other:?}"
                 )
             }
         }
@@ -7634,10 +7682,10 @@ async fn test_tag_listing_permission_denied() {
         let res_page = storage.list_tags_page("permrepo", None, 10).await;
         match res_page {
             Err(StorageError::Internal { kind, .. }) => {
-                assert_eq!(kind, StorageErrorKind::Io);
+                assert_eq!(kind, StorageErrorKind::PermissionDenied);
             }
             other => panic!(
-                "expected StorageErrorKind::Io on permission denied in list_tags_page, got {other:?}"
+                "expected StorageErrorKind::PermissionDenied on permission denied in list_tags_page, got {other:?}"
             ),
         }
     }
@@ -7962,22 +8010,22 @@ async fn test_tag_listing_root_replacement_divergence() {
         "contained get_tag_with_version returns None for tag-tree-b because it is not in pinned Tree A"
     );
 
-    // 2. Ambient tag listing operations resolve via self.root.join(...) -> observe Tree B!
+    // 2. Contained tag listing operations resolve via self.reader pinned descriptor -> observe Tree A!
     let tags_listed = storage.list_tags("myrepo").await.unwrap();
     assert_eq!(
         tags_listed,
-        vec!["tag-tree-b"],
-        "ambient list_tags observes replacement Tree B at root pathname"
+        vec!["tag-tree-a"],
+        "contained list_tags observes pinned Tree A without root pathname divergence"
     );
 
-    let (page_b, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
+    let (page_a_again, _) = storage.list_tags_page("myrepo", None, 10).await.unwrap();
     assert_eq!(
-        page_b.len(),
+        page_a_again.len(),
         1,
-        "ambient list_tags_page observes replacement Tree B at root pathname"
+        "contained list_tags_page observes pinned Tree A without root pathname divergence"
     );
-    assert_eq!(page_b[0].0, "tag-tree-b");
-    assert_eq!(page_b[0].1.hex(), hex_tree_b);
+    assert_eq!(page_a_again[0].0, "tag-tree-a");
+    assert_eq!(page_a_again[0].1.hex(), hex_tree_a);
 }
 
 #[tokio::test]
@@ -8035,18 +8083,1045 @@ async fn test_tag_listing_ignores_configured_manifest_enumeration_limits() {
         format!("sha256:{hex3}\n").as_bytes(),
     );
 
-    // list_tags is completely unbounded and does NOT enforce or consult manifest_listing_limits
+    // Tag listing is unconstrained by manifest_listing_limits, but bounded by its own tag_listing_limits
     let tags = storage
         .list_tags(repo)
         .await
         .expect("list_tags ignores manifest listing limits");
     assert_eq!(tags, vec!["tag-1", "tag-2", "tag-3"]);
 
-    // list_tags_page is also completely unconstrained by manifest_listing_limits
+    // list_tags_page is also unconstrained by manifest_listing_limits
     let (page, next_tok) = storage
         .list_tags_page(repo, None, 10)
         .await
         .expect("list_tags_page ignores manifest listing limits");
     assert_eq!(page.len(), 3);
     assert_eq!(next_tok, None);
+}
+
+#[tokio::test]
+async fn test_tag_listing_cutover_wiring_limits_enforcement_and_async_offload() {
+    let root = tmp_fs_root();
+    let calling_thread_id = std::thread::current().id();
+    let worker_tx = Arc::new(std::sync::Mutex::new(None));
+    let (tx, worker_rx) = tokio::sync::oneshot::channel();
+    *worker_tx.lock().unwrap() = Some(tx);
+
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    // Non-default tag listing limits: max_entries = 1, max_name_bytes = 100_000
+    config.fs_tag_listing_max_entries = 1;
+    config.fs_tag_listing_max_name_bytes = 100_000;
+
+    let wiring =
+        crate::storage::storage_wiring_try_from_config_async_with_factory(&config, move |cfg| {
+            let current_id = std::thread::current().id();
+            if let Some(tx) = worker_tx.lock().unwrap().take() {
+                let _ = tx.send(current_id);
+            }
+            crate::storage::storage_wiring_try_from_config(cfg)
+        })
+        .await
+        .expect("startup offload factory succeeds");
+
+    let construction_thread_id = worker_rx.await.expect("worker thread id must be sent");
+    assert_ne!(
+        calling_thread_id, construction_thread_id,
+        "primary storage construction must execute off the calling async thread via spawn_blocking"
+    );
+    assert_eq!(wiring.backend_kind(), "fs");
+
+    // 1. Primary storage wiring enforces nondefault tag listing limits
+    let primary_reader = wiring.tag_reader();
+    let repo = "primary_tag_repo";
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).expect("create primary tags dir");
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(
+        &tags_dir.join("tag-1"),
+        format!("sha256:{hex1}\n").as_bytes(),
+    );
+
+    // 1 tag <= max_entries(1) -> succeeds for both list_tags and list_tags_page
+    let tags = primary_reader
+        .list_tags(repo)
+        .await
+        .expect("1 tag within limit succeeds");
+    assert_eq!(tags, vec!["tag-1"]);
+    let (page, _) = primary_reader
+        .list_tags_page(repo, None, 10)
+        .await
+        .expect("1 tag page succeeds");
+    assert_eq!(page.len(), 1);
+
+    // 2 tags > max_entries(1) -> fails closed with StorageErrorKind::Backend
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    write_file(
+        &tags_dir.join("tag-2"),
+        format!("sha256:{hex2}\n").as_bytes(),
+    );
+
+    let err_tags = primary_reader
+        .list_tags(repo)
+        .await
+        .expect_err("exceeding max_entries must fail");
+    assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err_tags
+            .to_string()
+            .contains("directory enumeration resource limit exceeded")
+    );
+
+    let err_page = primary_reader
+        .list_tags_page(repo, None, 10)
+        .await
+        .expect_err("exceeding max_entries on page must fail");
+    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err_page
+            .to_string()
+            .contains("directory enumeration resource limit exceeded")
+    );
+
+    // 2. Proxy-cache storage wiring enforces nondefault tag listing limits
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    proxy_cfg.fs_tag_listing_max_entries = 1;
+
+    let proxy_storage = crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None)
+        .expect("proxy cache storage construction succeeds");
+    let proxy_repo = "proxy_tag_repo";
+    let proxy_tags_dir = cache_root.join("repos").join(proxy_repo).join("tags");
+    std::fs::create_dir_all(&proxy_tags_dir).expect("create proxy tags dir");
+
+    write_file(
+        &proxy_tags_dir.join("tag-1"),
+        format!("sha256:{hex1}\n").as_bytes(),
+    );
+    let proxy_tags = proxy_storage
+        .as_tag_reader()
+        .list_tags(proxy_repo)
+        .await
+        .expect("proxy 1 tag succeeds");
+    assert_eq!(proxy_tags, vec!["tag-1"]);
+
+    write_file(
+        &proxy_tags_dir.join("tag-2"),
+        format!("sha256:{hex2}\n").as_bytes(),
+    );
+    let proxy_err = proxy_storage
+        .as_tag_reader()
+        .list_tags(proxy_repo)
+        .await
+        .expect_err("proxy exceeding max_entries fails");
+    assert_eq!(proxy_err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        proxy_err
+            .to_string()
+            .contains("directory enumeration resource limit exceeded")
+    );
+
+    // 3. Proxy-cache storage async factory offload executes on blocking thread
+    let proxy_worker_tx = Arc::new(std::sync::Mutex::new(None));
+    let (ptx, proxy_worker_rx) = tokio::sync::oneshot::channel();
+    *proxy_worker_tx.lock().unwrap() = Some(ptx);
+
+    let _proxy_async_storage =
+        crate::storage::proxy_cache_storage_try_from_config_async_with_factory(
+            &proxy_cfg,
+            None,
+            move |cfg, upstream| {
+                let current_id = std::thread::current().id();
+                if let Some(tx) = proxy_worker_tx.lock().unwrap().take() {
+                    let _ = tx.send(current_id);
+                }
+                crate::storage::proxy_cache_storage_try_from_config(cfg, upstream)
+            },
+        )
+        .await
+        .expect("proxy cache async factory succeeds");
+
+    let proxy_construction_thread_id = proxy_worker_rx
+        .await
+        .expect("proxy worker thread id must be sent");
+    assert_ne!(
+        calling_thread_id, proxy_construction_thread_id,
+        "proxy cache storage construction must execute off the calling async thread via spawn_blocking"
+    );
+}
+
+#[tokio::test]
+async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
+    let root = tmp_fs_root();
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    // Non-default tag listing limits: max_entries = 100, max_name_bytes = 128 (approved minimum)
+    config.fs_tag_listing_max_entries = 100;
+    config.fs_tag_listing_max_name_bytes = 128;
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    let tag_exact_128 = "a".repeat(128);
+
+    // 1. Primary filesystem storage wiring path
+    let wiring = crate::storage::storage_wiring_try_from_config(&config)
+        .expect("primary storage wiring succeeds");
+    let primary_reader = wiring.tag_reader();
+    let primary_repo = "primary_name_bytes_repo";
+    let primary_tags_dir = root.join("repos").join(primary_repo).join("tags");
+    std::fs::create_dir_all(&primary_tags_dir).expect("create primary tags dir");
+
+    write_file(
+        &primary_tags_dir.join(&tag_exact_128),
+        format!("sha256:{hex1}\n").as_bytes(),
+    );
+
+    // Exact boundary (128 bytes <= 128 limit) succeeds for list_tags and list_tags_page
+    let tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect("128-byte tag name within 128-byte limit succeeds");
+    assert_eq!(tags, vec![tag_exact_128.clone()]);
+    let (page, _) = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect("128-byte tag name page within limit succeeds");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, tag_exact_128);
+
+    // Over-limit failure: adding a 1-byte name pushes cumulative bytes to 129 > 128
+    write_file(
+        &primary_tags_dir.join("b"),
+        format!("sha256:{hex2}\n").as_bytes(),
+    );
+    let err_tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect_err("exceeding max_name_bytes must fail list_tags");
+    assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err_tags.to_string().contains("MaxTotalNameBytes(128)"),
+        "error must cite MaxTotalNameBytes(128): {err_tags}"
+    );
+
+    let err_page = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect_err("exceeding max_name_bytes must fail list_tags_page");
+    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err_page.to_string().contains("MaxTotalNameBytes(128)"),
+        "error must cite MaxTotalNameBytes(128): {err_page}"
+    );
+
+    // 2. Proxy-cache filesystem storage wiring path
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    let proxy_storage = crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None)
+        .expect("proxy cache storage construction succeeds");
+    let proxy_reader = proxy_storage.as_tag_reader();
+    let proxy_repo = "proxy_name_bytes_repo";
+    let proxy_tags_dir = cache_root.join("repos").join(proxy_repo).join("tags");
+    std::fs::create_dir_all(&proxy_tags_dir).expect("create proxy tags dir");
+
+    write_file(
+        &proxy_tags_dir.join(&tag_exact_128),
+        format!("sha256:{hex1}\n").as_bytes(),
+    );
+    let proxy_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect("proxy 128-byte tag name succeeds");
+    assert_eq!(proxy_tags, vec![tag_exact_128.clone()]);
+    let (proxy_page, _) = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect("proxy 128-byte tag page succeeds");
+    assert_eq!(proxy_page.len(), 1);
+
+    write_file(
+        &proxy_tags_dir.join("b"),
+        format!("sha256:{hex2}\n").as_bytes(),
+    );
+    let proxy_err_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect_err("proxy exceeding max_name_bytes must fail list_tags");
+    assert_eq!(
+        proxy_err_tags.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(
+        proxy_err_tags
+            .to_string()
+            .contains("MaxTotalNameBytes(128)")
+    );
+
+    let proxy_err_page = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect_err("proxy exceeding max_name_bytes must fail list_tags_page");
+    assert_eq!(
+        proxy_err_page.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(
+        proxy_err_page
+            .to_string()
+            .contains("MaxTotalNameBytes(128)")
+    );
+}
+
+#[tokio::test]
+async fn test_tag_listing_wiring_repo_probe_entries_enforcement() {
+    let root = tmp_fs_root();
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    // Non-default probe limits: max_entries = 1 (approved minimum), max_name_bytes = 4096
+    config.fs_tag_listing_repo_probe_max_entries = 1;
+    config.fs_tag_listing_repo_probe_max_name_bytes = 4096;
+
+    // 1. Primary filesystem storage wiring path
+    let wiring = crate::storage::storage_wiring_try_from_config(&config)
+        .expect("primary storage wiring succeeds");
+    let primary_reader = wiring.tag_reader();
+    let primary_repo = "primary_probe_entries_repo";
+    let repo_dir = root.join("repos").join(primary_repo);
+
+    // Ensure tags/ directory does NOT exist (NotFound triggers probe)
+    // Create 1 immediate child directory: "manifests"
+    // Create nested descendants inside manifests/: these MUST NOT count towards the probe budget!
+    write_file(
+        &repo_dir.join("manifests").join("descendant_1"),
+        b"payload1",
+    );
+    write_file(
+        &repo_dir.join("manifests").join("descendant_2"),
+        b"payload2",
+    );
+    write_file(
+        &repo_dir.join("manifests").join("descendant_3"),
+        b"payload3",
+    );
+
+    // Exact boundary: exactly 1 immediate child ("manifests") <= repo_probe_max_entries(1)
+    // Probe succeeds; list_tags returns empty Vec, list_tags_page returns (empty, None)
+    let tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect("1 immediate child with nested descendants must succeed probe");
+    assert!(tags.is_empty());
+    let (page, next_tok) = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect("1 immediate child probe must succeed page");
+    assert!(page.is_empty());
+    assert!(next_tok.is_none());
+
+    // Over-limit failure: add a 2nd immediate child directory to repo_dir
+    write_file(&repo_dir.join("referrers").join("ref_file"), b"payload");
+    // Immediate children count is now 2 > 1 limit
+    let err_tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect_err("exceeding repo_probe_max_entries must fail list_tags");
+    assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err_tags.to_string().contains("MaxEntries(1)"),
+        "error must cite MaxEntries(1): {err_tags}"
+    );
+    assert!(
+        err_tags.to_string().contains(primary_repo),
+        "error must reference repository: {err_tags}"
+    );
+
+    let err_page = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect_err("exceeding repo_probe_max_entries must fail list_tags_page");
+    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(err_page.to_string().contains("MaxEntries(1)"));
+
+    // 2. Proxy-cache filesystem storage wiring path
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    let proxy_storage = crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None)
+        .expect("proxy cache storage construction succeeds");
+    let proxy_reader = proxy_storage.as_tag_reader();
+    let proxy_repo = "proxy_probe_entries_repo";
+    let proxy_repo_dir = cache_root.join("repos").join(proxy_repo);
+
+    write_file(
+        &proxy_repo_dir.join("manifests").join("descendant_1"),
+        b"payload1",
+    );
+    write_file(
+        &proxy_repo_dir.join("manifests").join("descendant_2"),
+        b"payload2",
+    );
+
+    let proxy_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect("proxy 1 immediate child probe succeeds");
+    assert!(proxy_tags.is_empty());
+    let (proxy_page, _) = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect("proxy 1 immediate child page probe succeeds");
+    assert!(proxy_page.is_empty());
+
+    write_file(
+        &proxy_repo_dir.join("referrers").join("ref_file"),
+        b"payload",
+    );
+    let proxy_err_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect_err("proxy exceeding repo_probe_max_entries must fail");
+    assert_eq!(
+        proxy_err_tags.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(proxy_err_tags.to_string().contains("MaxEntries(1)"));
+
+    let proxy_err_page = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect_err("proxy exceeding repo_probe_max_entries must fail page");
+    assert_eq!(
+        proxy_err_page.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(proxy_err_page.to_string().contains("MaxEntries(1)"));
+}
+
+#[tokio::test]
+async fn test_tag_listing_wiring_repo_probe_name_bytes_enforcement() {
+    let root = tmp_fs_root();
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    // Non-default probe limits: max_entries = 10, max_name_bytes = 64 (approved minimum)
+    config.fs_tag_listing_repo_probe_max_entries = 10;
+    config.fs_tag_listing_repo_probe_max_name_bytes = 64;
+
+    let child_exact_64 = "c".repeat(64);
+
+    // 1. Primary filesystem storage wiring path
+    let wiring = crate::storage::storage_wiring_try_from_config(&config)
+        .expect("primary storage wiring succeeds");
+    let primary_reader = wiring.tag_reader();
+    let primary_repo = "primary_probe_name_bytes_repo";
+    let repo_dir = root.join("repos").join(primary_repo);
+
+    // Ensure tags/ does not exist; create 1 immediate child with name length exactly 64 bytes
+    write_file(&repo_dir.join(&child_exact_64).join("subfile"), b"payload");
+
+    // Exact boundary (64 bytes <= 64 limit) succeeds
+    let tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect("64-byte probe child name within limit must succeed");
+    assert!(tags.is_empty());
+    let (page, _) = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect("64-byte probe child name within limit must succeed page");
+    assert!(page.is_empty());
+
+    // Over-limit failure: add a 2nd immediate child of 1 byte ("d"), total bytes = 65 > 64
+    write_file(&repo_dir.join("d").join("subfile"), b"payload");
+    let err_tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect_err("exceeding repo_probe_max_name_bytes must fail list_tags");
+    assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        err_tags.to_string().contains("MaxTotalNameBytes(64)"),
+        "error must cite MaxTotalNameBytes(64): {err_tags}"
+    );
+
+    let err_page = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect_err("exceeding repo_probe_max_name_bytes must fail list_tags_page");
+    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(err_page.to_string().contains("MaxTotalNameBytes(64)"));
+
+    // 2. Proxy-cache filesystem storage wiring path
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    let proxy_storage = crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None)
+        .expect("proxy cache storage construction succeeds");
+    let proxy_reader = proxy_storage.as_tag_reader();
+    let proxy_repo = "proxy_probe_name_bytes_repo";
+    let proxy_repo_dir = cache_root.join("repos").join(proxy_repo);
+
+    write_file(
+        &proxy_repo_dir.join(&child_exact_64).join("subfile"),
+        b"payload",
+    );
+    let proxy_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect("proxy 64-byte probe child succeeds");
+    assert!(proxy_tags.is_empty());
+    let (proxy_page, _) = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect("proxy 64-byte probe child page succeeds");
+    assert!(proxy_page.is_empty());
+
+    write_file(&proxy_repo_dir.join("d").join("subfile"), b"payload");
+    let proxy_err_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect_err("proxy exceeding repo_probe_max_name_bytes must fail");
+    assert_eq!(
+        proxy_err_tags.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(proxy_err_tags.to_string().contains("MaxTotalNameBytes(64)"));
+
+    let proxy_err_page = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect_err("proxy exceeding repo_probe_max_name_bytes must fail page");
+    assert_eq!(
+        proxy_err_page.internal_kind(),
+        Some(StorageErrorKind::Backend)
+    );
+    assert!(proxy_err_page.to_string().contains("MaxTotalNameBytes(64)"));
+}
+
+#[tokio::test]
+async fn test_tag_listing_wiring_payload_ceiling_enforcement() {
+    let root = tmp_fs_root();
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    // Non-default payload ceiling: max_payload_bytes = 256 (approved minimum)
+    config.fs_tag_listing_max_payload_bytes = 256;
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    let prefix1 = format!("sha256:{hex1}");
+    let prefix2 = format!("sha256:{hex2}");
+    // Construct valid digest padded with whitespace to exactly 256 bytes (71 + 185 = 256)
+    let payload_exact_256 = format!("{prefix1}{}", " ".repeat(256 - prefix1.len()));
+    assert_eq!(payload_exact_256.len(), 256);
+    // Construct valid digest padded with whitespace to 257 bytes (71 + 186 = 257 > 256)
+    let payload_overflow_257 = format!("{prefix2}{}", " ".repeat(257 - prefix2.len()));
+    assert_eq!(payload_overflow_257.len(), 257);
+
+    // 1. Primary filesystem storage wiring path
+    let wiring = crate::storage::storage_wiring_try_from_config(&config)
+        .expect("primary storage wiring succeeds");
+    let primary_reader = wiring.tag_reader();
+    let primary_repo = "primary_payload_ceiling_repo";
+    let primary_tags_dir = root.join("repos").join(primary_repo).join("tags");
+    std::fs::create_dir_all(&primary_tags_dir).expect("create primary tags dir");
+
+    // Exact boundary: 256-byte valid payload succeeds
+    write_file(
+        &primary_tags_dir.join("tag-exact"),
+        payload_exact_256.as_bytes(),
+    );
+    let tags = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect("list_tags succeeds");
+    assert_eq!(tags, vec!["tag-exact"]);
+    let (page, _) = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect("256-byte payload within 256 ceiling must succeed list_tags_page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, "tag-exact");
+    assert_eq!(page[0].1.hex(), hex1);
+
+    // Over-limit failure: 257-byte payload fails closed with CorruptData
+    // Distinct from malformed digest omission because payload is a valid digest with spaces
+    write_file(
+        &primary_tags_dir.join("tag-overflow"),
+        payload_overflow_257.as_bytes(),
+    );
+    let err_page = primary_reader
+        .list_tags_page(primary_repo, None, 10)
+        .await
+        .expect_err("257-byte payload exceeding 256 ceiling must fail list_tags_page");
+    assert_eq!(
+        err_page.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+    assert!(
+        err_page.to_string().contains("exceeds limit"),
+        "error must report ceiling exceeded: {err_page}"
+    );
+
+    // In contrast, name-only listing does NOT open candidate payloads -> succeeds!
+    let tags_after = primary_reader
+        .list_tags(primary_repo)
+        .await
+        .expect("name-only listing does not open payloads and must succeed");
+    assert_eq!(tags_after.len(), 2);
+
+    // 2. Proxy-cache filesystem storage wiring path
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    let proxy_storage = crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None)
+        .expect("proxy cache storage construction succeeds");
+    let proxy_reader = proxy_storage.as_tag_reader();
+    let proxy_repo = "proxy_payload_ceiling_repo";
+    let proxy_tags_dir = cache_root.join("repos").join(proxy_repo).join("tags");
+    std::fs::create_dir_all(&proxy_tags_dir).expect("create proxy tags dir");
+
+    write_file(
+        &proxy_tags_dir.join("tag-exact"),
+        payload_exact_256.as_bytes(),
+    );
+    let proxy_tags = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect("proxy list_tags succeeds");
+    assert_eq!(proxy_tags, vec!["tag-exact"]);
+    let (proxy_page, _) = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect("proxy 256-byte payload within ceiling succeeds");
+    assert_eq!(proxy_page.len(), 1);
+
+    write_file(
+        &proxy_tags_dir.join("tag-overflow"),
+        payload_overflow_257.as_bytes(),
+    );
+    let proxy_err_page = proxy_reader
+        .list_tags_page(proxy_repo, None, 10)
+        .await
+        .expect_err("proxy 257-byte payload exceeding ceiling must fail");
+    assert_eq!(
+        proxy_err_page.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+    assert!(proxy_err_page.to_string().contains("exceeds limit"));
+
+    let proxy_tags_after = proxy_reader
+        .list_tags(proxy_repo)
+        .await
+        .expect("proxy name-only listing continues to succeed");
+    assert_eq!(proxy_tags_after.len(), 2);
+}
+
+#[tokio::test]
+async fn test_tag_listing_cutover_shared_reader_identity() {
+    let root = tmp_fs_root();
+
+    // 1. Pointer identity assertion:
+    // Verify that FsStorage.reader() and FsStorage.read_adapter().reader() share the identical Arc<FsMetadataReader>
+    let storage_default = FsStorage::new(root.clone(), 1024 * 1024);
+    assert!(
+        std::sync::Arc::ptr_eq(
+            storage_default.reader(),
+            storage_default.read_adapter().reader()
+        ),
+        "FsStorage.reader and read_adapter must share the identical Arc<FsMetadataReader>"
+    );
+
+    let listing_limits = crate::storage::fs::tag_listing::TagListingLimits::new(
+        storage_fs::DirEnumerationLimits::new(64, 4096),
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        tag_read::TagReadLimits {
+            max_payload_bytes: Some(1024),
+        },
+    );
+    let storage_custom = FsStorage::try_new_with_all_limits(
+        root.clone(),
+        1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        repo_discovery::DiscoveryLimits::default(),
+        manifest_refs::ManifestReferenceLimits::default(),
+        listing_limits.clone(),
+    )
+    .expect("storage init with all limits");
+    assert!(
+        std::sync::Arc::ptr_eq(
+            storage_custom.reader(),
+            storage_custom.read_adapter().reader()
+        ),
+        "custom FsStorage.reader and read_adapter must share the identical Arc<FsMetadataReader>"
+    );
+
+    // 2. Source evidence & behavioral equivalence:
+    // Production list_tags and list_tags_page pass self.reader.as_ref() to the contained seam functions.
+    // For list_tags_page, the same reader is passed for both directory enumeration and ObjectPayloadReader.
+    let repo = "shared-reader-identity-repo";
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).expect("create tags dir");
+    let hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(
+        &tags_dir.join("tag-1"),
+        format!("sha256:{hex}\n").as_bytes(),
+    );
+
+    let direct_tags = storage_custom
+        .list_tags(repo)
+        .await
+        .expect("direct list_tags succeeds");
+    let seam_tags = crate::storage::fs::tag_listing::contained_list_tags_seam(
+        storage_custom.reader().as_ref(),
+        repo,
+        storage_custom.tag_listing_limits().repo_probe_limits,
+        storage_custom.tag_listing_limits().tags_dir_limits,
+    )
+    .await
+    .expect("seam list_tags succeeds");
+    assert_eq!(direct_tags, seam_tags);
+
+    let direct_page = storage_custom
+        .list_tags_page(repo, None, 10)
+        .await
+        .expect("direct list_tags_page succeeds");
+    let seam_page = crate::storage::fs::tag_listing::contained_list_tags_page_seam(
+        storage_custom.reader().as_ref(),
+        storage_custom.reader().as_ref(),
+        repo,
+        None,
+        10,
+        storage_custom.tag_listing_limits().repo_probe_limits,
+        storage_custom.tag_listing_limits().tags_dir_limits,
+        storage_custom.tag_listing_limits().payload_limits.clone(),
+    )
+    .await
+    .expect("seam list_tags_page succeeds");
+    assert_eq!(direct_page, seam_page);
+}
+
+#[tokio::test]
+async fn test_tag_listing_point_read_limits_unaffected_by_listing_ceiling() {
+    let root = tmp_fs_root();
+    let listing_limits = crate::storage::fs::tag_listing::TagListingLimits::new(
+        storage_fs::DirEnumerationLimits::new(64, 4096),
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        tag_read::TagReadLimits {
+            max_payload_bytes: Some(256),
+        },
+    );
+    let storage = FsStorage::try_new_with_all_limits(
+        root.clone(),
+        10 * 1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        repo_discovery::DiscoveryLimits::default(),
+        manifest_refs::ManifestReferenceLimits::default(),
+        listing_limits,
+    )
+    .expect("storage init");
+
+    let repo = "oversized-tag-repo";
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).expect("create tags dir");
+
+    let hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    // Construct 300-byte valid payload: "sha256:<hex>" (71 bytes) + 229 spaces = 300 bytes
+    let padding = " ".repeat(229);
+    let payload = format!("sha256:{hex}{padding}");
+    assert_eq!(payload.len(), 300);
+    write_file(&tags_dir.join("large-tag"), payload.as_bytes());
+
+    // 1. list_tags_page enforces tag_listing_max_payload_bytes (256) -> fails CorruptData
+    let err_page = storage
+        .list_tags_page(repo, None, 10)
+        .await
+        .expect_err("payload exceeding 256 bytes must fail list_tags_page");
+    assert_eq!(
+        err_page.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+    assert!(err_page.to_string().contains("exceeds limit"));
+
+    // 2. list_tags (name only) does NOT open or read candidate payload -> succeeds
+    let tag_names = storage
+        .list_tags(repo)
+        .await
+        .expect("name-only listing must succeed without opening payloads");
+    assert_eq!(tag_names, vec!["large-tag"]);
+
+    // 3. resolve_tag uses TagReadLimits::default() (unbounded max_payload_bytes: None) -> succeeds
+    let resolved = storage
+        .resolve_tag(repo, "large-tag")
+        .await
+        .expect("resolve_tag must succeed unconstrained by listing payload ceiling");
+    assert_eq!(resolved.hex(), hex);
+
+    // 4. get_tag_with_version uses TagReadLimits::default() -> succeeds
+    let (ver_digest, _version) = storage
+        .get_tag_with_version(repo, "large-tag")
+        .await
+        .expect("get_tag_with_version must succeed")
+        .expect("tag must exist");
+    assert_eq!(ver_digest.hex(), hex);
+}
+
+#[tokio::test]
+async fn test_tag_listing_zero_page_avoidance_and_offpage_failure() {
+    let root = tmp_fs_root();
+    let listing_limits = crate::storage::fs::tag_listing::TagListingLimits::new(
+        storage_fs::DirEnumerationLimits::new(64, 4096),
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        tag_read::TagReadLimits {
+            max_payload_bytes: Some(256),
+        },
+    );
+    let storage = FsStorage::try_new_with_all_limits(
+        root.clone(),
+        10 * 1024 * 1024,
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        repo_discovery::DiscoveryLimits::default(),
+        manifest_refs::ManifestReferenceLimits::default(),
+        listing_limits,
+    )
+    .expect("storage init");
+
+    let repo = "zero-page-repo";
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).expect("create tags dir");
+
+    let hex_a = "1111111111111111111111111111111111111111111111111111111111111111";
+    write_file(
+        &tags_dir.join("tag-a"),
+        format!("sha256:{hex_a}").as_bytes(),
+    );
+
+    // tag-b has oversized payload (300 bytes > 256)
+    let padding = " ".repeat(229);
+    write_file(
+        &tags_dir.join("tag-b"),
+        format!("sha256:{hex_a}{padding}").as_bytes(),
+    );
+
+    // 1. Zero-page request (page_limit = 0) validates and enumerates but opens ZERO candidate payloads
+    let (empty_page, next_tok) = storage
+        .list_tags_page(repo, None, 0)
+        .await
+        .expect("zero-page request must succeed without opening candidate payloads");
+    assert_eq!(empty_page.len(), 0);
+    assert!(next_tok.is_none() || next_tok == Some("tag-a".to_string()));
+
+    // 2. Nonzero page request (page_limit = 1) acquires ALL candidates before sorting and slicing
+    // Even though tag-a comes first lexically and could fill limit = 1, tag-b fails acquisition,
+    // so list_tags_page fails closed!
+    let err_nonzero = storage
+        .list_tags_page(repo, None, 1)
+        .await
+        .expect_err("off-page candidate failure must fail nonzero page request");
+    assert_eq!(
+        err_nonzero.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+}
+
+#[tokio::test]
+async fn test_tag_listing_mutation_path_list_tag_files_preserved() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 10 * 1024 * 1024);
+    let repo = "mutation-test-repo";
+
+    let manifest1_digest =
+        Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let manifest2_digest =
+        Digest::parse("sha256:2222222222222222222222222222222222222222222222222222222222222222")
+            .unwrap();
+
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+    storage
+        .put_manifest(repo, &manifest1_digest, Bytes::from_static(manifest_bytes))
+        .await
+        .unwrap();
+    storage
+        .put_manifest(repo, &manifest2_digest, Bytes::from_static(manifest_bytes))
+        .await
+        .unwrap();
+
+    // Create tag-1 referencing manifest1, and tag-2 referencing manifest2
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+    write_file(
+        &tags_dir.join("tag-1"),
+        manifest1_digest.as_str().as_bytes(),
+    );
+    write_file(
+        &tags_dir.join("tag-2"),
+        manifest2_digest.as_str().as_bytes(),
+    );
+
+    // list_tag_files discovers both tag paths
+    let tag_files_before = storage.list_tag_files(repo).await.unwrap();
+    assert_eq!(tag_files_before.len(), 2);
+
+    // Call FsStorage::delete_manifest for manifest1 -> uses self.list_tag_files
+    storage
+        .delete_manifest(repo, &manifest1_digest)
+        .await
+        .unwrap();
+
+    // tag-1 pointing to manifest1 must be unlinked; tag-2 pointing to manifest2 must remain
+    let tag_files_after = storage.list_tag_files(repo).await.unwrap();
+    assert_eq!(tag_files_after.len(), 1);
+    assert_eq!(tag_files_after[0].file_name().unwrap(), "tag-2");
+
+    // Contained list_tags also observes tag-2
+    let tags_after = storage.list_tags(repo).await.unwrap();
+    assert_eq!(tags_after, vec!["tag-2"]);
+}
+
+#[tokio::test]
+async fn test_tag_listing_budget_failures_reach_actual_callers() {
+    // A. Supervisor caller: compute_protected_blobs
+    let root = tmp_fs_root();
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    config.fs_tag_listing_max_entries = 1; // Strict limit: 1 entry
+
+    let wiring = crate::storage::storage_wiring_try_from_config(&config).unwrap();
+    let repo = "library/budget-repo";
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    let hex1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    write_file(&tags_dir.join("tag-1"), format!("sha256:{hex1}").as_bytes());
+    write_file(&tags_dir.join("tag-2"), format!("sha256:{hex2}").as_bytes());
+
+    let rules = vec![crate::config::ProxyRepoRule {
+        match_pattern: crate::proxy::ProxyRepoPattern::parse("library/*").unwrap(),
+        upstream_repo: None,
+        tag_policy: crate::config::TagPolicy::AlwaysRevalidate,
+        eviction_policy: crate::config::EvictionPolicy::KeepLatestCachedSemver {
+            tag_regex: None,
+            allow_prerelease: false,
+        },
+    }];
+    let proxy_db_path = root.join("proxy.db");
+    let proxy_cfg = crate::config::ProxyConfig {
+        enabled: true,
+        mode: crate::config::ProxyMode::Allowlist,
+        upstream_base_url: Some("http://localhost:5000".to_string()),
+        upstream_username: None,
+        upstream_password: None,
+        allowed_upstream_hosts: vec!["localhost".to_string()],
+        allowed_repo_prefixes: vec![],
+        block_private_networks: false,
+        redirect_policy: crate::config::RedirectPolicy::AnyPublic,
+        max_concurrent_upstream: 10,
+        index_path: proxy_db_path,
+        cache_fs_root: None,
+        cache_s3_prefix: None,
+        gc_interval_secs: 0,
+        scrub_enabled: false,
+        scrub_interval_secs: 0,
+        scrub_max_files_per_run: 0,
+        max_cache_bytes: None,
+        repo_rules: vec![],
+        upstreams: vec![],
+        routing_proxy_hosts: vec![],
+        routing_trust_x_forwarded_host: false,
+    };
+    let proxy = crate::proxy::Proxy::new(&proxy_cfg).unwrap().unwrap();
+
+    let sup_result =
+        crate::supervisor::compute_protected_blobs(wiring.proxy_storage().as_ref(), &rules, &proxy)
+            .await;
+    let sup_err = sup_result
+        .expect_err("compute_protected_blobs must fail on FsStorage tag listing budget exhaustion");
+    assert!(sup_err.contains(repo), "error must contain repo context");
+    assert!(
+        sup_err.contains("directory enumeration resource limit exceeded"),
+        "error must contain underlying budget message: {sup_err}"
+    );
+
+    // B. Membership migration caller: verify_membership_migration
+    let mig_result =
+        crate::membership_migration::verify_membership_migration(wiring.blob_mutation().as_ref())
+            .await;
+    let mig_err = mig_result.expect_err(
+        "verify_membership_migration must fail closed on FsStorage tag listing budget exhaustion",
+    );
+    assert_eq!(mig_err.internal_kind(), Some(StorageErrorKind::Backend));
+    assert!(
+        mig_err
+            .to_string()
+            .contains("directory enumeration resource limit exceeded")
+    );
+
+    // C. Lifecycle caller: ManifestLifecycleService::delete_manifest
+    let root2 = tmp_fs_root();
+    let listing_limits2 = crate::storage::fs::tag_listing::TagListingLimits::new(
+        storage_fs::DirEnumerationLimits::new(64, 4096),
+        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        tag_read::TagReadLimits {
+            max_payload_bytes: Some(256),
+        },
+    );
+    let storage2 = Arc::new(
+        FsStorage::try_new_with_all_limits(
+            root2.clone(),
+            10 * 1024 * 1024,
+            storage_fs::DirEnumerationLimits::new(1000, 100_000),
+            repo_discovery::DiscoveryLimits::default(),
+            manifest_refs::ManifestReferenceLimits::default(),
+            listing_limits2,
+        )
+        .unwrap(),
+    );
+    let consistency = crate::consistency::ConsistencyCoordinator::new();
+    let service = crate::manifest_lifecycle::ManifestLifecycleService::new(
+        storage2.clone(),
+        None,
+        consistency,
+    );
+
+    let del_repo = "lifecycle-budget-repo";
+    let manifest_digest =
+        Digest::parse("sha256:3333333333333333333333333333333333333333333333333333333333333333")
+            .unwrap();
+    let manifest_bytes =
+        br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+    storage2
+        .put_manifest(
+            del_repo,
+            &manifest_digest,
+            Bytes::from_static(manifest_bytes),
+        )
+        .await
+        .unwrap();
+
+    // Write a tag with oversized payload (300 bytes > 256 limit)
+    let tags_dir2 = root2.join("repos").join(del_repo).join("tags");
+    std::fs::create_dir_all(&tags_dir2).unwrap();
+    let padding = " ".repeat(229);
+    write_file(
+        &tags_dir2.join("oversized-tag"),
+        format!("{manifest_digest}{padding}").as_bytes(),
+    );
+
+    let del_result = service.delete_manifest(del_repo, &manifest_digest).await;
+    match del_result {
+        Err(crate::manifest_lifecycle::ManifestLifecycleError::Storage(e)) => {
+            assert_eq!(e.internal_kind(), Some(StorageErrorKind::CorruptData));
+            assert!(e.to_string().contains("exceeds limit"));
+        }
+        other => panic!("expected Storage error with CorruptData, got: {other:?}"),
+    }
 }

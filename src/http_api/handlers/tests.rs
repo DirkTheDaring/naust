@@ -580,7 +580,18 @@ fn minimal_config_for_token_tests() -> Config {
             crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_ENTRIES,
         fs_manifest_listing_max_name_bytes:
             crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES,
+        fs_tag_listing_max_entries:
+            crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_ENTRIES,
+        fs_tag_listing_max_name_bytes:
+            crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_NAME_BYTES,
+        fs_tag_listing_repo_probe_max_entries:
+            crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_REPO_PROBE_MAX_ENTRIES,
+        fs_tag_listing_repo_probe_max_name_bytes:
+            crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES,
+        fs_tag_listing_max_payload_bytes:
+            crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES,
         fs_gc_discovery_max_depth: 32,
+
         fs_gc_discovery_max_dir_enumerations: 10_000,
         fs_gc_discovery_max_total_discovery_entries: 250_000,
         fs_gc_discovery_max_manifest_dirs: 10_000,

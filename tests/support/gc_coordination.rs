@@ -1143,7 +1143,13 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         fs_root,
         fs_manifest_listing_max_entries: 10_000,
         fs_manifest_listing_max_name_bytes: 1_500_000,
+        fs_tag_listing_max_entries: 10_000,
+        fs_tag_listing_max_name_bytes: 1_500_000,
+        fs_tag_listing_repo_probe_max_entries: 64,
+        fs_tag_listing_repo_probe_max_name_bytes: 4_096,
+        fs_tag_listing_max_payload_bytes: 1_024,
         fs_gc_discovery_max_depth: 32,
+
         fs_gc_discovery_max_dir_enumerations: 10_000,
         fs_gc_discovery_max_total_discovery_entries: 250_000,
         fs_gc_discovery_max_manifest_dirs: 10_000,

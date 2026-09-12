@@ -198,16 +198,18 @@ pub struct FsStorage {
     manifest_listing_limits: storage_fs::DirEnumerationLimits,
     gc_discovery_limits: repo_discovery::DiscoveryLimits,
     gc_ref_limits: manifest_refs::ManifestReferenceLimits,
+    pub(crate) tag_listing_limits: tag_listing::TagListingLimits,
 }
 
 impl FsStorage {
-    /// Crate-visible constructor enforcing complete limit validation.
-    pub(crate) fn try_new_with_gc_limits(
+    /// Crate-visible constructor enforcing complete limit validation including tag listing limits.
+    pub(crate) fn try_new_with_all_limits(
         root: PathBuf,
         max_upload_bytes: u64,
         manifest_listing_limits: storage_fs::DirEnumerationLimits,
         gc_discovery_limits: repo_discovery::DiscoveryLimits,
         gc_ref_limits: manifest_refs::ManifestReferenceLimits,
+        tag_listing_limits: tag_listing::TagListingLimits,
     ) -> Result<Self, StorageError> {
         // 1. Validate manifest listing limits
         if manifest_listing_limits.max_entries() < manifest_listing::MIN_MANIFEST_LISTING_ENTRIES {
@@ -304,6 +306,48 @@ impl FsStorage {
             }
         }
 
+        // 4. Validate tag listing limits
+        if tag_listing_limits.tags_dir_limits.max_entries() < tag_listing::MIN_TAG_LISTING_ENTRIES {
+            return Err(StorageError::configuration(
+                "tag_listing_max_entries must be at least 1",
+            ));
+        }
+        if tag_listing_limits.tags_dir_limits.max_total_name_bytes()
+            < tag_listing::MIN_TAG_LISTING_NAME_BYTES
+        {
+            return Err(StorageError::configuration(
+                "tag_listing_max_name_bytes must be at least 128",
+            ));
+        }
+        if tag_listing_limits.repo_probe_limits.max_entries()
+            < tag_listing::MIN_TAG_LISTING_REPO_PROBE_ENTRIES
+        {
+            return Err(StorageError::configuration(
+                "tag_listing_repo_probe_max_entries must be at least 1",
+            ));
+        }
+        if tag_listing_limits.repo_probe_limits.max_total_name_bytes()
+            < tag_listing::MIN_TAG_LISTING_REPO_PROBE_NAME_BYTES
+        {
+            return Err(StorageError::configuration(
+                "tag_listing_repo_probe_max_name_bytes must be at least 64",
+            ));
+        }
+        match tag_listing_limits.payload_limits.max_payload_bytes {
+            Some(ceiling) => {
+                if ceiling < tag_listing::MIN_TAG_LISTING_PAYLOAD_BYTES || ceiling == u64::MAX {
+                    return Err(StorageError::configuration(
+                        "tag_listing_max_payload_bytes must be >= 256 and < u64::MAX",
+                    ));
+                }
+            }
+            None => {
+                return Err(StorageError::configuration(
+                    "tag_listing_max_payload_bytes must be >= 256 and < u64::MAX",
+                ));
+            }
+        }
+
         ensure_dir(&root)?;
         let reader = storage_fs::FsMetadataReader::open(&root)
             .map_err(read_adapter::map_fs_startup_error)?;
@@ -334,7 +378,26 @@ impl FsStorage {
             manifest_listing_limits,
             gc_discovery_limits,
             gc_ref_limits,
+            tag_listing_limits,
         })
+    }
+
+    /// Crate-visible constructor enforcing complete limit validation with default tag listing limits.
+    pub(crate) fn try_new_with_gc_limits(
+        root: PathBuf,
+        max_upload_bytes: u64,
+        manifest_listing_limits: storage_fs::DirEnumerationLimits,
+        gc_discovery_limits: repo_discovery::DiscoveryLimits,
+        gc_ref_limits: manifest_refs::ManifestReferenceLimits,
+    ) -> Result<Self, StorageError> {
+        Self::try_new_with_all_limits(
+            root,
+            max_upload_bytes,
+            manifest_listing_limits,
+            gc_discovery_limits,
+            gc_ref_limits,
+            tag_listing::TagListingLimits::default(),
+        )
     }
 
     pub fn try_new_with_limits(
@@ -383,6 +446,13 @@ impl FsStorage {
     #[cfg(test)]
     pub(crate) fn manifest_listing_limits(&self) -> storage_fs::DirEnumerationLimits {
         self.manifest_listing_limits
+    }
+
+    /// Returns configured limits for contained tag listing.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn tag_listing_limits(&self) -> &tag_listing::TagListingLimits {
+        &self.tag_listing_limits
     }
 
     /// Internal test helper to list manifest digests with explicitly injected limits.
@@ -948,39 +1018,13 @@ impl Storage for FsStorage {
     }
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
-        let repo_dir = self.root.join("repos").join(name);
-        match tokio::fs::metadata(&repo_dir).await {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        }
-
-        let tags_dir = repo_dir.join("tags");
-        let mut dir = match tokio::fs::read_dir(&tags_dir).await {
-            Ok(d) => d,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-
-        let mut tags = Vec::new();
-        loop {
-            match dir.next_entry().await {
-                Ok(Some(entry)) => {
-                    if let Some(file_name) = entry.file_name().to_str() {
-                        if !file_name.starts_with('.') {
-                            tags.push(file_name.to_string());
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => return Err(StorageError::io(err.to_string())),
-            }
-        }
-
-        tags.sort();
-        Ok(tags)
+        tag_listing::contained_list_tags_seam(
+            self.reader.as_ref(),
+            name,
+            self.tag_listing_limits.repo_probe_limits,
+            self.tag_listing_limits.tags_dir_limits,
+        )
+        .await
     }
 
     async fn head_manifest(
@@ -1172,45 +1216,17 @@ impl Storage for FsStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
-        let tag_files = self.list_tag_files(repo).await?;
-        let tags_dir = self.root.join("repos").join(repo).join("tags");
-
-        let mut tags_with_digest: Vec<(String, Digest)> = Vec::new();
-        for path in tag_files {
-            let rel = match path.strip_prefix(&tags_dir) {
-                Ok(r) => r.to_string_lossy().to_string(),
-                Err(_) => continue,
-            };
-            if rel.starts_with(".tmp.") || rel.starts_with(".lock.") {
-                continue;
-            }
-            if let Ok(content) = tokio::fs::read_to_string(&path).await
-                && let Ok(digest) = Digest::parse(content.trim())
-            {
-                tags_with_digest.push((rel, digest));
-            }
-        }
-        tags_with_digest.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let start_idx = if let Some(token) = continuation_token {
-            match tags_with_digest.binary_search_by(|(t, _)| t.as_str().cmp(token)) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            }
-        } else {
-            0
-        };
-
-        let end_idx = (start_idx + page_limit).min(tags_with_digest.len());
-        let page_slice = &tags_with_digest[start_idx..end_idx];
-
-        let next_token = if end_idx < tags_with_digest.len() {
-            page_slice.last().map(|(t, _)| t.clone())
-        } else {
-            None
-        };
-
-        Ok((page_slice.to_vec(), next_token))
+        tag_listing::contained_list_tags_page_seam(
+            self.reader.as_ref(),
+            self.reader.as_ref(),
+            repo,
+            continuation_token,
+            page_limit,
+            self.tag_listing_limits.repo_probe_limits,
+            self.tag_listing_limits.tags_dir_limits,
+            self.tag_listing_limits.payload_limits.clone(),
+        )
+        .await
     }
 
     async fn list_referrers_page(
@@ -3707,6 +3723,5 @@ pub(crate) use manifest_refs as manifest_refs_seam;
 #[path = "fs/tag_read.rs"]
 pub(crate) mod tag_read;
 
-#[cfg(test)]
 #[path = "fs/tag_listing.rs"]
-mod tag_listing;
+pub(crate) mod tag_listing;
