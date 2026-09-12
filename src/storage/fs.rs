@@ -3590,3 +3590,7 @@ pub(crate) mod manifest_listing;
 #[cfg(test)]
 #[path = "fs/repo_discovery.rs"]
 mod repo_discovery;
+
+#[cfg(test)]
+#[path = "fs/manifest_refs_seam.rs"]
+mod manifest_refs_seam;
