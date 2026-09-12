@@ -9125,3 +9125,1192 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
         other => panic!("expected Storage error with CorruptData, got: {other:?}"),
     }
 }
+
+// ============================================================================
+// OCI Referrers Read Characterization Slice
+// ============================================================================
+mod referrers_read_characterization {
+    use super::*;
+    use crate::application::ReferrersQueryError;
+    use crate::application::referrers::{ReferrersQueryParams, ReferrersQueryService};
+    use crate::storage::ports::StorageWiring;
+    use crate::storage::{ReferrerDescriptor, StorageErrorKind};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_descriptor(
+        digest: &str,
+        size: u64,
+        artifact_type: Option<&str>,
+        annotations: Option<HashMap<String, String>>,
+    ) -> ReferrerDescriptor {
+        ReferrerDescriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: digest.to_string(),
+            size,
+            artifact_type: artifact_type.map(|s| s.to_string()),
+            annotations,
+        }
+    }
+
+    fn write_referrers_file(
+        root: &std::path::Path,
+        repo: &str,
+        subject: &Digest,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let path = root
+            .join("repos")
+            .join(repo)
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()));
+        write_file(&path, bytes);
+        path
+    }
+
+    #[cfg(unix)]
+    struct ScopedPermReset<'a> {
+        path: &'a std::path::Path,
+        original_permissions: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl<'a> Drop for ScopedPermReset<'a> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, self.original_permissions.clone());
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Group 1: Missing and successful reads
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_missing_repository() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let list = storage
+            .list_referrers("nonexistent_repo", &subject)
+            .await
+            .expect("missing repo yields Ok(vec![])");
+        assert!(list.is_empty());
+
+        let (page, token) = storage
+            .list_referrers_page("nonexistent_repo", &subject, None, 10)
+            .await
+            .expect("missing repo yields Ok((vec![], None))");
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_missing_referrers_dir() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // Create repo dir without referrers/ subdirectory
+        std::fs::create_dir_all(root.join("repos").join("existing_repo")).unwrap();
+
+        let list = storage
+            .list_referrers("existing_repo", &subject)
+            .await
+            .expect("missing referrers dir yields Ok(vec![])");
+        assert!(list.is_empty());
+
+        let (page, token) = storage
+            .list_referrers_page("existing_repo", &subject, None, 10)
+            .await
+            .expect("missing referrers dir yields Ok((vec![], None))");
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_missing_subject_file() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // Create referrers/ directory, but do not create <hex>.json
+        std::fs::create_dir_all(root.join("repos").join("myrepo").join("referrers")).unwrap();
+
+        let list = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .expect("missing subject file yields Ok(vec![])");
+        assert!(list.is_empty());
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .expect("missing subject file yields Ok((vec![], None))");
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_empty_json_array() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        write_referrers_file(&root, "myrepo", &subject, b"[]");
+
+        let list = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .expect("empty json array yields Ok(vec![])");
+        assert!(list.is_empty());
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .expect("empty json array yields Ok((vec![], None))");
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_valid_multi_descriptor_ordering_and_fields() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "org.opencontainers.image.created".to_string(),
+            "2026-09-12T00:00:00Z".to_string(),
+        );
+        annotations.insert("vnd.custom.field".to_string(), "custom_value".to_string());
+
+        let desc_c = make_descriptor(
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            300,
+            Some("application/vnd.example.sbom.v1"),
+            Some(annotations.clone()),
+        );
+        let desc_a = make_descriptor(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+            None,
+            None,
+        );
+        let desc_b = make_descriptor(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            200,
+            Some("application/vnd.example.signature.v1"),
+            None,
+        );
+
+        // Intentionally written in order: C, A, B
+        let descriptors = vec![desc_c.clone(), desc_a.clone(), desc_b.clone()];
+        let json_bytes = serde_json::to_vec(&descriptors).unwrap();
+        write_referrers_file(&root, "myrepo", &subject, &json_bytes);
+
+        // Direct read preserves file order [C, A, B]
+        let direct = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .expect("list_referrers succeeds");
+        assert_eq!(direct.len(), 3);
+        assert_eq!(direct[0], desc_c);
+        assert_eq!(direct[1], desc_a);
+        assert_eq!(direct[2], desc_b);
+
+        // Verify descriptor fields
+        assert_eq!(direct[0].size, 300);
+        assert_eq!(
+            direct[0].artifact_type.as_deref(),
+            Some("application/vnd.example.sbom.v1")
+        );
+        assert_eq!(
+            direct[0]
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("vnd.custom.field")
+                .unwrap(),
+            "custom_value"
+        );
+        assert_eq!(direct[1].artifact_type, None);
+        assert_eq!(direct[1].annotations, None);
+
+        // Paged read sorts by digest lexicographically [A, B, C]
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .expect("list_referrers_page succeeds");
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0], desc_a);
+        assert_eq!(page[1], desc_b);
+        assert_eq!(page[2], desc_c);
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_valid_sha256_and_sha512_subject_paths() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let subject_sha256 = Digest::parse(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let sha512_hex = "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555";
+        let subject_sha512 = Digest::parse(&format!("sha512:{sha512_hex}")).unwrap();
+
+        let desc256 = make_descriptor(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+            None,
+            None,
+        );
+        let desc512 = make_descriptor(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            200,
+            None,
+            None,
+        );
+
+        let path256 = write_referrers_file(
+            &root,
+            "repo256",
+            &subject_sha256,
+            &serde_json::to_vec(&vec![desc256.clone()]).unwrap(),
+        );
+        let path512 = write_referrers_file(
+            &root,
+            "repo512",
+            &subject_sha512,
+            &serde_json::to_vec(&vec![desc512.clone()]).unwrap(),
+        );
+
+        // Assert expected filename formatting: <hex>.json
+        assert!(
+            path256
+                .ends_with("2222222222222222222222222222222222222222222222222222222222222222.json")
+        );
+        assert!(path512.ends_with(&format!("{sha512_hex}.json")));
+
+        let res256 = storage
+            .list_referrers("repo256", &subject_sha256)
+            .await
+            .unwrap();
+        assert_eq!(res256, vec![desc256]);
+
+        let res512 = storage
+            .list_referrers("repo512", &subject_sha512)
+            .await
+            .unwrap();
+        assert_eq!(res512, vec![desc512]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Group 2: Payload parsing and errors
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_empty_file_serde_eof_error() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        write_referrers_file(&root, "myrepo", &subject, b"");
+
+        let err = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Internal {
+                kind, ref message, ..
+            } => {
+                assert_eq!(kind, StorageErrorKind::Io);
+                assert!(
+                    message.contains("EOF while parsing a value"),
+                    "expected EOF parse error: {message}"
+                );
+            }
+            other => panic!("expected StorageError::Internal(Io), got: {other:?}"),
+        }
+
+        // Paged read suppresses error
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_whitespace_only_file() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        write_referrers_file(&root, "myrepo", &subject, b"   \n\t  \r\n ");
+
+        let err = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageError::Internal(Io), got: {other:?}"),
+        }
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_truncated_json() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        write_referrers_file(
+            &root,
+            "myrepo",
+            &subject,
+            b"[{\"mediaType\": \"application/vnd.oci.image.manifest.v1+json\"",
+        );
+
+        let err = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageError::Internal(Io), got: {other:?}"),
+        }
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_syntax() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        write_referrers_file(&root, "myrepo", &subject, b"{not-valid-json}");
+
+        let err = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageError::Internal(Io), got: {other:?}"),
+        }
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_wrong_toplevel_json_type() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // Object instead of array
+        write_referrers_file(
+            &root,
+            "myrepo",
+            &subject,
+            b"{\"mediaType\": \"application/vnd.oci.image.manifest.v1+json\"}",
+        );
+
+        let err = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Internal {
+                kind, ref message, ..
+            } => {
+                assert_eq!(kind, StorageErrorKind::Io);
+                assert!(
+                    message.contains("invalid type"),
+                    "expected invalid type error: {message}"
+                );
+            }
+            other => panic!("expected StorageError::Internal(Io), got: {other:?}"),
+        }
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_utf8_payload() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        write_referrers_file(&root, "myrepo", &subject, b"[\xFF\xFE\xFD]");
+
+        let err = storage
+            .list_referrers("myrepo", &subject)
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageError::Internal(Io), got: {other:?}"),
+        }
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_valid_json_with_whitespace_formatting() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let formatted = br#"
+        [
+            {
+                "media_type": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                "size": 54321
+            }
+        ]
+        "#;
+        write_referrers_file(&root, "myrepo", &subject, formatted);
+
+        let list = storage.list_referrers("myrepo", &subject).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].size, 54321);
+
+        let (page, _) = storage
+            .list_referrers_page("myrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_moderate_payload_absence_of_read_ceiling() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // 100 descriptors (~15-20 KB of JSON)
+        let mut descriptors = Vec::with_capacity(100);
+        for i in 0..100 {
+            let digest_hex = format!("{:064x}", i);
+            descriptors.push(make_descriptor(
+                &format!("sha256:{digest_hex}"),
+                1000 + i as u64,
+                Some("application/vnd.example.item"),
+                None,
+            ));
+        }
+        let json_bytes = serde_json::to_vec(&descriptors).unwrap();
+        write_referrers_file(&root, "myrepo", &subject, &json_bytes);
+
+        // Reads all 100 descriptors successfully without a configured payload limit check
+        let list = storage.list_referrers("myrepo", &subject).await.unwrap();
+        assert_eq!(list.len(), 100);
+
+        let (page, token) = storage
+            .list_referrers_page("myrepo", &subject, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 100);
+        assert_eq!(token, None);
+    }
+
+    // ------------------------------------------------------------------------
+    // Group 3: Ambient path behavior
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_ambient_symlink_inside_fixture() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let target_path = root.join("shared_referrers.json");
+        let desc = make_descriptor(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            100,
+            None,
+            None,
+        );
+        let json_bytes = serde_json::to_vec(&vec![desc.clone()]).unwrap();
+        write_file(&target_path, &json_bytes);
+
+        let link_path = root
+            .join("repos")
+            .join("testrepo")
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()));
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        // Direct read ambiently follows symlink inside fixture
+        let direct = storage.list_referrers("testrepo", &subject).await.unwrap();
+        assert_eq!(direct, vec![desc.clone()]);
+
+        let paged = storage
+            .list_referrers_page("testrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(paged, (vec![desc], None));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_ambient_symlink_outside_storage_root() {
+        let fixture = tempfile::tempdir().expect("create test fixture");
+        let root = fixture.path().join("storage_root");
+        let outside = fixture.path().join("outside_target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let target_path = outside.join("external_referrers.json");
+        let desc = make_descriptor(
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            250,
+            None,
+            None,
+        );
+        let json_bytes = serde_json::to_vec(&vec![desc.clone()]).unwrap();
+        write_file(&target_path, &json_bytes);
+
+        let link_path = root
+            .join("repos")
+            .join("testrepo")
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()));
+        std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+
+        // Direct read ambiently follows symlink outside storage root without containment failure
+        let direct = storage.list_referrers("testrepo", &subject).await.unwrap();
+        assert_eq!(direct, vec![desc.clone()]);
+
+        let paged = storage
+            .list_referrers_page("testrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(paged, (vec![desc], None));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_ambient_directory_symlink() {
+        let fixture = tempfile::tempdir().expect("create test fixture");
+        let root = fixture.path().join("storage_root");
+        let outside_dir = fixture.path().join("outside_referrers");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let desc = make_descriptor(
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            400,
+            None,
+            None,
+        );
+        let target_file = outside_dir.join(format!("{}.json", subject.hex()));
+        let json_bytes = serde_json::to_vec(&vec![desc.clone()]).unwrap();
+        write_file(&target_file, &json_bytes);
+
+        let repo_dir = root.join("repos").join("testrepo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, repo_dir.join("referrers")).unwrap();
+
+        // Ambient read follows directory symlink
+        let direct = storage.list_referrers("testrepo", &subject).await.unwrap();
+        assert_eq!(direct, vec![desc.clone()]);
+
+        let paged = storage
+            .list_referrers_page("testrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(paged, (vec![desc], None));
+    }
+
+    #[tokio::test]
+    async fn test_repo_name_path_traversal_storage_boundary() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // Path constructed by storage: root.join("repos").join("../escaped_repo").join("referrers").join("<hex>.json")
+        // Ensure repos directory exists so that the "repos/.." path component can resolve on filesystem
+        std::fs::create_dir_all(root.join("repos")).unwrap();
+
+        let escaped_path = root
+            .join("escaped_repo")
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()));
+        let desc = make_descriptor(
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+            500,
+            None,
+            None,
+        );
+        let json_bytes = serde_json::to_vec(&vec![desc.clone()]).unwrap();
+        write_file(&escaped_path, &json_bytes);
+
+        // Direct read with "../escaped_repo" traverses path without containment error
+        let direct = storage
+            .list_referrers("../escaped_repo", &subject)
+            .await
+            .unwrap();
+        assert_eq!(direct, vec![desc]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Group 4: Object types and permission behavior
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_directory_in_place_of_json_file() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let dir_path = root
+            .join("repos")
+            .join("testrepo")
+            .join("referrers")
+            .join(format!("{}.json", subject.hex()));
+        std::fs::create_dir_all(&dir_path).unwrap();
+
+        // Direct read returns StorageErrorKind::Io (EISDIR on Unix)
+        let direct_err = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .unwrap_err();
+        match direct_err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageErrorKind::Io for directory read, got {other:?}"),
+        }
+
+        // Paged read suppresses directory read error into empty success
+        let paged_res = storage
+            .list_referrers_page("testrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(paged_res, (vec![], None));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+    async fn test_permission_denied_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let file_path = write_referrers_file(&root, "testrepo", &subject, b"[]");
+
+        let orig_perms = std::fs::metadata(&file_path).unwrap().permissions();
+        let _guard = ScopedPermReset {
+            path: &file_path,
+            original_permissions: orig_perms.clone(),
+        };
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        match std::fs::read(&file_path) {
+            Ok(_) => panic!("ineffective permissions: read succeeded under mode 0o000"),
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        let direct_err = storage
+            .list_referrers("testrepo", &subject)
+            .await
+            .unwrap_err();
+        match direct_err {
+            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+            other => panic!("expected StorageErrorKind::Io for permission denial, got {other:?}"),
+        }
+
+        let paged_res = storage
+            .list_referrers_page("testrepo", &subject, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(paged_res, (vec![], None));
+    }
+
+    // ------------------------------------------------------------------------
+    // Group 5: Pagination
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pagination_lexical_sorting_and_pages() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let desc_a = make_descriptor(
+            "sha256:111111111111111111111111111111111111111111111111111111111111111a",
+            100,
+            None,
+            None,
+        );
+        let desc_b = make_descriptor(
+            "sha256:222222222222222222222222222222222222222222222222222222222222222b",
+            200,
+            None,
+            None,
+        );
+        let desc_c = make_descriptor(
+            "sha256:333333333333333333333333333333333333333333333333333333333333333c",
+            300,
+            None,
+            None,
+        );
+
+        // Write in non-sorted order C, A, B
+        write_referrers_file(
+            &root,
+            "testrepo",
+            &subject,
+            &serde_json::to_vec(&vec![desc_c.clone(), desc_a.clone(), desc_b.clone()]).unwrap(),
+        );
+
+        // Page 1: limit 1, token None -> [A], token = Some(A)
+        let (page1, token1) = storage
+            .list_referrers_page("testrepo", &subject, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page1, vec![desc_a.clone()]);
+        assert_eq!(token1, Some(desc_a.digest.clone()));
+
+        // Page 2: limit 1, token Some(A) -> [B], token = Some(B)
+        let (page2, token2) = storage
+            .list_referrers_page("testrepo", &subject, token1.as_deref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(page2, vec![desc_b.clone()]);
+        assert_eq!(token2, Some(desc_b.digest.clone()));
+
+        // Page 3: limit 1, token Some(B) -> [C], token = None (terminal page because end_idx == refs.len())
+        let (page3, token3) = storage
+            .list_referrers_page("testrepo", &subject, token2.as_deref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(page3, vec![desc_c.clone()]);
+        assert_eq!(token3, None);
+
+        // Query beyond terminal page: token Some(C) -> [], token = None
+        let (page4, token4) = storage
+            .list_referrers_page("testrepo", &subject, Some(&desc_c.digest), 1)
+            .await
+            .unwrap();
+        assert!(page4.is_empty());
+        assert_eq!(token4, None);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_continuation_tokens_absent() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let desc_a = make_descriptor(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+            None,
+            None,
+        );
+        let desc_c = make_descriptor(
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            300,
+            None,
+            None,
+        );
+        write_referrers_file(
+            &root,
+            "testrepo",
+            &subject,
+            &serde_json::to_vec(&vec![desc_a.clone(), desc_c.clone()]).unwrap(),
+        );
+
+        // Absent token before stored digests: Err(0) -> start_idx = 0 -> returns from beginning
+        let (page_before, token_before) = storage
+            .list_referrers_page(
+                "testrepo",
+                &subject,
+                Some("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_before, vec![desc_a.clone()]);
+        assert_eq!(token_before, Some(desc_a.digest.clone()));
+
+        // Absent token between stored digests: Err(1) -> start_idx = 1 -> returns from desc_c
+        let (page_between, token_between) = storage
+            .list_referrers_page(
+                "testrepo",
+                &subject,
+                Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_between, vec![desc_c.clone()]);
+        assert_eq!(token_between, None); // terminal page
+
+        // Absent token after all stored digests: Err(2) -> start_idx = 2 -> returns empty slice
+        let (page_after, token_after) = storage
+            .list_referrers_page(
+                "testrepo",
+                &subject,
+                Some("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(page_after.is_empty());
+        assert_eq!(token_after, None);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_duplicate_descriptor_digests() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let dup_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let desc_1 = make_descriptor(dup_digest, 100, None, None);
+        let desc_2 = make_descriptor(dup_digest, 200, None, None);
+
+        write_referrers_file(
+            &root,
+            "testrepo",
+            &subject,
+            &serde_json::to_vec(&vec![desc_1.clone(), desc_2.clone()]).unwrap(),
+        );
+
+        // Page 1 with limit 1 yields one descriptor with duplicate digest
+        let (page1, token1) = storage
+            .list_referrers_page("testrepo", &subject, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].digest, dup_digest);
+        assert_eq!(token1, Some(dup_digest.to_string()));
+
+        // Next page with duplicate digest token:
+        // Rust's binary_search_by on equal keys may return either matching index.
+        // Observable characterization: start_idx is either 1 or 2, returning at most 1 item.
+        let (page2, token2) = storage
+            .list_referrers_page("testrepo", &subject, token1.as_deref(), 1)
+            .await
+            .unwrap();
+        assert!(page2.len() <= 1);
+        assert_eq!(token2, None);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_zero_page_limit_behavior() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let desc_a = make_descriptor(
+            "sha256:111111111111111111111111111111111111111111111111111111111111111a",
+            100,
+            None,
+            None,
+        );
+        let desc_b = make_descriptor(
+            "sha256:222222222222222222222222222222222222222222222222222222222222222b",
+            200,
+            None,
+            None,
+        );
+        write_referrers_file(
+            &root,
+            "testrepo",
+            &subject,
+            &serde_json::to_vec(&vec![desc_a, desc_b]).unwrap(),
+        );
+
+        // Zero limit on valid file: returns Ok((vec![], None)).
+        // Observable behavior: end_idx = (0 + 0).min(2) = 0.
+        // Although end_idx < refs.len() (0 < 2) is true, page_slice is empty, so page_slice.last() is None.
+        let (page, token) = storage
+            .list_referrers_page("testrepo", &subject, None, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(token, None);
+
+        // Zero limit on corrupted file: also returns Ok((vec![], None)).
+        // Behavioral observation alone does not distinguish an early return from error suppression,
+        // because unwrap_or_default() suppresses all errors into an empty vector.
+        // Source inspection of src/storage/fs.rs:1239 establishes that self.list_referrers()
+        // is invoked unconditionally before page_limit slicing occurs.
+        let corrupt_subject = Digest::parse(
+            "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        )
+        .unwrap();
+        write_referrers_file(&root, "testrepo", &corrupt_subject, b"not-json");
+
+        let (corrupt_page, corrupt_token) = storage
+            .list_referrers_page("testrepo", &corrupt_subject, None, 0)
+            .await
+            .unwrap();
+        assert!(corrupt_page.is_empty());
+        assert_eq!(corrupt_token, None);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_large_limit_start_idx_zero() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let desc = make_descriptor(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            100,
+            None,
+            None,
+        );
+        write_referrers_file(
+            &root,
+            "testrepo",
+            &subject,
+            &serde_json::to_vec(&vec![desc.clone()]).unwrap(),
+        );
+
+        // start_idx = 0: (0 + usize::MAX).min(refs.len()) does not overflow addition.
+        let (page, token) = storage
+            .list_referrers_page("testrepo", &subject, None, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(page, vec![desc]);
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_large_limit_start_idx_gt_zero_complete_method_panic() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        let desc_a = make_descriptor(
+            "sha256:111111111111111111111111111111111111111111111111111111111111111a",
+            100,
+            None,
+            None,
+        );
+        let desc_b = make_descriptor(
+            "sha256:222222222222222222222222222222222222222222222222222222222222222b",
+            200,
+            None,
+            None,
+        );
+        write_referrers_file(
+            &root,
+            "testrepo",
+            &subject,
+            &serde_json::to_vec(&vec![desc_a.clone(), desc_b]).unwrap(),
+        );
+
+        // Continuation token matches desc_a at index 0 -> start_idx = 1.
+        // Complete method evaluates: (start_idx + page_limit).min(refs.len())
+        // In the tested debug build profile (overflow-checks = true):
+        // 1 + usize::MAX panics with attempt to add with overflow.
+        // In release profile without overflow checks:
+        // 1 + usize::MAX wraps to 0, then slicing &refs[1..0] panics on slice index ordering.
+        let token = desc_a.digest.clone();
+        let handle = tokio::spawn(async move {
+            storage
+                .list_referrers_page("testrepo", &subject, Some(&token), usize::MAX)
+                .await
+        });
+        let join_res = handle.await;
+        assert!(
+            join_res.is_err(),
+            "complete method must fail with panic on large page_limit with start_idx > 0"
+        );
+        let join_err = join_res.unwrap_err();
+        assert!(
+            join_err.is_panic(),
+            "join error must be caused by panic in list_referrers_page"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Group 6: Caller boundaries
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_service_caller_referrers_query_corrupt_json_error_propagation() {
+        let root = tmp_fs_root();
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let wiring = StorageWiring::from_backend(storage.clone());
+        let service = ReferrersQueryService::new(wiring.referrers_reader());
+
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        write_referrers_file(&root, "validrepo", &subject, b"invalid-json-content");
+
+        // The public query service calls list_referrers directly (NOT list_referrers_page).
+        // Therefore, it does NOT swallow errors; it propagates the error as ReferrersQueryError::Storage.
+        let err = service
+            .query_referrers("validrepo", &subject, ReferrersQueryParams::default(), None)
+            .await
+            .expect_err("corrupt JSON must fail in ReferrersQueryService");
+
+        match err {
+            ReferrersQueryError::Storage(StorageError::Internal { kind, .. }) => {
+                assert_eq!(kind, StorageErrorKind::Io);
+            }
+            other => panic!("expected ReferrersQueryError::Storage(Internal(Io)), got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_service_caller_rejects_path_traversal_repo_name() {
+        let root = tmp_fs_root();
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let wiring = StorageWiring::from_backend(storage.clone());
+        let service = ReferrersQueryService::new(wiring.referrers_reader());
+
+        let subject = Digest::parse(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        // At the service boundary, CanonicalRepoName::parse rejects path traversal syntax before storage is called
+        let err = service
+            .query_referrers(
+                "../escape_repo",
+                &subject,
+                ReferrersQueryParams::default(),
+                None,
+            )
+            .await
+            .expect_err("service must reject path traversal repository name");
+
+        match err {
+            ReferrersQueryError::InvalidRepoName { name, .. } => {
+                assert_eq!(name, "../escape_repo");
+            }
+            other => panic!("expected InvalidRepoName, got: {other:?}"),
+        }
+    }
+}
