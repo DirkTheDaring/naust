@@ -5541,3 +5541,602 @@ async fn test_manifest_listing_shared_reader_and_startup_offload() {
             .contains("enumeration resource limit exceeded")
     );
 }
+
+// --- Filesystem Repository Discovery Characterization Tests (list_repositories) ---
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_missing_and_empty_repos_dir() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    assert!(!root.join("repos").exists());
+    let repos = storage
+        .list_repositories()
+        .await
+        .expect("missing repos dir must succeed");
+    assert!(repos.is_empty(), "missing repos dir must return empty list");
+
+    std::fs::create_dir_all(root.join("repos")).expect("create empty repos dir");
+    let repos = storage
+        .list_repositories()
+        .await
+        .expect("empty repos dir must succeed");
+    assert!(repos.is_empty(), "empty repos dir must return empty list");
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_leaf_directory_recognition_rules() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+
+    let no_leaf = repos_dir.join("no_leaf");
+    std::fs::create_dir_all(no_leaf.join("arbitrary_subdir")).unwrap();
+    write_file(&no_leaf.join("file.txt"), b"hello");
+
+    let referrers_only = repos_dir.join("referrers_only");
+    std::fs::create_dir_all(referrers_only.join("referrers")).unwrap();
+
+    std::fs::create_dir_all(repos_dir.join("tags_only").join("tags")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("manifests_only").join("manifests")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("blobs_only").join("blobs")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("meta_only").join("meta")).unwrap();
+
+    let all_leaves = repos_dir.join("all_leaves");
+    std::fs::create_dir_all(all_leaves.join("tags")).unwrap();
+    std::fs::create_dir_all(all_leaves.join("manifests")).unwrap();
+    std::fs::create_dir_all(all_leaves.join("blobs")).unwrap();
+    std::fs::create_dir_all(all_leaves.join("meta")).unwrap();
+
+    let mut repos = storage.list_repositories().await.unwrap();
+    repos.sort();
+
+    assert_eq!(
+        repos,
+        vec![
+            "all_leaves".to_string(),
+            "blobs_only".to_string(),
+            "manifests_only".to_string(),
+            "meta_only".to_string(),
+            "tags_only".to_string(),
+        ],
+        "only directories with tags, manifests, blobs, or meta are recognized; referrers-only and no-leaf are excluded"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_nested_hierarchy_parent_child_sorting_dedup() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+
+    std::fs::create_dir_all(repos_dir.join("org").join("meta")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("org").join("team").join("tags")).unwrap();
+    std::fs::create_dir_all(
+        repos_dir
+            .join("org")
+            .join("team")
+            .join("project")
+            .join("manifests"),
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(repos_dir.join("zebra").join("manifests")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("alpha").join("team").join("blobs")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("alpha").join("blobs")).unwrap();
+
+    let repos = storage.list_repositories().await.unwrap();
+
+    assert_eq!(
+        repos,
+        vec![
+            "alpha".to_string(),
+            "alpha/team".to_string(),
+            "org".to_string(),
+            "org/team".to_string(),
+            "org/team/project".to_string(),
+            "zebra".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_reserved_leaf_names_excluded_and_gc_divergence() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+
+    fn create_manifest(config_digest: &str, layer_digest: &str) -> (Vec<u8>, String, String) {
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": 100,
+                "digest": config_digest
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 200,
+                    "digest": layer_digest
+                }
+            ]
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
+        let hex = hex_sha256(&manifest_bytes);
+        let manifest_digest = format!("sha256:{hex}");
+        (manifest_bytes, hex, manifest_digest)
+    }
+
+    // 1. Direct repos/manifests/<hex> (manifests directory directly under repos)
+    let config_direct = "sha256:11111111111111111111111111111111111111111111111111111111111111c1";
+    let layer_direct = "sha256:11111111111111111111111111111111111111111111111111111111111111d1";
+    let (bytes_direct, hex_direct, digest_direct) = create_manifest(config_direct, layer_direct);
+    let direct_manifests_dir = repos_dir.join("manifests");
+    std::fs::create_dir_all(&direct_manifests_dir).unwrap();
+    write_file(&direct_manifests_dir.join(&hex_direct), &bytes_direct);
+
+    // 2. Reserved 'tags' segment: repos/tags/subrepo/manifests/<hex>
+    let config_tags = "sha256:22222222222222222222222222222222222222222222222222222222222222c2";
+    let layer_tags = "sha256:22222222222222222222222222222222222222222222222222222222222222d2";
+    let (bytes_tags, hex_tags, digest_tags) = create_manifest(config_tags, layer_tags);
+    let tags_manifests_dir = repos_dir.join("tags").join("subrepo").join("manifests");
+    std::fs::create_dir_all(&tags_manifests_dir).unwrap();
+    write_file(&tags_manifests_dir.join(&hex_tags), &bytes_tags);
+
+    // 3. Reserved 'referrers' segment: repos/referrers/subrepo/manifests/<hex>
+    let config_referrers =
+        "sha256:33333333333333333333333333333333333333333333333333333333333333c3";
+    let layer_referrers = "sha256:33333333333333333333333333333333333333333333333333333333333333d3";
+    let (bytes_referrers, hex_referrers, digest_referrers) =
+        create_manifest(config_referrers, layer_referrers);
+    let referrers_manifests_dir = repos_dir
+        .join("referrers")
+        .join("subrepo")
+        .join("manifests");
+    std::fs::create_dir_all(&referrers_manifests_dir).unwrap();
+    write_file(
+        &referrers_manifests_dir.join(&hex_referrers),
+        &bytes_referrers,
+    );
+
+    // 4. Reserved 'blobs' segment: repos/blobs/subrepo/manifests/<hex>
+    let config_blobs = "sha256:44444444444444444444444444444444444444444444444444444444444444c4";
+    let layer_blobs = "sha256:44444444444444444444444444444444444444444444444444444444444444d4";
+    let (bytes_blobs, hex_blobs, digest_blobs) = create_manifest(config_blobs, layer_blobs);
+    let blobs_manifests_dir = repos_dir.join("blobs").join("subrepo").join("manifests");
+    std::fs::create_dir_all(&blobs_manifests_dir).unwrap();
+    write_file(&blobs_manifests_dir.join(&hex_blobs), &bytes_blobs);
+
+    // 5. Reserved 'meta' segment: repos/meta/subrepo/manifests/<hex>
+    let config_meta = "sha256:55555555555555555555555555555555555555555555555555555555555555c5";
+    let layer_meta = "sha256:55555555555555555555555555555555555555555555555555555555555555d5";
+    let (bytes_meta, hex_meta, digest_meta) = create_manifest(config_meta, layer_meta);
+    let meta_manifests_dir = repos_dir.join("meta").join("subrepo").join("manifests");
+    std::fs::create_dir_all(&meta_manifests_dir).unwrap();
+    write_file(&meta_manifests_dir.join(&hex_meta), &bytes_meta);
+
+    // 6. Nested beneath 'manifests' segment: repos/manifests/nested_repo/manifests/<hex>
+    // The GC walker treats 'manifests' as a leaf scan and does not recursively traverse it.
+    let config_nested = "sha256:66666666666666666666666666666666666666666666666666666666666666c6";
+    let layer_nested = "sha256:66666666666666666666666666666666666666666666666666666666666666d6";
+    let (bytes_nested, hex_nested, digest_nested) = create_manifest(config_nested, layer_nested);
+    let nested_manifests_dir = repos_dir
+        .join("manifests")
+        .join("nested_repo")
+        .join("manifests");
+    std::fs::create_dir_all(&nested_manifests_dir).unwrap();
+    write_file(&nested_manifests_dir.join(&hex_nested), &bytes_nested);
+
+    // Assert list_repositories behavior:
+    // All 5 reserved names (tags, manifests, referrers, blobs, meta) are skipped at top level.
+    // Therefore, list_repositories discovers zero repositories.
+    let repos = storage.list_repositories().await.unwrap();
+    assert!(
+        repos.is_empty(),
+        "list_repositories skips all reserved directory names (tags, manifests, referrers, blobs, meta); expected empty, got: {repos:?}"
+    );
+
+    // Assert build_manifest_protected_set_fs behavior:
+    let protected = crate::blob_gc::policy::build_manifest_protected_set_fs(&root)
+        .await
+        .unwrap();
+
+    // 1. Direct manifests leaf under repos/ is scanned by the GC walker:
+    assert!(
+        protected.contains(&digest_direct),
+        "GC walker discovers direct manifest in repos/manifests"
+    );
+    assert!(
+        protected.contains(config_direct),
+        "GC walker protects config reference from direct manifest"
+    );
+    assert!(
+        protected.contains(layer_direct),
+        "GC walker protects layer reference from direct manifest"
+    );
+
+    // 2. Manifests under reserved 'tags' ancestor are traversed and discovered:
+    assert!(
+        protected.contains(&digest_tags),
+        "GC walker descends through 'tags' ancestor and discovers manifest"
+    );
+    assert!(
+        protected.contains(config_tags),
+        "GC walker protects config reference beneath 'tags'"
+    );
+    assert!(
+        protected.contains(layer_tags),
+        "GC walker protects layer reference beneath 'tags'"
+    );
+
+    // 3. Manifests under reserved 'referrers' ancestor are traversed and discovered:
+    assert!(
+        protected.contains(&digest_referrers),
+        "GC walker descends through 'referrers' ancestor and discovers manifest"
+    );
+    assert!(
+        protected.contains(config_referrers),
+        "GC walker protects config reference beneath 'referrers'"
+    );
+    assert!(
+        protected.contains(layer_referrers),
+        "GC walker protects layer reference beneath 'referrers'"
+    );
+
+    // 4. Manifests under reserved 'blobs' ancestor are traversed and discovered:
+    assert!(
+        protected.contains(&digest_blobs),
+        "GC walker descends through 'blobs' ancestor and discovers manifest"
+    );
+    assert!(
+        protected.contains(config_blobs),
+        "GC walker protects config reference beneath 'blobs'"
+    );
+    assert!(
+        protected.contains(layer_blobs),
+        "GC walker protects layer reference beneath 'blobs'"
+    );
+
+    // 5. Manifests under reserved 'meta' ancestor are traversed and discovered:
+    assert!(
+        protected.contains(&digest_meta),
+        "GC walker descends through 'meta' ancestor and discovers manifest"
+    );
+    assert!(
+        protected.contains(config_meta),
+        "GC walker protects config reference beneath 'meta'"
+    );
+    assert!(
+        protected.contains(layer_meta),
+        "GC walker protects layer reference beneath 'meta'"
+    );
+
+    // 6. Subtree nested inside 'manifests' is NOT traversed by the GC walker (manifests is a leaf scan):
+    assert!(
+        !protected.contains(&digest_nested),
+        "GC walker does NOT recursively traverse subdirectories within 'manifests'"
+    );
+    assert!(
+        !protected.contains(config_nested),
+        "config reference from repository nested inside 'manifests' is omitted from protected set"
+    );
+    assert!(
+        !protected.contains(layer_nested),
+        "layer reference from repository nested inside 'manifests' is omitted from protected set"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_non_utf8_ancestors_skipped_vs_gc_walker() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+
+    let non_utf8_name = std::ffi::OsStr::from_bytes(b"non_utf8_\xff\xfe");
+    let non_utf8_ancestor = repos_dir.join(non_utf8_name);
+    let subrepo_manifests = non_utf8_ancestor.join("subrepo").join("manifests");
+    std::fs::create_dir_all(&subrepo_manifests).unwrap();
+
+    let layer_digest = "sha256:77777777777777777777777777777777777777777777777777777777777777d7";
+    let config_digest = "sha256:77777777777777777777777777777777777777777777777777777777777777c7";
+    let manifest_json = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": 50,
+            "digest": config_digest
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 150,
+                "digest": layer_digest
+            }
+        ]
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
+    let hex = hex_sha256(&manifest_bytes);
+    let manifest_digest = format!("sha256:{hex}");
+    write_file(&subrepo_manifests.join(&hex), &manifest_bytes);
+
+    let repos = storage.list_repositories().await.unwrap();
+    assert!(
+        repos.is_empty(),
+        "list_repositories skips non-UTF-8 ancestor entries"
+    );
+
+    let protected = crate::blob_gc::policy::build_manifest_protected_set_fs(&root)
+        .await
+        .unwrap();
+    assert!(
+        protected.contains(&manifest_digest),
+        "build_manifest_protected_set_fs descends through non-UTF-8 ancestors and discovers manifest"
+    );
+    assert!(
+        protected.contains(layer_digest),
+        "build_manifest_protected_set_fs protects layer reference beneath non-UTF-8 ancestor"
+    );
+    assert!(
+        protected.contains(config_digest),
+        "build_manifest_protected_set_fs protects config reference beneath non-UTF-8 ancestor"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_invalid_repo_name_aborts_downstream_manifest_listing() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+
+    let bad_repo_name = "invalid\\backslash";
+    let bad_repo_dir = repos_dir.join(bad_repo_name);
+    std::fs::create_dir_all(bad_repo_dir.join("manifests")).unwrap();
+
+    let repos = storage.list_repositories().await.unwrap();
+    assert_eq!(repos, vec![bad_repo_name.to_string()]);
+
+    let listing_res = storage
+        .list_manifest_digests_page(bad_repo_name, None, 10)
+        .await;
+    let err = listing_res.expect_err("manifest_dir_key must reject invalid repository name");
+    match err {
+        StorageError::InvalidRepoName(msg) => {
+            assert!(
+                msg.contains("backslashes"),
+                "expected error message about backslashes, got: {msg}"
+            );
+        }
+        other => panic!("expected StorageError::InvalidRepoName, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_symlink_semantics() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("storage-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Case A: Initial repos/ directory as a symlink
+    let external_repos = fixture.path().join("external_repos");
+    std::fs::create_dir_all(external_repos.join("repo_in_ext").join("tags")).unwrap();
+    std::os::unix::fs::symlink(&external_repos, root.join("repos")).unwrap();
+
+    let repos = storage.list_repositories().await.unwrap();
+    assert_eq!(
+        repos,
+        vec!["repo_in_ext".to_string()],
+        "read_dir follows initial repos/ symlink"
+    );
+
+    // Case B: Symlinked repository entry within repos/:
+    let ext_target_repo = fixture.path().join("ext_target_repo");
+    std::fs::create_dir_all(ext_target_repo.join("manifests")).unwrap();
+    std::os::unix::fs::symlink(&ext_target_repo, external_repos.join("symlink_repo")).unwrap();
+
+    let repos_after_symlink = storage.list_repositories().await.unwrap();
+    assert_eq!(
+        repos_after_symlink,
+        vec!["repo_in_ext".to_string()],
+        "symlinked repository entries are skipped because entry file_type is not a directory"
+    );
+
+    // Case C: Symlinked recognition leaf (tags/):
+    let ext_tags = fixture.path().join("ext_tags");
+    std::fs::create_dir_all(&ext_tags).unwrap();
+    let real_repo = external_repos.join("repo_with_symlink_leaf");
+    std::fs::create_dir_all(&real_repo).unwrap();
+    std::os::unix::fs::symlink(&ext_tags, real_repo.join("tags")).unwrap();
+
+    let repos_with_symlink_leaf = storage.list_repositories().await.unwrap();
+    assert!(
+        repos_with_symlink_leaf.contains(&"repo_with_symlink_leaf".to_string()),
+        "tokio::fs::metadata follows symlinks to recognize leaf directory"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_wrong_type_paths() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    write_file(&root.join("repos"), b"not a directory");
+    let err = storage
+        .list_repositories()
+        .await
+        .expect_err("repos as file must fail");
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
+
+    let root2 = tmp_fs_root();
+    let storage2 = FsStorage::new(root2.clone(), 1024 * 1024);
+    let repos_dir = root2.join("repos");
+    std::fs::create_dir_all(&repos_dir).unwrap();
+    write_file(&repos_dir.join("file_entry"), b"not a repo");
+    let repos = storage2.list_repositories().await.unwrap();
+    assert!(
+        repos.is_empty(),
+        "regular file entry in repos/ must be skipped"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires unprivileged user environment where chmod 0o000 denies filesystem access"]
+async fn test_repo_discovery_permission_denied_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("storage-root");
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repos_dir = root.join("repos");
+    std::fs::create_dir_all(&repos_dir).unwrap();
+    std::fs::create_dir_all(repos_dir.join("valid_repo").join("tags")).unwrap();
+
+    let orig_perms = std::fs::metadata(&repos_dir).unwrap().permissions();
+
+    struct ScopedPermReset<'a> {
+        path: &'a std::path::Path,
+        original_permissions: std::fs::Permissions,
+    }
+
+    impl<'a> Drop for ScopedPermReset<'a> {
+        fn drop(&mut self) {
+            if let Err(err) = std::fs::set_permissions(self.path, self.original_permissions.clone())
+            {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "ScopedPermReset: failed to restore permissions on {:?} during unwinding: {err}",
+                        self.path
+                    );
+                } else {
+                    panic!(
+                        "ScopedPermReset: failed to restore permissions on {:?}: {err}",
+                        self.path
+                    );
+                }
+            }
+        }
+    }
+
+    {
+        let _guard = ScopedPermReset {
+            path: &repos_dir,
+            original_permissions: orig_perms.clone(),
+        };
+        std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("set mode 0o000");
+
+        match std::fs::read_dir(&repos_dir) {
+            Ok(_) => {
+                panic!("ineffective permissions: std::fs::read_dir succeeded under mode 0o000");
+            }
+            Err(err) => assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected PermissionDenied, got: {err:?}"
+            ),
+        }
+
+        let res = storage.list_repositories().await;
+        let err = res.expect_err("PermissionDenied on read_dir(&repos_root) must fail");
+        assert_eq!(
+            err.internal_kind(),
+            Some(StorageErrorKind::Io),
+            "list_repo_names maps read_dir error to StorageErrorKind::Io"
+        );
+    }
+
+    let restored_perms = std::fs::metadata(&repos_dir).unwrap().permissions();
+    assert_eq!(restored_perms.mode(), orig_perms.mode());
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_repo_discovery_root_replacement_vs_repos_replacement() {
+    let fixture = tempfile::tempdir().unwrap();
+    let base = fixture.path();
+
+    // Part 1: Rename/Replacement of the storage-root pathname
+    let active_root = base.join("active_root");
+    std::fs::create_dir_all(&active_root).unwrap();
+
+    let hex_old = "1111111111111111111111111111111111111111111111111111111111111111";
+    let old_manifests = active_root.join("repos").join("repo_old").join("manifests");
+    std::fs::create_dir_all(&old_manifests).unwrap();
+    write_file(&old_manifests.join(hex_old), b"{}");
+
+    let storage = FsStorage::new(active_root.clone(), 1024 * 1024);
+
+    let initial_repos = storage.list_repositories().await.unwrap();
+    assert_eq!(initial_repos, vec!["repo_old".to_string()]);
+
+    let backup_root = base.join("backup_root");
+    std::fs::rename(&active_root, &backup_root).unwrap();
+    std::fs::create_dir_all(&active_root).unwrap();
+
+    let hex_new = "2222222222222222222222222222222222222222222222222222222222222222";
+    let new_manifests = active_root.join("repos").join("repo_new").join("manifests");
+    std::fs::create_dir_all(&new_manifests).unwrap();
+    write_file(&new_manifests.join(hex_new), b"{}");
+
+    let new_repos = storage.list_repositories().await.unwrap();
+    assert_eq!(new_repos, vec!["repo_new".to_string()]);
+
+    let (page, _) = storage
+        .list_manifest_digests_page("repo_new", None, 10)
+        .await
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "pinned root_fd does not contain repo_new; translates NotFound to empty page without error"
+    );
+
+    // Part 2: Replacement of repos/ beneath the SAME storage root
+    let root_b = base.join("root_b");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let storage_b = FsStorage::new(root_b.clone(), 1024 * 1024);
+
+    let hex_b1 = "3333333333333333333333333333333333333333333333333333333333333333";
+    let repos_dir_b = root_b.join("repos");
+    let b1_manifests = repos_dir_b.join("repo_b1").join("manifests");
+    std::fs::create_dir_all(&b1_manifests).unwrap();
+    write_file(&b1_manifests.join(hex_b1), b"{}");
+
+    let b_initial = storage_b.list_repositories().await.unwrap();
+    assert_eq!(b_initial, vec!["repo_b1".to_string()]);
+
+    let repos_backup = root_b.join("repos_backup");
+    std::fs::rename(&repos_dir_b, &repos_backup).unwrap();
+    std::fs::create_dir_all(&repos_dir_b).unwrap();
+
+    let hex_b2 = "4444444444444444444444444444444444444444444444444444444444444444";
+    let b2_manifests = repos_dir_b.join("repo_b2").join("manifests");
+    std::fs::create_dir_all(&b2_manifests).unwrap();
+    write_file(&b2_manifests.join(hex_b2), b"{}");
+
+    let b_replaced = storage_b.list_repositories().await.unwrap();
+    assert_eq!(b_replaced, vec!["repo_b2".to_string()]);
+
+    let (page_b2, _) = storage_b
+        .list_manifest_digests_page("repo_b2", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        page_b2.len(),
+        1,
+        "contained lookup relative to root_fd observes replacement repos/ beneath the same root"
+    );
+    assert_eq!(page_b2[0].hex(), hex_b2);
+}
