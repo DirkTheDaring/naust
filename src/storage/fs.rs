@@ -3706,3 +3706,7 @@ pub(crate) use manifest_refs as manifest_refs_seam;
 
 #[path = "fs/tag_read.rs"]
 pub(crate) mod tag_read;
+
+#[cfg(test)]
+#[path = "fs/tag_listing.rs"]
+mod tag_listing;
