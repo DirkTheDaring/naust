@@ -554,6 +554,15 @@ pub struct LifecycleFaultStorage {
     pub corrupt_manifest_get_target: Arc<StdMutex<Option<Digest>>>,
     pub token_cycle_immediate: Arc<AtomicBool>,
     pub token_cycle_multi: Arc<AtomicBool>,
+    pub fail_tag_listing: Arc<AtomicBool>,
+    pub fail_tag_listing_error: Arc<StdMutex<Option<StorageError>>>,
+    pub fail_tag_listing_after_n: Arc<AtomicUsize>,
+    pub recorded_delete_manifest: Arc<StdMutex<Vec<(String, Digest)>>>,
+    pub recorded_remove_referrer: Arc<StdMutex<Vec<(String, Digest, Digest)>>>,
+    pub recorded_unlink_repo_blob: Arc<StdMutex<Vec<(String, Digest)>>>,
+    pub recorded_delete_journal: Arc<StdMutex<Vec<String>>>,
+    pub recorded_delete_tag: Arc<StdMutex<Vec<(String, String)>>>,
+    pub recorded_delete_tag_conditional: Arc<StdMutex<Vec<(String, String, Option<String>)>>>,
 }
 
 impl LifecycleFaultStorage {
@@ -568,6 +577,15 @@ impl LifecycleFaultStorage {
             corrupt_manifest_get_target: Arc::new(StdMutex::new(None)),
             token_cycle_immediate: Arc::new(AtomicBool::new(false)),
             token_cycle_multi: Arc::new(AtomicBool::new(false)),
+            fail_tag_listing: Arc::new(AtomicBool::new(false)),
+            fail_tag_listing_error: Arc::new(StdMutex::new(None)),
+            fail_tag_listing_after_n: Arc::new(AtomicUsize::new(0)),
+            recorded_delete_manifest: Arc::new(StdMutex::new(Vec::new())),
+            recorded_remove_referrer: Arc::new(StdMutex::new(Vec::new())),
+            recorded_unlink_repo_blob: Arc::new(StdMutex::new(Vec::new())),
+            recorded_delete_journal: Arc::new(StdMutex::new(Vec::new())),
+            recorded_delete_tag: Arc::new(StdMutex::new(Vec::new())),
+            recorded_delete_tag_conditional: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 }
@@ -582,6 +600,10 @@ impl RepositoryBlobMembershipStorage for LifecycleFaultStorage {
     }
 
     async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
+        self.recorded_unlink_repo_blob
+            .lock()
+            .unwrap()
+            .push((repo.to_string(), digest.clone()));
         self.inner.unlink_repo_blob(repo, digest).await
     }
 
@@ -760,6 +782,10 @@ impl Storage for LifecycleFaultStorage {
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
+        self.recorded_delete_tag
+            .lock()
+            .unwrap()
+            .push((name.to_string(), tag.to_string()));
         Storage::delete_tag(&self.inner, name, tag).await
     }
 
@@ -817,6 +843,31 @@ impl Storage for LifecycleFaultStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+        if self.fail_tag_listing.load(AtomicOrdering::SeqCst) {
+            let err = self
+                .fail_tag_listing_error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| StorageError::backend("simulated tag listing error"));
+            return Err(err);
+        }
+        let threshold = self.fail_tag_listing_after_n.load(AtomicOrdering::SeqCst);
+        if threshold > 0 {
+            if threshold == 1 {
+                let err = self
+                    .fail_tag_listing_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| {
+                        StorageError::backend("simulated threshold tag listing error")
+                    });
+                return Err(err);
+            }
+            self.fail_tag_listing_after_n
+                .store(threshold - 1, AtomicOrdering::SeqCst);
+        }
         Storage::list_tags_page(&self.inner, repo, continuation_token, page_limit).await
     }
 
@@ -845,6 +896,11 @@ impl Storage for LifecycleFaultStorage {
         tag: &str,
         expected_version: Option<&str>,
     ) -> Result<ConditionalDeleteResult, StorageError> {
+        self.recorded_delete_tag_conditional.lock().unwrap().push((
+            repo.to_string(),
+            tag.to_string(),
+            expected_version.map(|s| s.to_string()),
+        ));
         Storage::delete_tag_conditional(&self.inner, repo, tag, expected_version).await
     }
 
@@ -857,6 +913,10 @@ impl Storage for LifecycleFaultStorage {
     }
 
     async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+        self.recorded_delete_journal
+            .lock()
+            .unwrap()
+            .push(repo.to_string());
         Storage::delete_lifecycle_journal(&self.inner, repo).await
     }
 
@@ -932,10 +992,19 @@ impl Storage for LifecycleFaultStorage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
+        self.recorded_remove_referrer.lock().unwrap().push((
+            name.to_string(),
+            subject.clone(),
+            referrer.clone(),
+        ));
         Storage::remove_referrer(&self.inner, name, subject, referrer).await
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
+        self.recorded_delete_manifest
+            .lock()
+            .unwrap()
+            .push((name.to_string(), digest.clone()));
         Storage::delete_manifest(&self.inner, name, digest).await
     }
 }

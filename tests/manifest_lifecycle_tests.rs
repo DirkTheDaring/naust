@@ -4792,3 +4792,1392 @@ fn copy_dir_recursive_helper(src: &std::path::Path, dst: &std::path::Path) {
         }
     }
 }
+
+// =========================================================================
+// Hardened Lifecycle Tag-Listing Error Handling Tests
+// =========================================================================
+
+// Branch 1: recover_interrupted_operation — LifecycleOpKind::DeleteManifest
+#[tokio::test]
+async fn test_delete_manifest_recovery_tag_listing_error_first_page_propagates_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/del-man-rec-backend";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let tag_name = "t1";
+    storage
+        .mutate_tag(
+            repo,
+            tag_name,
+            &m_d,
+            registry_rust::storage::TagMutationPolicy::Replace,
+        )
+        .await
+        .unwrap();
+    let (_, version) = storage
+        .get_tag_with_version(repo, tag_name)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-del-op-backend".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::DeleteManifest,
+        target_digest: m_d.clone(),
+        target_reference: Some(tag_name.to_string()),
+        phase: LifecyclePhase::TagsSnapshotted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![TagSnapshot {
+            tag: tag_name.to_string(),
+            observed_version: version,
+            target_digest: m_d.clone(),
+            deleted: false,
+        }],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    // Clear setup recordings before running test operation
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_remove_referrer.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+    storage.recorded_delete_tag.lock().unwrap().clear();
+    storage
+        .recorded_delete_tag_conditional
+        .lock()
+        .unwrap()
+        .clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::backend(
+        "simulated backend tag listing failure",
+    ));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("recovery must propagate non-NotFound listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("simulated backend tag listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    assert!(
+        storage
+            .get_tag_with_version(repo, tag_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "tag deleted before listing failure must remain deleted"
+    );
+    assert!(
+        storage
+            .recorded_delete_tag_conditional
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, t, _)| r == repo && t == tag_name),
+        "conditional tag deletion must have been recorded"
+    );
+
+    assert!(
+        storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "no manifest deletion must be attempted after failed listing"
+    );
+    assert!(
+        storage.recorded_remove_referrer.lock().unwrap().is_empty(),
+        "no referrer removal must be attempted after failed listing"
+    );
+    assert!(
+        storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "no journal deletion must be attempted after failed listing"
+    );
+
+    let j_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must remain durable");
+    let j: LifecycleJournalRecord = serde_json::from_slice(&j_bytes).unwrap();
+    assert_eq!(j.phase, LifecyclePhase::TagsSnapshotted);
+
+    storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    assert!(
+        !storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "manifest deletion must succeed on retry"
+    );
+    assert!(
+        !storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "journal deletion must succeed on retry"
+    );
+    assert!(
+        storage
+            .read_lifecycle_journal(repo)
+            .await
+            .unwrap()
+            .is_none(),
+        "journal must be removed after successful retry"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_manifest_recovery_tag_listing_error_first_page_propagates_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/del-man-rec-io";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-del-op-io".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::DeleteManifest,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::TagsSnapshotted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::io("simulated io tag listing failure"));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("recovery must propagate io listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Io);
+            assert!(message.contains("simulated io tag listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Io)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_manifest_recovery_tag_listing_error_first_page_propagates_permission_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/del-man-rec-perm";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-del-op-perm".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::DeleteManifest,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::TagsSnapshotted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::permission_denied(
+        "simulated tag dir permission denied",
+    ));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("recovery must propagate permission denied listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::PermissionDenied);
+            assert!(message.contains("simulated tag dir permission denied"));
+        }
+        other => panic!("expected Storage(Internal(PermissionDenied)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_manifest_recovery_tag_listing_error_later_page_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/del-man-rec-later-page";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    // Create 70 tags all pointing to m_d. Since POLICY_B_TAG_PAGE_SIZE = 64, this spans 2 pages.
+    for i in 0..70 {
+        let tag = format!("tag-{i:03}");
+        storage
+            .mutate_tag(
+                repo,
+                &tag,
+                &m_d,
+                registry_rust::storage::TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+    }
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-del-op-later".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::DeleteManifest,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::TagsSnapshotted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+    storage.recorded_delete_tag.lock().unwrap().clear();
+
+    // Fail listing on page 2 (allow 1 successful page, fail when threshold reaches 1)
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::backend(
+        "simulated page 2 tag listing failure",
+    ));
+    storage
+        .fail_tag_listing_after_n
+        .store(2, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("recovery must propagate later-page listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("simulated page 2 tag listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    // Earlier mutations from page 1 must remain: exactly 64 tags deleted
+    let deleted_tags = storage.recorded_delete_tag.lock().unwrap().clone();
+    assert_eq!(
+        deleted_tags.len(),
+        64,
+        "first page of 64 tags must have been deleted"
+    );
+
+    // No manifest deletion or journal cleanup attributable to code after failed listing
+    assert!(
+        storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "manifest deletion must not be attempted after later-page listing failure"
+    );
+    assert!(
+        storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "journal cleanup must not be attempted after later-page listing failure"
+    );
+
+    // Journal remains durable at TagsSnapshotted
+    let j_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must remain durable");
+    let j: LifecycleJournalRecord = serde_json::from_slice(&j_bytes).unwrap();
+    assert_eq!(j.phase, LifecyclePhase::TagsSnapshotted);
+
+    // Retry after clearing fault finishes remaining tags and cleanup
+    storage
+        .fail_tag_listing_after_n
+        .store(0, AtomicOrdering::SeqCst);
+    storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    assert!(
+        !storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "manifest deletion must be recorded on successful retry"
+    );
+    assert!(
+        !storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "journal deletion must be recorded on successful retry"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_manifest_recovery_tag_listing_not_found_compatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/del-man-rec-notfound";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-del-op-notfound".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::DeleteManifest,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::TagsSnapshotted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    // Inject NotFound: authorized narrow compatibility policy treats it as empty terminal page
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::NotFound);
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        res.is_ok(),
+        "NotFound must be treated as empty terminal page and succeed: {res:?}"
+    );
+
+    assert!(
+        !storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "manifest deletion must proceed when tags listing returns NotFound"
+    );
+    assert!(
+        !storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "journal deletion must proceed when tags listing returns NotFound"
+    );
+}
+
+// Branch 2: recover_interrupted_operation — LifecycleOpKind::ProxyEvict
+#[tokio::test]
+async fn test_proxy_evict_recovery_tag_listing_error_first_page_propagates_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/proxy-evict-rec-backend";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let tag_name = "v1";
+    storage
+        .mutate_tag(
+            repo,
+            tag_name,
+            &m_d,
+            registry_rust::storage::TagMutationPolicy::Replace,
+        )
+        .await
+        .unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-proxy-backend".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: Some(tag_name.to_string()),
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+    storage
+        .recorded_delete_tag_conditional
+        .lock()
+        .unwrap()
+        .clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::backend("proxy evict backend listing failure"));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("proxy evict recovery must propagate backend listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("proxy evict backend listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    assert!(
+        storage
+            .recorded_delete_tag_conditional
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, t, _)| r == repo && t == tag_name),
+        "target tag alias must be deleted in step 1"
+    );
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+
+    let j_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must remain");
+    let j: LifecycleJournalRecord = serde_json::from_slice(&j_bytes).unwrap();
+    assert_eq!(j.phase, LifecyclePhase::ProxyTagDeleted);
+
+    storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    assert!(!storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(!storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(!storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_proxy_evict_recovery_tag_listing_error_first_page_propagates_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/proxy-evict-rec-io";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-proxy-io".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::io("proxy evict io listing failure"));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("proxy evict recovery must propagate io listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Io);
+            assert!(message.contains("proxy evict io listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Io)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_proxy_evict_recovery_tag_listing_error_first_page_propagates_permission_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/proxy-evict-rec-perm";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-proxy-perm".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::permission_denied(
+        "proxy evict permission denied listing failure",
+    ));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("proxy evict recovery must propagate permission denied listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::PermissionDenied);
+            assert!(message.contains("proxy evict permission denied listing failure"));
+        }
+        other => panic!("expected Storage(Internal(PermissionDenied)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_proxy_evict_recovery_tag_listing_error_later_page_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/proxy-evict-rec-later-page";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    // Create 70 tags pointing to a different manifest so page 1 has no matches and requests page 2
+    let config2 = write_test_blob(&storage, repo, b"cfg2").await;
+    let layer2 = write_test_blob(&storage, repo, b"layer2").await;
+    let (m2_bytes, m2_d) = create_manifest_json(&config2, &layer2);
+    storage.put_manifest(repo, &m2_d, m2_bytes).await.unwrap();
+
+    for i in 0..70 {
+        let tag = format!("other-tag-{i:03}");
+        storage
+            .mutate_tag(
+                repo,
+                &tag,
+                &m2_d,
+                registry_rust::storage::TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+    }
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-proxy-later".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    // Fail listing on page 2 (allow 1 successful page, fail when threshold reaches 1)
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::backend(
+        "simulated page 2 proxy evict tag listing failure",
+    ));
+    storage
+        .fail_tag_listing_after_n
+        .store(2, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    let err = res.expect_err("proxy evict recovery must propagate later-page listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("simulated page 2 proxy evict tag listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+
+    let j_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must remain");
+    let j: LifecycleJournalRecord = serde_json::from_slice(&j_bytes).unwrap();
+    assert_eq!(j.phase, LifecyclePhase::ProxyTagDeleted);
+
+    storage
+        .fail_tag_listing_after_n
+        .store(0, AtomicOrdering::SeqCst);
+    storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    assert!(!storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(!storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_proxy_evict_recovery_tag_listing_not_found_compatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/proxy-evict-rec-notfound";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-proxy-notfound".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::NotFound);
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        res.is_ok(),
+        "NotFound must be treated as empty terminal page and proceed with eviction: {res:?}"
+    );
+
+    assert!(!storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(!storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(!storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_proxy_evict_recovery_tag_listing_discovers_other_referencing_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/proxy-evict-rec-other-tag";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    // There is another tag referencing this target_digest
+    storage
+        .mutate_tag(
+            repo,
+            "v2",
+            &m_d,
+            registry_rust::storage::TagMutationPolicy::Replace,
+        )
+        .await
+        .unwrap();
+
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-proxy-other-tag".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::ProxyEvict,
+        target_digest: m_d.clone(),
+        target_reference: Some("v1".to_string()),
+        phase: LifecyclePhase::ProxyTagDeleted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    let res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(res.is_ok(), "recovery must succeed: {res:?}");
+
+    // Manifest and proxy blob must NOT be deleted because another tag references it
+    assert!(
+        storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "manifest must not be deleted when another referencing tag exists"
+    );
+    assert!(
+        storage.recorded_unlink_repo_blob.lock().unwrap().is_empty(),
+        "blob must not be unlinked when another referencing tag exists"
+    );
+    // Journal must be cleaned up
+    assert!(
+        !storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "journal must be deleted"
+    );
+}
+
+// Branch 3: evict_proxy_cached_entry
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_tag_listing_error_first_page_propagates_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/evict-entry-backend";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    // Clear setup recordings before running test operation
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_remove_referrer.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+    storage.recorded_delete_tag.lock().unwrap().clear();
+    storage
+        .recorded_delete_tag_conditional
+        .lock()
+        .unwrap()
+        .clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::backend(
+        "evict entry backend tag listing failure",
+    ));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("evict_proxy_cached_entry must propagate backend listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("evict entry backend tag listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    // Earlier legitimate mutations remain: tag alias "v1" was conditionally deleted in step 4
+    assert!(
+        storage
+            .get_tag_with_version(repo, "v1")
+            .await
+            .unwrap()
+            .is_none(),
+        "tag alias v1 must have been deleted"
+    );
+    assert!(
+        storage
+            .recorded_delete_tag_conditional
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, t, _)| r == repo && t == "v1"),
+        "conditional tag deletion must be recorded"
+    );
+
+    // No manifest deletion, no blob unlinking, no journal cleanup attributable to code after failed listing
+    assert!(
+        storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "no manifest deletion must be attempted after failed listing"
+    );
+    assert!(
+        storage.recorded_unlink_repo_blob.lock().unwrap().is_empty(),
+        "no blob unlinking must be attempted after failed listing"
+    );
+    assert!(
+        storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "no journal deletion must be attempted after failed listing"
+    );
+
+    // Journal remains durable at ProxyTagDeleted
+    let j_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must remain");
+    let j: LifecycleJournalRecord = serde_json::from_slice(&j_bytes).unwrap();
+    assert_eq!(j.phase, LifecyclePhase::ProxyTagDeleted);
+
+    // Recovery retry succeeds after fault is cleared
+    storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    assert!(!storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(!storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(!storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_tag_listing_error_first_page_propagates_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/evict-entry-io";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::io("evict entry io tag listing failure"));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("evict_proxy_cached_entry must propagate io listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Io);
+            assert!(message.contains("evict entry io tag listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Io)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_tag_listing_error_first_page_propagates_permission_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/evict-entry-perm";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::permission_denied(
+        "evict entry perm denied listing failure",
+    ));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("evict_proxy_cached_entry must propagate permission denied error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::PermissionDenied);
+            assert!(message.contains("evict entry perm denied listing failure"));
+        }
+        other => panic!("expected Storage(Internal(PermissionDenied)), got {other:?}"),
+    }
+
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_tag_listing_error_later_page_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/evict-entry-later-page";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    // Create 70 other tags pointing to another manifest
+    let config2 = write_test_blob(&storage, repo, b"cfg2").await;
+    let layer2 = write_test_blob(&storage, repo, b"layer2").await;
+    let (m2_bytes, m2_d) = create_manifest_json(&config2, &layer2);
+    storage.put_manifest(repo, &m2_d, m2_bytes).await.unwrap();
+
+    for i in 0..70 {
+        let tag = format!("other-tag-{i:03}");
+        storage
+            .mutate_tag(
+                repo,
+                &tag,
+                &m2_d,
+                registry_rust::storage::TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+    }
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    // Fail listing on page 2 (allow 1 successful page, fail when threshold reaches 1)
+    *storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::backend("evict entry page 2 listing failure"));
+    storage
+        .fail_tag_listing_after_n
+        .store(2, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    let err = res.expect_err("evict_proxy_cached_entry must propagate page 2 listing error");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("evict entry page 2 listing failure"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    // Tag alias v1 was deleted in step 4
+    assert!(
+        storage
+            .get_tag_with_version(repo, "v1")
+            .await
+            .unwrap()
+            .is_none(),
+        "tag alias v1 must have been deleted"
+    );
+
+    // No manifest deletion, no blob unlinking, no journal deletion
+    assert!(storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(storage.recorded_delete_journal.lock().unwrap().is_empty());
+
+    let j_bytes = storage
+        .read_lifecycle_journal(repo)
+        .await
+        .unwrap()
+        .expect("journal must remain");
+    let j: LifecycleJournalRecord = serde_json::from_slice(&j_bytes).unwrap();
+    assert_eq!(j.phase, LifecyclePhase::ProxyTagDeleted);
+
+    storage
+        .fail_tag_listing_after_n
+        .store(0, AtomicOrdering::SeqCst);
+    storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+
+    let retry_res = service.recover_and_ensure_index_healthy(repo).await;
+    assert!(
+        retry_res.is_ok(),
+        "recovery retry must succeed: {retry_res:?}"
+    );
+
+    assert!(!storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(!storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(!storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_tag_listing_not_found_compatibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/evict-entry-notfound";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::NotFound);
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    assert!(
+        res.is_ok(),
+        "NotFound must be treated as empty terminal page and succeed: {res:?}"
+    );
+
+    assert!(!storage.recorded_delete_manifest.lock().unwrap().is_empty());
+    assert!(!storage.recorded_unlink_repo_blob.lock().unwrap().is_empty());
+    assert!(!storage.recorded_delete_journal.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_evict_proxy_cached_entry_tag_listing_discovers_other_referencing_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/evict-entry-other-tag";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let proxy_record = RepoBlobMembershipRecord::try_new_proxy(repo, layer.clone()).unwrap();
+    storage.link_repo_blob(&proxy_record).await.unwrap();
+
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    let ev = ProxyPublicationEvidence::new_for_test(
+        repo,
+        "v1",
+        m_bytes.clone(),
+        None,
+        true,
+        m_d.clone(),
+    );
+    service.publish_proxy_cached_manifest(ev).await.unwrap();
+
+    // Add another tag pointing to same manifest
+    storage
+        .mutate_tag(
+            repo,
+            "v2",
+            &m_d,
+            registry_rust::storage::TagMutationPolicy::Replace,
+        )
+        .await
+        .unwrap();
+
+    storage.recorded_delete_manifest.lock().unwrap().clear();
+    storage.recorded_unlink_repo_blob.lock().unwrap().clear();
+    storage.recorded_delete_journal.lock().unwrap().clear();
+
+    let res = service
+        .evict_proxy_cached_entry(repo, Some("v1"), &m_d)
+        .await;
+    assert!(res.is_ok(), "eviction must succeed: {res:?}");
+
+    // v1 is deleted
+    assert!(
+        storage
+            .get_tag_with_version(repo, "v1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // v2 remains
+    assert!(
+        storage
+            .get_tag_with_version(repo, "v2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Manifest and blob preserved
+    assert!(
+        storage.recorded_delete_manifest.lock().unwrap().is_empty(),
+        "manifest must not be deleted when another referencing tag exists"
+    );
+    assert!(
+        storage.recorded_unlink_repo_blob.lock().unwrap().is_empty(),
+        "blob must not be unlinked when another referencing tag exists"
+    );
+    // Journal cleaned up
+    assert!(
+        !storage.recorded_delete_journal.lock().unwrap().is_empty(),
+        "journal must be deleted"
+    );
+}
+
+#[tokio::test]
+async fn test_outer_caller_aborts_mutation_on_pending_recovery_tag_listing_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, _ref_idx, service) = setup_fault_service(&dir).await;
+    let repo = "library/outer-caller-aborts";
+
+    let config = write_test_blob(&storage, repo, b"cfg").await;
+    let layer = write_test_blob(&storage, repo, b"layer").await;
+    let (m_bytes, m_d) = create_manifest_json(&config, &layer);
+    storage.put_manifest(repo, &m_d, m_bytes).await.unwrap();
+
+    // Setup pending interrupted journal
+    let journal = LifecycleJournalRecord {
+        op_id: "rec-pending-op".to_string(),
+        repo: CanonicalRepoName::parse(repo).unwrap(),
+        op_kind: LifecycleOpKind::DeleteManifest,
+        target_digest: m_d.clone(),
+        target_reference: None,
+        phase: LifecyclePhase::TagsSnapshotted,
+        owner_id: "test-owner".to_string(),
+        lease_expiry_unix_secs: 9999999999,
+        started_unix_secs: 100,
+        updated_unix_secs: 100,
+        relevant_tags: vec![],
+        subject_digest: None,
+        artifact_type: None,
+        annotations: None,
+        media_type: None,
+        manifest_size: None,
+    };
+    storage
+        .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+        .await
+        .unwrap();
+
+    // Inject listing fault
+    *storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::backend(
+        "simulated pending recovery listing fault",
+    ));
+    storage.fail_tag_listing.store(true, AtomicOrdering::SeqCst);
+
+    // Outer mutating caller: delete_tag calls recover_and_ensure_index_healthy at start
+    let res = service.delete_tag(repo, "some-tag").await;
+    let err = res.expect_err("outer caller must abort on pending recovery listing fault");
+    match &err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("simulated pending recovery listing fault"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+
+    // Outer mutating caller: publish_proxy_cached_manifest or other mutating operation also aborts
+    let config2 = write_test_blob(&storage, repo, b"cfg2").await;
+    let layer2 = write_test_blob(&storage, repo, b"layer2").await;
+    let (m2_bytes, m2_d) = create_manifest_json(&config2, &layer2);
+    let ev = ProxyPublicationEvidence::new_for_test(repo, "new-tag", m2_bytes, None, true, m2_d);
+    let pub_res = service.publish_proxy_cached_manifest(ev).await;
+    let pub_err = pub_res.expect_err("publish must abort on pending recovery listing fault");
+    match &pub_err {
+        ManifestLifecycleError::Storage(StorageError::Internal { kind, message }) => {
+            assert_eq!(*kind, StorageErrorKind::Backend);
+            assert!(message.contains("simulated pending recovery listing fault"));
+        }
+        other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
+    }
+}

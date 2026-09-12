@@ -588,7 +588,8 @@ impl ManifestLifecycleService {
                             .await
                         {
                             Ok(res) => res,
-                            Err(_) => (Vec::new(), None),
+                            Err(StorageError::NotFound) => (Vec::new(), None),
+                            Err(e) => return Err(ManifestLifecycleError::Storage(e)),
                         };
 
                         for (t, d) in page {
@@ -669,7 +670,8 @@ impl ManifestLifecycleService {
                         .await
                     {
                         Ok(p) => p,
-                        Err(_) => (Vec::new(), None),
+                        Err(StorageError::NotFound) => (Vec::new(), None),
+                        Err(e) => return Err(ManifestLifecycleError::Storage(e)),
                     };
                     for (_t_name, t_d) in page {
                         if t_d == journal.target_digest {
@@ -1223,7 +1225,8 @@ impl ManifestLifecycleService {
                 .await
             {
                 Ok(p) => p,
-                Err(_) => (Vec::new(), None),
+                Err(StorageError::NotFound) => (Vec::new(), None),
+                Err(e) => return Err(ManifestLifecycleError::Storage(e)),
             };
             for (_t_name, t_d) in page {
                 if t_d.hex() == target_digest.hex() {
