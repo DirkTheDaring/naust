@@ -16,7 +16,7 @@ use registry_rust::application::blob::BlobMutationService;
 use registry_rust::application::blob_read::BlobReadService;
 use registry_rust::application::catalog::{CatalogQueryParams, CatalogQueryService};
 use registry_rust::application::errors::{
-    BlobMutationError, BlobReadError, ManifestMutationError, TagQueryError,
+    BlobMutationError, BlobReadError, ManifestMutationError, ManifestReadError, TagQueryError,
 };
 use registry_rust::application::manifest::ManifestMutationService;
 use registry_rust::application::manifest_read::ManifestReadService;
@@ -42,7 +42,7 @@ use registry_rust::storage::s3::S3Storage;
 use registry_rust::storage::upload_session::UploadByteStream;
 use registry_rust::storage::{
     BlobMeta, FinalizeOutcome, FinalizedReceipt, ReferrerDescriptor, StorageError,
-    UploadTransitionError,
+    StorageErrorKind, UploadTransitionError,
 };
 use registry_rust::upload_coordinator::BlobUploadCoordinatorConfig;
 use std::path::PathBuf;
@@ -3634,5 +3634,544 @@ async fn test_application_read_and_proxy_publication_services_s3_minio() {
     assert_eq!(
         remaining_count, 0,
         "S3 prefix must be completely empty after cleanup"
+    );
+}
+
+// =================================================================================================
+// Filesystem Tag-Read Production Cutover: Application and Router Wire Verification
+// =================================================================================================
+
+#[tokio::test]
+async fn test_manifest_read_service_tag_fixtures_cutover() {
+    let services = TestServices::new_fs().await;
+    let repo = "test/manifest-cutover";
+
+    let manifest_bytes = Bytes::from_static(
+        br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":2,"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"layers":[]}"#,
+    );
+    let digest = sha256_digest(&manifest_bytes);
+
+    let evidence = ProxyPublicationEvidence::new(
+        repo,
+        "valid-tag",
+        manifest_bytes.clone(),
+        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        true,
+        digest.clone(),
+    );
+    services
+        .manifest_mutation
+        .publish_verified_proxy_manifest(evidence)
+        .await
+        .unwrap();
+
+    // 1. Valid tag fixture returns Ok with exact manifest outcome
+    let outcome = services
+        .manifest_read
+        .get_manifest(repo, "valid-tag", None, false, None)
+        .await
+        .expect("valid tag should resolve successfully");
+    assert_eq!(outcome.digest, digest);
+    assert_eq!(outcome.payload, manifest_bytes);
+
+    // 2. Missing tag fixture returns ManifestReadError::TagNotFound
+    let err_missing = services
+        .manifest_read
+        .get_manifest(repo, "missing-tag", None, false, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_missing, ManifestReadError::TagNotFound),
+        "missing tag must yield ManifestReadError::TagNotFound, got {err_missing:?}"
+    );
+
+    // 3. Malformed tag fixture returns ManifestReadError::TagNotFound
+    // (Correcting assessment test-plan typo: malformed tag text maps through resolve_tag NotFound to TagNotFound, not NotFound)
+    let tags_dir = services
+        .fs_root
+        .join("repos")
+        .join("test")
+        .join("manifest-cutover")
+        .join("tags");
+    let malformed_tag_path = tags_dir.join("malformed-tag");
+    tokio::fs::write(&malformed_tag_path, b"not-a-valid-digest\n")
+        .await
+        .unwrap();
+
+    let err_malformed = services
+        .manifest_read
+        .get_manifest(repo, "malformed-tag", None, false, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_malformed, ManifestReadError::TagNotFound),
+        "malformed tag content must yield ManifestReadError::TagNotFound, got {err_malformed:?}"
+    );
+
+    // 4. Symlink tag fixture returns ManifestReadError::Storage(StorageError::Internal { kind: Io, .. })
+    let symlink_tag_path = tags_dir.join("symlink-tag");
+    std::os::unix::fs::symlink(tags_dir.join("valid-tag"), &symlink_tag_path).unwrap();
+
+    let err_symlink = services
+        .manifest_read
+        .get_manifest(repo, "symlink-tag", None, false, None)
+        .await
+        .unwrap_err();
+    match err_symlink {
+        ManifestReadError::Storage(StorageError::Internal { kind, .. }) => {
+            assert_eq!(kind, StorageErrorKind::Io);
+        }
+        other => panic!("expected ManifestReadError::Storage(Io) for symlink tag, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_manifest_tag_read_endpoints_and_error_mappings() {
+    let server = HttpTestServer::spawn(None).await;
+    let client = reqwest::Client::new();
+    let repo = "test/http-manifest-cutover";
+
+    let manifest_bytes = Bytes::from_static(
+        br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":2,"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"layers":[]}"#,
+    );
+    let digest = sha256_digest(&manifest_bytes);
+
+    let evidence = ProxyPublicationEvidence::new(
+        repo,
+        "valid-tag",
+        manifest_bytes.clone(),
+        Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        true,
+        digest.clone(),
+    );
+    server
+        .services
+        .manifest_mutation
+        .publish_verified_proxy_manifest(evidence)
+        .await
+        .unwrap();
+
+    // 1. GET & HEAD valid tag -> 200 OK with exact body and digest header
+    let resp_valid = client
+        .get(format!(
+            "{}/v2/{}/manifests/valid-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_valid.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp_valid
+            .headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        digest.as_str()
+    );
+    let body_valid = resp_valid.bytes().await.unwrap();
+    assert_eq!(body_valid, manifest_bytes);
+
+    let resp_valid_head = client
+        .head(format!(
+            "{}/v2/{}/manifests/valid-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_valid_head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp_valid_head
+            .headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        digest.as_str()
+    );
+    assert_eq!(
+        resp_valid_head
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.oci.image.manifest.v1+json"
+    );
+    assert_eq!(
+        resp_valid_head
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        manifest_bytes.len().to_string()
+    );
+    let body_valid_head = resp_valid_head.bytes().await.unwrap();
+    assert!(
+        body_valid_head.is_empty(),
+        "HEAD response body for valid tag must be empty, got {} bytes",
+        body_valid_head.len()
+    );
+
+    // 2. GET & HEAD missing tag -> 404 NOT_FOUND with MANIFEST_UNKNOWN error code
+    let resp_missing = client
+        .get(format!(
+            "{}/v2/{}/manifests/missing-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let body_missing = resp_missing.text().await.unwrap();
+    assert!(
+        body_missing.contains("\"code\":\"MANIFEST_UNKNOWN\""),
+        "missing tag body must have MANIFEST_UNKNOWN code, got: {body_missing}"
+    );
+
+    let resp_missing_head = client
+        .head(format!(
+            "{}/v2/{}/manifests/missing-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_missing_head.status(), reqwest::StatusCode::NOT_FOUND);
+    let body_missing_head = resp_missing_head.bytes().await.unwrap();
+    assert!(
+        body_missing_head.is_empty(),
+        "HEAD response body for missing tag must be empty, got {} bytes",
+        body_missing_head.len()
+    );
+
+    // 3. GET & HEAD malformed tag -> 404 NOT_FOUND with MANIFEST_UNKNOWN error code
+    let tags_dir = server
+        .services
+        .fs_root
+        .join("repos")
+        .join("test")
+        .join("http-manifest-cutover")
+        .join("tags");
+    let malformed_tag_path = tags_dir.join("malformed-tag");
+    tokio::fs::write(&malformed_tag_path, b"corrupted-digest-content\n")
+        .await
+        .unwrap();
+
+    let resp_malformed = client
+        .get(format!(
+            "{}/v2/{}/manifests/malformed-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_malformed.status(), reqwest::StatusCode::NOT_FOUND);
+    let body_malformed = resp_malformed.text().await.unwrap();
+    assert!(
+        body_malformed.contains("\"code\":\"MANIFEST_UNKNOWN\""),
+        "malformed tag body must have MANIFEST_UNKNOWN code, got: {body_malformed}"
+    );
+
+    let resp_malformed_head = client
+        .head(format!(
+            "{}/v2/{}/manifests/malformed-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_malformed_head.status(), reqwest::StatusCode::NOT_FOUND);
+    let body_malformed_head = resp_malformed_head.bytes().await.unwrap();
+    assert!(
+        body_malformed_head.is_empty(),
+        "HEAD response body for malformed tag must be empty, got {} bytes",
+        body_malformed_head.len()
+    );
+
+    // 4. GET & HEAD symlink tag -> 500 INTERNAL_SERVER_ERROR with UNKNOWN error code
+    let symlink_tag_path = tags_dir.join("symlink-tag");
+    std::os::unix::fs::symlink(tags_dir.join("valid-tag"), &symlink_tag_path).unwrap();
+
+    let resp_symlink = client
+        .get(format!(
+            "{}/v2/{}/manifests/symlink-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_symlink.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body_symlink = resp_symlink.text().await.unwrap();
+    assert!(
+        body_symlink.contains("\"code\":\"UNKNOWN\""),
+        "symlink tag rejection must yield 500 UNKNOWN error code, got: {body_symlink}"
+    );
+
+    let resp_symlink_head = client
+        .head(format!(
+            "{}/v2/{}/manifests/symlink-tag",
+            server.base_url, repo
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_symlink_head.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body_symlink_head = resp_symlink_head.bytes().await.unwrap();
+    assert!(
+        body_symlink_head.is_empty(),
+        "HEAD response body for symlink tag must be empty, got {} bytes",
+        body_symlink_head.len()
+    );
+
+    // 5. Pre-storage input rejection:
+    // When input is rejected before storage (by router is_valid_repo_name), returns 400 NAME_INVALID
+    let resp_pre_storage = client
+        .get(format!(
+            "{}/v2/-invalid-repo/manifests/valid-tag",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_pre_storage.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body_pre_storage = resp_pre_storage.text().await.unwrap();
+    assert!(
+        body_pre_storage.contains("\"code\":\"NAME_INVALID\""),
+        "pre-storage invalid repo name must return 400 NAME_INVALID, got: {body_pre_storage}"
+    );
+}
+
+struct InjectedTagReader {
+    inner: Arc<FsStorage>,
+    injected_repo: String,
+}
+
+#[async_trait::async_trait]
+impl TagReader for InjectedTagReader {
+    async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
+        if name == self.injected_repo {
+            return Err(StorageError::InvalidRepoName(format!(
+                "injected storage rejection for valid http name: {name}"
+            )));
+        }
+        self.inner.resolve_tag(name, tag).await
+    }
+
+    async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+        self.inner.list_tags(name).await
+    }
+
+    async fn list_tags_page(
+        &self,
+        repo: &str,
+        continuation_token: Option<&str>,
+        page_limit: usize,
+    ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+        self.inner
+            .list_tags_page(repo, continuation_token, page_limit)
+            .await
+    }
+
+    async fn get_tag_with_version(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<(Digest, String)>, StorageError> {
+        if repo == self.injected_repo {
+            return Err(StorageError::InvalidRepoName(format!(
+                "injected storage rejection for valid http name: {repo}"
+            )));
+        }
+        self.inner.get_tag_with_version(repo, tag).await
+    }
+}
+
+#[tokio::test]
+async fn test_http_distinguish_valid_input_storage_error_and_tag_precondition_failed() {
+    let services = TestServices::new_fs().await;
+    let fs_root = services.temp.path().join("root");
+    let index_root = services.temp.path().join("index");
+    let mut cfg = support::gc_coordination::test_config(fs_root.clone(), index_root);
+    cfg.auth_strategy = AuthStrategy::Both;
+    cfg.push_username = Some("testuser".to_string());
+    cfg.push_password = Some("testpass".to_string());
+    cfg.push_implies_delete = true;
+    cfg.anonymous_pull = true;
+    let cfg_arc = Arc::new(cfg);
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
+
+    let mut app_state = AppState::new_test_with_proxy(
+        cfg_arc,
+        storage.clone(),
+        Some(services.ref_index.clone()),
+        None,
+        None,
+    );
+
+    let injected_reader = Arc::new(InjectedTagReader {
+        inner: storage.clone(),
+        injected_repo: "valid/injected-repo".to_string(),
+    });
+
+    let new_manifest_read = Arc::new(ManifestReadService::new(
+        app_state.manifest_read_service.manifest_reader().clone(),
+        injected_reader,
+        app_state.manifest_service.clone(),
+        10 * 1024 * 1024,
+        None,
+    ));
+    app_state.manifest_read_service = new_manifest_read;
+
+    let router = registry_rust::supervisor::build_router(app_state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let base_url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+
+    // 1. Valid HTTP syntax for repo name, but storage returns InvalidRepoName:
+    // Reaches ManifestReadService -> maps to ManifestReadError::Storage(InvalidRepoName) -> HTTP 500 UNKNOWN!
+    let resp_storage_err = client
+        .get(format!(
+            "{base_url}/v2/valid/injected-repo/manifests/latest"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_storage_err.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body_storage_err = resp_storage_err.text().await.unwrap();
+    assert!(
+        body_storage_err.contains("\"code\":\"UNKNOWN\""),
+        "injected storage InvalidRepoName must yield HTTP 500 UNKNOWN, got: {body_storage_err}"
+    );
+
+    // 2. In contrast, invalid HTTP syntax rejected BEFORE storage by handler validation:
+    let resp_pre_storage = client
+        .get(format!("{base_url}/v2/-invalid-repo/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_pre_storage.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body_pre_storage = resp_pre_storage.text().await.unwrap();
+    assert!(
+        body_pre_storage.contains("\"code\":\"NAME_INVALID\""),
+        "pre-storage invalid repo syntax must yield HTTP 400 NAME_INVALID, got: {body_pre_storage}"
+    );
+
+    // 3. Verify existing TagPreconditionFailed HTTP mapping on DELETE endpoint without changing it:
+    // Setup a tag on disk, then replace root sequentially so get_tag_with_version reads old root
+    // and delete_tag_conditional reads new root with differing bytes, triggering TagPreconditionFailed
+    let hex_c1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hex_c2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    let repo_pre = "valid/precondition-repo";
+    let tags_dir = fs_root
+        .join("repos")
+        .join("valid")
+        .join("precondition-repo")
+        .join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+    std::fs::write(tags_dir.join("latest"), format!("sha256:{hex_c1}\n")).unwrap();
+
+    // Replace root directory: rename to fs_root_old, recreate fs_root
+    let fs_root_old = services.temp.path().join("root-old");
+    std::fs::rename(&fs_root, &fs_root_old).unwrap();
+    std::fs::create_dir_all(&fs_root).unwrap();
+    let new_tags_dir = fs_root
+        .join("repos")
+        .join("valid")
+        .join("precondition-repo")
+        .join("tags");
+    std::fs::create_dir_all(&new_tags_dir).unwrap();
+    std::fs::write(new_tags_dir.join("latest"), format!("sha256:{hex_c2}\n")).unwrap();
+
+    // Preconditions before DELETE: healthy index, clean journal, exact tag bytes on disk
+    assert!(services.ref_index.check_health().is_ok());
+    assert!(
+        storage
+            .read_lifecycle_journal(repo_pre)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let tree_a_bytes_before = std::fs::read(
+        fs_root_old
+            .join("repos")
+            .join("valid")
+            .join("precondition-repo")
+            .join("tags")
+            .join("latest"),
+    )
+    .unwrap();
+    let tree_b_bytes_before = std::fs::read(new_tags_dir.join("latest")).unwrap();
+
+    // Send DELETE request:
+    // get_tag_with_version reads through pinned descriptor (fs_root_old) getting hex_c1 version,
+    // delete_tag_conditional reads fs_root getting hex_c2 version -> TagPreconditionFailed!
+    // Handler matches Err(_) => errors::internal_error() -> 500 INTERNAL_SERVER_ERROR with UNKNOWN!
+    let resp_del_precondition = client
+        .delete(format!("{base_url}/v2/{repo_pre}/manifests/latest"))
+        .basic_auth("testuser", Some("testpass"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_del_precondition.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body_del_precondition = resp_del_precondition.text().await.unwrap();
+    assert!(
+        body_del_precondition.contains("\"code\":\"UNKNOWN\""),
+        "TagPreconditionFailed on DELETE must map to HTTP 500 UNKNOWN without modification, got: {body_del_precondition}"
+    );
+
+    // Demonstrate deterministic TagPreconditionFailed execution path by inspecting cleanup and state outcomes:
+    // 1. Journal was deleted on PreconditionFailed cleanup
+    assert!(
+        storage
+            .read_lifecycle_journal(repo_pre)
+            .await
+            .unwrap()
+            .is_none(),
+        "journal must be deleted on TagPreconditionFailed cleanup"
+    );
+    // 2. Index was restored to ready health
+    assert!(
+        services.ref_index.check_health().is_ok(),
+        "ref_index must be marked ready on TagPreconditionFailed cleanup"
+    );
+    // 3. Tree B tag was preserved intact on disk with unchanged bytes
+    assert_eq!(
+        std::fs::read(new_tags_dir.join("latest")).unwrap(),
+        tree_b_bytes_before,
+        "Tree B tag bytes must be preserved intact on disk"
+    );
+    // 4. Tree A tag was preserved intact on disk with unchanged bytes
+    assert_eq!(
+        std::fs::read(
+            fs_root_old
+                .join("repos")
+                .join("valid")
+                .join("precondition-repo")
+                .join("tags")
+                .join("latest")
+        )
+        .unwrap(),
+        tree_a_bytes_before,
+        "Tree A tag bytes must be preserved intact on disk"
     );
 }

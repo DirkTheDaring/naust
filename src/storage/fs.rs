@@ -938,16 +938,13 @@ impl Storage for FsStorage {
     }
 
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
-        let path = self.tag_path(name, tag);
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(s) => s,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        let reference = content.trim();
-        Digest::parse(reference).map_err(|_| StorageError::NotFound)
+        tag_read::resolve_tag(
+            self.reader.as_ref(),
+            name,
+            tag,
+            &tag_read::TagReadLimits::default(),
+        )
+        .await
     }
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
@@ -1252,20 +1249,13 @@ impl Storage for FsStorage {
         repo: &str,
         tag: &str,
     ) -> Result<Option<(Digest, String)>, StorageError> {
-        let tag_path = self.tag_path(repo, tag);
-        match tokio::fs::read(&tag_path).await {
-            Ok(bytes) => {
-                let s = String::from_utf8_lossy(&bytes);
-                let digest = Digest::parse(s.trim())
-                    .map_err(|e| StorageError::corrupt_data(format!("corrupt tag {tag}: {e}")))?;
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(&bytes);
-                let version = hex::encode(hasher.finalize());
-                Ok(Some((digest, version)))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(StorageError::io(e.to_string())),
-        }
+        tag_read::get_tag_with_version(
+            self.reader.as_ref(),
+            repo,
+            tag,
+            &tag_read::TagReadLimits::default(),
+        )
+        .await
     }
 
     async fn delete_tag_conditional(
@@ -3714,6 +3704,5 @@ pub(crate) mod manifest_refs;
 #[allow(unused_imports)]
 pub(crate) use manifest_refs as manifest_refs_seam;
 
-#[cfg(test)]
-#[path = "fs/tag_seam.rs"]
-mod tag_seam;
+#[path = "fs/tag_read.rs"]
+pub(crate) mod tag_read;

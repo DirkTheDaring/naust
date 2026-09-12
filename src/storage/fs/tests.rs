@@ -6486,47 +6486,52 @@ async fn test_tag_read_controlled_symlinks() {
     write_file(&target_file, format!("sha256:{hex_internal}\n").as_bytes());
     std::os::unix::fs::symlink(&target_file, tags_dir.join("symlink_internal")).unwrap();
 
-    let d = storage
+    let err_resolve = storage
         .resolve_tag("myrepo", "symlink_internal")
         .await
-        .unwrap();
-    assert_eq!(
-        d.hex(),
-        hex_internal,
-        "resolve_tag follows internal symlink"
-    );
-    let (d_v, v) = storage
+        .unwrap_err();
+    match err_resolve {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for symlink_internal resolve_tag, got {other:?}")
+        }
+    }
+    let err_version = storage
         .get_tag_with_version("myrepo", "symlink_internal")
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(d_v.hex(), hex_internal);
-    assert_eq!(v, hex_sha256(format!("sha256:{hex_internal}\n").as_bytes()));
+        .unwrap_err();
+    match err_version {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!(
+            "expected StorageErrorKind::Io for symlink_internal get_tag_with_version, got {other:?}"
+        ),
+    }
 
     // 2. Final tag symlink targeting a sibling directory outside that root but inside the temporary fixture
     let ext_file = ext_dir.join("ext_tag_file");
     write_file(&ext_file, format!("sha256:{hex_external}\n").as_bytes());
     std::os::unix::fs::symlink(&ext_file, tags_dir.join("symlink_external")).unwrap();
 
-    let d_ext = storage
+    let err_ext = storage
         .resolve_tag("myrepo", "symlink_external")
         .await
-        .unwrap();
-    assert_eq!(
-        d_ext.hex(),
-        hex_external,
-        "ambient read_to_string follows symlink outside storage root"
-    );
-    let (d_ext_v, v_ext) = storage
+        .unwrap_err();
+    match err_ext {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for symlink_external resolve_tag, got {other:?}")
+        }
+    }
+    let err_ext_v = storage
         .get_tag_with_version("myrepo", "symlink_external")
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(d_ext_v.hex(), hex_external);
-    assert_eq!(
-        v_ext,
-        hex_sha256(format!("sha256:{hex_external}\n").as_bytes())
-    );
+        .unwrap_err();
+    match err_ext_v {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!(
+            "expected StorageErrorKind::Io for symlink_external get_tag_with_version, got {other:?}"
+        ),
+    }
 
     // 3. Ancestor directory symlink (symlinked tags/ directory)
     let ext_tags_dir = ext_dir.join("external_tags");
@@ -6540,21 +6545,26 @@ async fn test_tag_read_controlled_symlinks() {
     std::fs::create_dir_all(&repo_ancestor_dir).unwrap();
     std::os::unix::fs::symlink(&ext_tags_dir, repo_ancestor_dir.join("tags")).unwrap();
 
-    let d_anc = storage
+    let err_anc = storage
         .resolve_tag("ancestor_repo", "ancestor_tag")
         .await
-        .unwrap();
-    assert_eq!(
-        d_anc.hex(),
-        hex_ancestor,
-        "ambient read_to_string follows ancestor tags/ symlink"
-    );
-    let (d_anc_v, _) = storage
+        .unwrap_err();
+    match err_anc {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for ancestor symlink resolve_tag, got {other:?}")
+        }
+    }
+    let err_anc_v = storage
         .get_tag_with_version("ancestor_repo", "ancestor_tag")
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(d_anc_v.hex(), hex_ancestor);
+        .unwrap_err();
+    match err_anc_v {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!(
+            "expected StorageErrorKind::Io for ancestor symlink get_tag_with_version, got {other:?}"
+        ),
+    }
 
     // 4. Dangling symlink
     std::os::unix::fs::symlink(
@@ -6562,19 +6572,26 @@ async fn test_tag_read_controlled_symlinks() {
         tags_dir.join("dangling_symlink"),
     )
     .unwrap();
-    let res_resolve = storage.resolve_tag("myrepo", "dangling_symlink").await;
-    assert!(
-        matches!(res_resolve, Err(StorageError::NotFound)),
-        "dangling symlink maps to NotFound in resolve_tag"
-    );
-    let res_version = storage
+    let err_dang = storage
+        .resolve_tag("myrepo", "dangling_symlink")
+        .await
+        .unwrap_err();
+    match err_dang {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => {
+            panic!("expected StorageErrorKind::Io for dangling symlink resolve_tag, got {other:?}")
+        }
+    }
+    let err_dang_v = storage
         .get_tag_with_version("myrepo", "dangling_symlink")
         .await
-        .unwrap();
-    assert_eq!(
-        res_version, None,
-        "dangling symlink maps to None in get_tag_with_version"
-    );
+        .unwrap_err();
+    match err_dang_v {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!(
+            "expected StorageErrorKind::Io for dangling symlink get_tag_with_version, got {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -6676,22 +6693,22 @@ async fn test_tag_read_path_component_and_traversal_cases() {
     let outside_file = root.join("repos").join("myrepo").join("outside.txt");
     write_file(&outside_file, format!("sha256:{hex}\n").as_bytes());
 
-    let d = storage
+    let err_outside = storage
         .resolve_tag("myrepo", "../outside.txt")
         .await
-        .unwrap();
-    assert_eq!(
-        d.hex(),
-        hex,
-        "ambient tag_path joins unchecked '..' component"
+        .unwrap_err();
+    assert!(
+        matches!(err_outside, StorageError::InvalidRepoName(_)),
+        "resolve_tag rejects '..' traversal in tag name with InvalidRepoName, got {err_outside:?}"
     );
-    let (d_v, v) = storage
+    let err_outside_v = storage
         .get_tag_with_version("myrepo", "../outside.txt")
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(d_v.hex(), hex);
-    assert_eq!(v, hex_sha256(format!("sha256:{hex}\n").as_bytes()));
+        .unwrap_err();
+    assert!(
+        matches!(err_outside_v, StorageError::InvalidRepoName(_)),
+        "get_tag_with_version rejects '..' traversal in tag name with InvalidRepoName, got {err_outside_v:?}"
+    );
 
     // 2. Subdirectory component in tag: "sub/nested_tag"
     let nested_file = root
@@ -6709,7 +6726,7 @@ async fn test_tag_read_path_component_and_traversal_cases() {
     assert_eq!(
         d_sub.hex(),
         hex,
-        "ambient tag_path joins slash subdirectories"
+        "nested tag path components remain supported under contained tag reading"
     );
     let (d_sub_v, _) = storage
         .get_tag_with_version("myrepo", "sub/nested_tag")
@@ -6724,22 +6741,22 @@ async fn test_tag_read_path_component_and_traversal_cases() {
     let sibling_tag_file = root.join("sibling_repo").join("tags").join("mytag");
     write_file(&sibling_tag_file, format!("sha256:{hex}\n").as_bytes());
 
-    let d_repo = storage
+    let err_repo = storage
         .resolve_tag("../sibling_repo", "mytag")
         .await
-        .unwrap();
-    assert_eq!(
-        d_repo.hex(),
-        hex,
-        "ambient tag_path joins unchecked '..' in repository argument"
+        .unwrap_err();
+    assert!(
+        matches!(err_repo, StorageError::InvalidRepoName(_)),
+        "resolve_tag rejects '..' in repository argument with InvalidRepoName, got {err_repo:?}"
     );
-    let (d_repo_v, v_repo) = storage
+    let err_repo_v = storage
         .get_tag_with_version("../sibling_repo", "mytag")
         .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(d_repo_v.hex(), hex);
-    assert_eq!(v_repo, hex_sha256(format!("sha256:{hex}\n").as_bytes()));
+        .unwrap_err();
+    assert!(
+        matches!(err_repo_v, StorageError::InvalidRepoName(_)),
+        "get_tag_with_version rejects '..' in repository argument with InvalidRepoName, got {err_repo_v:?}"
+    );
 }
 
 #[tokio::test]
@@ -6790,13 +6807,13 @@ async fn test_tag_read_sequential_root_replacement_observed_tree() {
         format!("sha256:{hex_repl}\n").as_bytes(),
     );
 
-    // 3. Ambient resolve_tag and get_tag_with_version use string PathBuf join on self.root;
-    // they resolve the NEW directory currently at root_path
+    // 3. Contained resolve_tag and get_tag_with_version use self.reader;
+    // self.reader retains its descriptor pinned to root_old, observing hex_orig!
     let d_observed = storage.resolve_tag("myrepo", "latest").await.unwrap();
     assert_eq!(
         d_observed.hex(),
-        hex_repl,
-        "ambient resolve_tag observes replacement pathname tree, demonstrating lack of root pinning"
+        hex_orig,
+        "contained resolve_tag observes pinned root_fd tree, demonstrating root pinning"
     );
     let (d_observed_v, v_observed) = storage
         .get_tag_with_version("myrepo", "latest")
@@ -6805,13 +6822,13 @@ async fn test_tag_read_sequential_root_replacement_observed_tree() {
         .unwrap();
     assert_eq!(
         d_observed_v.hex(),
-        hex_repl,
-        "ambient get_tag_with_version observes replacement digest"
+        hex_orig,
+        "contained get_tag_with_version observes pinned root digest"
     );
     assert_eq!(
         v_observed,
-        hex_sha256(format!("sha256:{hex_repl}\n").as_bytes()),
-        "ambient get_tag_with_version computes version from replacement bytes"
+        hex_sha256(format!("sha256:{hex_orig}\n").as_bytes()),
+        "contained get_tag_with_version computes version from pinned root bytes"
     );
 }
 
@@ -6903,4 +6920,170 @@ async fn test_tag_conditional_delete_version_precondition_role() {
         v1_recreated, v1,
         "identical byte content produces identical version hash; version does not detect replacement if bytes match"
     );
+}
+
+#[tokio::test]
+async fn test_fs_storage_tag_read_production_contract_and_entry_points() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let tags_dir = root.join("repos").join("myrepo").join("tags");
+    std::fs::create_dir_all(&tags_dir).unwrap();
+
+    // 1. Valid SHA-256 with leading/trailing whitespace
+    let hex_val_256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let raw_sha256 = format!("  \n sha256:{hex_val_256} \t\n ");
+    write_file(&tags_dir.join("tag-sha256"), raw_sha256.as_bytes());
+
+    let d256 = storage.resolve_tag("myrepo", "tag-sha256").await.unwrap();
+    assert_eq!(d256.hex(), hex_val_256);
+    let (d256_v, v256) = storage
+        .get_tag_with_version("myrepo", "tag-sha256")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d256_v.hex(), hex_val_256);
+    assert_eq!(v256, hex_sha256(raw_sha256.as_bytes()));
+
+    // 2. Valid SHA-512
+    let hex_val_512 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let raw_sha512 = format!("sha512:{hex_val_512}\n");
+    write_file(&tags_dir.join("tag-sha512"), raw_sha512.as_bytes());
+
+    let d512 = storage.resolve_tag("myrepo", "tag-sha512").await.unwrap();
+    assert_eq!(d512.hex(), hex_val_512);
+    let (d512_v, v512) = storage
+        .get_tag_with_version("myrepo", "tag-sha512")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d512_v.hex(), hex_val_512);
+    assert_eq!(v512, hex_sha256(raw_sha512.as_bytes()));
+
+    // 3. Padded data exceeding 64 KiB (unbounded production reading: max_payload_bytes = None)
+    let padding = " ".repeat(70 * 1024);
+    let raw_large = format!("{padding}sha256:{hex_val_256}\n{padding}");
+    assert!(raw_large.len() > 64 * 1024);
+    write_file(&tags_dir.join("tag-large"), raw_large.as_bytes());
+
+    let d_large = storage.resolve_tag("myrepo", "tag-large").await.unwrap();
+    assert_eq!(d_large.hex(), hex_val_256);
+    let (d_large_v, v_large) = storage
+        .get_tag_with_version("myrepo", "tag-large")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d_large_v.hex(), hex_val_256);
+    assert_eq!(v_large, hex_sha256(raw_large.as_bytes()));
+
+    // 4. Missing tag
+    let err_missing = storage
+        .resolve_tag("myrepo", "nonexistent")
+        .await
+        .unwrap_err();
+    assert!(matches!(err_missing, StorageError::NotFound));
+    let opt_missing = storage
+        .get_tag_with_version("myrepo", "nonexistent")
+        .await
+        .unwrap();
+    assert_eq!(opt_missing, None);
+
+    // 5. Empty file: resolve_tag -> NotFound; get_tag_with_version -> CorruptData
+    write_file(&tags_dir.join("tag-empty"), b"");
+    let err_empty_res = storage
+        .resolve_tag("myrepo", "tag-empty")
+        .await
+        .unwrap_err();
+    assert!(matches!(err_empty_res, StorageError::NotFound));
+    let err_empty_ver = storage
+        .get_tag_with_version("myrepo", "tag-empty")
+        .await
+        .unwrap_err();
+    match err_empty_ver {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected CorruptData for empty tag file, got {other:?}"),
+    }
+
+    // 6. Malformed digest text: resolve_tag -> NotFound; get_tag_with_version -> CorruptData
+    write_file(&tags_dir.join("tag-malformed"), b"not-a-digest\n");
+    let err_mal_res = storage
+        .resolve_tag("myrepo", "tag-malformed")
+        .await
+        .unwrap_err();
+    assert!(matches!(err_mal_res, StorageError::NotFound));
+    let err_mal_ver = storage
+        .get_tag_with_version("myrepo", "tag-malformed")
+        .await
+        .unwrap_err();
+    match err_mal_ver {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected CorruptData for malformed tag text, got {other:?}"),
+    }
+
+    // 7. Invalid UTF-8 bytes: resolve_tag -> Io; get_tag_with_version -> CorruptData
+    write_file(&tags_dir.join("tag-invalid-utf8"), &[0xff, 0xfe, 0xfd]);
+    let err_utf8_res = storage
+        .resolve_tag("myrepo", "tag-invalid-utf8")
+        .await
+        .unwrap_err();
+    match err_utf8_res {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        other => panic!("expected Io for invalid UTF-8 in resolve_tag, got {other:?}"),
+    }
+    let err_utf8_ver = storage
+        .get_tag_with_version("myrepo", "tag-invalid-utf8")
+        .await
+        .unwrap_err();
+    match err_utf8_ver {
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => {
+            panic!("expected CorruptData for invalid UTF-8 in get_tag_with_version, got {other:?}")
+        }
+    }
+
+    // 8. Structural validation rejections
+    for bad_repo in [
+        "",
+        "/leading",
+        "trailing/",
+        "a//b",
+        "a\\b",
+        "a\0b",
+        "a\x01b",
+        ".",
+        "..",
+    ] {
+        let res = storage.resolve_tag(bad_repo, "latest").await;
+        assert!(
+            matches!(res, Err(StorageError::InvalidRepoName(_))),
+            "repo '{bad_repo}' must be rejected with InvalidRepoName, got {res:?}"
+        );
+        let ver = storage.get_tag_with_version(bad_repo, "latest").await;
+        assert!(
+            matches!(ver, Err(StorageError::InvalidRepoName(_))),
+            "repo '{bad_repo}' must be rejected with InvalidRepoName, got {ver:?}"
+        );
+    }
+
+    for bad_tag in [
+        "",
+        "/leading",
+        "trailing/",
+        "a//b",
+        "a\\b",
+        "a\0b",
+        "a\x1fb",
+        ".",
+        "..",
+    ] {
+        let res = storage.resolve_tag("myrepo", bad_tag).await;
+        assert!(
+            matches!(res, Err(StorageError::InvalidRepoName(_))),
+            "tag '{bad_tag}' must be rejected with InvalidRepoName, got {res:?}"
+        );
+        let ver = storage.get_tag_with_version("myrepo", bad_tag).await;
+        assert!(
+            matches!(ver, Err(StorageError::InvalidRepoName(_))),
+            "tag '{bad_tag}' must be rejected with InvalidRepoName, got {ver:?}"
+        );
+    }
 }

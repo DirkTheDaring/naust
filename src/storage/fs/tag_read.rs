@@ -1,4 +1,4 @@
-//! Contained filesystem tag read test seam for `registry-rust`.
+//! Contained filesystem tag read implementation for `registry-rust`.
 //!
 //! # Architectural Ownership Boundaries
 //! - `storage-core`: Defines domain-neutral contracts ([`storage_core::ObjectPayloadReader`],
@@ -12,10 +12,10 @@
 //!   raw-byte version hashing, and mapping to [`StorageError`].
 //!
 //! # Separate Caller Contracts
-//! - `resolve_tag_seam`: Validates UTF-8 via [`std::str::from_utf8`] (invalid UTF-8 maps to
+//! - `resolve_tag`: Validates UTF-8 via [`std::str::from_utf8`] (invalid UTF-8 maps to
 //!   [`StorageErrorKind::Io`]), trims whitespace, and parses digest (missing file, empty content,
 //!   and malformed digest text map to [`StorageError::NotFound`]).
-//! - `get_tag_with_version_seam`: Decodes via [`String::from_utf8_lossy`], trims whitespace,
+//! - `get_tag_with_version`: Decodes via [`String::from_utf8_lossy`], trims whitespace,
 //!   and parses digest (missing file maps to `Ok(None)`, while empty content, malformed text,
 //!   and invalid UTF-8 replacement characters map to [`StorageErrorKind::CorruptData`]).
 //!   Hashes the **unmodified original raw bytes** via SHA-256 for optimistic-concurrency versions.
@@ -29,21 +29,33 @@
 //! - Metadata size is treated as an acquisition-time observation and is not used for early rejection,
 //!   preventing false rejections if a file shrinks before stream reading.
 //!
-//! # Concurrency and Coherence Demarcation
-//! - In current production, both tag reads and tag mutations dynamically resolve pathnames starting
-//!   from `self.root`. However, shared pathname resolution is not a coherence guarantee: separate
-//!   operations can observe different trees if replacement occurs between them.
-//! - The contained seam resolves relative to the pinned root descriptor (`openat2` on `root_fd`).
-//!   If `self.root` is replaced, contained reads continue to observe the original pinned tree,
-//!   while pathname mutations operate on the replacement tree.
-//! - Contained mutations, lock containment, and operational root-stability controls remain
-//!   alternatives requiring evaluation before any production cutover.
-//! - Neither legacy nor contained reads serialize with advisory locks (`.lock.{tag}`).
-//! - Concurrent modifications during stream draining may affect the bytes returned; detection
-//!   is not guaranteed. Version hashing describes bytes actually read and does not prove a snapshot.
+//! # Concurrency, Containment, and Coherence Demarcation
+//! - In production, tag reads resolve through the shared pinned root descriptor (`openat2` on `root_fd`).
+//!   They no longer dynamically resolve from `self.root`.
+//! - Renaming/replacing the configured root pathname leaves the existing root descriptor referring to
+//!   the originally opened directory.
+//! - Descendant paths are resolved afresh beneath that descriptor for each payload acquisition.
+//! - Replacing a descendant directory or file can therefore affect subsequent acquisitions.
+//! - Once acquired, a file descriptor refers to that opened object, but concurrent modification of its
+//!   contents can still affect reading.
+//! - Root pinning provides neither a namespace snapshot nor read/write coherence.
+//! - Mutating operations (`set_tag`, `delete_tag_conditional`, `put_manifest`) continue to resolve
+//!   ambient pathnames starting from `self.root`.
+//! - Pathname mutation divergence is a current residual limitation under the operational
+//!   namespace-stability assumption: if the root path is replaced concurrently, pinned reads continue
+//!   to resolve beneath the originally opened root, while pathname mutations operate on the replacement tree.
+//! - Read operations do not serialize with advisory locks (`.lock.{tag}`).
+//! - Payload reads do not provide snapshot isolation: concurrent writes or file truncation during stream
+//!   draining may return changed or partial bytes; detection is not guaranteed.
+//! - Version hashing describes the raw bytes actually read and does not bind a version to a root directory or inode.
+//! - Identical byte content produces identical version hashes across different roots or files.
+//! - Linux descriptor-relative containment (`openat2`) requires a genuine, accessible, stable procfs mount
+//!   for Phase 2 readable reopenings via `/proc/self/fd/N`.
+//! - Kernel containment does not guarantee mount or hard-link isolation.
+//! - Non-Linux verification remains unperformed.
 
 use crate::registry::digest::Digest;
-use crate::storage::{StorageError, StorageErrorKind};
+use crate::storage::StorageError;
 use sha2::Digest as Sha2Digest;
 use storage_core::{ObjectKey, ObjectPayload, ObjectPayloadReader, ReadError};
 use tokio::io::AsyncReadExt;
@@ -177,7 +189,7 @@ pub(crate) async fn drain_tag_stream(
 /// - Invalid UTF-8 bytes -> [`StorageErrorKind::Io`].
 /// - Empty content / malformed digest text -> [`StorageError::NotFound`].
 /// - Whitespace trimmed before parsing.
-pub(crate) async fn resolve_tag_seam(
+pub(crate) async fn resolve_tag(
     reader: &(impl ObjectPayloadReader + ?Sized),
     repo: &str,
     tag: &str,
@@ -200,6 +212,10 @@ pub(crate) async fn resolve_tag_seam(
     Digest::parse(reference).map_err(|_| StorageError::NotFound)
 }
 
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use resolve_tag as resolve_tag_seam;
+
 /// Retrieves a tag target [`Digest`] and optimistic-concurrency version token.
 ///
 /// Preserves legacy `get_tag_with_version` contract:
@@ -207,7 +223,7 @@ pub(crate) async fn resolve_tag_seam(
 /// - Stream read error -> [`StorageErrorKind::Io`].
 /// - Empty content / malformed text / invalid UTF-8 replacement chars -> [`StorageErrorKind::CorruptData`].
 /// - Version is computed strictly as the SHA-256 hex digest of the raw unmodified bytes (`&bytes`).
-pub(crate) async fn get_tag_with_version_seam(
+pub(crate) async fn get_tag_with_version(
     reader: &(impl ObjectPayloadReader + ?Sized),
     repo: &str,
     tag: &str,
@@ -235,8 +251,13 @@ pub(crate) async fn get_tag_with_version_seam(
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use get_tag_with_version as get_tag_with_version_seam;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageErrorKind;
     use async_trait::async_trait;
     use std::collections::{HashMap, VecDeque};
     use std::pin::Pin;
@@ -1457,7 +1478,7 @@ mod tests {
                 format!("sha256:{hex_new}\n").as_bytes(),
             );
 
-            // 1. Contained seam continues to observe the OLD pinned root!
+            // 1. Contained seam and production entry points continue to observe the OLD pinned root!
             let d_contained = resolve_tag_seam(&*storage.reader, "myrepo", "target", &limits)
                 .await
                 .unwrap();
@@ -1467,27 +1488,41 @@ mod tests {
                 "contained seam observes pinned old root"
             );
 
-            let (d_contained_get, _) =
+            let (d_contained_get, v_contained) =
                 get_tag_with_version_seam(&*storage.reader, "myrepo", "target", &limits)
                     .await
                     .unwrap()
                     .unwrap();
             assert_eq!(d_contained_get.hex(), hex_old);
 
-            // 2. Legacy ambient operations immediately observe the NEW tree at self.root!
-            let d_legacy = storage.resolve_tag("myrepo", "target").await.unwrap();
+            // 2. Production entry points route through the contained reader and observe the pinned OLD root
+            let d_prod = storage.resolve_tag("myrepo", "target").await.unwrap();
             assert_eq!(
-                d_legacy.hex(),
-                hex_new,
-                "legacy resolution immediately observes new pathname tree"
+                d_prod.hex(),
+                hex_old,
+                "production resolve_tag observes pinned old root"
             );
 
-            let (d_legacy_get, _) = storage
+            let (d_prod_get, v_prod) = storage
                 .get_tag_with_version("myrepo", "target")
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(d_legacy_get.hex(), hex_new);
+            assert_eq!(d_prod_get.hex(), hex_old);
+            assert_eq!(v_prod, v_contained);
+
+            // 3. Pathname mutations operate on the replacement tree at self.root, demonstrating divergence
+            let del_res = storage
+                .delete_tag_conditional("myrepo", "target", Some(&v_contained))
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    del_res,
+                    crate::storage::ConditionalDeleteResult::PreconditionFailed { .. }
+                ),
+                "pathname mutation on replacement tree sees hex_new and fails precondition against hex_old version"
+            );
         }
 
         #[tokio::test]
