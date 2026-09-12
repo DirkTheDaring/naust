@@ -543,6 +543,12 @@ use registry_rust::storage::fs::FsStorage;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagListingRecord {
+    pub repo: String,
+    pub phase: Option<MigrationPhase>,
+}
+
 #[derive(Clone)]
 pub struct LifecycleFaultStorage {
     pub inner: Arc<FsStorage>,
@@ -555,8 +561,16 @@ pub struct LifecycleFaultStorage {
     pub token_cycle_immediate: Arc<AtomicBool>,
     pub token_cycle_multi: Arc<AtomicBool>,
     pub fail_tag_listing: Arc<AtomicBool>,
+    pub fail_tag_listing_target_repo: Arc<StdMutex<Option<String>>>,
     pub fail_tag_listing_error: Arc<StdMutex<Option<StorageError>>>,
     pub fail_tag_listing_after_n: Arc<AtomicUsize>,
+    pub fail_save_checkpoint_phase: Arc<StdMutex<Option<MigrationPhase>>>,
+    pub fail_tag_listing_phase: Arc<StdMutex<Option<MigrationPhase>>>,
+    pub current_phase: Arc<StdMutex<Option<MigrationPhase>>>,
+    pub recorded_save_checkpoint: Arc<StdMutex<Vec<MigrationCheckpointRecord>>>,
+    pub recorded_link_repo_blob: Arc<StdMutex<Vec<RepoBlobMembershipRecord>>>,
+    pub recorded_mark_membership_ready: Arc<AtomicUsize>,
+    pub recorded_list_tags: Arc<StdMutex<Vec<TagListingRecord>>>,
     pub recorded_delete_manifest: Arc<StdMutex<Vec<(String, Digest)>>>,
     pub recorded_remove_referrer: Arc<StdMutex<Vec<(String, Digest, Digest)>>>,
     pub recorded_unlink_repo_blob: Arc<StdMutex<Vec<(String, Digest)>>>,
@@ -578,8 +592,16 @@ impl LifecycleFaultStorage {
             token_cycle_immediate: Arc::new(AtomicBool::new(false)),
             token_cycle_multi: Arc::new(AtomicBool::new(false)),
             fail_tag_listing: Arc::new(AtomicBool::new(false)),
+            fail_tag_listing_target_repo: Arc::new(StdMutex::new(None)),
             fail_tag_listing_error: Arc::new(StdMutex::new(None)),
             fail_tag_listing_after_n: Arc::new(AtomicUsize::new(0)),
+            fail_save_checkpoint_phase: Arc::new(StdMutex::new(None)),
+            fail_tag_listing_phase: Arc::new(StdMutex::new(None)),
+            current_phase: Arc::new(StdMutex::new(None)),
+            recorded_save_checkpoint: Arc::new(StdMutex::new(Vec::new())),
+            recorded_link_repo_blob: Arc::new(StdMutex::new(Vec::new())),
+            recorded_mark_membership_ready: Arc::new(AtomicUsize::new(0)),
+            recorded_list_tags: Arc::new(StdMutex::new(Vec::new())),
             recorded_delete_manifest: Arc::new(StdMutex::new(Vec::new())),
             recorded_remove_referrer: Arc::new(StdMutex::new(Vec::new())),
             recorded_unlink_repo_blob: Arc::new(StdMutex::new(Vec::new())),
@@ -596,6 +618,10 @@ impl UploadSessionStorage for LifecycleFaultStorage {}
 #[async_trait::async_trait]
 impl RepositoryBlobMembershipStorage for LifecycleFaultStorage {
     async fn link_repo_blob(&self, record: &RepoBlobMembershipRecord) -> Result<(), StorageError> {
+        self.recorded_link_repo_blob
+            .lock()
+            .unwrap()
+            .push(record.clone());
         self.inner.link_repo_blob(record).await
     }
 
@@ -624,6 +650,41 @@ impl RepositoryBlobMembershipStorage for LifecycleFaultStorage {
         self.inner
             .list_repo_blob_memberships_page(repo, continuation_token, limit)
             .await
+    }
+
+    async fn get_migration_checkpoint(
+        &self,
+    ) -> Result<Option<MigrationCheckpointRecord>, StorageError> {
+        self.inner.get_migration_checkpoint().await
+    }
+
+    async fn save_migration_checkpoint(
+        &self,
+        checkpoint: &MigrationCheckpointRecord,
+    ) -> Result<(), StorageError> {
+        self.recorded_save_checkpoint
+            .lock()
+            .unwrap()
+            .push(checkpoint.clone());
+        *self.current_phase.lock().unwrap() = Some(checkpoint.phase);
+        if let Some(target_phase) = *self.fail_save_checkpoint_phase.lock().unwrap() {
+            if checkpoint.phase == target_phase {
+                return Err(StorageError::backend(
+                    "simulated failure-before-write saving checkpoint",
+                ));
+            }
+        }
+        self.inner.save_migration_checkpoint(checkpoint).await
+    }
+
+    async fn is_membership_ready(&self) -> Result<bool, StorageError> {
+        self.inner.is_membership_ready().await
+    }
+
+    async fn mark_membership_ready(&self) -> Result<(), StorageError> {
+        self.recorded_mark_membership_ready
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        self.inner.mark_membership_ready().await
     }
 }
 
@@ -719,6 +780,52 @@ impl Storage for LifecycleFaultStorage {
     }
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
+        let current_phase = *self.current_phase.lock().unwrap();
+        self.recorded_list_tags
+            .lock()
+            .unwrap()
+            .push(TagListingRecord {
+                repo: name.to_string(),
+                phase: current_phase,
+            });
+        let matches_repo = self
+            .fail_tag_listing_target_repo
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|target| target == name)
+            .unwrap_or(true);
+        let matches_phase = match *self.fail_tag_listing_phase.lock().unwrap() {
+            Some(target) => *self.current_phase.lock().unwrap() == Some(target),
+            None => true,
+        };
+        if matches_repo && matches_phase {
+            if self.fail_tag_listing.load(AtomicOrdering::SeqCst) {
+                let err = self
+                    .fail_tag_listing_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| StorageError::backend("simulated tag listing error"));
+                return Err(err);
+            }
+            let threshold = self.fail_tag_listing_after_n.load(AtomicOrdering::SeqCst);
+            if threshold > 0 {
+                if threshold == 1 {
+                    let err = self
+                        .fail_tag_listing_error
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| {
+                            StorageError::backend("simulated threshold tag listing error")
+                        });
+                    return Err(err);
+                }
+                self.fail_tag_listing_after_n
+                    .store(threshold - 1, AtomicOrdering::SeqCst);
+            }
+        }
         Storage::list_tags(&self.inner, name).await
     }
 

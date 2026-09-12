@@ -1,5 +1,7 @@
 #![allow(clippy::all)]
 
+mod support;
+
 use base64::prelude::*;
 use reqwest::header;
 use serde_json::json;
@@ -8,6 +10,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+use tracing_subscriber::layer::SubscriberExt;
 
 fn pick_unused_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
@@ -2633,4 +2636,798 @@ async fn test_indexed_mode_versus_storage_only_mode_configuration() {
     let _srv2 = spawn_server(&cfg_path2, &log_path2);
     let base = format!("http://127.0.0.1:{port}");
     wait_ready(&base, &log_path2).await;
+}
+
+// ================================================================================================
+// Bounded Membership-Migration Tag-Listing Error-Hardening Integration Tests
+// ================================================================================================
+
+use registry_rust::membership_migration::{
+    MigrationPhase, apply_membership_migration, plan_membership_migration,
+    verify_membership_migration,
+};
+use registry_rust::registry::canonical_name::CanonicalRepoName;
+use registry_rust::registry::digest::Digest;
+use registry_rust::storage::fs::FsStorage;
+use registry_rust::storage::{RepositoryBlobMembershipStorage, StorageError, StorageErrorKind};
+use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use support::gc_coordination::LifecycleFaultStorage;
+
+fn seed_repo_with_tagged_manifest(
+    fs_root: &Path,
+    repo: &str,
+    tag: &str,
+    blob_payload: &[u8],
+) -> (Digest, Digest) {
+    let hex = hex_sha256(blob_payload);
+    let blob_digest = Digest::parse(&format!("sha256:{hex}")).expect("valid blob digest");
+
+    let cas_path = fs_root
+        .join("blobs")
+        .join("sha256")
+        .join(&hex[0..2])
+        .join(&hex);
+    std::fs::create_dir_all(cas_path.parent().unwrap()).expect("mkdir cas");
+    std::fs::write(&cas_path, blob_payload).expect("write cas blob");
+
+    let config_payload = b"{}";
+    let cfg_hex = hex_sha256(config_payload);
+    let cfg_digest = format!("sha256:{cfg_hex}");
+    let cfg_cas = fs_root
+        .join("blobs")
+        .join("sha256")
+        .join(&cfg_hex[0..2])
+        .join(&cfg_hex);
+    std::fs::create_dir_all(cfg_cas.parent().unwrap()).expect("mkdir cfg cas");
+    std::fs::write(&cfg_cas, config_payload).expect("write cfg cas");
+
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": cfg_digest,
+            "size": config_payload.len()
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": blob_digest.to_string(),
+                "size": blob_payload.len()
+            }
+        ]
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let manifest_hex = hex_sha256(&manifest_bytes);
+    let manifest_digest =
+        Digest::parse(&format!("sha256:{manifest_hex}")).expect("valid manifest digest");
+
+    let manifest_path = fs_root
+        .join("repos")
+        .join(repo)
+        .join("manifests")
+        .join(&manifest_hex);
+    std::fs::create_dir_all(manifest_path.parent().unwrap()).expect("mkdir manifests");
+    std::fs::write(&manifest_path, &manifest_bytes).expect("write manifest");
+
+    let tag_path = fs_root.join("repos").join(repo).join("tags").join(tag);
+    std::fs::create_dir_all(tag_path.parent().unwrap()).expect("mkdir tags");
+    std::fs::write(&tag_path, manifest_digest.to_string()).expect("write tag");
+
+    (manifest_digest, blob_digest)
+}
+
+#[tokio::test]
+async fn test_membership_migration_plan_listing_failure_propagates_and_performs_zero_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_root = dir.path().join("data");
+    std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+    seed_repo_with_tagged_manifest(&fs_root, "repo-a", "latest", b"blob-a-data");
+
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+    fault_storage
+        .fail_tag_listing
+        .store(true, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::backend("simulated planning backend failure"));
+
+    let res = plan_membership_migration(&fault_storage).await;
+    match res {
+        Err(e) => {
+            assert_eq!(
+                e.internal_kind(),
+                Some(StorageErrorKind::Backend),
+                "Expected Backend error, got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("simulated planning backend failure"),
+                "Error message mismatch: {e}"
+            );
+        }
+        Ok(_) => panic!("plan_membership_migration must fail when tag listing fails"),
+    }
+
+    // Assert ZERO writes attempted
+    assert!(
+        fault_storage
+            .recorded_save_checkpoint
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "Plan must attempt zero checkpoint saves"
+    );
+    assert!(
+        fault_storage
+            .recorded_link_repo_blob
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "Plan must attempt zero membership links"
+    );
+    assert!(
+        fault_storage
+            .get_migration_checkpoint()
+            .await
+            .unwrap()
+            .is_none(),
+        "Storage must contain no checkpoint after failed plan"
+    );
+    assert!(
+        !fault_storage.is_membership_ready().await.unwrap(),
+        "Storage must not be marked ready"
+    );
+}
+
+#[tokio::test]
+async fn test_membership_migration_apply_listing_failure_preserves_completed_work_and_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_root = dir.path().join("data");
+    std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+    let (_man_a, blob_a) =
+        seed_repo_with_tagged_manifest(&fs_root, "repo-a", "latest", b"blob-a-payload");
+    let (_man_b, blob_b) =
+        seed_repo_with_tagged_manifest(&fs_root, "repo-b", "latest", b"blob-b-payload");
+
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+    // Target listing failure to repo-b only
+    *fault_storage.fail_tag_listing_target_repo.lock().unwrap() = Some("repo-b".to_string());
+    fault_storage
+        .fail_tag_listing
+        .store(true, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::backend("tag listing failed for repo-b"));
+
+    let res = apply_membership_migration(&fault_storage).await;
+    match res {
+        Err(e) => {
+            assert_eq!(
+                e.internal_kind(),
+                Some(StorageErrorKind::Backend),
+                "Expected Backend error, got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("tag listing failed for repo-b"),
+                "Error message mismatch: {e}"
+            );
+        }
+        Ok(_) => panic!("apply must fail when listing fails on repo-b"),
+    }
+
+    // 1. repo-a memberships are preserved
+    let mem_a = fault_storage
+        .get_repo_blob_membership("repo-a", &blob_a)
+        .await
+        .unwrap();
+    assert!(
+        mem_a.is_some(),
+        "repo-a memberships must be preserved after repo-b failure"
+    );
+
+    // 2. repo-b membership was not created
+    let mem_b = fault_storage
+        .get_repo_blob_membership("repo-b", &blob_b)
+        .await
+        .unwrap();
+    assert!(
+        mem_b.is_none(),
+        "repo-b membership must not have been linked"
+    );
+
+    // 3. Saved checkpoint reflects Failed phase, cursor at repo-a, current at repo-b
+    let cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("persisted checkpoint exists");
+    assert_eq!(
+        cp.phase,
+        MigrationPhase::Failed,
+        "Checkpoint phase must be Failed"
+    );
+    assert_eq!(
+        cp.source_continuation_token,
+        Some("repo-a".to_string()),
+        "Continuation token must remain at completed repo-a"
+    );
+    assert_eq!(
+        cp.current_repository,
+        Some(CanonicalRepoName::parse("repo-b").unwrap()),
+        "Current repository must remain repo-b"
+    );
+    assert!(
+        cp.failure_info
+            .as_ref()
+            .unwrap()
+            .contains("tag listing failed for repo repo-b"),
+        "failure_info must contain repo and error detail"
+    );
+    // Exact lease preservation comparison against last successfully saved Applying checkpoint
+    let last_applying_cp = {
+        let records = fault_storage.recorded_save_checkpoint.lock().unwrap();
+        records
+            .iter()
+            .rfind(|c| {
+                c.phase == MigrationPhase::Applying
+                    && c.current_repository.as_ref().map(|r| r.as_str()) == Some("repo-b")
+            })
+            .cloned()
+            .expect("must find last Applying checkpoint for repo-b")
+    };
+    assert_eq!(
+        cp.owner_id, last_applying_cp.owner_id,
+        "owner_id must exactly match last Applying checkpoint"
+    );
+    assert_eq!(
+        cp.lease_expiry_unix_secs, last_applying_cp.lease_expiry_unix_secs,
+        "lease_expiry_unix_secs must exactly match last Applying checkpoint"
+    );
+    assert_eq!(
+        cp.source_continuation_token, last_applying_cp.source_continuation_token,
+        "continuation token must remain unchanged from last Applying checkpoint"
+    );
+    assert_eq!(
+        cp.current_repository, last_applying_cp.current_repository,
+        "current_repository must be retained exactly from last Applying checkpoint"
+    );
+
+    // 4. Failure-record save was actually awaited (persisted on disk in inner FsStorage)
+    let inner_cp = fault_storage
+        .inner
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("inner persisted checkpoint");
+    assert_eq!(inner_cp.phase, MigrationPhase::Failed);
+
+    // 5. Active retained lease rejects immediate reinvocation
+    let reinvoke_res = apply_membership_migration(&fault_storage).await;
+    match reinvoke_res {
+        Err(e) => {
+            assert_eq!(
+                e.internal_kind(),
+                Some(StorageErrorKind::Conflict),
+                "Immediate retry must be rejected with Conflict, got {e:?}"
+            );
+        }
+        Ok(_) => panic!("Immediate retry must fail with Conflict due to retained active lease"),
+    }
+
+    // 6. Controlled lease expiry permits retry without sleeping
+    let mut expired_cp = cp.clone();
+    expired_cp.lease_expiry_unix_secs = Some(0);
+    fault_storage
+        .inner
+        .save_migration_checkpoint(&expired_cp)
+        .await
+        .unwrap();
+
+    // Clear fault on repo-b
+    fault_storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_target_repo.lock().unwrap() = None;
+
+    let links_before = fault_storage.recorded_link_repo_blob.lock().unwrap().len();
+    let tags_before_retry = fault_storage.recorded_list_tags.lock().unwrap().len();
+
+    // 7. Retry resumes: skips completed repo-a, retries repo-b, performs verification, reaches Ready
+    let retry_stats = apply_membership_migration(&fault_storage)
+        .await
+        .expect("retry after lease expiry must succeed");
+
+    // Assert application-stage work skipping via recorded list_tags
+    let retry_tags = fault_storage.recorded_list_tags.lock().unwrap()[tags_before_retry..].to_vec();
+    let applying_repos: Vec<_> = retry_tags
+        .iter()
+        .filter(|r| r.phase == Some(MigrationPhase::Applying))
+        .map(|r| r.repo.as_str())
+        .collect();
+    assert!(
+        !applying_repos.contains(&"repo-a"),
+        "Completed repo-a must NOT be listed during Applying phase on retry, got: {applying_repos:?}"
+    );
+    assert!(
+        applying_repos.contains(&"repo-b"),
+        "Failed repo-b MUST be listed during Applying phase on retry, got: {applying_repos:?}"
+    );
+
+    let verifying_repos: Vec<_> = retry_tags
+        .iter()
+        .filter(|r| r.phase == Some(MigrationPhase::Verifying))
+        .map(|r| r.repo.as_str())
+        .collect();
+    assert_eq!(
+        verifying_repos,
+        vec!["repo-a", "repo-b"],
+        "Verification subsequently lists both expected repositories"
+    );
+
+    let links_after = fault_storage.recorded_link_repo_blob.lock().unwrap().len();
+    assert_eq!(
+        links_after - links_before,
+        2,
+        "Retry must skip completed repo-a and link only repo-b's 2 blobs (config and layer)"
+    );
+    {
+        let recorded = fault_storage.recorded_link_repo_blob.lock().unwrap();
+        for rec in &recorded[links_before..] {
+            assert_eq!(
+                rec.repo.as_str(),
+                "repo-b",
+                "New links during retry must only belong to repo-b"
+            );
+        }
+    }
+    assert!(
+        fault_storage
+            .get_repo_blob_membership("repo-b", &blob_b)
+            .await
+            .unwrap()
+            .is_some(),
+        "repo-b membership must now be present"
+    );
+
+    let final_cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("final checkpoint");
+    assert_eq!(
+        final_cp.phase,
+        MigrationPhase::Ready,
+        "Final checkpoint must be Ready"
+    );
+    assert!(
+        fault_storage.is_membership_ready().await.unwrap(),
+        "Storage must be marked ready"
+    );
+    assert!(
+        retry_stats.manifests_scanned >= 1,
+        "Manifests must be scanned"
+    );
+}
+
+#[derive(Clone)]
+struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for BufferWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+    type Writer = BufferWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_membership_migration_apply_secondary_checkpoint_save_failure_handling() {
+    let captured_logs = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(BufferWriter(captured_logs.clone()))
+            .with_ansi(false),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_root = dir.path().join("data");
+    std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+    let (_man_a, _blob_a) =
+        seed_repo_with_tagged_manifest(&fs_root, "repo-a", "latest", b"blob-a-data");
+    let (_man_b, _blob_b) =
+        seed_repo_with_tagged_manifest(&fs_root, "repo-b", "latest", b"blob-b-data");
+
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+    // Target listing failure on repo-b with Io error
+    *fault_storage.fail_tag_listing_target_repo.lock().unwrap() = Some("repo-b".to_string());
+    fault_storage
+        .fail_tag_listing
+        .store(true, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "tag listing connection reset",
+        )));
+
+    // Inject secondary failure: checkpoint save fails ONLY when phase is Failed (before write)
+    *fault_storage.fail_save_checkpoint_phase.lock().unwrap() = Some(MigrationPhase::Failed);
+
+    let res = apply_membership_migration(&fault_storage).await;
+    match res {
+        Err(e) => {
+            assert_eq!(
+                e.internal_kind(),
+                Some(StorageErrorKind::Io),
+                "Must return the original listing error (Io), got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("tag listing connection reset"),
+                "Error message must be the original listing error: {e}"
+            );
+        }
+        Ok(_) => panic!("apply must fail when listing fails"),
+    }
+
+    // Verify secondary-failure diagnostic captured via isolated subscriber
+    let logs_str =
+        String::from_utf8(captured_logs.lock().unwrap().clone()).expect("valid utf8 log");
+    assert!(
+        logs_str.contains(
+            "failed to persist migration failure checkpoint; returning original listing error"
+        ),
+        "Warning message must be logged on secondary save failure, got: {logs_str}"
+    );
+    assert!(
+        logs_str.contains("repo-b"),
+        "Warning event must record repository repo-b, got: {logs_str}"
+    );
+    assert!(
+        logs_str.contains("tag listing connection reset"),
+        "Warning event must record original listing error, got: {logs_str}"
+    );
+    assert!(
+        logs_str.contains("simulated failure-before-write saving checkpoint"),
+        "Warning event must record secondary checkpoint-save error, got: {logs_str}"
+    );
+
+    // Storage retains the last successfully saved checkpoint (Applying for repo-b, cursor at repo-a)
+    let cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("persisted checkpoint exists");
+    assert_eq!(
+        cp.phase,
+        MigrationPhase::Applying,
+        "Persisted checkpoint must remain in Applying because Failed save failed before write"
+    );
+    assert_eq!(
+        cp.source_continuation_token,
+        Some("repo-a".to_string()),
+        "Continuation token must remain at completed repo-a"
+    );
+    assert_eq!(
+        cp.current_repository,
+        Some(CanonicalRepoName::parse("repo-b").unwrap()),
+        "Current repository must remain repo-b"
+    );
+}
+
+#[tokio::test]
+async fn test_membership_migration_verify_listing_failure_prevents_ready_and_leaves_verifying_checkpoint()
+ {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_root = dir.path().join("data");
+    std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+    let (_man_a, _blob_a) =
+        seed_repo_with_tagged_manifest(&fs_root, "repo-a", "latest", b"blob-a-data");
+    let (_man_b, _blob_b) =
+        seed_repo_with_tagged_manifest(&fs_root, "repo-b", "latest", b"blob-b-data");
+
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+    // Fail listing ONLY when phase is Verifying
+    *fault_storage.fail_tag_listing_phase.lock().unwrap() = Some(MigrationPhase::Verifying);
+    fault_storage
+        .fail_tag_listing
+        .store(true, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::permission_denied(
+        "verification tag listing denied",
+    ));
+
+    let res = apply_membership_migration(&fault_storage).await;
+    match res {
+        Err(e) => {
+            assert_eq!(
+                e.internal_kind(),
+                Some(StorageErrorKind::PermissionDenied),
+                "Expected PermissionDenied error from verification, got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("verification tag listing denied"),
+                "Error message mismatch: {e}"
+            );
+        }
+        Ok(_) => panic!("apply must fail when verification tag listing fails"),
+    }
+
+    // Must NOT be marked ready
+    assert!(
+        !fault_storage.is_membership_ready().await.unwrap(),
+        "Storage must NOT be marked ready after verification failure"
+    );
+    assert_eq!(
+        fault_storage
+            .recorded_mark_membership_ready
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "mark_membership_ready must not be called"
+    );
+
+    // Checkpoint remains in Verifying phase with full continuation token
+    let cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("checkpoint exists");
+    assert_eq!(
+        cp.phase,
+        MigrationPhase::Verifying,
+        "Checkpoint phase must remain Verifying"
+    );
+    assert_eq!(
+        cp.source_continuation_token,
+        Some("repo-b".to_string()),
+        "Continuation token was advanced to repo-b during application"
+    );
+
+    // Controlled lease expiry and retry with unchanged inventory
+    let mut expired_cp = cp.clone();
+    expired_cp.lease_expiry_unix_secs = Some(0);
+    fault_storage
+        .inner
+        .save_migration_checkpoint(&expired_cp)
+        .await
+        .unwrap();
+
+    // Clear verification listing fault
+    fault_storage
+        .fail_tag_listing
+        .store(false, AtomicOrdering::SeqCst);
+
+    let links_before = fault_storage.recorded_link_repo_blob.lock().unwrap().len();
+    let tags_before_retry = fault_storage.recorded_list_tags.lock().unwrap().len();
+
+    let _retry_stats = apply_membership_migration(&fault_storage)
+        .await
+        .expect("retry verification must succeed");
+
+    let links_after = fault_storage.recorded_link_repo_blob.lock().unwrap().len();
+    assert_eq!(
+        links_before, links_after,
+        "Retry must skip application completely since source_continuation_token covers all repos"
+    );
+
+    // Assert retry makes NO application-stage tag-listing calls and repeats verification
+    let retry_tags = fault_storage.recorded_list_tags.lock().unwrap()[tags_before_retry..].to_vec();
+    let retry_applying: Vec<_> = retry_tags
+        .iter()
+        .filter(|r| r.phase == Some(MigrationPhase::Applying))
+        .collect();
+    assert!(
+        retry_applying.is_empty(),
+        "After verification-only failure, retry with unchanged inventory makes NO application-stage tag listing calls, got: {retry_applying:?}"
+    );
+    let retry_verifying: Vec<_> = retry_tags
+        .iter()
+        .filter(|r| r.phase == Some(MigrationPhase::Verifying))
+        .map(|r| r.repo.as_str())
+        .collect();
+    assert_eq!(
+        retry_verifying,
+        vec!["repo-a", "repo-b"],
+        "Retry must repeat verification listing for all expected repositories"
+    );
+
+    assert!(
+        fault_storage.is_membership_ready().await.unwrap(),
+        "Storage must now be marked ready"
+    );
+    let final_cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("final checkpoint");
+    assert_eq!(
+        final_cp.phase,
+        MigrationPhase::Ready,
+        "Final checkpoint phase must be Ready"
+    );
+}
+
+#[tokio::test]
+async fn test_membership_migration_not_found_compatibility_in_planning_apply_and_verify() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_root = dir.path().join("data");
+    std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+    // Create repo-nf directory with manifests/ but no tags/
+    let repo_dir = fs_root.join("repos").join("repo-nf");
+    std::fs::create_dir_all(repo_dir.join("manifests")).expect("mkdir manifests");
+
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+    // Configure list_tags to return StorageError::NotFound
+    fault_storage
+        .fail_tag_listing
+        .store(true, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_error.lock().unwrap() = Some(StorageError::NotFound);
+
+    // 1. Planning: NotFound treated as empty tags (0 manifests scanned, zero writes)
+    let plan_stats = plan_membership_migration(&fault_storage)
+        .await
+        .expect("planning with NotFound must succeed with empty tags");
+    assert_eq!(plan_stats.manifests_scanned, 0);
+    assert_eq!(plan_stats.memberships_created, 0);
+    assert!(
+        fault_storage
+            .recorded_save_checkpoint
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "Plan must perform zero checkpoint writes"
+    );
+
+    // 2. Application: NotFound treated as empty tags, continues, verifies, reaches Ready
+    let apply_stats = apply_membership_migration(&fault_storage)
+        .await
+        .expect("apply with NotFound must succeed with empty tags");
+    assert_eq!(apply_stats.manifests_scanned, 0);
+    assert_eq!(apply_stats.memberships_created, 0);
+    assert!(
+        fault_storage.is_membership_ready().await.unwrap(),
+        "Storage must be marked ready after NotFound application"
+    );
+    let cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("checkpoint");
+    assert_eq!(cp.phase, MigrationPhase::Ready);
+
+    // 3. Direct verification call with NotFound returns Ok(true)
+    let verify_res = verify_membership_migration(&fault_storage)
+        .await
+        .expect("verify with NotFound must succeed");
+    assert!(verify_res, "Verification with NotFound must return true");
+}
+
+#[tokio::test]
+async fn test_membership_migration_representative_error_propagation() {
+    let errors = vec![
+        (
+            StorageError::backend("representative backend failure"),
+            StorageErrorKind::Backend,
+        ),
+        (
+            StorageError::io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "representative broken pipe",
+            )),
+            StorageErrorKind::Io,
+        ),
+        (
+            StorageError::permission_denied("representative permission denied"),
+            StorageErrorKind::PermissionDenied,
+        ),
+    ];
+
+    for (err, expected_kind) in errors {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs_root = dir.path().join("data");
+        std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+        seed_repo_with_tagged_manifest(&fs_root, "repo-test", "latest", b"blob-payload");
+
+        let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+        let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+        fault_storage
+            .fail_tag_listing
+            .store(true, AtomicOrdering::SeqCst);
+        *fault_storage.fail_tag_listing_error.lock().unwrap() = Some(err.clone());
+
+        // Test Planning propagation
+        let plan_res = plan_membership_migration(&fault_storage).await;
+        assert!(
+            plan_res.is_err(),
+            "Plan must propagate error: {expected_kind:?}"
+        );
+        assert_eq!(plan_res.unwrap_err().internal_kind(), Some(expected_kind));
+
+        // Test Apply propagation
+        let apply_res = apply_membership_migration(&fault_storage).await;
+        assert!(
+            apply_res.is_err(),
+            "Apply must propagate error: {expected_kind:?}"
+        );
+        assert_eq!(apply_res.unwrap_err().internal_kind(), Some(expected_kind));
+
+        // Test Direct Verify propagation
+        let verify_res = verify_membership_migration(&fault_storage).await;
+        assert!(
+            verify_res.is_err(),
+            "Verify must propagate error: {expected_kind:?}"
+        );
+        assert_eq!(verify_res.unwrap_err().internal_kind(), Some(expected_kind));
+    }
+}
+
+#[tokio::test]
+async fn test_membership_migration_multibyte_diagnostic_truncation_during_apply() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_root = dir.path().join("data");
+    std::fs::create_dir_all(&fs_root).expect("mkdir data");
+
+    seed_repo_with_tagged_manifest(&fs_root, "repo-long", "latest", b"blob-long-data");
+
+    let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
+    let fault_storage = Arc::new(LifecycleFaultStorage::new(storage));
+
+    // Construct a long multibyte error string that comfortably exceeds 512 bytes
+    let multibyte_suffix = "🦀_🦀_🦀_".repeat(60); // 16 bytes * 60 = 960 bytes
+    let error_msg = format!("long_listing_err_{multibyte_suffix}");
+    assert!(error_msg.len() > 512);
+
+    fault_storage
+        .fail_tag_listing
+        .store(true, AtomicOrdering::SeqCst);
+    *fault_storage.fail_tag_listing_error.lock().unwrap() =
+        Some(StorageError::backend(error_msg.clone()));
+
+    let res = apply_membership_migration(&fault_storage).await;
+    assert!(res.is_err());
+
+    let cp = fault_storage
+        .get_migration_checkpoint()
+        .await
+        .unwrap()
+        .expect("checkpoint exists");
+    assert_eq!(cp.phase, MigrationPhase::Failed);
+
+    let failure_info = cp.failure_info.expect("failure_info must be populated");
+    assert!(
+        failure_info.len() <= 512,
+        "failure_info length ({}) must be <= 512 bytes",
+        failure_info.len()
+    );
+    assert!(
+        std::str::from_utf8(failure_info.as_bytes()).is_ok(),
+        "failure_info must remain valid UTF-8 without split characters"
+    );
+    assert!(
+        failure_info.starts_with("tag listing failed for repo repo-long:"),
+        "failure_info must preserve expected prefix"
+    );
 }

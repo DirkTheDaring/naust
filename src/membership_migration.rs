@@ -7,6 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEASE_DURATION_SECS: u64 = 60;
 
+fn bound_utf8_diagnostic(err_msg: &mut String, max_bytes: usize) {
+    if err_msg.len() > max_bytes {
+        let mut boundary = max_bytes;
+        while !err_msg.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        err_msg.truncate(boundary);
+    }
+}
+
 /// Plan repository blob membership migration (dry-run). Performs ZERO writes.
 pub async fn plan_membership_migration(
     storage: &(impl BlobRefIndexStoragePort + ?Sized),
@@ -16,7 +26,11 @@ pub async fn plan_membership_migration(
     stats.repositories_scanned = repos.len();
 
     for repo in &repos {
-        let tags = storage.list_tags(repo).await.unwrap_or_default();
+        let tags = match storage.list_tags(repo).await {
+            Ok(tags) => tags,
+            Err(StorageError::NotFound) => Vec::new(),
+            Err(e) => return Err(e),
+        };
         for tag in tags {
             if let Ok(manifest_digest) = storage.resolve_tag(repo, &tag).await {
                 stats.manifests_scanned += 1;
@@ -124,7 +138,25 @@ pub async fn apply_membership_migration(
         checkpoint.lease_expiry_unix_secs = Some(cur_time + LEASE_DURATION_SECS);
         storage.save_migration_checkpoint(&checkpoint).await?;
 
-        let tags = storage.list_tags(repo).await.unwrap_or_default();
+        let tags = match storage.list_tags(repo).await {
+            Ok(tags) => tags,
+            Err(StorageError::NotFound) => Vec::new(),
+            Err(e) => {
+                checkpoint.phase = MigrationPhase::Failed;
+                let mut err_msg = format!("tag listing failed for repo {repo}: {e}");
+                bound_utf8_diagnostic(&mut err_msg, 512);
+                checkpoint.failure_info = Some(err_msg);
+                if let Err(save_err) = storage.save_migration_checkpoint(&checkpoint).await {
+                    tracing::warn!(
+                        repo = %repo,
+                        listing_error = %e,
+                        checkpoint_save_error = %save_err,
+                        "failed to persist migration failure checkpoint; returning original listing error"
+                    );
+                }
+                return Err(e);
+            }
+        };
         for tag in tags {
             if let Ok(manifest_digest) = storage.resolve_tag(repo, &tag).await {
                 checkpoint.stats.manifests_scanned += 1;
@@ -213,7 +245,11 @@ pub async fn verify_membership_migration(
 ) -> Result<bool, StorageError> {
     let repos = storage.list_repositories().await?;
     for repo in &repos {
-        let tags = storage.list_tags(repo).await.unwrap_or_default();
+        let tags = match storage.list_tags(repo).await {
+            Ok(tags) => tags,
+            Err(StorageError::NotFound) => Vec::new(),
+            Err(e) => return Err(e),
+        };
         for tag in tags {
             if let Ok(manifest_digest) = storage.resolve_tag(repo, &tag).await {
                 if let Ok((_meta, bytes)) = storage.get_manifest(repo, &manifest_digest).await {
@@ -238,4 +274,81 @@ pub async fn verify_membership_migration(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bound_utf8_diagnostic_multibyte_boundary() {
+        let mut msg = String::from("prefix_");
+        // Append 4-byte emoji 🦀 (0xF0 0x9F 0x90 0x80) repeatedly
+        while msg.len() < 510 {
+            msg.push('🦀');
+        }
+        // At len 511 (or close), push multibyte sequence crossing 512
+        msg.push_str("AB🦀CD");
+        assert!(msg.len() > 512);
+
+        bound_utf8_diagnostic(&mut msg, 512);
+        assert!(msg.len() <= 512);
+        // Valid UTF-8 string guaranteed by &mut String, truncation lands on character boundary
+        std::str::from_utf8(msg.as_bytes()).expect("must remain valid UTF-8");
+    }
+
+    #[test]
+    fn test_bound_utf8_diagnostic_under_limit() {
+        let mut msg = String::from("short error");
+        bound_utf8_diagnostic(&mut msg, 512);
+        assert_eq!(msg, "short error");
+    }
+
+    #[test]
+    fn test_bound_utf8_diagnostic_exact_512() {
+        let mut msg = "a".repeat(512);
+        bound_utf8_diagnostic(&mut msg, 512);
+        assert_eq!(msg.len(), 512);
+    }
+
+    #[test]
+    fn test_bound_utf8_diagnostic_2byte_crossing() {
+        // 'é' is 2 bytes: 0xC3 0xA9
+        let mut msg = "a".repeat(511);
+        msg.push('é'); // len is 513
+        assert_eq!(msg.len(), 513);
+        bound_utf8_diagnostic(&mut msg, 512);
+        assert_eq!(msg.len(), 511);
+        assert_eq!(msg, "a".repeat(511));
+        std::str::from_utf8(msg.as_bytes()).expect("must remain valid UTF-8");
+    }
+
+    #[test]
+    fn test_bound_utf8_diagnostic_3byte_crossing() {
+        // '中' is 3 bytes: 0xE4 0xB8 0xAD
+        let mut msg = "a".repeat(511);
+        msg.push('中'); // len is 514
+        assert_eq!(msg.len(), 514);
+        bound_utf8_diagnostic(&mut msg, 512);
+        assert_eq!(msg.len(), 511);
+        assert_eq!(msg, "a".repeat(511));
+        std::str::from_utf8(msg.as_bytes()).expect("must remain valid UTF-8");
+
+        let mut msg2 = "a".repeat(510);
+        msg2.push('中'); // len is 513
+        bound_utf8_diagnostic(&mut msg2, 512);
+        assert_eq!(msg2.len(), 510);
+        assert_eq!(msg2, "a".repeat(510));
+    }
+
+    #[test]
+    fn test_bound_utf8_diagnostic_empty_and_zero_bound() {
+        let mut empty = String::new();
+        bound_utf8_diagnostic(&mut empty, 512);
+        assert_eq!(empty, "");
+
+        let mut non_empty = String::from("hello");
+        bound_utf8_diagnostic(&mut non_empty, 0);
+        assert_eq!(non_empty, "");
+    }
 }
