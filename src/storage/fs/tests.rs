@@ -1474,12 +1474,10 @@ async fn test_repository_enumeration_io_failure_is_io() {
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
 
-    // Create a regular file at the 'repos' path so read_dir fails with ENOTDIR (deterministic, root-safe)
+    // Create a regular file at the 'repos' path so contained enumeration fails
+    // with NotADirectory (deterministic, root-safe)
     let repos_path = root.join("repos");
     std::fs::write(&repos_path, b"not a directory").unwrap();
-
-    let expected_err = tokio::fs::read_dir(&repos_path).await.unwrap_err();
-    let expected_message = expected_err.to_string();
 
     let res = storage.list_repositories().await;
     assert!(res.is_err());
@@ -1487,10 +1485,11 @@ async fn test_repository_enumeration_io_failure_is_io() {
     assert_eq!(
         err.internal_kind(),
         Some(crate::storage::StorageErrorKind::Io),
-        "read_dir on non-directory file must classify as StorageErrorKind::Io"
+        "wrong-type repos root must keep the legacy StorageErrorKind::Io classification"
     );
 
-    assert_eq!(err.message(), Some(expected_message.as_str()));
+    let expected_message = "target path is not a directory: repos";
+    assert_eq!(err.message(), Some(expected_message));
     assert_eq!(
         err.to_string(),
         format!("internal error: {expected_message}")
@@ -5888,7 +5887,7 @@ async fn test_repo_discovery_non_utf8_ancestors_skipped_vs_gc_walker() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn test_repo_discovery_invalid_repo_name_aborts_downstream_manifest_listing() {
+async fn test_repo_discovery_unaddressable_repo_name_fails_closed() {
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
     let repos_dir = root.join("repos");
@@ -5896,10 +5895,29 @@ async fn test_repo_discovery_invalid_repo_name_aborts_downstream_manifest_listin
     let bad_repo_name = "invalid\\backslash";
     let bad_repo_dir = repos_dir.join(bad_repo_name);
     std::fs::create_dir_all(bad_repo_dir.join("manifests")).unwrap();
+    std::fs::create_dir_all(repos_dir.join("valid_repo").join("manifests")).unwrap();
 
-    let repos = storage.list_repositories().await.unwrap();
-    assert_eq!(repos, vec![bad_repo_name.to_string()]);
+    // Contained catalog discovery fails closed on UTF-8 entry names that
+    // cannot compose a contained ObjectKey. Silently skipping them would turn
+    // previously visible downstream failures into successful incomplete
+    // discovery, which safety-relevant consumers could mistake for completion.
+    let err = storage
+        .list_repositories()
+        .await
+        .expect_err("unaddressable repository names must fail catalog discovery closed");
+    match err {
+        StorageError::Internal { kind, ref message } => {
+            assert_eq!(kind, StorageErrorKind::CorruptData);
+            assert!(
+                message.contains("cannot form a contained object key")
+                    && message.contains("invalid"),
+                "error must carry name/context, got: {message}"
+            );
+        }
+        other => panic!("expected Internal(CorruptData), got: {other:?}"),
+    }
 
+    // Downstream contained manifest listing continues to reject the name.
     let listing_res = storage
         .list_manifest_digests_page(bad_repo_name, None, 10)
         .await;
@@ -5923,41 +5941,50 @@ async fn test_repo_discovery_symlink_semantics() {
     std::fs::create_dir_all(&root).unwrap();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
 
-    // Case A: Initial repos/ directory as a symlink
+    // Case A: Initial repos/ directory as a symlink is now rejected by
+    // contained resolution instead of silently followed.
     let external_repos = fixture.path().join("external_repos");
     std::fs::create_dir_all(external_repos.join("repo_in_ext").join("tags")).unwrap();
     std::os::unix::fs::symlink(&external_repos, root.join("repos")).unwrap();
 
-    let repos = storage.list_repositories().await.unwrap();
-    assert_eq!(
-        repos,
-        vec!["repo_in_ext".to_string()],
-        "read_dir follows initial repos/ symlink"
-    );
+    let err = storage
+        .list_repositories()
+        .await
+        .expect_err("symlinked repos/ root must be rejected, not followed");
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
 
-    // Case B: Symlinked repository entry within repos/:
+    // Replace the symlink with a real repos/ directory for the entry cases.
+    std::fs::remove_file(root.join("repos")).unwrap();
+    let repos_dir = root.join("repos");
+    std::fs::create_dir_all(repos_dir.join("plain_repo").join("tags")).unwrap();
+
+    // Case B: Symlinked repository entry within repos/ remains skipped
+    // (dirent type is not a directory), matching legacy behavior.
     let ext_target_repo = fixture.path().join("ext_target_repo");
     std::fs::create_dir_all(ext_target_repo.join("manifests")).unwrap();
-    std::os::unix::fs::symlink(&ext_target_repo, external_repos.join("symlink_repo")).unwrap();
+    std::os::unix::fs::symlink(&ext_target_repo, repos_dir.join("symlink_repo")).unwrap();
 
     let repos_after_symlink = storage.list_repositories().await.unwrap();
     assert_eq!(
         repos_after_symlink,
-        vec!["repo_in_ext".to_string()],
-        "symlinked repository entries are skipped because entry file_type is not a directory"
+        vec!["plain_repo".to_string()],
+        "symlinked repository entries are skipped because the dirent type is not a directory"
     );
 
-    // Case C: Symlinked recognition leaf (tags/):
+    // Case C: Symlinked recognition leaf (tags/) no longer recognizes the
+    // repository: markers are judged by contained dirent type, not by an
+    // ambient symlink-following stat.
     let ext_tags = fixture.path().join("ext_tags");
     std::fs::create_dir_all(&ext_tags).unwrap();
-    let real_repo = external_repos.join("repo_with_symlink_leaf");
+    let real_repo = repos_dir.join("repo_with_symlink_leaf");
     std::fs::create_dir_all(&real_repo).unwrap();
     std::os::unix::fs::symlink(&ext_tags, real_repo.join("tags")).unwrap();
 
     let repos_with_symlink_leaf = storage.list_repositories().await.unwrap();
-    assert!(
-        repos_with_symlink_leaf.contains(&"repo_with_symlink_leaf".to_string()),
-        "tokio::fs::metadata follows symlinks to recognize leaf directory"
+    assert_eq!(
+        repos_with_symlink_leaf,
+        vec!["plain_repo".to_string()],
+        "symlinked recognition markers no longer recognize repositories"
     );
 }
 
@@ -6086,8 +6113,29 @@ async fn test_repo_discovery_root_replacement_vs_repos_replacement() {
     std::fs::create_dir_all(&new_manifests).unwrap();
     write_file(&new_manifests.join(hex_new), b"{}");
 
-    let new_repos = storage.list_repositories().await.unwrap();
-    assert_eq!(new_repos, vec!["repo_new".to_string()]);
+    // Contained catalog discovery resolves beneath the pinned root descriptor:
+    // it continues to observe the ORIGINAL tree after the root pathname is
+    // replaced (previously the ambient walk followed the replacement tree).
+    let pinned_repos = storage.list_repositories().await.unwrap();
+    assert_eq!(
+        pinned_repos,
+        vec!["repo_old".to_string()],
+        "catalog discovery observes the pinned original root across pathname replacement"
+    );
+
+    // Contained manifest listing agrees: repo_old remains visible beneath the
+    // pinned root, and repo_new (which exists only in the replacement tree) is
+    // an empty page.
+    let (page_old, _) = storage
+        .list_manifest_digests_page("repo_old", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        page_old.len(),
+        1,
+        "pinned root_fd still contains repo_old after pathname replacement"
+    );
+    assert_eq!(page_old[0].hex(), hex_old);
 
     let (page, _) = storage
         .list_manifest_digests_page("repo_new", None, 10)
@@ -10700,5 +10748,226 @@ mod referrers_contained_mutation_compat {
             }
             other => panic!("expected Storage(Internal(Io)), got: {other:?}"),
         }
+    }
+}
+
+/// Production wiring and caller-propagation coverage for the contained
+/// repository-catalog discovery cutover.
+///
+/// `FsStorage::list_repositories` (via `list_repo_names`) now routes through
+/// `catalog_discovery::discover_catalog_repositories_impl` over the shared
+/// pinned reader. These tests freeze the caller-visible consequences: symlink
+/// path rejection, fail-closed propagation into safety-sensitive callers, and
+/// preserved application-level pagination semantics.
+#[cfg(target_os = "linux")]
+mod catalog_discovery_contained_integration {
+    use super::*;
+    use crate::application::CatalogQueryError;
+    use crate::application::catalog::{CatalogQueryParams, CatalogQueryService};
+    use crate::storage::ports::StorageWiring;
+
+    fn fixture_root() -> (tempfile::TempDir, PathBuf) {
+        let fixture = tempfile::tempdir().expect("create test fixture");
+        let root = fixture.path().join("storage_root");
+        std::fs::create_dir_all(&root).unwrap();
+        (fixture, root)
+    }
+
+    fn catalog_service(storage: Arc<FsStorage>) -> CatalogQueryService {
+        let wiring = StorageWiring::from_backend(storage);
+        CatalogQueryService::new(
+            wiring.catalog_reader(),
+            wiring.tag_reader(),
+            wiring.manifest_reader(),
+            wiring.blob_reader(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_catalog_service_contained_listing_and_pagination_preserved() {
+        let (_fixture, root) = fixture_root();
+        let repos_dir = root.join("repos");
+        std::fs::create_dir_all(repos_dir.join("alpha").join("tags")).unwrap();
+        std::fs::create_dir_all(repos_dir.join("beta").join("manifests")).unwrap();
+        std::fs::create_dir_all(repos_dir.join("gamma").join("meta")).unwrap();
+
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let service = catalog_service(storage);
+
+        // Page 1: n=2 -> [alpha, beta], has_more with next_last = beta.
+        let page1 = service
+            .query_catalog(
+                CatalogQueryParams {
+                    n: Some(2),
+                    last: None,
+                },
+                None,
+            )
+            .await
+            .expect("catalog page 1 succeeds through contained discovery");
+        assert_eq!(page1.repositories, vec!["alpha", "beta"]);
+        assert!(page1.has_more);
+        assert_eq!(page1.next_last.as_deref(), Some("beta"));
+
+        // Page 2: last=beta -> [gamma], terminal.
+        let page2 = service
+            .query_catalog(
+                CatalogQueryParams {
+                    n: Some(2),
+                    last: Some("beta".to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("catalog page 2 succeeds");
+        assert_eq!(page2.repositories, vec!["gamma"]);
+        assert!(!page2.has_more);
+        assert_eq!(page2.next_last, None);
+    }
+
+    #[tokio::test]
+    async fn test_catalog_service_fails_closed_on_symlinked_repos_root() {
+        let (fixture, root) = fixture_root();
+        let outside = fixture.path().join("outside_repos");
+        std::fs::create_dir_all(outside.join("ext_repo").join("tags")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("repos")).unwrap();
+
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let service = catalog_service(storage);
+
+        // The public catalog path propagates the containment rejection instead
+        // of serving repositories discovered through a symlinked root
+        // (HTTP handler maps this to HTTP 500).
+        let err = service
+            .query_catalog(
+                CatalogQueryParams {
+                    n: None,
+                    last: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("symlinked repos/ root must fail closed on the catalog route");
+        match err {
+            CatalogQueryError::Storage(StorageError::Internal { kind, .. }) => {
+                assert_eq!(kind, StorageErrorKind::Io);
+            }
+            other => panic!("expected Storage(Internal(Io)), got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_second_storage_instance_proxy_cache_role_contained() {
+        // Primary and proxy-cache filesystem storages are separate FsStorage
+        // instances sharing the same trait path; both must route contained.
+        let (_fixture_a, root_a) = fixture_root();
+        std::fs::create_dir_all(root_a.join("repos").join("primary_repo").join("tags")).unwrap();
+        let primary = Arc::new(FsStorage::new(root_a.clone(), 1024 * 1024));
+
+        let (fixture_b, root_b) = fixture_root();
+        let outside = fixture_b.path().join("outside_repos");
+        std::fs::create_dir_all(outside.join("cache_repo").join("tags")).unwrap();
+        std::os::unix::fs::symlink(&outside, root_b.join("repos")).unwrap();
+        let proxy_cache = Arc::new(FsStorage::new(root_b.clone(), 1024 * 1024));
+
+        let primary_repos = primary.list_repositories().await.unwrap();
+        assert_eq!(primary_repos, vec!["primary_repo".to_string()]);
+
+        let err = proxy_cache
+            .list_repositories()
+            .await
+            .expect_err("proxy-cache instance must also reject symlinked repos/ root");
+        assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
+    }
+
+    #[tokio::test]
+    async fn test_is_storage_empty_propagates_discovery_failure() {
+        let (fixture, root) = fixture_root();
+        let outside = fixture.path().join("outside_repos");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("repos")).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let err = storage
+            .is_storage_empty()
+            .await
+            .expect_err("readiness probing must not mistake a discovery failure for emptiness");
+        assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
+    }
+
+    #[tokio::test]
+    async fn test_membership_migration_planning_propagates_discovery_failure() {
+        let (fixture, root) = fixture_root();
+        let outside = fixture.path().join("outside_repos");
+        std::fs::create_dir_all(outside.join("mig_repo").join("tags")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("repos")).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let err = crate::membership_migration::plan_membership_migration(&storage)
+            .await
+            .expect_err("migration planning must fail closed on discovery failure");
+        assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
+    }
+
+    /// Real-FsStorage regression for the unaddressable-name fail-closed policy:
+    /// membership migration APPLICATION and VERIFICATION must fail explicitly
+    /// and must not establish readiness when catalog discovery encounters a
+    /// directory name that cannot form a contained object key. Under the
+    /// earlier silent-skip policy, both would have proceeded without the
+    /// affected repository and could have established Ready.
+    #[tokio::test]
+    async fn test_membership_migration_apply_and_verify_fail_closed_on_unaddressable_name() {
+        let (_fixture, root) = fixture_root();
+        let repos_dir = root.join("repos");
+        std::fs::create_dir_all(repos_dir.join("validrepo").join("tags")).unwrap();
+        std::fs::create_dir_all(repos_dir.join("bad\\name").join("manifests")).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        // Application: fails with the explicit discovery error.
+        let apply_err = crate::membership_migration::apply_membership_migration(&storage)
+            .await
+            .expect_err("application must fail closed instead of omitting the repository");
+        assert_eq!(
+            apply_err.internal_kind(),
+            Some(StorageErrorKind::CorruptData),
+            "expected the catalog discovery CorruptData error, got: {apply_err:?}"
+        );
+
+        // Application persists its initial Applying checkpoint (with an owner
+        // lease) BEFORE catalog discovery runs; the discovery failure aborts
+        // further processing but that earlier legitimate write is not rolled
+        // back. The checkpoint therefore exists and is NOT Ready.
+        let checkpoint = storage
+            .get_migration_checkpoint()
+            .await
+            .expect("checkpoint read succeeds")
+            .expect("initial Applying checkpoint was persisted before discovery");
+        assert_eq!(
+            checkpoint.phase,
+            crate::storage::repo_membership::MigrationPhase::Applying,
+            "discovery failure aborts before any later phase transition"
+        );
+
+        // Readiness is not established.
+        assert!(
+            !storage.is_membership_ready().await.unwrap(),
+            "failed application must not establish membership readiness"
+        );
+
+        // Verification: also fails explicitly rather than reporting a verdict
+        // computed from an incomplete repository set.
+        let verify_err = crate::membership_migration::verify_membership_migration(&storage)
+            .await
+            .expect_err("verification must fail closed instead of verifying a partial catalog");
+        assert_eq!(
+            verify_err.internal_kind(),
+            Some(StorageErrorKind::CorruptData)
+        );
+
+        assert!(
+            !storage.is_membership_ready().await.unwrap(),
+            "readiness must remain unestablished after failed verification"
+        );
     }
 }

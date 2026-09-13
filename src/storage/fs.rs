@@ -739,80 +739,11 @@ impl FsStorage {
     }
 
     async fn list_repo_names(&self) -> Result<Vec<String>, StorageError> {
-        let repos_root = self.root.join("repos");
-        let mut repos = Vec::new();
-
-        let mut stack: Vec<(PathBuf, String)> = vec![(repos_root.clone(), String::new())];
-        while let Some((dir_path, rel)) = stack.pop() {
-            let mut dir = match tokio::fs::read_dir(&dir_path).await {
-                Ok(d) => d,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(StorageError::io(err.to_string())),
-            };
-
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                let file_type = match entry.file_type().await {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-
-                let name = match entry.file_name().to_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-
-                // Do not descend into internal leaf dirs.
-                if name == "tags"
-                    || name == "manifests"
-                    || name == "referrers"
-                    || name == "blobs"
-                    || name == "meta"
-                {
-                    continue;
-                }
-
-                let child_path = entry.path();
-                let child_rel = if rel.is_empty() {
-                    name
-                } else {
-                    format!("{rel}/{name}")
-                };
-
-                // Consider this a repo if it has tags/, manifests/, blobs/, or meta/ directories.
-                let tags_dir = child_path.join("tags");
-                let manifests_dir = child_path.join("manifests");
-                let blobs_dir = child_path.join("blobs");
-                let meta_dir = child_path.join("meta");
-                let has_tags = tokio::fs::metadata(&tags_dir)
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
-                let has_manifests = tokio::fs::metadata(&manifests_dir)
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
-                let has_blobs = tokio::fs::metadata(&blobs_dir)
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
-                let has_meta = tokio::fs::metadata(&meta_dir)
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
-                if has_tags || has_manifests || has_blobs || has_meta {
-                    repos.push(child_rel.clone());
-                }
-
-                stack.push((child_path, child_rel));
-            }
-        }
-
-        repos.sort();
-        repos.dedup();
-        Ok(repos)
+        catalog_discovery::discover_catalog_repositories_impl(
+            self.reader.as_ref(),
+            &catalog_discovery::CatalogDiscoveryLimits::default(),
+        )
+        .await
     }
 
     async fn max_mtime_in_dir(&self, dir: &PathBuf) -> Result<Option<SystemTime>, StorageError> {
@@ -3727,3 +3658,6 @@ pub(crate) mod tag_listing;
 
 #[path = "fs/referrers_read.rs"]
 pub(crate) mod referrers_read;
+
+#[path = "fs/catalog_discovery.rs"]
+pub(crate) mod catalog_discovery;
