@@ -2734,25 +2734,7 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         digest: &Digest,
     ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
     {
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let path = self.repo_blob_path(&canonical, digest);
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                let record = serde_json::from_slice::<
-                    crate::storage::repo_membership::RepoBlobMembershipRecord,
-                >(&bytes)
-                .map_err(|e| {
-                    StorageError::corrupt_data(format!(
-                        "corrupt membership record in {}: {e}",
-                        path.display()
-                    ))
-                })?;
-                Ok(Some(record))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(StorageError::io(err.to_string())),
-        }
+        membership_read::get_repo_blob_membership_impl(self.reader.as_ref(), repo, digest).await
     }
 
     async fn link_repo_blob(
@@ -2850,120 +2832,13 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         ),
         StorageError,
     > {
-        let max_limit = 1000;
-        let limit = page_limit.min(max_limit).max(1);
-
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let encoded_repo = crate::storage::repo_membership::encode_canonical_repo_key(&canonical);
-        let repo_dir = self
-            .root
-            .join("repo-memberships")
-            .join("by-repo")
-            .join(&encoded_repo);
-        if tokio::fs::metadata(&repo_dir).await.is_err() {
-            return Ok((Vec::new(), None));
-        }
-
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-
-        #[derive(Eq, PartialEq)]
-        struct Candidate {
-            digest_str: String,
-            path: PathBuf,
-        }
-
-        impl Ord for Candidate {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.digest_str.cmp(&other.digest_str)
-            }
-        }
-
-        impl PartialOrd for Candidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit + 2);
-
-        if let Ok(mut algo_entries) = tokio::fs::read_dir(&repo_dir).await {
-            while let Ok(Some(algo_entry)) = algo_entries.next_entry().await {
-                if algo_entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-                {
-                    let algo_path = algo_entry.path();
-                    let algo_str = algo_entry.file_name().to_string_lossy().to_string();
-                    if let Ok(mut file_entries) = tokio::fs::read_dir(&algo_path).await {
-                        while let Ok(Some(file_entry)) = file_entries.next_entry().await {
-                            let file_name = file_entry.file_name().to_string_lossy().to_string();
-                            if file_name.ends_with(".json") && !file_name.contains(".tmp.") {
-                                let hex = file_name.trim_end_matches(".json");
-                                let digest_str = format!("{algo_str}:{hex}");
-
-                                if let Some(token) = continuation_token
-                                    && digest_str.as_str() <= token
-                                {
-                                    continue;
-                                }
-
-                                let cand = Candidate {
-                                    digest_str,
-                                    path: file_entry.path(),
-                                };
-
-                                if heap.len() < limit + 1 {
-                                    heap.push(cand);
-                                } else if let Some(top) = heap.peek()
-                                    && cand.digest_str < top.digest_str
-                                {
-                                    heap.pop();
-                                    heap.push(cand);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut sorted: Vec<Candidate> = heap.into_sorted_vec();
-        let has_more = sorted.len() > limit;
-        if has_more {
-            sorted.truncate(limit);
-        }
-
-        let next_token = if has_more {
-            sorted.last().map(|c| c.digest_str.clone())
-        } else {
-            None
-        };
-
-        let mut records = Vec::with_capacity(sorted.len());
-        for cand in sorted {
-            let bytes = tokio::fs::read(&cand.path).await.map_err(|e| {
-                StorageError::io(format!(
-                    "failed to read membership in {}: {e}",
-                    cand.path.display()
-                ))
-            })?;
-            let record = serde_json::from_slice::<
-                crate::storage::repo_membership::RepoBlobMembershipRecord,
-            >(&bytes)
-            .map_err(|e| {
-                StorageError::corrupt_data(format!(
-                    "corrupt membership record in {}: {e}",
-                    cand.path.display()
-                ))
-            })?;
-            records.push(record);
-        }
-
-        Ok((records, next_token))
+        membership_read::list_repo_blob_memberships_page_impl(
+            self.reader.as_ref(),
+            repo,
+            continuation_token,
+            page_limit,
+        )
+        .await
     }
 
     async fn list_all_repo_blob_memberships_page(
@@ -2977,174 +2852,22 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         ),
         StorageError,
     > {
-        let max_limit = 1000;
-        let limit = page_limit.min(max_limit).max(1);
-
-        let root_dir = self.root.join("repo-memberships").join("by-repo");
-        if tokio::fs::metadata(&root_dir).await.is_err() {
-            return Ok((Vec::new(), None));
-        }
-
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-
-        #[derive(Eq, PartialEq)]
-        struct Candidate {
-            sort_key: String,
-            repo: crate::registry::canonical_name::CanonicalRepoName,
-            digest: Digest,
-            path: PathBuf,
-        }
-
-        impl Ord for Candidate {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.sort_key.cmp(&other.sort_key)
-            }
-        }
-
-        impl PartialOrd for Candidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit + 2);
-
-        if let Ok(mut repo_entries) = tokio::fs::read_dir(&root_dir).await {
-            while let Ok(Some(repo_entry)) = repo_entries.next_entry().await {
-                if repo_entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-                {
-                    let repo_encoded = repo_entry.file_name().to_string_lossy().to_string();
-                    let repo =
-                        crate::storage::repo_membership::decode_canonical_repo_key(&repo_encoded)
-                            .map_err(|e| {
-                            StorageError::corrupt_data(format!(
-                                "corrupt repository membership directory '{repo_encoded}': {e}"
-                            ))
-                        })?;
-                    let repo_path = repo_entry.path();
-                    if let Ok(mut algo_entries) = tokio::fs::read_dir(&repo_path).await {
-                        while let Ok(Some(algo_entry)) = algo_entries.next_entry().await {
-                            if algo_entry
-                                .file_type()
-                                .await
-                                .map(|t| t.is_dir())
-                                .unwrap_or(false)
-                            {
-                                let algo_path = algo_entry.path();
-                                let algo_str = algo_entry.file_name().to_string_lossy().to_string();
-                                if let Ok(mut file_entries) = tokio::fs::read_dir(&algo_path).await
-                                {
-                                    while let Ok(Some(file_entry)) = file_entries.next_entry().await
-                                    {
-                                        let file_name =
-                                            file_entry.file_name().to_string_lossy().to_string();
-                                        if file_name.ends_with(".json")
-                                            && !file_name.contains(".tmp.")
-                                        {
-                                            let hex = file_name.trim_end_matches(".json");
-                                            if let Ok(digest) =
-                                                Digest::parse(&format!("{algo_str}:{hex}"))
-                                            {
-                                                let sort_key =
-                                                    format!("{repo_encoded}/{algo_str}/{hex}");
-
-                                                if let Some(token) = continuation_token
-                                                    && sort_key.as_str() <= token
-                                                {
-                                                    continue;
-                                                }
-
-                                                let cand = Candidate {
-                                                    sort_key,
-                                                    repo: repo.clone(),
-                                                    digest,
-                                                    path: file_entry.path(),
-                                                };
-
-                                                if heap.len() < limit + 1 {
-                                                    heap.push(cand);
-                                                } else if let Some(top) = heap.peek()
-                                                    && cand.sort_key < top.sort_key
-                                                {
-                                                    heap.pop();
-                                                    heap.push(cand);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut sorted: Vec<Candidate> = heap.into_sorted_vec();
-        let has_more = sorted.len() > limit;
-        if has_more {
-            sorted.truncate(limit);
-        }
-
-        let next_token = if has_more {
-            sorted.last().map(|c| c.sort_key.clone())
-        } else {
-            None
-        };
-
-        let mut records = Vec::with_capacity(sorted.len());
-        for cand in sorted {
-            let bytes = tokio::fs::read(&cand.path).await.map_err(|e| {
-                StorageError::io(format!(
-                    "failed to read membership in {}: {e}",
-                    cand.path.display()
-                ))
-            })?;
-            let record = serde_json::from_slice::<
-                crate::storage::repo_membership::RepoBlobMembershipRecord,
-            >(&bytes)
-            .map_err(|e| {
-                StorageError::corrupt_data(format!(
-                    "corrupt membership record in {}: {e}",
-                    cand.path.display()
-                ))
-            })?;
-            records.push(record);
-        }
-
-        Ok((records, next_token))
+        membership_read::list_all_repo_blob_memberships_page_impl(
+            self.reader.as_ref(),
+            continuation_token,
+            page_limit,
+        )
+        .await
     }
 
     async fn count_repo_blob_memberships(&self, digest: &Digest) -> Result<usize, StorageError> {
-        let mut count = 0;
-        let by_repo_root = self.root.join("repo-memberships").join("by-repo");
-        if let Ok(mut repo_entries) = tokio::fs::read_dir(&by_repo_root).await {
-            while let Ok(Some(repo_entry)) = repo_entries.next_entry().await {
-                if let Ok(ft) = repo_entry.file_type().await
-                    && ft.is_dir()
-                {
-                    let marker_path = repo_entry
-                        .path()
-                        .join(digest.algorithm())
-                        .join(format!("{}.json", digest.hex()));
-                    if tokio::fs::metadata(&marker_path).await.is_ok() {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        Ok(count)
+        membership_read::count_repo_blob_memberships_impl(self.reader.as_ref(), digest).await
     }
 
     async fn is_membership_ready(&self) -> Result<bool, StorageError> {
         let checkpoint = self.get_migration_checkpoint().await?;
-        let marker = self.root.join("meta").join("membership_ready.json");
-        let ready_marker_exists = tokio::fs::metadata(&marker).await.is_ok();
+        let ready_marker_exists =
+            membership_read::membership_ready_marker_present(self.reader.as_ref()).await?;
         match checkpoint {
             Some(cp) => Ok(
                 cp.phase == crate::storage::repo_membership::MigrationPhase::Ready
@@ -3202,20 +2925,7 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         &self,
     ) -> Result<Option<crate::storage::repo_membership::MigrationCheckpointRecord>, StorageError>
     {
-        let path = self.root.join("meta").join("migration_checkpoint.json");
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                let rec = serde_json::from_slice::<
-                    crate::storage::repo_membership::MigrationCheckpointRecord,
-                >(&bytes)
-                .map_err(|e| {
-                    StorageError::corrupt_data(format!("corrupt migration checkpoint: {e}"))
-                })?;
-                Ok(Some(rec))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(StorageError::io(e.to_string())),
-        }
+        membership_read::get_migration_checkpoint_impl(self.reader.as_ref()).await
     }
 
     async fn save_migration_checkpoint(
@@ -3592,3 +3302,6 @@ pub(crate) mod catalog_discovery;
 
 #[path = "fs/timestamps_emptiness.rs"]
 pub(crate) mod timestamps_emptiness;
+
+#[path = "fs/membership_read.rs"]
+pub(crate) mod membership_read;

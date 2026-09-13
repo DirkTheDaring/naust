@@ -1741,9 +1741,11 @@ async fn test_get_repo_blob_membership_malformed_json_is_corrupt_data() {
         crate::storage::repo_membership::RepoBlobMembershipRecord,
     >(malformed_bytes)
     .unwrap_err();
+    // Contained reads report the storage-relative object key, not an ambient
+    // absolute path.
     let expected_message = format!(
         "corrupt membership record in {}: {expected_err}",
-        path.display()
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest)
     );
 
     let res = storage.get_repo_blob_membership("testrepo", &digest).await;
@@ -1839,7 +1841,7 @@ async fn test_list_all_repo_blob_memberships_page_corrupt_repo_dir_is_corrupt_da
 }
 
 #[tokio::test]
-async fn test_list_repo_blob_memberships_page_io_error_is_io() {
+async fn test_list_repo_blob_memberships_page_nonregular_json_candidate_fails_closed() {
     use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
 
     let root = tmp_fs_root();
@@ -1853,31 +1855,25 @@ async fn test_list_repo_blob_memberships_page_io_error_is_io() {
         .join(encoded_repo)
         .join("sha256");
 
-    // Create a directory instead of a regular file ending in .json to deterministically trigger an OS I/O error on file read
+    // Create a directory instead of a regular file at a name-qualifying
+    // record path. Under the contained implementation this is an explicit
+    // failure: a nonregular object at a membership-record name must never be
+    // silently omitted from an authoritative page (unsafe for ledger
+    // reconciliation) and is rejected from dirent evidence without being
+    // opened. The legacy ambient listing surfaced an OS I/O error only when
+    // the entry was selected into the page (and silently followed symlinks).
     let cand_path =
         algo_dir.join("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.json");
     std::fs::create_dir_all(&cand_path).unwrap();
 
-    let raw_io_err = tokio::fs::read(&cand_path).await.unwrap_err();
-    let expected_message = format!(
-        "failed to read membership in {}: {raw_io_err}",
-        cand_path.display()
-    );
-
-    let res = storage
+    let err = storage
         .list_repo_blob_memberships_page("testrepo", None, 10)
-        .await;
-    assert!(res.is_err());
-    let err = res.unwrap_err();
+        .await
+        .expect_err("a nonregular name-qualifying candidate must fail the page closed");
     assert_eq!(
         err.internal_kind(),
-        Some(crate::storage::StorageErrorKind::Io),
-        "Filesystem read failure during membership enumeration must classify as Io"
-    );
-    assert_eq!(err.message(), Some(expected_message.as_str()));
-    assert_eq!(
-        err.to_string(),
-        format!("internal error: {expected_message}")
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "nonregular record candidates classify as CorruptData"
     );
 }
 
