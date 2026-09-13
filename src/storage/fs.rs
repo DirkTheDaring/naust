@@ -1200,16 +1200,7 @@ impl Storage for FsStorage {
     }
 
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
-        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let path = fs_repo_dir(&self.root, &canonical)?
-            .join("meta")
-            .join("lifecycle_journal.json");
-        match tokio::fs::read(&path).await {
-            Ok(b) => Ok(Some(Bytes::from(b))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(StorageError::io(e.to_string())),
-        }
+        journal_read::read_lifecycle_journal_impl(self.reader.as_ref(), repo).await
     }
 
     async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
@@ -3305,3 +3296,6 @@ pub(crate) mod timestamps_emptiness;
 
 #[path = "fs/membership_read.rs"]
 pub(crate) mod membership_read;
+
+#[path = "fs/journal_read.rs"]
+pub(crate) mod journal_read;

@@ -370,11 +370,15 @@ impl ManifestLifecycleService {
     }
 
     /// Tests whether an unexpired active lifecycle journal exists for this repo.
-    pub async fn is_lifecycle_active(&self, repo: &str) -> bool {
-        let Some(journal) = self.read_journal(repo).await.ok().flatten() else {
-            return false;
+    ///
+    /// Read failures propagate: an unreadable or corrupt journal must never
+    /// present as "no pending operation". Genuine absence and an expired
+    /// lease both report `Ok(false)`.
+    pub async fn is_lifecycle_active(&self, repo: &str) -> Result<bool, ManifestLifecycleError> {
+        let Some(journal) = self.read_journal(repo).await? else {
+            return Ok(false);
         };
-        journal.lease_expiry_unix_secs > now_unix_secs()
+        Ok(journal.lease_expiry_unix_secs > now_unix_secs())
     }
 
     /// Acquires bounded mutual exclusion for a repository lifecycle mutation.
@@ -466,6 +470,19 @@ impl ManifestLifecycleService {
         };
         let record: LifecycleJournalRecord =
             serde_json::from_slice(&bytes).map_err(ManifestLifecycleError::CorruptJournal)?;
+        // Recovery applies the journal's digests/tags/referrers to the
+        // repository it was read FROM; a journal recording a different
+        // repository (misplaced or mis-written) would redirect recovery
+        // mutations, so an identity mismatch fails closed. Valid journals
+        // always record the repository they are stored under.
+        if record.repo.as_str() != repo {
+            return Err(ManifestLifecycleError::Storage(StorageError::corrupt_data(
+                format!(
+                    "lifecycle journal repository mismatch: journal records '{}' but was read for '{repo}'",
+                    record.repo.as_str()
+                ),
+            )));
+        }
         Ok(Some(record))
     }
 
