@@ -2633,20 +2633,7 @@ impl UploadSessionStorage for FsStorage {
         &self,
         session: &UploadSessionId,
     ) -> Result<Option<FinalizedReceipt>, StorageError> {
-        let receipt_path = self.finalized_receipt_path(&session.uuid);
-        match tokio::fs::read(&receipt_path).await {
-            Ok(bytes) => {
-                let receipt: FinalizedReceipt = serde_json::from_slice(&bytes)
-                    .map_err(|e| StorageError::corrupt_data(e.to_string()))?;
-                if receipt.repo == session.repo && receipt.uuid == session.uuid {
-                    Ok(Some(receipt))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(StorageError::io(err.to_string())),
-        }
+        upload_quarantine_read::get_finalized_receipt_impl(self.reader.as_ref(), session).await
     }
 
     async fn reap_expired_sessions(
@@ -2659,6 +2646,24 @@ impl UploadSessionStorage for FsStorage {
             .unwrap_or_default()
             .as_secs();
         let mut count = 0;
+
+        // DEFERRED CONTAINMENT (see the quarantine/upload inspection record and
+        // the post-batch gap assessment): the reaper's inspection reads are NOT
+        // routed through the pinned reader. Inspection and the destructive
+        // actions it authorizes (session lock, `recover_session`,
+        // `abort_session` meta/data unlink, receipt `remove_file`) must resolve
+        // through one and the same tree. Routing inspection through the pinned
+        // reader while these mutations resolve fresh ambient pathnames lets a
+        // detached original tree's expiry drive deletion of a same-UUID
+        // REPLACEMENT record in the current tree (regression:
+        // `upload_quarantine_read::tests::real_fs_tests::
+        // test_real_reaper_root_replacement_acts_only_on_current_tree`). Binding
+        // inspection to the mutations requires write-side containment (O-04),
+        // out of this batch's scope, so this body stays on its pre-batch
+        // internally-coherent ambient implementation: it reads AND acts through
+        // the same ambient pathnames. The returned count tallies cleanup
+        // ATTEMPTS (recovery/abort and receipt-unlink results are intentionally
+        // ignored), not confirmed successes.
 
         // 1. Scan sessions in uploads_dir
         let uploads_dir = self.uploads_dir();
@@ -2962,22 +2967,7 @@ impl FsStorage {
         &self,
         digest: &Digest,
     ) -> Result<Option<SystemTime>, StorageError> {
-        let ts_path = self
-            .root
-            .join("quarantine")
-            .join("meta")
-            .join(digest.algorithm())
-            .join(digest.prefix2())
-            .join(format!("{}.ts", digest.hex()));
-        if let Ok(content) = tokio::fs::read_to_string(&ts_path).await {
-            if let Ok(secs) = content.trim().parse::<u64>() {
-                return Ok(Some(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-                ));
-            }
-        }
-
-        Ok(None)
+        upload_quarantine_read::read_quarantine_timestamp_impl(self.reader.as_ref(), digest).await
     }
 
     pub async fn remove_quarantine_timestamp(&self, digest: &Digest) -> Result<(), StorageError> {
@@ -3157,17 +3147,7 @@ impl GcStorage for FsStorage {
         &self,
         digest: &Digest,
     ) -> Result<Option<BlobObjectVersion>, StorageError> {
-        let path = self
-            .root
-            .join("quarantine")
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2())
-            .join(digest.hex());
-        if tokio::fs::metadata(&path).await.is_err() {
-            return Ok(None);
-        }
-        compute_fs_blob_version(&path).await.map(Some)
+        upload_quarantine_read::quarantined_blob_version_impl(self.reader.as_ref(), digest).await
     }
 
     async fn delete_blob_conditional(
@@ -3299,3 +3279,6 @@ pub(crate) mod membership_read;
 
 #[path = "fs/journal_read.rs"]
 pub(crate) mod journal_read;
+
+#[path = "fs/upload_quarantine_read.rs"]
+pub(crate) mod upload_quarantine_read;

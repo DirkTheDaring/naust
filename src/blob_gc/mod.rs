@@ -785,20 +785,81 @@ async fn read_quarantine_time(
     cfg: &crate::config::Config,
     digest: &Digest,
 ) -> Result<Option<SystemTime>, BlobGcError> {
+    // Narrow error-handling correction for this quarantine-age safety check
+    // (the read itself remains an ambient cfg-rooted path, documented as such):
+    // only genuine absence may report None — the sweep then initializes a new
+    // timestamp. Read failures and corrupt/unrepresentable stored values must
+    // not be conflated with absence, which previously overwrote the stored
+    // evidence with a fresh timestamp and restarted the deletion clock.
     let path = quarantine_meta_path(cfg, digest);
-    if let Ok(s) = tokio::fs::read_to_string(&path).await {
-        if let Ok(secs) = s.trim().parse::<u64>() {
-            return Ok(Some(UNIX_EPOCH + Duration::from_secs(secs)));
-        }
-    }
-
-    Ok(None)
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(BlobGcError::FsReadMeta { path, source }),
+    };
+    let secs: u64 = content
+        .trim()
+        .parse()
+        .map_err(|e| BlobGcError::FsReadMeta {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("corrupt quarantine timestamp: {e}"),
+            ),
+        })?;
+    let ts = UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| BlobGcError::FsReadMeta {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("quarantine timestamp {secs}s is not representable as a system time"),
+            ),
+        })?;
+    Ok(Some(ts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::validation::revalidate_candidate_before_delete;
     use super::*;
+
+    #[tokio::test]
+    async fn test_read_quarantine_time_absence_vs_failure_and_checked_arithmetic() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::from_env().unwrap();
+        cfg.fs_root = temp.path().to_path_buf();
+        let digest = Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
+        let path = quarantine_meta_path(&cfg, &digest);
+
+        // Genuine absence -> Ok(None) (the sweep may then initialize a fresh
+        // timestamp; that write path is unchanged).
+        assert!(read_quarantine_time(&cfg, &digest).await.unwrap().is_none());
+
+        // Valid stored value round-trips.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "1700000000\n").unwrap();
+        assert_eq!(
+            read_quarantine_time(&cfg, &digest).await.unwrap(),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+
+        // Corrupt stored value -> Err (previously silently None, which
+        // overwrote the stored evidence and restarted the deletion clock).
+        std::fs::write(&path, "garbage").unwrap();
+        assert!(matches!(
+            read_quarantine_time(&cfg, &digest).await,
+            Err(BlobGcError::FsReadMeta { .. })
+        ));
+
+        // Unrepresentable stored value -> Err via checked arithmetic
+        // (previously an unchecked UNIX_EPOCH + Duration addition).
+        std::fs::write(&path, format!("{}\n", u64::MAX)).unwrap();
+        assert!(matches!(
+            read_quarantine_time(&cfg, &digest).await,
+            Err(BlobGcError::FsReadMeta { .. })
+        ));
+    }
     use crate::storage::mutation_authority::RuntimeMutationAuthority;
     use sha2::Digest as Sha2Digest;
 
