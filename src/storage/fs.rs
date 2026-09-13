@@ -745,34 +745,6 @@ impl FsStorage {
         )
         .await
     }
-
-    async fn max_mtime_in_dir(&self, dir: &PathBuf) -> Result<Option<SystemTime>, StorageError> {
-        let mut rd = match tokio::fs::read_dir(dir).await {
-            Ok(d) => d,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-
-        let mut max_time: Option<SystemTime> = None;
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let meta = match entry.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let modified = match meta.modified() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            max_time = Some(match max_time {
-                Some(cur) if cur >= modified => cur,
-                _ => modified,
-            });
-        }
-        Ok(max_time)
-    }
 }
 
 fn map_fs_io_err(err: std::io::Error) -> StorageError {
@@ -833,33 +805,6 @@ async fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError
     Ok(())
 }
 
-async fn fs_dir_has_any_entry(path: &Path) -> Result<bool, StorageError> {
-    match tokio::fs::read_dir(path).await {
-        Ok(mut read_dir) => {
-            while let Some(entry) = read_dir
-                .next_entry()
-                .await
-                .map_err(|e| StorageError::io(e.to_string()))?
-            {
-                let file_type = entry
-                    .file_type()
-                    .await
-                    .map_err(|e| StorageError::io(e.to_string()))?;
-                if file_type.is_dir() {
-                    if Box::pin(fs_dir_has_any_entry(&entry.path())).await? {
-                        return Ok(true);
-                    }
-                } else {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(StorageError::io(err.to_string())),
-    }
-}
-
 /// Low-level filesystem metadata inquiry returning object byte size.
 ///
 /// Retains the original [`std::io::Error`] on failure so its [`std::io::ErrorKind`]
@@ -881,25 +826,7 @@ impl Storage for FsStorage {
     }
 
     async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
-        let repo_dir = self.root.join("repos").join(name);
-        match tokio::fs::metadata(&repo_dir).await {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        }
-
-        let tags_dir = repo_dir.join("tags");
-        let manifests_dir = repo_dir.join("manifests");
-
-        let last_tag_update = self.max_mtime_in_dir(&tags_dir).await?;
-        let last_manifest_update = self.max_mtime_in_dir(&manifests_dir).await?;
-
-        Ok(RepoTimestamps {
-            last_tag_update,
-            last_manifest_update,
-        })
+        timestamps_emptiness::repo_timestamps_impl(self.reader.as_ref(), name).await
     }
 
     async fn is_storage_empty(&self) -> Result<bool, StorageError> {
@@ -917,8 +844,9 @@ impl Storage for FsStorage {
             "journals",
         ];
         for sub in &subdirs {
-            let p = self.root.join(sub);
-            if fs_dir_has_any_entry(&p).await? {
+            if timestamps_emptiness::contained_subtree_has_any_entry(self.reader.as_ref(), sub)
+                .await?
+            {
                 return Ok(false);
             }
         }
@@ -3661,3 +3589,6 @@ pub(crate) mod referrers_read;
 
 #[path = "fs/catalog_discovery.rs"]
 pub(crate) mod catalog_discovery;
+
+#[path = "fs/timestamps_emptiness.rs"]
+pub(crate) mod timestamps_emptiness;

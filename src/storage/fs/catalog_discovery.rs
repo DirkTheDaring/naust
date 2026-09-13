@@ -161,15 +161,17 @@ impl Default for CatalogDiscoveryLimits {
     }
 }
 
-/// Maps a directory enumeration failure to the catalog's legacy-compatible
-/// [`StorageError`] taxonomy.
+/// Maps a directory enumeration failure to the legacy-compatible
+/// [`StorageError`] taxonomy shared by the contained catalog, timestamp, and
+/// emptiness walks.
 ///
 /// Unlike GC discovery, permission and wrong-type failures keep the legacy
 /// [`StorageErrorKind::Io`] mapping that ambient `tokio::fs::read_dir` errors
 /// produced; budget exhaustion maps to `Backend`; unsupported environments map
-/// to `Configuration`. `NotFound` is handled by the caller (root: empty
-/// success; observed child: skip) and must not reach this function.
-fn map_catalog_dir_error(err: FsDirError, dir_key: &str) -> StorageError {
+/// to `Configuration`. `NotFound` is handled by callers (missing roots and
+/// concurrently removed observed children have caller-specific contracts) and
+/// must not reach this function.
+pub(crate) fn map_contained_dir_error(err: FsDirError, dir_key: &str) -> StorageError {
     match err {
         FsDirError::NotADirectory { .. } => {
             StorageError::io(format!("target path is not a directory: {dir_key}"))
@@ -181,7 +183,7 @@ fn map_catalog_dir_error(err: FsDirError, dir_key: &str) -> StorageError {
             "containment rejected path resolution for {dir_key}: {source}"
         )),
         FsDirError::LimitExceeded { reason } => StorageError::backend(format!(
-            "catalog discovery per-directory limit exceeded in {dir_key}: {reason:?}"
+            "contained per-directory enumeration limit exceeded in {dir_key}: {reason:?}"
         )),
         FsDirError::EntryDisappeared { name } => StorageError::io(format!(
             "directory entry disappeared during type inspection in {dir_key}: {name:?}"
@@ -202,7 +204,7 @@ fn map_catalog_dir_error(err: FsDirError, dir_key: &str) -> StorageError {
             StorageError::backend(format!("blocking enumeration task join failed: {err}"))
         }
         FsDirError::NotFound { .. } => StorageError::internal_invariant(format!(
-            "NotFound must be handled before catalog error mapping: {dir_key}"
+            "NotFound must be handled before contained dir error mapping: {dir_key}"
         )),
         other => StorageError::backend(format!(
             "unexpected directory enumeration error in {dir_key}: {other}"
@@ -265,7 +267,7 @@ pub(crate) async fn discover_catalog_repositories_impl(
                 // both matching the legacy `NotFound => continue` behavior.
                 continue;
             }
-            Err(other) => return Err(map_catalog_dir_error(other, current_key.as_str())),
+            Err(other) => return Err(map_contained_dir_error(other, current_key.as_str())),
         };
 
         let mut recognized = false;

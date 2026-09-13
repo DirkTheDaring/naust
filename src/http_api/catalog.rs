@@ -292,7 +292,13 @@ pub async fn meta_repo(
         .await
     {
         Ok(t) => t,
-        _ => return errors::name_unknown().into_response(),
+        // Absence (missing repository) and structurally invalid names present
+        // as unknown; genuine inspection failures must not masquerade as 404.
+        Err(crate::application::CatalogQueryError::Storage(StorageError::NotFound))
+        | Err(crate::application::CatalogQueryError::Storage(StorageError::InvalidRepoName(_))) => {
+            return errors::name_unknown().into_response();
+        }
+        Err(_) => return errors::internal_error().into_response(),
     };
 
     let payload = repo_meta_from_timestamps(&name, ts);
