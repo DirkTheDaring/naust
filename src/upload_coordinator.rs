@@ -70,6 +70,10 @@ pub(crate) fn map_ref_index_error(e: crate::blob_ref_index::RefIndexError) -> St
             other => other,
         },
         crate::blob_ref_index::RefIndexError::Corrupt(_) => StorageError::corrupt_data(msg),
+        // Deliberate fail-closed resource-limit exhaustion; classified as a
+        // backend failure (NOT corruption) so it cannot trigger an
+        // auto-rebuild-on-corruption loop that would exhaust the same limit.
+        crate::blob_ref_index::RefIndexError::ResourceLimit(_) => StorageError::backend(msg),
         crate::blob_ref_index::RefIndexError::ManifestParse(_) => StorageError::corrupt_data(msg),
         crate::blob_ref_index::RefIndexError::NotFound(_) => StorageError::NotFound,
         crate::blob_ref_index::RefIndexError::Sled(err) => match err {
@@ -103,6 +107,10 @@ pub(crate) fn map_ref_index_error_with_context(
             other => other,
         },
         crate::blob_ref_index::RefIndexError::Corrupt(_) => StorageError::corrupt_data(msg),
+        // Deliberate fail-closed resource-limit exhaustion; classified as a
+        // backend failure (NOT corruption) so it cannot trigger an
+        // auto-rebuild-on-corruption loop that would exhaust the same limit.
+        crate::blob_ref_index::RefIndexError::ResourceLimit(_) => StorageError::backend(msg),
         crate::blob_ref_index::RefIndexError::ManifestParse(_) => StorageError::corrupt_data(msg),
         crate::blob_ref_index::RefIndexError::NotFound(_) => StorageError::NotFound,
         crate::blob_ref_index::RefIndexError::Sled(err) => match err {

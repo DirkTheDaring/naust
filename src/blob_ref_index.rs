@@ -41,6 +41,9 @@ pub enum RefIndexError {
     #[error("ref-index corrupt: {0}")]
     Corrupt(String),
 
+    #[error("ref-index discovery resource limit exceeded: {0}")]
+    ResourceLimit(String),
+
     #[error("ref-index not found at {0}")]
     NotFound(PathBuf),
 }
@@ -58,6 +61,10 @@ pub struct BlobRefIndex {
     repo_memberships: sled::Tree,
     fail_mark_dirty: Arc<std::sync::atomic::AtomicBool>,
     fail_mark_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only discovery-limit override; production code never sets this
+    /// (the setter is `cfg(test)`), so production always uses
+    /// [`DiscoveryLimits::PRODUCTION`].
+    test_discovery_limits: Arc<std::sync::Mutex<Option<DiscoveryLimits>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -114,6 +121,136 @@ struct DiscoveredRepoData {
     tags: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Finite ceilings for one repository discovery/traversal pass. All staged
+/// discovery structures (roots, edges, tags), traversal state (visited nodes,
+/// parsed-refs cache), and pagination streams are charged against ONE budget so
+/// no single staged collection can bypass the aggregate ceiling. Limits are
+/// count-based plus an aggregate staged-byte ceiling; exceeding any limit fails
+/// the discovery deterministically BEFORE any committed index mutation (the
+/// staged-sync invariant is unchanged). These are internal resource-safety
+/// constants, not a protocol/API commitment.
+#[derive(Debug, Clone, Copy)]
+struct DiscoveryLimits {
+    /// Maximum stored manifests enumerated per repository.
+    max_manifests: usize,
+    /// Maximum tag mappings enumerated per repository.
+    max_tags: usize,
+    /// Maximum staged reverse-DAG edges per repository discovery.
+    max_edges: usize,
+    /// Maximum manifest nodes traversed (cumulative across roots for a
+    /// discovery pass; per call for incremental `ingest_root`). Also bounds the
+    /// parsed-refs cache entry count.
+    max_traversal_nodes: usize,
+    /// Maximum pages consumed per pagination stream (manifests, tags, and the
+    /// rebuild membership stream). Guards distinct-token/empty-page floods that
+    /// the token-cycle detector cannot see.
+    max_pages: usize,
+    /// Aggregate ceiling on staged key/value payload bytes (roots + edges +
+    /// tags). Count limits bound entries; this bounds combined memory pressure.
+    max_staged_bytes: usize,
+}
+
+impl DiscoveryLimits {
+    /// Production ceilings. Rationale: generous for legitimate registries
+    /// (100k manifests/tags per repository, 1M reverse edges, 500k traversal
+    /// nodes, 100k pages per stream) while capping staged payload memory at
+    /// 64 MiB — a worst-case in-memory footprint on the order of a few hundred
+    /// MiB including container overhead, instead of unbounded.
+    const PRODUCTION: DiscoveryLimits = DiscoveryLimits {
+        max_manifests: 100_000,
+        max_tags: 100_000,
+        max_edges: 1_000_000,
+        max_traversal_nodes: 500_000,
+        max_pages: 100_000,
+        max_staged_bytes: 64 * 1024 * 1024,
+    };
+}
+
+/// Consumed-resource state for one discovery pass, charged against
+/// [`DiscoveryLimits`]. Every charge returns a deterministic
+/// [`RefIndexError::ResourceLimit`] on exhaustion; nothing is truncated or
+/// partially indexed.
+struct DiscoveryBudget {
+    limits: DiscoveryLimits,
+    repo: String,
+    manifests: usize,
+    tags: usize,
+    edges: usize,
+    nodes: usize,
+    staged_bytes: usize,
+}
+
+impl DiscoveryBudget {
+    fn new(limits: DiscoveryLimits, repo: &str) -> Self {
+        Self {
+            limits,
+            repo: repo.to_string(),
+            manifests: 0,
+            tags: 0,
+            edges: 0,
+            nodes: 0,
+            staged_bytes: 0,
+        }
+    }
+
+    fn exceeded(&self, what: &str, limit: usize) -> RefIndexError {
+        RefIndexError::ResourceLimit(format!(
+            "{what} limit of {limit} exceeded during discovery for repository '{}'",
+            self.repo
+        ))
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), RefIndexError> {
+        self.staged_bytes = self.staged_bytes.saturating_add(bytes);
+        if self.staged_bytes > self.limits.max_staged_bytes {
+            return Err(self.exceeded("staged bytes", self.limits.max_staged_bytes));
+        }
+        Ok(())
+    }
+
+    fn charge_manifest(&mut self, staged_bytes: usize) -> Result<(), RefIndexError> {
+        self.manifests += 1;
+        if self.manifests > self.limits.max_manifests {
+            return Err(self.exceeded("manifest", self.limits.max_manifests));
+        }
+        self.charge_bytes(staged_bytes)
+    }
+
+    fn charge_tag(&mut self, staged_bytes: usize) -> Result<(), RefIndexError> {
+        self.tags += 1;
+        if self.tags > self.limits.max_tags {
+            return Err(self.exceeded("tag", self.limits.max_tags));
+        }
+        self.charge_bytes(staged_bytes)
+    }
+
+    fn charge_edge(&mut self, staged_bytes: usize) -> Result<(), RefIndexError> {
+        self.edges += 1;
+        if self.edges > self.limits.max_edges {
+            return Err(self.exceeded("edge", self.limits.max_edges));
+        }
+        self.charge_bytes(staged_bytes)
+    }
+
+    fn charge_node(&mut self) -> Result<(), RefIndexError> {
+        self.nodes += 1;
+        if self.nodes > self.limits.max_traversal_nodes {
+            return Err(self.exceeded("traversal node", self.limits.max_traversal_nodes));
+        }
+        Ok(())
+    }
+
+    /// `pages` counts every fetched page across the CALLER-chosen stream; each
+    /// stream uses its own counter by passing a dedicated counter reference.
+    fn charge_page(&mut self, pages: &mut usize) -> Result<(), RefIndexError> {
+        *pages += 1;
+        if *pages > self.limits.max_pages {
+            return Err(self.exceeded("pagination page", self.limits.max_pages));
+        }
+        Ok(())
+    }
+}
+
 impl BlobRefIndex {
     pub fn open(path: PathBuf) -> Result<Self, RefIndexError> {
         let db = sled::open(path)?;
@@ -136,6 +273,7 @@ impl BlobRefIndex {
             repo_memberships,
             fail_mark_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_mark_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_discovery_limits: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -398,6 +536,21 @@ impl BlobRefIndex {
         }
     }
 
+    fn effective_discovery_limits(&self) -> DiscoveryLimits {
+        self.test_discovery_limits
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(DiscoveryLimits::PRODUCTION)
+    }
+
+    /// Test seam: override discovery limits for this index instance. Not
+    /// compiled into production builds.
+    #[cfg(test)]
+    fn set_test_discovery_limits(&self, limits: Option<DiscoveryLimits>) {
+        *self.test_discovery_limits.lock().unwrap() = limits;
+    }
+
     pub fn is_blob_referenced(&self, digest: &Digest) -> Result<bool, RefIndexError> {
         // If the index isn't healthy, treat it as corrupt.
         self.check_health()?;
@@ -488,8 +641,15 @@ impl BlobRefIndex {
         storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
     ) -> Result<(), RefIndexError> {
-        // Phase 1: Read-only storage discovery (all-or-nothing; zero index mutations on error)
-        let staged = Self::discover_repo_manifests_and_tags(storage, repo).await?;
+        // Phase 1: Read-only storage discovery (all-or-nothing; zero index mutations
+        // on error), bounded by the discovery budget: any limit exhaustion fails
+        // closed here, before Phase 2 touches committed state.
+        let staged = Self::discover_repo_manifests_and_tags(
+            storage,
+            repo,
+            self.effective_discovery_limits(),
+        )
+        .await?;
 
         // Phase 2: Index application (performs sled operations, no backend I/O).
         // Reconcile THIS repository's contribution against the staged discovery:
@@ -572,23 +732,29 @@ impl BlobRefIndex {
     async fn discover_repo_manifests_and_tags(
         storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
         repo: &str,
+        limits: DiscoveryLimits,
     ) -> Result<DiscoveredRepoData, RefIndexError> {
+        let mut budget = DiscoveryBudget::new(limits, repo);
         let mut roots: Vec<Digest> = Vec::new();
         let mut edges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut tags: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         // 1. Enumerate all stored manifests in this repo with token cycle detection.
-        // Memory growth across distinct continuation tokens and staged data remains unbounded
-        // in this slice; arbitrary page caps are deliberately deferred.
+        // Every staged structure, the traversal state, and the pagination streams
+        // are charged against ONE bounded discovery budget; token-cycle detection
+        // fires before the page budget can be consumed by a repeating token.
         let mut manifest_token: Option<String> = None;
         let mut seen_manifest_tokens: HashSet<String> = HashSet::new();
+        let mut manifest_pages: usize = 0;
 
         loop {
+            budget.charge_page(&mut manifest_pages)?;
             let (manifests, next_tok) = storage
                 .list_manifest_digests_page(repo, manifest_token.as_deref(), 128)
                 .await?;
 
             for digest in manifests {
+                budget.charge_manifest(digest.as_str().len())?;
                 roots.push(digest.clone());
 
                 // Perform recursive DAG discovery for this root.
@@ -605,6 +771,7 @@ impl BlobRefIndex {
                     if !visited.insert(cur_digest.hex().to_string()) {
                         continue;
                     }
+                    budget.charge_node()?;
 
                     let digest_hex = cur_digest.hex().to_string();
                     let refs = if let Some(v) = refs_cache.get(&digest_hex) {
@@ -631,20 +798,20 @@ impl BlobRefIndex {
 
                     // child blob -> parent manifest
                     for child_blob in refs.blob_references() {
-                        edges.push((
-                            child_blob.as_str().as_bytes().to_vec(),
-                            cur_digest.as_str().as_bytes().to_vec(),
-                        ));
+                        let child = child_blob.as_str().as_bytes().to_vec();
+                        let parent = cur_digest.as_str().as_bytes().to_vec();
+                        budget.charge_edge(child.len() + parent.len())?;
+                        edges.push((child, parent));
                     }
 
                     // child manifest -> parent manifest
                     // The parent edge to the child manifest is retained even if the child manifest
                     // is subsequently found to be missing from storage.
                     for child_manifest in refs.manifest_references() {
-                        edges.push((
-                            child_manifest.as_str().as_bytes().to_vec(),
-                            cur_digest.as_str().as_bytes().to_vec(),
-                        ));
+                        let child = child_manifest.as_str().as_bytes().to_vec();
+                        let parent = cur_digest.as_str().as_bytes().to_vec();
+                        budget.charge_edge(child.len() + parent.len())?;
+                        edges.push((child, parent));
                         queue.push_back(child_manifest.clone());
                     }
                 }
@@ -667,14 +834,19 @@ impl BlobRefIndex {
         // 2. Enumerate tags in this repo with independent token cycle detection
         let mut tag_token: Option<String> = None;
         let mut seen_tag_tokens: HashSet<String> = HashSet::new();
+        let mut tag_pages: usize = 0;
 
         loop {
+            budget.charge_page(&mut tag_pages)?;
             let (page_tags, next_tok) = storage
                 .list_tags_page(repo, tag_token.as_deref(), 128)
                 .await?;
 
             for (tag, digest) in page_tags {
-                tags.push((tag_key(repo, &tag), digest.as_str().as_bytes().to_vec()));
+                let key = tag_key(repo, &tag);
+                let val = digest.as_str().as_bytes().to_vec();
+                budget.charge_tag(key.len() + val.len())?;
+                tags.push((key, val));
             }
 
             match next_tok {
@@ -775,10 +947,17 @@ impl BlobRefIndex {
             self.sync_repo_manifests_and_tags(storage, repo).await?;
         }
 
-        // Global bounded pagination over ALL repository blob memberships
-        // (Ensures membership-only repositories with zero tags/manifests are fully indexed)
+        // Global pagination over ALL repository blob memberships (ensures
+        // membership-only repositories with zero tags/manifests are fully
+        // indexed). Memory per page is bounded; the page budget guards
+        // non-terminating/token-flooding streams (this stream has no
+        // token-cycle detector).
+        let mut membership_budget =
+            DiscoveryBudget::new(self.effective_discovery_limits(), "<memberships>");
+        let mut membership_pages: usize = 0;
         let mut token: Option<String> = None;
         loop {
+            membership_budget.charge_page(&mut membership_pages)?;
             let (page, next_tok) = storage
                 .list_all_repo_blob_memberships_page(token.as_deref(), 256)
                 .await?;
@@ -860,6 +1039,12 @@ impl BlobRefIndex {
         repo: &str,
         root: &Digest,
     ) -> Result<(), RefIndexError> {
+        // Incremental traversal shares the discovery budget model: the visited
+        // set and parsed-refs cache are bounded by the traversal-node ceiling
+        // (edges here are written directly to sled, not staged in memory). A
+        // limit failure surfaces to the lifecycle caller, whose existing
+        // dirty/rebuild protection applies.
+        let mut budget = DiscoveryBudget::new(self.effective_discovery_limits(), repo);
         let mut queue: VecDeque<Digest> = VecDeque::new();
         queue.push_back(root.clone());
 
@@ -873,6 +1058,7 @@ impl BlobRefIndex {
             if !visited.insert(digest.hex().to_string()) {
                 continue;
             }
+            budget.charge_node()?;
 
             let digest_hex = digest.hex().to_string();
             let refs = if let Some(v) = refs_cache.get(&digest_hex) {
@@ -3085,9 +3271,20 @@ mod tests {
         );
         assert_eq!(idx.debug_contribution("r", &m1), Some((true, 1)));
 
-        // Reopen normally under the new schema.
+        // Reopen normally under the new schema. Sled releases its file lock
+        // asynchronously after drop, so retry briefly and deterministically.
         drop(idx);
-        let idx2 = BlobRefIndex::open(path.clone()).expect("reopen v2");
+        let mut idx2 = None;
+        for _ in 0..100 {
+            match BlobRefIndex::open(path.clone()) {
+                Ok(i) => {
+                    idx2 = Some(i);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let idx2 = idx2.expect("reopen v2 within retry window");
         idx2.check_health().expect("v2 index healthy on reopen");
 
         let _ = std::fs::remove_dir_all(path);
@@ -3225,6 +3422,358 @@ mod tests {
         assert_eq!(idx.debug_contribution("solo", &m), None);
         assert_eq!(idx.debug_root_count(&m), None);
 
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // ------------------------------------------------------------------
+    // REFIDX-BOUNDS: bounded discovery/staging
+    // ------------------------------------------------------------------
+
+    fn limits_for_tests() -> DiscoveryLimits {
+        // Generous in every dimension; individual tests tighten one knob.
+        DiscoveryLimits {
+            max_manifests: 1_000,
+            max_tags: 1_000,
+            max_edges: 10_000,
+            max_traversal_nodes: 10_000,
+            max_pages: 1_000,
+            max_staged_bytes: 1024 * 1024,
+        }
+    }
+
+    fn dn(i: u32) -> Digest {
+        Digest::parse(&format!("sha256:{:064x}", 0x1000 + i)).unwrap()
+    }
+
+    fn assert_resource_limit(err: RefIndexError, what: &str) {
+        match err {
+            RefIndexError::ResourceLimit(msg) => {
+                assert!(msg.contains(what), "expected {what:?} limit, got: {msg}")
+            }
+            other => panic!("expected ResourceLimit({what}), got {other:?}"),
+        }
+    }
+
+    // T1 + T10: exceeding the manifest ceiling fails deterministically BEFORE
+    // Phase 2 — previously committed accounting is byte-identical, and no
+    // partial "successful" index is produced.
+    #[tokio::test]
+    async fn test_bounds_manifest_limit_fails_closed_preserving_committed_state() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let repo = "org/repo";
+
+        mock.put_manifest_bytes(repo, &dn(1), image_manifest(&dn(101), &dn(201)));
+        mock.put_manifest_bytes(repo, &dn(2), image_manifest(&dn(102), &dn(202)));
+        mock.set_tag_sync(repo, "keep", &dn(1));
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("initial sync under production limits");
+
+        let tags_before = snapshot_tree(&idx.tag_to_root);
+        let roots_before = snapshot_tree(&idx.root_counts);
+        let contribs_before = snapshot_tree(&idx.repo_roots);
+        let edges_before = snapshot_tree(&idx.rev_edges);
+
+        // Third manifest + a budget that only admits two.
+        mock.put_manifest_bytes(repo, &dn(3), image_manifest(&dn(103), &dn(203)));
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_manifests: 2,
+            ..limits_for_tests()
+        }));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("manifest limit must fail the sync");
+        assert_resource_limit(err, "manifest");
+
+        assert_eq!(snapshot_tree(&idx.tag_to_root), tags_before);
+        assert_eq!(snapshot_tree(&idx.root_counts), roots_before);
+        assert_eq!(snapshot_tree(&idx.repo_roots), contribs_before);
+        assert_eq!(snapshot_tree(&idx.rev_edges), edges_before);
+        assert_eq!(
+            idx.debug_contribution(repo, &dn(3)),
+            None,
+            "no partial indexing of the over-limit manifest"
+        );
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T2: tag ceiling fails closed before Phase 2 with committed tag mappings,
+    // provenance, and derived counts unchanged.
+    #[tokio::test]
+    async fn test_bounds_tag_limit_fails_closed_preserving_committed_state() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let repo = "org/repo";
+
+        mock.put_manifest_bytes(repo, &dn(1), image_manifest(&dn(101), &dn(201)));
+        mock.set_tag_sync(repo, "t1", &dn(1));
+        mock.set_tag_sync(repo, "t2", &dn(1));
+        idx.sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect("initial sync");
+
+        let tags_before = snapshot_tree(&idx.tag_to_root);
+        let roots_before = snapshot_tree(&idx.root_counts);
+        let contribs_before = snapshot_tree(&idx.repo_roots);
+
+        mock.set_tag_sync(repo, "t3", &dn(1));
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_tags: 2,
+            ..limits_for_tests()
+        }));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("tag limit must fail the sync");
+        assert_resource_limit(err, "tag");
+
+        assert_eq!(snapshot_tree(&idx.tag_to_root), tags_before);
+        assert_eq!(snapshot_tree(&idx.root_counts), roots_before);
+        assert_eq!(snapshot_tree(&idx.repo_roots), contribs_before);
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T3: staged-edge ceiling fails closed with no committed mutation.
+    #[tokio::test]
+    async fn test_bounds_edge_limit_fails_closed() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let repo = "org/repo";
+
+        // Two manifests x two blob refs each = 4 staged edges.
+        mock.put_manifest_bytes(repo, &dn(1), image_manifest(&dn(101), &dn(201)));
+        mock.put_manifest_bytes(repo, &dn(2), image_manifest(&dn(102), &dn(202)));
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_edges: 3,
+            ..limits_for_tests()
+        }));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("edge limit must fail the sync");
+        assert_resource_limit(err, "edge");
+        assert_eq!(snapshot_tree(&idx.root_counts), Vec::new());
+        assert_eq!(snapshot_tree(&idx.repo_roots), Vec::new());
+        assert_eq!(snapshot_tree(&idx.rev_edges), Vec::new());
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T4: the aggregate staged-byte budget fires even when every per-entry
+    // count limit is far from exhausted.
+    #[tokio::test]
+    async fn test_bounds_aggregate_bytes_limit_fires() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let repo = "org/repo";
+
+        // Two manifests: counts are tiny, but staged digest+edge bytes exceed
+        // a 200-byte aggregate ceiling (each digest string is 71 bytes).
+        mock.put_manifest_bytes(repo, &dn(1), image_manifest(&dn(101), &dn(201)));
+        mock.put_manifest_bytes(repo, &dn(2), image_manifest(&dn(102), &dn(202)));
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_staged_bytes: 200,
+            ..limits_for_tests()
+        }));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("aggregate byte budget must fail the sync");
+        assert_resource_limit(err, "staged bytes");
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T5 + T6 + T7: exactly-at-limit input succeeds with correct
+    // REFIDX-ACCOUNTING semantics (multi-repo shared digest), limit+1 fails,
+    // and repeated bounded sync stays idempotent.
+    #[tokio::test]
+    async fn test_bounds_exact_boundary_and_idempotent_bounded_sync() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let shared = dn(1);
+        mock.put_manifest_bytes("a", &shared, image_manifest(&dn(101), &dn(201)));
+        mock.put_manifest_bytes("a", &dn(2), image_manifest(&dn(102), &dn(202)));
+        mock.put_manifest_bytes("b", &shared, image_manifest(&dn(101), &dn(201)));
+        mock.set_tag_sync("a", "t1", &shared);
+        mock.set_tag_sync("a", "t2", &dn(2));
+
+        // Exactly at the manifest/tag limits for repo a.
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_manifests: 2,
+            max_tags: 2,
+            ..limits_for_tests()
+        }));
+        idx.sync_repo_manifests_and_tags(&storage, "a")
+            .await
+            .expect("exactly-at-limit sync succeeds");
+        idx.sync_repo_manifests_and_tags(&storage, "b")
+            .await
+            .expect("sync b");
+
+        assert_eq!(idx.debug_contribution("a", &shared), Some((true, 1)));
+        assert_eq!(idx.debug_contribution("b", &shared), Some((true, 0)));
+        assert_eq!(idx.debug_root_count(&shared), Some(2));
+
+        // Repeated bounded sync is idempotent (fresh budget per run).
+        let roots = snapshot_tree(&idx.root_counts);
+        let contribs = snapshot_tree(&idx.repo_roots);
+        idx.sync_repo_manifests_and_tags(&storage, "a")
+            .await
+            .expect("repeat bounded sync");
+        assert_eq!(snapshot_tree(&idx.root_counts), roots);
+        assert_eq!(snapshot_tree(&idx.repo_roots), contribs);
+
+        // limit + 1 fails.
+        mock.put_manifest_bytes("a", &dn(3), image_manifest(&dn(103), &dn(203)));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, "a")
+            .await
+            .expect_err("limit+1 must fail");
+        assert_resource_limit(err, "manifest");
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T8: rebuild under sufficient limits completes healthy with correct
+    // accounting; a rebuild limit failure leaves the documented recovery path
+    // working (BUILDING state -> unhealthy -> auto-rebuild succeeds once the
+    // pathological input is admitted or removed).
+    #[tokio::test]
+    async fn test_bounds_rebuild_success_and_limit_failure_recovery() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        mock.put_manifest_bytes("r", &dn(1), image_manifest(&dn(101), &dn(201)));
+        mock.set_tag_sync("r", "t", &dn(1));
+
+        idx.set_test_discovery_limits(Some(limits_for_tests()));
+        idx.rebuild(&storage).await.expect("bounded rebuild");
+        idx.check_health().expect("healthy after bounded rebuild");
+        assert_eq!(idx.debug_contribution("r", &dn(1)), Some((true, 1)));
+
+        // Force a rebuild limit failure.
+        mock.put_manifest_bytes("r", &dn(2), image_manifest(&dn(102), &dn(202)));
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_manifests: 1,
+            ..limits_for_tests()
+        }));
+        let err = idx.rebuild(&storage).await.expect_err("rebuild over limit");
+        assert_resource_limit(err, "manifest");
+        assert!(
+            idx.check_health().is_err(),
+            "failed rebuild leaves the index unhealthy (BUILDING), never silently ready"
+        );
+
+        // Documented recovery: once limits admit the state, auto-rebuild heals.
+        idx.set_test_discovery_limits(Some(limits_for_tests()));
+        idx.ensure_healthy_or_rebuild(&storage, true, false)
+            .await
+            .expect("auto-rebuild recovery");
+        idx.check_health().expect("healthy after recovery");
+        assert_eq!(idx.debug_contribution("r", &dn(2)), Some((true, 0)));
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T9: a repeating continuation token still reports a pagination CYCLE
+    // (backend error), not resource exhaustion; a distinct-token empty-page
+    // flood is caught by the page budget.
+    #[tokio::test]
+    async fn test_bounds_cycle_detection_precedes_page_budget() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let repo = "org/repo";
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_pages: 3,
+            ..limits_for_tests()
+        }));
+
+        // Cycle: token repeats -> cycle error (not ResourceLimit).
+        mock.queue_manifest_page(repo, Ok((vec![], Some("tok".to_string()))));
+        mock.queue_manifest_page(repo, Ok((vec![], Some("tok".to_string()))));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("cycle must fail");
+        match err {
+            RefIndexError::Storage(se) => {
+                assert!(se.to_string().contains("pagination cycle"), "got: {se}")
+            }
+            other => panic!("expected cycle backend error, got {other:?}"),
+        }
+
+        // Distinct-token empty-page flood -> page budget fires.
+        for i in 0..4 {
+            mock.queue_manifest_page(repo, Ok((vec![], Some(format!("tok{i}")))));
+        }
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("page flood must fail");
+        assert_resource_limit(err, "pagination page");
+
+        idx.set_test_discovery_limits(None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // Traversal-node ceiling: a deep child-manifest chain exceeds the node
+    // budget during staged discovery, failing closed with no mutation.
+    #[tokio::test]
+    async fn test_bounds_traversal_node_limit() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let repo = "org/repo";
+
+        // Chain: m0 -> m1 -> m2 -> m3 (child manifest references).
+        let chain: Vec<Digest> = (0..4).map(dn).collect();
+        for i in 0..3 {
+            mock.put_manifest_bytes(repo, &chain[i], index_manifest(&chain[i + 1]));
+        }
+        mock.put_manifest_bytes(repo, &chain[3], image_manifest(&dn(103), &dn(203)));
+        // Only enumerate the chain head as a stored manifest page, so the
+        // traversal (not enumeration) does the walking.
+        mock.queue_manifest_page(repo, Ok((vec![chain[0].clone()], None)));
+
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_traversal_nodes: 2,
+            ..limits_for_tests()
+        }));
+        let err = idx
+            .sync_repo_manifests_and_tags(&storage, repo)
+            .await
+            .expect_err("node limit must fail");
+        assert_resource_limit(err, "traversal node");
+        assert_eq!(snapshot_tree(&idx.repo_roots), Vec::new());
+
+        idx.set_test_discovery_limits(None);
         let _ = std::fs::remove_dir_all(path);
     }
 }
