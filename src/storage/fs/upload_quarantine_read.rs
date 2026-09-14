@@ -92,6 +92,7 @@ use tokio::io::AsyncReadExt;
 
 use super::membership_read::MembershipReadOps;
 use crate::registry::digest::Digest;
+#[cfg(test)]
 use crate::storage::upload_session::{FinalizedReceipt, UploadSessionId};
 use crate::storage::{BlobObjectVersion, StorageError};
 
@@ -234,6 +235,13 @@ pub(crate) async fn read_quarantine_timestamp_impl(
 }
 
 /// Contained finalized-receipt read with the preserved identity check.
+///
+/// NOTE: This resolves `uploads/.finalized` from the pinned root via the reader on
+/// every call and is therefore NOT used in production — `FsStorage::get_finalized_receipt`
+/// routes through the cached finalized-directory authority so it agrees with the
+/// writers after a `.finalized` / `uploads` replacement. It is retained only as a
+/// test oracle characterizing the reader-path semantics the public method preserves.
+#[cfg(test)]
 pub(crate) async fn get_finalized_receipt_impl(
     ops: &(impl MembershipReadOps + ?Sized),
     session: &UploadSessionId,
@@ -770,24 +778,25 @@ mod tests {
             assert_eq!(e.internal_kind(), Some(StorageErrorKind::Io));
         }
 
-        /// Root-replacement regression: development evidence of the rejected
-        /// intermediate reaper cutover, and the permanent guard on the
-        /// deferred inspection-to-action boundary.
+        /// Root-replacement regression: the reaper inspects AND mutates through
+        /// one pinned authority, so it acts coherently on a single tree.
         ///
-        /// The pinned root descriptor keeps the ORIGINAL tree readable after a
-        /// rename, while write/unlink mutations (`abort_session` meta/data
-        /// unlink, receipt `remove_file`) resolve freshly through the ambient
-        /// root pathname. A reaper that INSPECTED expired records through the
-        /// pinned reader while ACTING through those ambient pathnames would
-        /// abort/unlink a same-UUID REPLACEMENT session and receipt living in
-        /// the CURRENT tree on the strength of the OLD tree's expiry — deleting
-        /// fresh, non-expired records.
+        /// Under the Option A contained lifecycle the reaper enumerates, locks,
+        /// recovers, and aborts entirely through the process-lifetime pinned
+        /// uploads/finalized authorities captured at construction. After the
+        /// original storage root is renamed away, those authorities continue to
+        /// resolve the ORIGINAL (now detached) inode — both for inspection and
+        /// for the destructive actions it authorizes. A fresh replacement tree
+        /// created at the same ambient pathname is therefore never touched: the
+        /// reaper cannot abort/unlink a same-UUID replacement on the strength of
+        /// the detached tree's expiry, because it never resolves the ambient
+        /// pathname at all.
         ///
-        /// The shipped reaper reads and acts on the same current tree, so the
-        /// fresh replacement records survive and the stale detached tree is
-        /// never resolved by the action paths. Assertions check the files
-        /// themselves in BOTH trees, distinguishing an actual deletion from the
-        /// returned attempt counter.
+        /// Conversely, the detached tree's own expired records ARE reaped
+        /// coherently through the pinned authority (the deliberate Option A
+        /// tradeoff: a pinned ancestor follows its inode until restart).
+        /// Assertions check the files themselves in BOTH trees, distinguishing
+        /// an actual deletion from the returned confirmed-cleanup counter.
         #[tokio::test]
         async fn test_real_reaper_root_replacement_acts_only_on_current_tree() {
             let fixture = tempfile::tempdir().unwrap();
@@ -869,34 +878,35 @@ mod tests {
 
             assert!(
                 new_uploads.join(format!("{uuid}.meta.json")).exists(),
-                "fresh replacement session meta must survive: it must not be \
-                 aborted on the detached tree's expiry"
+                "fresh replacement session meta must survive: the pinned authority \
+                 never resolves the ambient replacement tree"
             );
             assert!(
                 new_finalized.join(format!("{uuid}.json")).exists(),
-                "fresh replacement receipt must survive: it must not be \
-                 unlinked on the detached tree's expiry"
+                "fresh replacement receipt must survive: the pinned authority never \
+                 resolves the ambient replacement tree"
             );
             assert!(
-                old_root
+                !old_root
                     .join("uploads")
                     .join(format!("{uuid}.meta.json"))
                     .exists(),
-                "detached-tree session meta is never resolved by the ambient \
-                 action paths"
+                "detached-tree expired session meta is reaped coherently through the \
+                 pinned authority"
             );
             assert!(
-                old_root
+                !old_root
                     .join("uploads")
                     .join(".finalized")
                     .join(format!("{uuid}.json"))
                     .exists(),
-                "detached-tree receipt is never resolved by the ambient action \
-                 paths"
+                "detached-tree expired receipt is reaped coherently through the \
+                 pinned authority"
             );
             assert_eq!(
-                count, 0,
-                "the current tree holds no expired records; nothing is attempted"
+                count, 2,
+                "the pinned authority confirms exactly two cleanups on the detached \
+                 tree: the expired session abort and the expired receipt unlink"
             );
         }
     }

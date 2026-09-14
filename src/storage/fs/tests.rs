@@ -398,6 +398,22 @@ fn make_failing_stream(first_chunk: Bytes, err: UploadStreamError) -> UploadByte
     Box::pin(futures_util::stream::iter(items))
 }
 
+/// A stream that yields exactly one chunk and then pends forever. The supervised
+/// worker writes the in-flight chunk to the data file, then blocks in
+/// `blocking_recv` while still holding the session lock, giving a deterministic
+/// in-flight boundary for cancellation tests.
+fn make_paused_stream(first_chunk: Bytes) -> UploadByteStream {
+    use futures_util::StreamExt as _;
+    let head =
+        futures_util::stream::once(async move { Ok::<Bytes, UploadStreamError>(first_chunk) });
+    let tail = futures_util::stream::pending::<Result<Bytes, UploadStreamError>>();
+    Box::pin(head.chain(tail))
+}
+
+fn on_disk_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
 #[tokio::test]
 async fn test_fs_session_same_offset_concurrent_append() {
     let root = tmp_fs_root();
@@ -467,6 +483,611 @@ async fn test_fs_session_same_offset_concurrent_append() {
 
     let status = s1.session_status(&session).await.unwrap();
     assert_eq!(status.committed_offset, 11);
+}
+
+/// Requirement #2 (append): a real append paused at a controlled in-flight boundary,
+/// then cancelled, must keep its supervised owner in exclusive possession of the lock
+/// until the in-flight write is rolled back to the committed offset. A competing append
+/// is excluded until then, and afterwards observes only consistent, committed state.
+#[tokio::test]
+async fn test_fs_append_cancellation_excludes_competing_until_rolled_back() {
+    let root = tmp_fs_root();
+    let storage = Arc::new(FsStorage::new(root.clone(), 10 * 1024 * 1024));
+    let session = storage.create_session("myrepo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // Commit a base prefix so there is a committed offset to roll back to.
+    let r = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"BASE_PREFIX_0123")]), // 16 bytes
+            10 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r, UploadAppendResult::Committed { new_offset: 16 });
+
+    let data_path = storage.session_data_path(&uuid);
+    let meta_path = storage.session_meta_path(&uuid);
+
+    // Start a paused append that writes an in-flight chunk, then blocks holding the lock.
+    let s_a = storage.clone();
+    let sess_a = session.clone();
+    let paused = tokio::spawn(async move {
+        let stream = make_paused_stream(Bytes::from_static(b"AAAA_INFLIGHT")); // 13 bytes
+        s_a.append_if_offset(
+            &sess_a,
+            UploadOffsetPrecondition::Exact(16),
+            stream,
+            10 * 1024 * 1024,
+        )
+        .await
+    });
+
+    // Wait until the worker has written the in-flight chunk (data grows past committed).
+    let mut waited = 0;
+    while on_disk_len(&data_path) <= 16 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+        assert!(
+            waited < 500,
+            "paused append never reached in-flight boundary"
+        );
+    }
+    assert_eq!(
+        on_disk_len(&data_path),
+        29,
+        "in-flight chunk is on disk ahead of the committed offset"
+    );
+    // The in-flight write is NOT committed: metadata still records the base offset.
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta_json["committed_offset"].as_u64(), Some(16));
+
+    // A competing append must be excluded while the paused op holds the lock.
+    let s_b = storage.clone();
+    let sess_b = session.clone();
+    let competing = tokio::spawn(async move {
+        let stream = make_test_stream(vec![Bytes::from_static(b"BBBB")]);
+        s_b.append_if_offset(
+            &sess_b,
+            UploadOffsetPrecondition::Exact(16),
+            stream,
+            10 * 1024 * 1024,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !competing.is_finished(),
+        "competing append must be excluded while the paused op holds the lock"
+    );
+
+    // Cancel the request task. The supervised owner retains the lock, rolls the
+    // in-flight write back to the committed offset, then releases.
+    paused.abort();
+    let _ = paused.await; // await termination of the request task
+
+    // The competing append only proceeds once the supervised owner has released the
+    // lock, and it observes only consistent, committed state (no stray in-flight bytes).
+    let res = competing.await.unwrap().unwrap();
+    assert_eq!(res, UploadAppendResult::Committed { new_offset: 20 });
+    assert_eq!(
+        on_disk_len(&data_path),
+        20,
+        "only base + competing bytes remain; no stray in-flight bytes survived"
+    );
+
+    // Metadata + retry consistency: finalize over base+competing succeeds, proving the
+    // cancelled op left no residue in the committed prefix.
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"BASE_PREFIX_0123BBBB");
+    let digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
+    let prepared = storage
+        .begin_finalize(
+            &session,
+            UploadOffsetPrecondition::Exact(20),
+            None,
+            &digest,
+            10 * 1024 * 1024,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.committed_offset, 20);
+}
+
+/// Requirement #2 (finalize): the trailing stream of a `begin_finalize` is a mutation
+/// under the same supervised-owner guarantee. Paused mid-drain and cancelled, it must
+/// roll the trailing write back and hold the lock until it does, excluding a competing
+/// append until the session is once again coherent and Active.
+#[tokio::test]
+async fn test_fs_finalize_cancellation_excludes_competing_until_rolled_back() {
+    let root = tmp_fs_root();
+    let storage = Arc::new(FsStorage::new(root.clone(), 10 * 1024 * 1024));
+    let session = storage.create_session("myrepo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    let r = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"BASE_PREFIX_0123")]), // 16 bytes
+            10 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r, UploadAppendResult::Committed { new_offset: 16 });
+
+    let data_path = storage.session_data_path(&uuid);
+
+    // Paused finalize: the trailing stream writes an in-flight chunk, then blocks. The
+    // digest and expected offset are never reached because the op is cancelled mid-drain.
+    let s_a = storage.clone();
+    let sess_a = session.clone();
+    let dummy =
+        Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap();
+    let paused = tokio::spawn(async move {
+        let stream = make_paused_stream(Bytes::from_static(b"TRAIL_INFLIGHT")); // 14 bytes
+        s_a.begin_finalize(
+            &sess_a,
+            UploadOffsetPrecondition::Exact(30),
+            Some(stream),
+            &dummy,
+            10 * 1024 * 1024,
+            false,
+        )
+        .await
+    });
+
+    let mut waited = 0;
+    while on_disk_len(&data_path) <= 16 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+        assert!(
+            waited < 500,
+            "paused finalize never reached in-flight boundary"
+        );
+    }
+    assert_eq!(
+        on_disk_len(&data_path),
+        30,
+        "trailing in-flight chunk on disk"
+    );
+
+    // Competing append excluded while the paused finalize holds the lock.
+    let s_b = storage.clone();
+    let sess_b = session.clone();
+    let competing = tokio::spawn(async move {
+        let stream = make_test_stream(vec![Bytes::from_static(b"BBBB")]);
+        s_b.append_if_offset(
+            &sess_b,
+            UploadOffsetPrecondition::Exact(16),
+            stream,
+            10 * 1024 * 1024,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !competing.is_finished(),
+        "competing append must be excluded while the paused finalize holds the lock"
+    );
+
+    paused.abort();
+    let _ = paused.await;
+
+    // The competing append proceeds only after the supervised owner releases the lock;
+    // the session was never advanced to Finalizing and its data stays consistent.
+    let res = competing.await.unwrap().unwrap();
+    assert_eq!(res, UploadAppendResult::Committed { new_offset: 20 });
+
+    let status = storage.session_status(&session).await.unwrap();
+    assert_eq!(status.committed_offset, 20);
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"BASE_PREFIX_0123BBBB");
+    let digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
+    let prepared = storage
+        .begin_finalize(
+            &session,
+            UploadOffsetPrecondition::Exact(20),
+            None,
+            &digest,
+            10 * 1024 * 1024,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.committed_offset, 20);
+}
+
+/// Requirement #2 (direct rollback observation): with no competing consumer touching
+/// the data file, a cancelled in-flight append is deterministically rolled back to the
+/// committed offset by its supervised owner before the lock is released. Afterwards the
+/// session is Active at the committed offset and accepts a fresh append.
+#[tokio::test]
+async fn test_fs_append_cancellation_rolls_back_under_lock() {
+    let root = tmp_fs_root();
+    let storage = Arc::new(FsStorage::new(root.clone(), 10 * 1024 * 1024));
+    let session = storage.create_session("myrepo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    let r = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"BASE_PREFIX_0123")]), // 16 bytes
+            10 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r, UploadAppendResult::Committed { new_offset: 16 });
+
+    let data_path = storage.session_data_path(&uuid);
+
+    let s_a = storage.clone();
+    let sess_a = session.clone();
+    let paused = tokio::spawn(async move {
+        let stream = make_paused_stream(Bytes::from_static(b"AAAA_INFLIGHT")); // 13 bytes
+        s_a.append_if_offset(
+            &sess_a,
+            UploadOffsetPrecondition::Exact(16),
+            stream,
+            10 * 1024 * 1024,
+        )
+        .await
+    });
+
+    // Reach the in-flight boundary (data ahead of the committed offset).
+    let mut waited = 0;
+    while on_disk_len(&data_path) <= 16 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+        assert!(
+            waited < 500,
+            "paused append never reached in-flight boundary"
+        );
+    }
+    assert_eq!(on_disk_len(&data_path), 29);
+
+    paused.abort();
+    let _ = paused.await;
+
+    // No other operation touches the file, so the rollback to the committed offset is
+    // deterministically observable.
+    let mut waited = 0;
+    while on_disk_len(&data_path) != 16 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+        assert!(
+            waited < 500,
+            "supervised owner never rolled the in-flight write back to the committed offset"
+        );
+    }
+
+    // The session is intact: Active at the committed offset, and a fresh append works.
+    let status = storage.session_status(&session).await.unwrap();
+    assert_eq!(status.committed_offset, 16);
+    assert_eq!(status.state, UploadSessionState::Active);
+
+    let res = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(16),
+            make_test_stream(vec![Bytes::from_static(b"CCCC")]),
+            10 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res, UploadAppendResult::Committed { new_offset: 20 });
+    assert_eq!(on_disk_len(&data_path), 20);
+}
+
+// ---------------------------------------------------------------------------
+// Requirement #1: shared, stable lifecycle subtree authority.
+//
+// These tests exercise the contract that each lifecycle subtree is pinned once
+// (lazily) and shared thereafter, so that once an operation resolves a subtree
+// every later access, lock, read, write, recovery, and commit flows through the
+// same pinned inode — a later rename/replacement of the subtree *pathname* on
+// disk cannot redirect any in-progress or subsequent operation. Root replacement
+// is covered by the existing regression
+// `test_real_reaper_root_replacement_acts_only_on_current_tree`.
+// ---------------------------------------------------------------------------
+
+/// Category: a later lifecycle call retains a compatible (identical) pinned
+/// authority; the subtree is shared, not re-derived, across separate calls, and
+/// distinct subtrees are distinct authorities.
+#[tokio::test]
+async fn test_fs_authority_shared_across_separate_lifecycle_calls() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Resolving the uploads authority initializes the shared cell.
+    let id1 = storage
+        .upload_authorities
+        .uploads()
+        .await
+        .unwrap()
+        .authority_id();
+
+    // A real lifecycle call, then a fresh resolution: same pinned authority.
+    let _session = storage.create_session("myrepo").await.unwrap();
+    let id2 = storage
+        .upload_authorities
+        .uploads()
+        .await
+        .unwrap()
+        .authority_id();
+    assert_eq!(
+        id1, id2,
+        "uploads authority must be shared, not re-derived, across separate calls"
+    );
+
+    // The `.finalized` authority is likewise stable, and distinct from uploads.
+    let f1 = storage
+        .upload_authorities
+        .finalized()
+        .await
+        .unwrap()
+        .authority_id();
+    let f2 = storage
+        .upload_authorities
+        .finalized()
+        .await
+        .unwrap()
+        .authority_id();
+    assert_eq!(f1, f2, "finalized authority must be shared across calls");
+    assert_ne!(
+        id1, f1,
+        "uploads and finalized must be distinct pinned authorities"
+    );
+}
+
+/// Category: concurrent lazy initialization cannot install competing authorities;
+/// every racing caller observes exactly one shared authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_fs_authority_concurrent_lazy_init_single_authority() {
+    let root = tmp_fs_root();
+    let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let s = storage.clone();
+        handles.push(tokio::spawn(async move {
+            s.upload_authorities.uploads().await.unwrap().authority_id()
+        }));
+    }
+    let mut ids = Vec::new();
+    for h in handles {
+        ids.push(h.await.unwrap());
+    }
+    let first = ids[0];
+    assert!(
+        ids.iter().all(|&i| i == first),
+        "concurrent lazy init must yield exactly one shared authority; got {ids:?}"
+    );
+}
+
+/// Category: uploads-subtree replacement beneath an unchanged root. After the
+/// uploads authority is pinned, replacing the `uploads` directory on disk with a
+/// fresh inode must not redirect subsequent operations.
+#[tokio::test]
+async fn test_fs_authority_uploads_replacement_beneath_unchanged_root() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 10 * 1024 * 1024);
+    let session = storage.create_session("myrepo").await.unwrap();
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"HELLO")]),
+            10 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+
+    let uploads_dir = storage.uploads_dir();
+    let old_ino = std::fs::metadata(&uploads_dir).unwrap().ino();
+
+    // Replace the uploads subtree beneath the unchanged root with a fresh inode.
+    let detached = root.join("uploads.detached");
+    std::fs::rename(&uploads_dir, &detached).unwrap();
+    std::fs::create_dir(&uploads_dir).unwrap();
+    let new_ino = std::fs::metadata(&uploads_dir).unwrap().ino();
+    assert_ne!(old_ino, new_ino, "replacement must be a fresh inode");
+
+    // The next append flows through the pinned authority (the detached inode where
+    // the session actually lives), not the ambient replacement.
+    let res = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(5),
+            make_test_stream(vec![Bytes::from_static(b"WORLD")]),
+            10 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res, UploadAppendResult::Committed { new_offset: 10 });
+
+    // The fresh ambient uploads dir is untouched; committed data lives in the pin.
+    assert!(
+        std::fs::read_dir(&uploads_dir).unwrap().next().is_none(),
+        "operation must not touch the ambient replacement subtree"
+    );
+    let data_in_pin = detached.join(format!("{}.data", session.uuid));
+    assert_eq!(std::fs::metadata(&data_in_pin).unwrap().len(), 10);
+}
+
+/// Category: `.finalized`-subtree replacement beneath an unchanged root. After the
+/// receipt authority is pinned by a finalize, replacing `uploads/.finalized` must
+/// not hide the receipt from a later idempotent replay.
+#[tokio::test]
+async fn test_fs_authority_finalized_replacement_beneath_unchanged_root() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Fully finalize a session: writes a receipt and pins the `.finalized` authority.
+    let data = b"FINALIZED_PAYLOAD";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "myrepo", data).await;
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::Published(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+
+    let finalized_dir = storage.finalized_dir();
+    let receipt = storage.finalized_receipt_path(&session.uuid);
+    assert!(receipt.exists(), "receipt written before replacement");
+
+    // Replace the `.finalized` subtree with a fresh, empty inode.
+    let detached = storage.uploads_dir().join(".finalized.detached");
+    std::fs::rename(&finalized_dir, &detached).unwrap();
+    std::fs::create_dir(&finalized_dir).unwrap();
+    assert!(
+        std::fs::read_dir(&finalized_dir).unwrap().next().is_none(),
+        "ambient replacement is empty"
+    );
+
+    // An idempotent replay (meta is gone after commit) consults the receipt through
+    // the pinned authority (detached inode), not the empty ambient replacement.
+    let replay = storage
+        .begin_finalize(
+            &session,
+            UploadOffsetPrecondition::Exact(data.len() as u64),
+            None,
+            &digest,
+            1024 * 1024,
+            true,
+        )
+        .await
+        .expect("replay must find the receipt through the pinned .finalized authority");
+    assert_eq!(replay.size, data.len() as u64);
+}
+
+/// Category: subtree replacement interposed *between* lock acquisition and the
+/// later mutation. A test-controlled stream keeps an append in-flight (lock held)
+/// while the `uploads` pathname is replaced; the commit must still land on the
+/// pinned inode.
+#[tokio::test]
+async fn test_fs_authority_uploads_replacement_between_lock_and_mutation() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = tmp_fs_root();
+    let storage = Arc::new(FsStorage::new(root.clone(), 10 * 1024 * 1024));
+    let session = storage.create_session("myrepo").await.unwrap();
+
+    let uploads_dir = storage.uploads_dir();
+    let data_path = storage.session_data_path(&session.uuid);
+
+    // A test-controlled stream lets us interpose a replacement after the lock is
+    // held and the first bytes are already written.
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel::<Result<Bytes, UploadStreamError>>(4);
+    let stream: UploadByteStream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(feed_rx));
+    let s = storage.clone();
+    let sess = session.clone();
+    let handle = tokio::spawn(async move {
+        s.append_if_offset(
+            &sess,
+            UploadOffsetPrecondition::Exact(0),
+            stream,
+            10 * 1024 * 1024,
+        )
+        .await
+    });
+
+    // First chunk in-flight: the worker holds the lock on the pinned authority.
+    feed_tx
+        .send(Ok(Bytes::from_static(b"HELLO")))
+        .await
+        .unwrap();
+    let mut waited = 0;
+    while on_disk_len(&data_path) < 5 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 1;
+        assert!(waited < 500, "first chunk never landed in-flight");
+    }
+
+    // Replace the uploads subtree while the lock is held and the write is mid-flight.
+    let old_ino = std::fs::metadata(&uploads_dir).unwrap().ino();
+    let detached = root.join("uploads.detached");
+    std::fs::rename(&uploads_dir, &detached).unwrap();
+    std::fs::create_dir(&uploads_dir).unwrap();
+    assert_ne!(
+        old_ino,
+        std::fs::metadata(&uploads_dir).unwrap().ino(),
+        "replacement is a fresh inode"
+    );
+
+    // Complete the stream; the commit must land on the pinned (detached) inode.
+    feed_tx
+        .send(Ok(Bytes::from_static(b"WORLD")))
+        .await
+        .unwrap();
+    drop(feed_tx);
+    let res = handle.await.unwrap().unwrap();
+    assert_eq!(res, UploadAppendResult::Committed { new_offset: 10 });
+
+    // The ambient replacement stays empty; committed data + metadata live in the pin.
+    assert!(
+        std::fs::read_dir(&uploads_dir).unwrap().next().is_none(),
+        "mid-flight replacement must not capture the mutation"
+    );
+    let data_in_pin = detached.join(format!("{}.data", session.uuid));
+    assert_eq!(std::fs::metadata(&data_in_pin).unwrap().len(), 10);
+    let meta_in_pin = detached.join(format!("{}.meta.json", session.uuid));
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_in_pin).unwrap()).unwrap();
+    assert_eq!(meta_json["committed_offset"].as_u64(), Some(10));
+}
+
+/// Category: primary and proxy-cache production wiring. Both `storage/mod.rs`
+/// construction sites build the filesystem backend through
+/// `FsStorage::try_new_with_all_limits`, which captures the shared
+/// `UploadAuthorities` (pinning the root) at construction. This test drives both
+/// production factories and confirms a concrete backend built by the same
+/// constructor supports the full contained upload lifecycle.
+#[tokio::test]
+async fn test_fs_upload_authority_wired_through_primary_and_proxy_cache_construction() {
+    let root = tmp_fs_root();
+    let mut config = crate::config::Config::from_env().unwrap();
+    config.storage_backend = crate::config::StorageBackend::Filesystem;
+    config.fs_root = root.clone();
+    config.max_upload_bytes = 1024 * 1024;
+
+    // Primary production wiring constructs (root pinned; capture total).
+    let primary = crate::storage::storage_wiring_try_from_config(&config)
+        .expect("primary filesystem wiring constructs");
+    assert_eq!(primary.backend_kind(), "fs");
+
+    // Proxy-cache production wiring constructs against its own distinct root.
+    let cache_root = root.join("cache");
+    let mut proxy_cfg = config.clone();
+    proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
+    let _proxy = crate::storage::proxy_cache_storage_try_from_config(&proxy_cfg, None)
+        .expect("proxy-cache filesystem wiring constructs");
+
+    // A concrete backend built by the same constructor path supports the full
+    // contained lifecycle end to end (create -> append -> finalize -> publish),
+    // proving the captured authority is functional.
+    let storage = FsStorage::new(root.join("direct"), 1024 * 1024);
+    let data = b"WIRED_PAYLOAD";
+    let (_session, prepared, _digest) =
+        prepare_finalizable_session(&storage, "wirerepo", data).await;
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::Published(BlobMeta {
+            size: data.len() as u64
+        })
+    );
 }
 
 #[tokio::test]
@@ -990,6 +1611,1784 @@ async fn test_fs_session_reaper_recovers_expired_finalizing() {
     // Receipt should now be created
     let receipt = storage.get_finalized_receipt(&session).await.unwrap();
     assert!(receipt.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Requirement #3: reaper / publication fault-injection matrix.
+//
+// These drive the real production entry points against post-crash on-disk
+// states (the honest, deterministic form of fault injection available without a
+// syscall-level fault FS): CAS present/absent/mismatch, membership-before-
+// receipt crash + retry, receipt loss + retry, existing-receipt/missing-
+// membership, recover roll-forward, abort interruption + retry, and exact
+// reaper success/skip counting. Pure syscall-failure injection into the atomic
+// write helper (ENOSPC/EIO on the temp write, EXDEV rename, cleanup-unlink
+// failure) is not deterministically inducible from a unit test and is recorded
+// as a scoped gap in the evidence notes.
+// ---------------------------------------------------------------------------
+
+/// The ambient CAS path of a published blob: `blobs/{algo}/{prefix2}/{hex}`.
+fn cas_blob_path(root: &Path, digest: &Digest) -> PathBuf {
+    root.join("blobs")
+        .join(digest.algorithm())
+        .join(digest.prefix2())
+        .join(digest.hex())
+}
+
+/// Rewrite a single top-level numeric field of a JSON record on disk (used to
+/// backdate `last_active_at_unix_secs` / `finalized_at_unix_secs` so the reaper
+/// treats a record as expired without waiting real time).
+fn backdate_json_u64_field(path: &Path, field: &str, value: u64) {
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    v[field] = serde_json::json!(value);
+    std::fs::write(path, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+/// Exact success/skip counting: the reaper tallies only CONFIRMED cleanups
+/// (aborted expired sessions + unlinked past-TTL receipts), skipping fresh
+/// sessions, live-locked sessions, and fresh receipts.
+#[tokio::test]
+async fn test_fs_reaper_counts_only_confirmed_cleanups() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let now = now_unix_secs();
+    let stale = now.saturating_sub(100_000);
+
+    // Two expired sessions -> aborted -> counted.
+    let s1 = storage.create_session("repo").await.unwrap();
+    let s2 = storage.create_session("repo").await.unwrap();
+    backdate_json_u64_field(
+        &storage.session_meta_path(&s1.uuid),
+        "last_active_at_unix_secs",
+        stale,
+    );
+    backdate_json_u64_field(
+        &storage.session_meta_path(&s2.uuid),
+        "last_active_at_unix_secs",
+        stale,
+    );
+
+    // One fresh session -> skipped (not expired).
+    let s_fresh = storage.create_session("repo").await.unwrap();
+
+    // One expired but live-locked session -> skipped.
+    let s_locked = storage.create_session("repo").await.unwrap();
+    backdate_json_u64_field(
+        &storage.session_meta_path(&s_locked.uuid),
+        "last_active_at_unix_secs",
+        stale,
+    );
+    let _held = acquire_fs_session_lock(storage.session_lock_path(&s_locked.uuid))
+        .await
+        .unwrap();
+
+    // Two past-TTL receipts -> unlinked -> counted; one fresh receipt -> skipped.
+    let (r1, p1, _) = prepare_finalizable_session(&storage, "repo", b"RECEIPT_ONE_DATA").await;
+    storage.commit_finalize(&p1).await.unwrap();
+    let (r2, p2, _) = prepare_finalizable_session(&storage, "repo", b"RECEIPT_TWO_DATA").await;
+    storage.commit_finalize(&p2).await.unwrap();
+    let (r_fresh, p_fresh, _) =
+        prepare_finalizable_session(&storage, "repo", b"RECEIPT_FRESH_DATA").await;
+    storage.commit_finalize(&p_fresh).await.unwrap();
+    backdate_json_u64_field(
+        &storage.finalized_receipt_path(&r1.uuid),
+        "finalized_at_unix_secs",
+        stale,
+    );
+    backdate_json_u64_field(
+        &storage.finalized_receipt_path(&r2.uuid),
+        "finalized_at_unix_secs",
+        stale,
+    );
+
+    // max_age = 3600, receipt_ttl = 3600: only the backdated records qualify.
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 4, "2 aborted sessions + 2 unlinked receipts");
+
+    // Confirm exactly which records were acted on.
+    assert!(!storage.session_meta_path(&s1.uuid).exists());
+    assert!(!storage.session_meta_path(&s2.uuid).exists());
+    assert!(
+        storage.session_meta_path(&s_fresh.uuid).exists(),
+        "fresh session survives"
+    );
+    assert!(
+        storage.session_meta_path(&s_locked.uuid).exists(),
+        "locked session survives"
+    );
+    assert!(!storage.finalized_receipt_path(&r1.uuid).exists());
+    assert!(!storage.finalized_receipt_path(&r2.uuid).exists());
+    assert!(
+        storage.finalized_receipt_path(&r_fresh.uuid).exists(),
+        "fresh receipt survives"
+    );
+}
+
+/// CAS mismatch: after the source data file is gone, a destination blob of the
+/// WRONG size must fail the publish rather than assert a bogus finalization.
+#[tokio::test]
+async fn test_fs_commit_finalize_cas_mismatch_is_error() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let (session, prepared, digest) =
+        prepare_finalizable_session(&storage, "repo", b"PAYLOAD_TWELVE").await;
+
+    // Destination holds a wrong-size blob and the staging data is gone.
+    let cas = cas_blob_path(&root, &digest);
+    ensure_dir(cas.parent().unwrap()).unwrap();
+    std::fs::write(&cas, b"X").unwrap();
+    std::fs::remove_file(storage.session_data_path(&session.uuid)).unwrap();
+
+    let res = storage.commit_finalize(&prepared).await;
+    assert!(
+        res.is_err(),
+        "a wrong-size CAS destination with a missing source must fail the publish"
+    );
+    // No receipt was asserted for the mismatched publish.
+    assert!(!storage.finalized_receipt_path(&session.uuid).exists());
+}
+
+/// CAS present (partial-publication roll-forward): if the source data was already
+/// renamed into CAS at the correct size, a retry tolerates the missing source and
+/// completes membership + receipt, reporting a published finalize.
+#[tokio::test]
+async fn test_fs_commit_finalize_tolerates_prior_cas_publication() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"ROLL_FORWARD_DATA";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+
+    // Simulate a crash right after the CAS rename: the blob is present at the
+    // correct size, but the staging data file is gone.
+    let cas = cas_blob_path(&root, &digest);
+    ensure_dir(cas.parent().unwrap()).unwrap();
+    std::fs::copy(storage.session_data_path(&session.uuid), &cas).unwrap();
+    std::fs::remove_file(storage.session_data_path(&session.uuid)).unwrap();
+
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::Published(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+    assert!(membership_record_path(&root, "repo", &digest).exists());
+    assert!(storage.finalized_receipt_path(&session.uuid).exists());
+}
+
+/// Membership failure before receipt + retry: from a post-crash state where the
+/// CAS blob is present but meta/membership/receipt are all gone, a retry heals
+/// both membership and receipt and reports an idempotent finalization.
+#[tokio::test]
+async fn test_fs_commit_finalize_retry_heals_membership_and_receipt() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"HEAL_BOTH_DATA";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+
+    // CAS present at the correct size; every staging + index record removed.
+    let cas = cas_blob_path(&root, &digest);
+    ensure_dir(cas.parent().unwrap()).unwrap();
+    std::fs::copy(storage.session_data_path(&session.uuid), &cas).unwrap();
+    std::fs::remove_file(storage.session_data_path(&session.uuid)).unwrap();
+    let _ = std::fs::remove_file(storage.session_meta_path(&session.uuid));
+    let _ = std::fs::remove_file(storage.session_hash_path(&session.uuid, 1));
+    let _ = std::fs::remove_file(membership_record_path(&root, "repo", &digest));
+    assert!(!membership_record_path(&root, "repo", &digest).exists());
+
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::AlreadyFinalized(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+    assert!(
+        membership_record_path(&root, "repo", &digest).exists(),
+        "membership healed"
+    );
+    assert!(
+        storage.finalized_receipt_path(&session.uuid).exists(),
+        "receipt healed"
+    );
+}
+
+/// Receipt failure after membership success + retry: from a fully published blob
+/// whose receipt was lost, a retry re-asserts the receipt (membership already
+/// present) and reports an idempotent finalization.
+#[tokio::test]
+async fn test_fs_commit_finalize_retry_restores_lost_receipt() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"RESTORE_RECEIPT";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+    storage.commit_finalize(&prepared).await.unwrap();
+
+    // The receipt is lost post-crash; CAS + membership remain.
+    std::fs::remove_file(storage.finalized_receipt_path(&session.uuid)).unwrap();
+    assert!(membership_record_path(&root, "repo", &digest).exists());
+
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::AlreadyFinalized(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+    assert!(
+        storage.finalized_receipt_path(&session.uuid).exists(),
+        "receipt restored"
+    );
+}
+
+/// Existing receipt with missing membership: a commit replay is receipt-
+/// authoritative — it reports the finalization from the receipt without
+/// re-deriving the CAS state, so the membership index is NOT rewritten by replay.
+/// (Recovery is the path that re-asserts membership; see the recover test below.)
+#[tokio::test]
+async fn test_fs_commit_finalize_replay_is_receipt_authoritative() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"RECEIPT_AUTHORITATIVE";
+    let (_session, prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+    storage.commit_finalize(&prepared).await.unwrap();
+
+    // Receipt present, membership dropped.
+    std::fs::remove_file(membership_record_path(&root, "repo", &digest)).unwrap();
+
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::AlreadyFinalized(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+    assert!(
+        !membership_record_path(&root, "repo", &digest).exists(),
+        "receipt-authoritative replay does not rewrite membership"
+    );
+}
+
+/// Recover roll-forward: a Finalizing session whose CAS blob is present at the
+/// expected size re-asserts BOTH membership and receipt (self-healing the index
+/// that a receipt-authoritative replay leaves alone).
+#[tokio::test]
+async fn test_fs_recover_session_rolls_forward_membership_and_receipt() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"RECOVER_ROLLFORWARD";
+    let (session, _prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+
+    // CAS present at the expected size; no membership, no receipt yet.
+    let cas = cas_blob_path(&root, &digest);
+    ensure_dir(cas.parent().unwrap()).unwrap();
+    std::fs::copy(storage.session_data_path(&session.uuid), &cas).unwrap();
+    assert!(!membership_record_path(&root, "repo", &digest).exists());
+    assert!(!storage.finalized_receipt_path(&session.uuid).exists());
+
+    let status = storage.recover_session(&session).await.unwrap();
+    assert_eq!(status.state, UploadSessionState::Finalizing);
+    assert!(
+        membership_record_path(&root, "repo", &digest).exists(),
+        "membership rolled forward"
+    );
+    assert!(
+        storage.finalized_receipt_path(&session.uuid).exists(),
+        "receipt rolled forward"
+    );
+}
+
+/// Abort interruption before metadata removal + retry: with the staging data
+/// already gone (as after a crash mid-abort) but the meta still present, a retry
+/// completes the abort (meta removed) and is idempotent on a further retry.
+#[tokio::test]
+async fn test_fs_abort_session_retry_after_partial_interruption() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"ABORT_DATA")]),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+
+    // Simulate a crash after the data was unlinked but before the meta was removed.
+    std::fs::remove_file(storage.session_data_path(&session.uuid)).unwrap();
+    assert!(storage.session_meta_path(&session.uuid).exists());
+
+    // Retry completes the abort: meta removed LAST, and the operation is total.
+    storage.abort_session(&session).await.unwrap();
+    assert!(!storage.session_meta_path(&session.uuid).exists());
+
+    // Idempotent: a further retry against an already-aborted session still succeeds.
+    storage.abort_session(&session).await.unwrap();
+}
+
+// --------------------------------------------------------------------------
+// #1 Reaper lock-gap regressions
+//
+// The reaper inspects, decides expiry, revalidates, and acts on each candidate
+// inside ONE continuously-held `.lock.{uuid}` (acquired once, never dropped and
+// reacquired). These tests exercise the former inspection/action boundary
+// directly through the production reaper via the test-only boundary hook.
+// --------------------------------------------------------------------------
+
+/// A cooperating session update attempted at the former inspection/action boundary
+/// cannot slip between the locked expiry check and the destructive action: it blocks
+/// on the continuously-held session lock and, once released, observes the session as
+/// already reaped. (Not a root-replacement test: the same live session is contended.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_fs_reaper_locked_boundary_excludes_cooperating_update() {
+    use std::sync::mpsc as std_mpsc;
+
+    let root = tmp_fs_root();
+    let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+
+    // An expired Appending session with committed bytes.
+    let session = storage.create_session("repo").await.unwrap();
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"HALF")]),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+    let stale = now_unix_secs().saturating_sub(100_000);
+    backdate_json_u64_field(
+        &storage.session_meta_path(&session.uuid),
+        "last_active_at_unix_secs",
+        stale,
+    );
+
+    // Boundary hook: signal the test once the reaper reaches the post-expiry-check,
+    // pre-action boundary while holding the session lock, then block (still holding
+    // the lock) until the test releases it.
+    let (reached_tx, reached_rx) = std_mpsc::channel::<()>();
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    let reached_tx = std::sync::Mutex::new(Some(reached_tx));
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let target = session.uuid.clone();
+    storage.set_reaper_boundary_hook(Arc::new(move |uuid: &str| {
+        if uuid == target {
+            if let Some(tx) = reached_tx.lock().unwrap().take() {
+                tx.send(()).unwrap();
+            }
+            release_rx.lock().unwrap().recv().unwrap();
+        }
+    }));
+
+    // Run the reaper; it parks at the boundary holding the lock.
+    let s = storage.clone();
+    let reaper = tokio::spawn(async move { s.reap_expired_sessions(3600, 3600).await });
+
+    // Wait until the reaper is parked at the boundary (lock held, expiry decided).
+    tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    // A cooperating update now attempts to advance the SAME session. It must block on
+    // the still-held session lock and cannot slip in before the reaper's action.
+    let s2 = storage.clone();
+    let sess2 = session.clone();
+    let update = tokio::spawn(async move {
+        s2.append_if_offset(
+            &sess2,
+            UploadOffsetPrecondition::Exact(4),
+            make_test_stream(vec![Bytes::from_static(b"MORE")]),
+            1024 * 1024,
+        )
+        .await
+    });
+
+    // While the reaper holds the lock, the update must NOT complete.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !update.is_finished(),
+        "a cooperating update must not slip between the locked expiry check and the destructive action"
+    );
+
+    // Release the reaper: it aborts the expired session and drops the lock.
+    release_tx.send(()).unwrap();
+    let reaped = reaper.await.unwrap().unwrap();
+    assert_eq!(reaped, 1, "the expired session is confirmed reaped");
+    assert!(
+        !storage.session_meta_path(&session.uuid).exists(),
+        "the reaper aborted the session (meta removed) under the held lock"
+    );
+
+    // The update, unblocked only AFTER the destructive action, now finds no session
+    // and fails — it did not mutate a reaped session.
+    let update_res = update.await.unwrap();
+    assert!(
+        update_res.is_err(),
+        "the update ran strictly after the abort and must observe the session as gone"
+    );
+}
+
+/// An update that COMPLETED before the reaper's locked expiry check is respected: the
+/// reaper reads `last_active` freshly under the lock (never a stale listing snapshot),
+/// so a session that was expired on disk but has since been refreshed survives.
+#[tokio::test]
+async fn test_fs_reaper_honors_update_completed_before_locked_check() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // A session that is expired on disk...
+    let session = storage.create_session("repo").await.unwrap();
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"AAAA")]),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+    let stale = now_unix_secs().saturating_sub(100_000);
+    backdate_json_u64_field(
+        &storage.session_meta_path(&session.uuid),
+        "last_active_at_unix_secs",
+        stale,
+    );
+
+    // ...but a cooperating update lands and refreshes `last_active` to now BEFORE the
+    // reaper runs. The reaper's expiry decision reads the meta freshly under the lock.
+    let res = storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(4),
+            make_test_stream(vec![Bytes::from_static(b"BBBB")]),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res, UploadAppendResult::Committed { new_offset: 8 });
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "the freshly-updated session is not expired");
+    assert!(
+        storage.session_meta_path(&session.uuid).exists(),
+        "the reaper honored the completed update and left the session in place"
+    );
+}
+
+// --------------------------------------------------------------------------
+// #2 Receipt-cleanup locking regressions
+//
+// Each finalized receipt is unlinked only under the matching `.lock.{uuid}`
+// session lock, re-reading the receipt under the lock. These tests cover a busy
+// lock, concurrent (re)publication, a changed receipt identity, disappearance,
+// and a fresh same-UUID session's receipt.
+// --------------------------------------------------------------------------
+
+/// A receipt whose session lock is held by a live participant is left untouched: the
+/// reaper's per-receipt `try_lock` yields busy and the receipt is skipped.
+#[tokio::test]
+async fn test_fs_reaper_receipt_busy_lock_is_skipped() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let (session, prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"BUSY_RECEIPT_DATA").await;
+    storage.commit_finalize(&prepared).await.unwrap();
+    backdate_json_u64_field(
+        &storage.finalized_receipt_path(&session.uuid),
+        "finalized_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    // Hold the session lock: a live same-UUID participant owns the receipt.
+    let _held = acquire_fs_session_lock(storage.session_lock_path(&session.uuid))
+        .await
+        .unwrap();
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "a busy-locked receipt is not reaped");
+    assert!(
+        storage.finalized_receipt_path(&session.uuid).exists(),
+        "the busy-locked receipt is preserved"
+    );
+}
+
+/// A receipt (re)published fresh at the under-lock boundary is respected: the reaper
+/// re-reads the CURRENT receipt under the lock, sees a fresh `finalized_at`, and keeps
+/// it rather than acting on the stale listing-time snapshot.
+#[tokio::test]
+async fn test_fs_reaper_receipt_concurrent_publication_is_respected() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let (session, prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"REPUBLISH_RECEIPT").await;
+    storage.commit_finalize(&prepared).await.unwrap();
+    // Backdate so the LISTING-time snapshot looks expired.
+    let receipt_path = storage.finalized_receipt_path(&session.uuid);
+    backdate_json_u64_field(
+        &receipt_path,
+        "finalized_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    // At the under-lock boundary, a concurrent publisher refreshes the receipt.
+    let target = session.uuid.clone();
+    let refreshed_path = receipt_path.clone();
+    let fresh = now_unix_secs();
+    storage.set_reaper_receipt_boundary_hook(Arc::new(move |uuid: &str| {
+        if uuid == target {
+            backdate_json_u64_field(&refreshed_path, "finalized_at_unix_secs", fresh);
+        }
+    }));
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "a concurrently-republished receipt is not reaped");
+    assert!(
+        receipt_path.exists(),
+        "the reaper re-read the fresh receipt under the lock and preserved it"
+    );
+}
+
+/// A receipt whose stored identity no longer matches its leaf name (a same-UUID
+/// replacement) is preserved: identity revalidation under the lock reports Changed.
+#[tokio::test]
+async fn test_fs_reaper_receipt_changed_identity_is_preserved() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let (session, prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"IDENTITY_RECEIPT").await;
+    storage.commit_finalize(&prepared).await.unwrap();
+    let receipt_path = storage.finalized_receipt_path(&session.uuid);
+    backdate_json_u64_field(
+        &receipt_path,
+        "finalized_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    // Rewrite the receipt's stored uuid so it no longer matches the leaf name.
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    v["uuid"] = serde_json::json!(format!("{}-rotated", session.uuid));
+    std::fs::write(&receipt_path, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "a receipt with a changed identity is not reaped");
+    assert!(
+        receipt_path.exists(),
+        "the reaper preserved the identity-changed receipt"
+    );
+}
+
+/// A receipt that disappears at the under-lock boundary (a concurrent non-locked
+/// removal) is handled as absent: the reaper's re-read returns nothing and no cleanup
+/// is counted, with no error.
+#[tokio::test]
+async fn test_fs_reaper_receipt_disappearance_is_absent() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let (session, prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"VANISHING_RECEIPT").await;
+    storage.commit_finalize(&prepared).await.unwrap();
+    let receipt_path = storage.finalized_receipt_path(&session.uuid);
+    backdate_json_u64_field(
+        &receipt_path,
+        "finalized_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    // At the under-lock boundary, the receipt vanishes out from under the reaper.
+    let target = session.uuid.clone();
+    let vanish_path = receipt_path.clone();
+    storage.set_reaper_receipt_boundary_hook(Arc::new(move |uuid: &str| {
+        if uuid == target {
+            let _ = std::fs::remove_file(&vanish_path);
+        }
+    }));
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "a vanished receipt is not counted as a cleanup");
+    assert!(!receipt_path.exists(), "the receipt is (still) gone");
+}
+
+/// A fresh same-UUID session's receipt is preserved: even with an expired listing-time
+/// snapshot, the reaper re-reads under the lock, and a fresh `finalized_at` keeps it.
+#[tokio::test]
+async fn test_fs_reaper_receipt_fresh_same_uuid_is_preserved() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let (session, prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"FRESH_SAME_UUID").await;
+    storage.commit_finalize(&prepared).await.unwrap();
+    let receipt_path = storage.finalized_receipt_path(&session.uuid);
+
+    // The receipt is fresh (never backdated): a same-UUID session just finalized.
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "a fresh receipt is not reaped");
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_some(),
+        "the fresh same-UUID receipt is preserved and still resolvable"
+    );
+    assert!(receipt_path.exists());
+}
+
+// --------------------------------------------------------------------------
+// #3 Public receipt lookup routes through the pinned finalized authority
+//
+// `get_finalized_receipt` must resolve through the SAME pinned `.finalized`
+// authority the writers publish through, so reader and writer agree after a
+// `.finalized` or `uploads` pathname replacement.
+// --------------------------------------------------------------------------
+
+/// After the `.finalized` subtree is replaced beneath an unchanged root, the public
+/// `get_finalized_receipt` still resolves the receipt through the pinned authority
+/// (the detached inode where the writer published it), agreeing with commit.
+#[tokio::test]
+async fn test_fs_get_finalized_receipt_after_finalized_replacement_uses_pin() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let data = b"PUBLIC_LOOKUP_FINALIZED_REPLACE";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "myrepo", data).await;
+    storage.commit_finalize(&prepared).await.unwrap();
+
+    // Agreement before replacement.
+    let before = storage
+        .get_finalized_receipt(&session)
+        .await
+        .unwrap()
+        .expect("receipt present after commit");
+    assert_eq!(before.digest, digest.as_str());
+
+    // Replace the `.finalized` subtree with a fresh, empty inode.
+    let finalized_dir = storage.finalized_dir();
+    let detached = storage.uploads_dir().join(".finalized.detached");
+    std::fs::rename(&finalized_dir, &detached).unwrap();
+    std::fs::create_dir(&finalized_dir).unwrap();
+    assert!(
+        std::fs::read_dir(&finalized_dir).unwrap().next().is_none(),
+        "ambient replacement is empty"
+    );
+
+    // The public lookup consults the pinned authority (detached inode), not the empty
+    // ambient replacement — so it still agrees with the writer.
+    let after = storage
+        .get_finalized_receipt(&session)
+        .await
+        .unwrap()
+        .expect("public lookup must find the receipt through the pinned .finalized authority");
+    assert_eq!(after.digest, digest.as_str());
+    assert_eq!(after.uuid, session.uuid);
+    assert_eq!(after.repo, session.repo);
+}
+
+/// After the `uploads` subtree is replaced beneath an unchanged root, the public
+/// `get_finalized_receipt` still resolves through the pinned `.finalized` authority
+/// (nested in the detached uploads inode), agreeing with a recovery roll-forward.
+#[tokio::test]
+async fn test_fs_get_finalized_receipt_after_uploads_replacement_uses_pin() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    let data = b"PUBLIC_LOOKUP_UPLOADS_REPLACE";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "myrepo", data).await;
+    storage.commit_finalize(&prepared).await.unwrap();
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Replace the uploads subtree (which nests `.finalized`) with a fresh inode.
+    let uploads_dir = storage.uploads_dir();
+    let detached = root.join("uploads.detached");
+    std::fs::rename(&uploads_dir, &detached).unwrap();
+    std::fs::create_dir(&uploads_dir).unwrap();
+    assert!(
+        std::fs::read_dir(&uploads_dir).unwrap().next().is_none(),
+        "ambient replacement is empty"
+    );
+
+    // The public lookup still finds the receipt through the pinned authority, and a
+    // recovery roll-forward (also pinned) agrees on the same finalized state.
+    let after = storage
+        .get_finalized_receipt(&session)
+        .await
+        .unwrap()
+        .expect("public lookup must resolve through the pinned authority after uploads replace");
+    assert_eq!(after.digest, digest.as_str());
+    let recovered = storage.recover_session(&session).await.unwrap();
+    assert_eq!(recovered.state, UploadSessionState::Finalizing);
+}
+
+// --------------------------------------------------------------------------
+// #5 Deterministic atomic-write failure semantics
+//
+// These drive the dependency's `write_leaf_atomic` primitive through the
+// production membership/finalize paths and inject faults at each internal step
+// via the opt-in `storage_fs::mutate::fault` seam (enabled ONLY through the
+// registry dev-dependency; production builds never contain it). The global fault
+// registry is shared process-wide, so these tests serialize on a dedicated lock
+// and reset the table before and after each case.
+// --------------------------------------------------------------------------
+
+/// Serializes the fault-injection tests (the dep's fault registry is a single
+/// process-global table). Recover from poisoning so one failing case does not
+/// cascade into spurious failures in the others.
+static FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fault_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let g = FAULT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    storage_fs::mutate::fault::reset();
+    g
+}
+
+fn membership_digest(seed: u8) -> Digest {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update([seed; 32]);
+    Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap()
+}
+
+/// Primary write failure: an ENOSPC on the temp-file write inside `write_leaf_atomic`
+/// surfaces as an error (no silent success) and leaves no destination behind.
+#[tokio::test]
+async fn test_fs_atomic_primary_write_failure_surfaces_and_leaves_no_destination() {
+    use crate::storage::repo_membership::{
+        RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0x11);
+    let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+
+    arm(FaultPoint::AtomicWrite, Some(digest.hex()), 1, libc::ENOSPC);
+    let err = storage
+        .link_repo_blob(&record)
+        .await
+        .expect_err("a primary write failure must surface, not silently succeed");
+    let _ = err;
+    assert!(
+        !membership_record_path(&root, "repo", &digest).exists(),
+        "a failed primary write must not publish a destination record"
+    );
+
+    storage_fs::mutate::fault::reset();
+}
+
+/// Rename failure with prior-destination preservation: when the publish `renameat`
+/// fails, any pre-existing destination is preserved untouched and the temp is cleaned
+/// up (no residual, no partial overwrite).
+#[tokio::test]
+async fn test_fs_atomic_rename_failure_preserves_prior_destination() {
+    use crate::storage::repo_membership::{
+        MembershipState, RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0x22);
+    let path = membership_record_path(&root, "repo", &digest);
+
+    // Publish an initial record (Active) with no fault.
+    let original = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+    storage.link_repo_blob(&original).await.unwrap();
+    let original_bytes = std::fs::read(&path).unwrap();
+
+    // Attempt to overwrite with a mutated record while the publish rename fails.
+    let mut mutated = original.clone();
+    mutated.state = MembershipState::Candidate;
+    mutated.unreferenced_since_unix_secs = Some(now_unix_secs());
+    arm(FaultPoint::AtomicRename, Some(digest.hex()), 1, libc::EIO);
+    storage
+        .link_repo_blob(&mutated)
+        .await
+        .expect_err("a failed publish rename must surface an error");
+
+    // The prior destination is preserved byte-for-byte; no temp residue remains.
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original_bytes,
+        "a failed rename must preserve the prior destination unchanged"
+    );
+    let algo_dir = path.parent().unwrap();
+    let leftovers: Vec<_> = std::fs::read_dir(algo_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != &format!("{}.json", digest.hex()))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the failed write must leave no temp residual: {leftovers:?}"
+    );
+
+    storage_fs::mutate::fault::reset();
+}
+
+/// Secondary cleanup failure: when the publish rename fails AND the temp cleanup then
+/// also fails, the operation surfaces an error (the `CleanupFailed` combination is not
+/// swallowed) while the prior destination is still preserved.
+#[tokio::test]
+async fn test_fs_atomic_secondary_cleanup_failure_surfaces() {
+    use crate::storage::repo_membership::{
+        RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0x33);
+    let path = membership_record_path(&root, "repo", &digest);
+
+    let original = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+    storage.link_repo_blob(&original).await.unwrap();
+    let original_bytes = std::fs::read(&path).unwrap();
+
+    // Rename fails, then the cleanup unlink of the temp also fails.
+    arm(FaultPoint::AtomicRename, Some(digest.hex()), 1, libc::EIO);
+    arm(FaultPoint::AtomicCleanup, Some(digest.hex()), 1, libc::EIO);
+    storage
+        .link_repo_blob(&original)
+        .await
+        .expect_err("a rename failure whose cleanup also fails must surface an error");
+
+    // The prior destination is still intact.
+    assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+
+    storage_fs::mutate::fault::reset();
+}
+
+/// Retry after a transient write failure heals: once the injected fault is cleared, a
+/// retry of the same operation completes and publishes the record.
+#[tokio::test]
+async fn test_fs_atomic_write_failure_retry_heals() {
+    use crate::storage::repo_membership::{
+        RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0x44);
+    let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+
+    // First attempt fails on the primary write (count 1).
+    arm(FaultPoint::AtomicWrite, Some(digest.hex()), 1, libc::ENOSPC);
+    storage
+        .link_repo_blob(&record)
+        .await
+        .expect_err("the first attempt fails under the armed fault");
+    assert!(!membership_record_path(&root, "repo", &digest).exists());
+
+    // The rule has drained (count 0); a retry heals.
+    storage.link_repo_blob(&record).await.unwrap();
+    assert!(
+        membership_record_path(&root, "repo", &digest).exists(),
+        "a retry after the transient fault clears must publish the record"
+    );
+
+    storage_fs::mutate::fault::reset();
+}
+
+/// End-to-end honest propagation: a write fault injected on the membership record
+/// during `commit_finalize` must fail the finalize (not report a spurious success),
+/// demonstrating that per-step write failures are surfaced rather than suppressed.
+#[tokio::test]
+async fn test_fs_commit_finalize_membership_write_failure_is_surfaced() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"HONEST_FINALIZE_FAILURE";
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+
+    arm(FaultPoint::AtomicWrite, Some(digest.hex()), 1, libc::EIO);
+    let res = storage.commit_finalize(&prepared).await;
+    assert!(
+        res.is_err(),
+        "a membership write failure during finalize must surface, not report success"
+    );
+    // The receipt (published after membership) was not asserted for the failed commit.
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_none(),
+        "no finalized receipt is published when the membership write fails"
+    );
+
+    storage_fs::mutate::fault::reset();
+}
+
+// --------------------------------------------------------------------------
+// Abort failure boundary (honest cleanup) — requirement #1.
+//
+// abort_session_locked must remove staging data + every hash generation and
+// then the meta LAST, propagating a genuine cleanup failure and PRESERVING the
+// meta (so the session stays recoverable and an incomplete abort is never
+// counted as a cleanup). A genuine missing leaf is idempotent absence. Hash
+// discovery is driven by the recorded generation (and a contained scan when the
+// meta is corrupt), never a fixed 0..100 range, so a later/sparse generation is
+// never orphaned while the meta is deleted. Faults are injected at the dep's
+// `Unlink` fault point through the dev-only fault seam.
+// --------------------------------------------------------------------------
+
+/// Advance a session's rolling-hash generation to `appends` by streaming that
+/// many single-byte appends, leaving `meta.hash_generation == appends` with only
+/// the current generation's hash leaf on disk.
+async fn append_n(storage: &FsStorage, session: &UploadSessionId, appends: u64) {
+    let mut offset = 0u64;
+    for _ in 0..appends {
+        let stream = make_test_stream(vec![Bytes::from_static(b"x")]);
+        storage
+            .append_if_offset(
+                session,
+                UploadOffsetPrecondition::Exact(offset),
+                stream,
+                1024 * 1024,
+            )
+            .await
+            .unwrap();
+        offset += 1;
+    }
+}
+
+/// Data-unlink failure: an EIO on the staging data unlink surfaces through the
+/// public abort, PRESERVES the meta (session stays recoverable), and a retry
+/// after clearing the fault completes the abort.
+#[tokio::test]
+async fn test_fs_abort_data_unlink_failure_preserves_meta_and_retries() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+    let meta_path = storage.session_meta_path(&uuid);
+    let data_path = storage.session_data_path(&uuid);
+    let hash_path = storage.session_hash_path(&uuid, 0);
+
+    // The data unlink (leaf `{uuid}.data`) fails once with EIO.
+    arm(
+        FaultPoint::Unlink,
+        Some(&format!("{uuid}.data")),
+        1,
+        libc::EIO,
+    );
+    storage
+        .abort_session(&session)
+        .await
+        .expect_err("a failed data unlink must surface, not report a clean abort");
+
+    // Meta is preserved (removed LAST, and only after data/hash cleanup); the data
+    // and hash leaves also survive because cleanup stopped at the first failure.
+    assert!(meta_path.exists(), "meta must survive an incomplete abort");
+    assert!(
+        data_path.exists(),
+        "the data leaf that failed to unlink survives"
+    );
+    assert!(
+        hash_path.exists(),
+        "the hash leaf survives an incomplete abort"
+    );
+
+    // Clearing the fault and retrying completes the abort.
+    storage_fs::mutate::fault::reset();
+    storage.abort_session(&session).await.unwrap();
+    assert!(!meta_path.exists(), "retry removes the meta");
+    assert!(!data_path.exists(), "retry removes the data leaf");
+    assert!(!hash_path.exists(), "retry removes the hash leaf");
+}
+
+/// Hash-unlink failure AFTER an earlier successful deletion: with stray hash
+/// generations around the recorded generation, the abort deletes the data leaf
+/// and the earlier generations, then fails on a later generation's unlink. The
+/// meta is preserved and only the failed generation remains; a retry heals it.
+#[tokio::test]
+async fn test_fs_abort_hash_unlink_failure_after_earlier_deletion_preserves_meta() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // One append advances the generation to 1 (hash.1 present, hash.0 unlinked).
+    append_n(&storage, &session, 1).await;
+    // Simulate crash residue: stray hash generations at 0 and 2 around meta gen 1.
+    std::fs::write(storage.session_hash_path(&uuid, 0), b"g0").unwrap();
+    std::fs::write(storage.session_hash_path(&uuid, 2), b"g2").unwrap();
+
+    let meta_path = storage.session_meta_path(&uuid);
+    let data_path = storage.session_data_path(&uuid);
+    let (h0, h1, h2) = (
+        storage.session_hash_path(&uuid, 0),
+        storage.session_hash_path(&uuid, 1),
+        storage.session_hash_path(&uuid, 2),
+    );
+    assert!(h0.exists() && h1.exists() && h2.exists());
+
+    // Fail the unlink of the LAST generation in the window {0,1,2}; deletions of
+    // the data leaf and generations 0 and 1 succeed first.
+    arm(
+        FaultPoint::Unlink,
+        Some(&format!("{uuid}.hash.2")),
+        1,
+        libc::EIO,
+    );
+    storage
+        .abort_session(&session)
+        .await
+        .expect_err("a failed hash unlink must surface");
+
+    assert!(
+        meta_path.exists(),
+        "meta survives when hash cleanup is incomplete"
+    );
+    assert!(
+        !data_path.exists(),
+        "the data leaf was removed before the failure"
+    );
+    assert!(!h0.exists(), "generation 0 was removed before the failure");
+    assert!(!h1.exists(), "generation 1 was removed before the failure");
+    assert!(h2.exists(), "the generation whose unlink failed remains");
+
+    // Retry after clearing the fault completes the abort (window is re-derived).
+    storage_fs::mutate::fault::reset();
+    storage.abort_session(&session).await.unwrap();
+    assert!(
+        !meta_path.exists() && !h2.exists(),
+        "retry heals the remaining leaf"
+    );
+}
+
+/// Genuine missing files: aborting a session whose data + hash leaves are already
+/// gone is idempotent absence, not a failure, and still removes the meta.
+#[tokio::test]
+async fn test_fs_abort_tolerates_genuinely_missing_leaves() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // Remove the data + hash leaves out from under the session, leaving only meta.
+    std::fs::remove_file(storage.session_data_path(&uuid)).unwrap();
+    std::fs::remove_file(storage.session_hash_path(&uuid, 0)).unwrap();
+
+    storage
+        .abort_session(&session)
+        .await
+        .expect("missing leaves are idempotent absence, not an abort failure");
+    assert!(
+        !storage.session_meta_path(&uuid).exists(),
+        "abort still removes the meta when leaves were already absent"
+    );
+}
+
+/// Sparse/later hash generation: a session whose recorded generation is far above
+/// the old fixed 0..100 range must have its later generations removed, not
+/// orphaned while the meta (needed for rediscovery) is deleted.
+#[tokio::test]
+async fn test_fs_abort_removes_sparse_later_hash_generations() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // Move the recorded generation well past the former fixed scan bound and place
+    // stray leaves in the {G-1, G, G+1} crash window.
+    const G: u64 = 250;
+    backdate_json_u64_field(&storage.session_meta_path(&uuid), "hash_generation", G);
+    std::fs::remove_file(storage.session_hash_path(&uuid, 0)).unwrap();
+    for generation in [G - 1, G, G + 1] {
+        std::fs::write(storage.session_hash_path(&uuid, generation), b"stray").unwrap();
+    }
+
+    storage.abort_session(&session).await.unwrap();
+
+    for generation in [G - 1, G, G + 1] {
+        assert!(
+            !storage.session_hash_path(&uuid, generation).exists(),
+            "abort must remove later hash generation {generation}, not orphan it"
+        );
+    }
+    assert!(
+        !storage.session_meta_path(&uuid).exists(),
+        "meta removed only after the later generations were cleaned"
+    );
+}
+
+/// The reaper must count an aborted (non-finalizing) session but NOT count — and
+/// must PRESERVE — a session whose data unlink fails: an incomplete abort is a
+/// per-candidate failure, logged and skipped, never a confirmed cleanup.
+#[tokio::test]
+async fn test_fs_reaper_does_not_count_incomplete_abort() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let now = now_unix_secs();
+    let stale = now.saturating_sub(100_000);
+
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+    backdate_json_u64_field(
+        &storage.session_meta_path(&uuid),
+        "last_active_at_unix_secs",
+        stale,
+    );
+
+    arm(
+        FaultPoint::Unlink,
+        Some(&format!("{uuid}.data")),
+        1,
+        libc::EIO,
+    );
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "an incomplete abort is not a confirmed cleanup");
+    assert!(
+        storage.session_meta_path(&uuid).exists(),
+        "the session survives an incomplete reaper abort and stays recoverable"
+    );
+
+    storage_fs::mutate::fault::reset();
+}
+
+/// Out-of-window residual from a REAL append old-hash unlink failure. This is the
+/// production boundary the previous `{G-1, G, G+1}` derivation missed: the append
+/// commit protocol persists generation `G+1` in the meta and then cleans up the old
+/// `G` leaf with a *suppressed* unlink (`let _ = dir.unlink(...)`). A genuine unlink
+/// failure there leaves `G` behind while the recorded generation keeps advancing on
+/// later appends, so a residual can sit arbitrarily far below `hash_generation - 1`.
+/// The scan-based abort must still remove it.
+#[tokio::test]
+async fn test_fs_abort_removes_residual_generation_from_real_append_unlink_failure() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // Append 0 -> 1. The append writes `hash.1`, persists meta generation 1, then the
+    // best-effort cleanup of `hash.0` FAILS with EIO. Because that unlink result is
+    // suppressed in production, the append still commits and `hash.0` is orphaned.
+    arm(
+        FaultPoint::Unlink,
+        Some(&format!("{uuid}.hash.0")),
+        1,
+        libc::EIO,
+    );
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"x")]),
+            1024 * 1024,
+        )
+        .await
+        .expect("append commits even though the suppressed old-hash cleanup failed");
+    storage_fs::mutate::fault::reset();
+
+    // Append 1 -> 2 with normal cleanup: `hash.2` written, meta generation 2, `hash.1`
+    // removed. The recorded generation is now 2, so the OLD window {G-1,G,G+1}={1,2,3}
+    // would never revisit the orphaned `hash.0`.
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(1),
+            make_test_stream(vec![Bytes::from_static(b"y")]),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+
+    let meta_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(storage.session_meta_path(&uuid)).unwrap()).unwrap();
+    assert_eq!(
+        meta_json["hash_generation"].as_u64().unwrap(),
+        2,
+        "recorded generation advanced past the orphaned residual"
+    );
+    let (h0, h1, h2) = (
+        storage.session_hash_path(&uuid, 0),
+        storage.session_hash_path(&uuid, 1),
+        storage.session_hash_path(&uuid, 2),
+    );
+    assert!(
+        h0.exists(),
+        "generation 0 is an out-of-window residual (0 < hash_generation - 1 = 1)"
+    );
+    assert!(
+        !h1.exists(),
+        "generation 1 was cleaned by the second append"
+    );
+    assert!(h2.exists(), "generation 2 is the current committed hash");
+
+    // The scan-based abort removes EVERY residual for this UUID, not a fixed window.
+    storage.abort_session(&session).await.unwrap();
+    assert!(
+        !h0.exists(),
+        "abort removed the out-of-window residual hash.0"
+    );
+    assert!(!h2.exists(), "abort removed the current hash.2");
+    assert!(
+        !storage.session_data_path(&uuid).exists(),
+        "abort removed the data leaf"
+    );
+    assert!(
+        !storage.session_meta_path(&uuid).exists(),
+        "abort removed the meta last"
+    );
+}
+
+/// Residual from a REAL `begin_finalize` trailing-stream old-hash unlink failure. The
+/// trailing-stream branch of `begin_finalize` advances the generation exactly like an
+/// append and cleans the old leaf with the same suppressed unlink, so it can orphan a
+/// residual too. The scan-based abort removes it. (A finalize residual is at most
+/// `G-1` because the session becomes `Finalizing` and cannot advance further, so this
+/// covers the second suppressed-cleanup site rather than the out-of-window case.)
+#[tokio::test]
+async fn test_fs_abort_removes_residual_generation_from_real_finalize_unlink_failure() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+    let _g = fault_test_guard();
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // Commit "he" via a normal append: offset 2, generation 1, `hash.1` present.
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            make_test_stream(vec![Bytes::from_static(b"he")]),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+
+    // begin_finalize with a trailing "llo": drains the tail, writes `hash.2`, persists
+    // generation 2, then the suppressed cleanup of `hash.1` FAILS. begin_finalize still
+    // prepares successfully (digest matches "hello"), leaving `hash.1` orphaned.
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"hello");
+    let digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
+    arm(
+        FaultPoint::Unlink,
+        Some(&format!("{uuid}.hash.1")),
+        1,
+        libc::EIO,
+    );
+    storage
+        .begin_finalize(
+            &session,
+            UploadOffsetPrecondition::Exact(5),
+            Some(make_test_stream(vec![Bytes::from_static(b"llo")])),
+            &digest,
+            1024 * 1024,
+            true,
+        )
+        .await
+        .expect("begin_finalize prepares even though the suppressed old-hash cleanup failed");
+    storage_fs::mutate::fault::reset();
+
+    let (h1, h2) = (
+        storage.session_hash_path(&uuid, 1),
+        storage.session_hash_path(&uuid, 2),
+    );
+    assert!(h1.exists(), "the finalize path orphaned generation 1");
+    assert!(h2.exists(), "generation 2 is the finalize-committed hash");
+
+    // Aborting the (still-unpublished) Finalizing session scans and removes all leaves.
+    storage.abort_session(&session).await.unwrap();
+    assert!(!h1.exists(), "abort removed the orphaned finalize residual");
+    assert!(!h2.exists(), "abort removed the current hash.2");
+    assert!(
+        !storage.session_data_path(&uuid).exists(),
+        "abort removed the data leaf"
+    );
+    assert!(
+        !storage.session_meta_path(&uuid).exists(),
+        "abort removed the meta last"
+    );
+}
+
+/// Absent meta with a residual hash leaf: the old absent-meta path removed only the
+/// data leaf and returned, orphaning any `{uuid}.hash.*` residual forever. The
+/// scan-based abort now cleans the residual hash leaves even when the meta is already
+/// gone, while staying contained to this UUID.
+#[tokio::test]
+async fn test_fs_abort_absent_meta_still_removes_residual_hash() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let session = storage.create_session("repo").await.unwrap();
+    let uuid = session.uuid.clone();
+
+    // Remove ONLY the meta, leaving the data leaf and the `hash.0` residual behind.
+    std::fs::remove_file(storage.session_meta_path(&uuid)).unwrap();
+    let (data_path, h0) = (
+        storage.session_data_path(&uuid),
+        storage.session_hash_path(&uuid, 0),
+    );
+    assert!(data_path.exists() && h0.exists());
+
+    storage
+        .abort_session(&session)
+        .await
+        .expect("absent meta is idempotent, and the residual hash is still cleaned");
+    assert!(!data_path.exists(), "abort removed the data leaf");
+    assert!(
+        !h0.exists(),
+        "abort removed the residual hash leaf even with the meta already absent"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Reaper Finalizing policy (baseline preserved) — requirement #2.
+//
+// The reaper attempts recovery for an expired Finalizing session but NEVER
+// aborts it. A fully-published CAS blob rolls forward and counts; a not-yet-
+// published / size-mismatched / invalid finalization stays intact and available
+// for later completion (not counted); staging data + meta survive the pending
+// and error cases.
+// --------------------------------------------------------------------------
+
+/// Rewrite `finalizing_info.expected_digest` on the session meta on disk.
+fn corrupt_finalizing_digest(path: &Path, bogus: &str) {
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    v["finalizing_info"]["expected_digest"] = serde_json::json!(bogus);
+    std::fs::write(path, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+/// Expired Finalizing with staging data present and CAS absent: recovery leaves
+/// it pending. The reaper counts nothing and preserves staging data + meta.
+#[tokio::test]
+async fn test_fs_reaper_leaves_pending_finalizing_with_cas_absent() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let (session, _prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"PENDING_FIN_NO_CAS").await;
+    let uuid = session.uuid.clone();
+    backdate_json_u64_field(
+        &storage.session_meta_path(&uuid),
+        "last_active_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(
+        count, 0,
+        "an unpublished finalizing session is not cleaned up"
+    );
+    assert!(storage.session_meta_path(&uuid).exists(), "meta survives");
+    assert!(
+        storage.session_data_path(&uuid).exists(),
+        "staging data survives"
+    );
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_none(),
+        "no receipt is fabricated for an unpublished finalization"
+    );
+}
+
+/// Expired Finalizing whose CAS blob is present but the WRONG size: recovery
+/// declines to roll forward, the reaper counts nothing, staging survives.
+#[tokio::test]
+async fn test_fs_reaper_leaves_finalizing_with_cas_size_mismatch() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let (session, _prepared, digest) =
+        prepare_finalizable_session(&storage, "repo", b"MISMATCH_DATA").await;
+    let uuid = session.uuid.clone();
+
+    // Publish a blob of the wrong size at the expected CAS path.
+    let cas = cas_blob_path(&root, &digest);
+    std::fs::create_dir_all(cas.parent().unwrap()).unwrap();
+    std::fs::write(&cas, b"WRONG_SIZE_BLOB_CONTENTS").unwrap();
+
+    backdate_json_u64_field(
+        &storage.session_meta_path(&uuid),
+        "last_active_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 0, "a size-mismatched CAS blob must not roll forward");
+    assert!(storage.session_meta_path(&uuid).exists(), "meta survives");
+    assert!(
+        storage.session_data_path(&uuid).exists(),
+        "staging data survives"
+    );
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_none(),
+        "no receipt for a mismatched blob"
+    );
+}
+
+/// Expired Finalizing with invalid finalizing information: recovery cannot parse
+/// the expected digest, leaves it pending, the reaper counts nothing, survives.
+#[tokio::test]
+async fn test_fs_reaper_leaves_finalizing_with_invalid_finalizing_info() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let (session, _prepared, _digest) =
+        prepare_finalizable_session(&storage, "repo", b"INVALID_FIN_INFO").await;
+    let uuid = session.uuid.clone();
+    let meta_path = storage.session_meta_path(&uuid);
+
+    corrupt_finalizing_digest(&meta_path, "not-a-valid-digest");
+    backdate_json_u64_field(
+        &meta_path,
+        "last_active_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(
+        count, 0,
+        "invalid finalizing info must not authorize cleanup"
+    );
+    assert!(meta_path.exists(), "meta survives");
+    assert!(
+        storage.session_data_path(&uuid).exists(),
+        "staging data survives"
+    );
+}
+
+/// A pending finalization that is later published rolls forward on the next
+/// reaper pass, counting exactly one and publishing the receipt.
+#[tokio::test]
+async fn test_fs_reaper_finalizing_publication_then_retry_rolls_forward() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"PUBLISH_THEN_RETRY";
+    let (session, _prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+    let uuid = session.uuid.clone();
+    backdate_json_u64_field(
+        &storage.session_meta_path(&uuid),
+        "last_active_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    // First pass: CAS absent -> pending, nothing counted, staging survives.
+    assert_eq!(storage.reap_expired_sessions(3600, 3600).await.unwrap(), 0);
+    assert!(storage.session_meta_path(&uuid).exists());
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Publish the CAS blob of the correct size, then reap again -> roll forward.
+    let cas = cas_blob_path(&root, &digest);
+    std::fs::create_dir_all(cas.parent().unwrap()).unwrap();
+    std::fs::write(&cas, data).unwrap();
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(
+        count, 1,
+        "a now-published finalization rolls forward exactly once"
+    );
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_some(),
+        "roll-forward publishes the finalized receipt"
+    );
+}
+
+/// Accurate counting: a fully-published expired Finalizing session rolls forward
+/// (counted) while a fresh session is skipped — the reaper counts exactly one.
+#[tokio::test]
+async fn test_fs_reaper_rolls_forward_published_finalizing_with_accurate_count() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"ROLL_FORWARD_COUNTED";
+    let (session, _prepared, digest) = prepare_finalizable_session(&storage, "repo", data).await;
+    let uuid = session.uuid.clone();
+
+    // Publish the CAS blob (correct size) and expire the session.
+    let cas = cas_blob_path(&root, &digest);
+    std::fs::create_dir_all(cas.parent().unwrap()).unwrap();
+    std::fs::write(&cas, data).unwrap();
+    backdate_json_u64_field(
+        &storage.session_meta_path(&uuid),
+        "last_active_at_unix_secs",
+        now_unix_secs().saturating_sub(100_000),
+    );
+
+    // A second, fresh finalizing session must be skipped (not expired).
+    let (fresh, _p, _d) = prepare_finalizable_session(&storage, "repo", b"FRESH_FIN").await;
+
+    let count = storage.reap_expired_sessions(3600, 3600).await.unwrap();
+    assert_eq!(count, 1, "only the published+expired session is counted");
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_some(),
+        "the expired session rolled forward"
+    );
+    assert!(
+        storage.session_meta_path(&fresh.uuid).exists(),
+        "the fresh finalizing session is left intact"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Option A contained upload-lifecycle invariants
+//
+// These exercise the production entry points against a real filesystem and
+// assert the guarantees introduced by the coherent contained lifecycle:
+// the stable session-lock file is never unlinked during cleanup; commit
+// publishes a repository-membership record before the finalized receipt; and
+// commit is idempotent when the CAS blob was already published but the staging
+// meta was lost to a crash (a partial-publication retry).
+// --------------------------------------------------------------------------
+
+/// Drive a session through create -> append(sha256) -> begin_finalize and return
+/// the prepared handle plus the payload digest.
+async fn prepare_finalizable_session(
+    storage: &FsStorage,
+    repo: &str,
+    data: &[u8],
+) -> (UploadSessionId, PreparedFinalize, Digest) {
+    let session = storage.create_session(repo).await.unwrap();
+    let stream = make_test_stream(vec![Bytes::copy_from_slice(data)]);
+    storage
+        .append_if_offset(
+            &session,
+            UploadOffsetPrecondition::Exact(0),
+            stream,
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(data);
+    let digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
+
+    let prepared = storage
+        .begin_finalize(
+            &session,
+            UploadOffsetPrecondition::Exact(data.len() as u64),
+            None,
+            &digest,
+            1024 * 1024,
+            true,
+        )
+        .await
+        .unwrap();
+    (session, prepared, digest)
+}
+
+/// The ambient on-disk path of the membership record written by the lifecycle,
+/// mirroring `repo-memberships/by-repo/{key}/{algo}/{hex}.json`.
+fn membership_record_path(root: &Path, repo: &str, digest: &Digest) -> PathBuf {
+    let canonical = CanonicalRepoName::parse(repo).unwrap();
+    let key = crate::storage::repo_membership::encode_canonical_repo_key(&canonical);
+    root.join("repo-memberships")
+        .join("by-repo")
+        .join(key)
+        .join(digest.algorithm())
+        .join(format!("{}.json", digest.hex()))
+}
+
+#[tokio::test]
+async fn test_fs_session_lock_file_retained_through_abort_and_reaper() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+    // Aborting an active session removes its staging state but MUST retain the
+    // stable `.lock.{uuid}` file (never unlinked): the lock domain is stable for
+    // the process lifetime so a racing acquirer can never observe a recreated
+    // lock inode.
+    let aborted = storage.create_session("myrepo").await.unwrap();
+    let aborted_lock = storage.session_lock_path(&aborted.uuid);
+    let aborted_meta = storage.session_meta_path(&aborted.uuid);
+    let aborted_data = storage.session_data_path(&aborted.uuid);
+    assert!(
+        aborted_lock.exists(),
+        "create must materialize the lock file"
+    );
+    let lock_ino_before = std::fs::metadata(&aborted_lock).unwrap().ino();
+
+    storage.abort_session(&aborted).await.unwrap();
+    assert!(
+        !aborted_meta.exists() && !aborted_data.exists(),
+        "abort must remove staging meta and data"
+    );
+    assert!(
+        aborted_lock.exists(),
+        "abort must NOT unlink the stable session lock file"
+    );
+    assert_eq!(
+        lock_ino_before,
+        std::fs::metadata(&aborted_lock).unwrap().ino(),
+        "the retained lock file must keep the same inode"
+    );
+
+    // The reaper aborts an expired session, and likewise must never unlink the
+    // lock file it just probed.
+    let reaped = storage.create_session("myrepo").await.unwrap();
+    let reaped_lock = storage.session_lock_path(&reaped.uuid);
+    assert!(reaped_lock.exists());
+    let reaped_ino_before = std::fs::metadata(&reaped_lock).unwrap().ino();
+
+    let count = storage.reap_expired_sessions(0, 0).await.unwrap();
+    assert_eq!(count, 1, "the single expired session is confirmed reaped");
+    assert!(
+        !storage.session_meta_path(&reaped.uuid).exists(),
+        "reaper must remove the expired session meta"
+    );
+    assert!(
+        reaped_lock.exists(),
+        "reaper must NOT unlink the stable session lock file"
+    );
+    assert_eq!(
+        reaped_ino_before,
+        std::fs::metadata(&reaped_lock).unwrap().ino(),
+        "the retained lock file must keep the same inode after reaping"
+    );
+}
+
+#[tokio::test]
+async fn test_fs_session_commit_publishes_membership_and_receipt() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"OPTION_A_COMMIT_PUBLISHES_MEMBERSHIP";
+
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "myrepo", data).await;
+
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::Published(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+
+    // CAS blob published under the pinned blobs authority.
+    let cas_path = root
+        .join("blobs")
+        .join(digest.algorithm())
+        .join(digest.prefix2())
+        .join(digest.hex());
+    assert!(cas_path.exists(), "commit must publish the CAS blob");
+
+    // Membership record written under the pinned memberships authority. Commit
+    // orders the membership write before the receipt write, so at the instant of a
+    // successful commit the membership is present. This ordering is not a standing
+    // invariant that "an observed receipt implies a durable membership": a receipt-
+    // authoritative replay does not rewrite membership, and membership may later be
+    // reclaimed independently (see
+    // `test_fs_commit_finalize_replay_is_receipt_authoritative`).
+    let membership_path = membership_record_path(&root, "myrepo", &digest);
+    assert!(
+        membership_path.exists(),
+        "commit must write the repository membership record"
+    );
+
+    // Finalized receipt present and coherent.
+    let receipt = storage
+        .get_finalized_receipt(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.digest, digest.as_str());
+    assert_eq!(receipt.size, data.len() as u64);
+
+    // Staging meta + hash removed LAST.
+    assert!(!storage.session_meta_path(&session.uuid).exists());
+}
+
+#[tokio::test]
+async fn test_fs_session_commit_idempotent_after_partial_publication() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let data = b"OPTION_A_PARTIAL_PUBLICATION_RETRY";
+
+    let (session, prepared, digest) = prepare_finalizable_session(&storage, "myrepo", data).await;
+
+    // Simulate a crash AFTER the CAS blob was published but BEFORE the receipt
+    // and membership were written, and with the staging meta already gone.
+    let cas_dir = root
+        .join("blobs")
+        .join(digest.algorithm())
+        .join(digest.prefix2());
+    ensure_dir(&cas_dir).unwrap();
+    std::fs::write(cas_dir.join(digest.hex()), data).unwrap();
+    std::fs::remove_file(storage.session_meta_path(&session.uuid)).unwrap();
+
+    // Commit observes the pre-published blob at the expected size and reports an
+    // idempotent success rather than a spurious NotFound, (re)asserting the
+    // receipt and membership.
+    let outcome = storage.commit_finalize(&prepared).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::AlreadyFinalized(BlobMeta {
+            size: data.len() as u64
+        })
+    );
+    assert!(
+        membership_record_path(&root, "myrepo", &digest).exists(),
+        "idempotent commit must (re)assert the membership record"
+    );
+    assert!(
+        storage
+            .get_finalized_receipt(&session)
+            .await
+            .unwrap()
+            .is_some(),
+        "idempotent commit must (re)assert the finalized receipt"
+    );
 }
 
 #[tokio::test]
@@ -1730,7 +4129,9 @@ async fn test_get_repo_blob_membership_malformed_json_is_corrupt_data() {
         Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
             .unwrap();
 
-    let path = storage.repo_blob_path(&canonical, &digest);
+    let path = root.join(
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -1775,7 +4176,9 @@ async fn test_set_membership_candidate_malformed_json_is_corrupt_data() {
         Digest::parse("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
             .unwrap();
 
-    let path = storage.repo_blob_path(&canonical, &digest);
+    let path = root.join(
+        crate::storage::repo_membership::canonical_repo_membership_relpath(&canonical, &digest),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -8974,7 +11377,7 @@ async fn test_tag_listing_zero_page_avoidance_and_offpage_failure() {
 }
 
 #[tokio::test]
-async fn test_tag_listing_mutation_path_list_tag_files_preserved() {
+async fn test_tag_listing_mutation_path_delete_manifest_cleanup_preserved() {
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 10 * 1024 * 1024);
     let repo = "mutation-test-repo";
@@ -9009,20 +11412,27 @@ async fn test_tag_listing_mutation_path_list_tag_files_preserved() {
         manifest2_digest.as_str().as_bytes(),
     );
 
-    // list_tag_files discovers both tag paths
-    let tag_files_before = storage.list_tag_files(repo).await.unwrap();
-    assert_eq!(tag_files_before.len(), 2);
+    // Both tag leaves are present before deletion.
+    let mut before: Vec<String> = std::fs::read_dir(&tags_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    before.sort();
+    assert_eq!(before, vec!["tag-1".to_string(), "tag-2".to_string()]);
 
-    // Call FsStorage::delete_manifest for manifest1 -> uses self.list_tag_files
+    // delete_manifest for manifest1 runs the contained tag-cleanup scan.
     storage
         .delete_manifest(repo, &manifest1_digest)
         .await
         .unwrap();
 
     // tag-1 pointing to manifest1 must be unlinked; tag-2 pointing to manifest2 must remain
-    let tag_files_after = storage.list_tag_files(repo).await.unwrap();
-    assert_eq!(tag_files_after.len(), 1);
-    assert_eq!(tag_files_after[0].file_name().unwrap(), "tag-2");
+    let mut after: Vec<String> = std::fs::read_dir(&tags_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    after.sort();
+    assert_eq!(after, vec!["tag-2".to_string()]);
 
     // Contained list_tags also observes tag-2
     let tags_after = storage.list_tags(repo).await.unwrap();
@@ -10439,7 +12849,7 @@ mod referrers_contained_mutation_compat {
     }
 
     #[tokio::test]
-    async fn test_add_referrer_traversal_rejected_after_ensure_dir_side_effect() {
+    async fn test_add_referrer_traversal_rejected_fails_closed_no_side_effect() {
         let (fixture, root) = fixture_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let subject = subject_sha256();
@@ -10449,13 +12859,14 @@ mod referrers_contained_mutation_compat {
             100,
         );
 
-        // repos/ must exist so the ambient "repos/.." component can resolve during ensure_dir.
+        // repos/ exists so an ambient "repos/.." component COULD resolve if any
+        // uncontained directory creation remained.
         std::fs::create_dir_all(root.join("repos")).unwrap();
 
         let err = storage
             .add_referrer("../escaped_repo", &subject, desc)
             .await
-            .expect_err("contained read must reject traversal repository name");
+            .expect_err("contained authority must reject traversal repository name");
         assert!(
             matches!(err, StorageError::InvalidRepoName(_)),
             "expected InvalidRepoName from add_referrer, got {err:?}"
@@ -10472,12 +12883,14 @@ mod referrers_contained_mutation_compat {
             "no referrers file may be written at the escaped path"
         );
 
-        // Documented non-rollback: ensure_dir runs before the contained read and its
-        // uncontained directory creation is NOT rolled back by the read rejection.
+        // Contained cutover: repository-name validation now precedes ALL directory
+        // creation, so the former ambient `ensure_dir` escape side effect
+        // (`<fixture>/escaped_repo/referrers` being created and not rolled back)
+        // no longer occurs. The mutation fails closed with zero filesystem effect.
         let escaped_dir = root.join("escaped_repo").join("referrers");
         assert!(
-            escaped_dir.is_dir(),
-            "ensure_dir side effect precedes the contained read rejection and is not rolled back"
+            !escaped_dir.exists(),
+            "traversal rejection must not create any directory outside repos/"
         );
 
         drop(fixture);
@@ -10964,6 +13377,3205 @@ mod catalog_discovery_contained_integration {
         assert!(
             !storage.is_membership_ready().await.unwrap(),
             "readiness must remain unestablished after failed verification"
+        );
+    }
+}
+
+// --- Filesystem Tag Mutation Write Characterization Tests -------------------
+//
+// These freeze the CURRENT (ambient, not-yet-contained) behaviour of the
+// tag-mutation write paths at the production `FsStorage` boundary, ahead of the
+// O-04 repo-scoped write-containment cutover. They deliberately assert the
+// on-disk artifacts the cutover must reproduce byte-for-byte: the contained
+// `repos/<repo>/tags/<tag>` location, the exact `<digest>\n` body, the
+// temp-then-rename discipline (no `.tmp.*` residue), and the retained
+// `.lock.<tag>` file. They also pin the subtle control-flow outcomes
+// (same-digest short-circuit ahead of the policy check; corrupt-existing bytes
+// treated as absent; the `None`/absent conditional-delete branches;
+// unconditional `delete_tag`). Concurrency, and the version-precondition role
+// of `delete_tag_conditional`, are already covered above and are not repeated.
+//
+// Per the characterization mandate these freeze behaviour only; they assert no
+// fail-closed containment property that the ambient code does not yet provide.
+mod tag_mutation_write_characterization {
+    use super::*;
+    use crate::storage::{ConditionalDeleteResult, TagMutation, TagMutationPolicy};
+
+    fn d(hex: &str) -> Digest {
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    const HEX1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const HEX2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read tags dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // set_tag writes `<digest.as_str()>\n` at exactly repos/<repo>/tags/<tag>,
+    // via a temp-then-rename that leaves no `.tmp.*` residue but does retain a
+    // persistent `.lock.<tag>` file, and writes nothing outside repos/.
+    #[tokio::test]
+    async fn test_set_tag_writes_canonical_bytes_at_contained_path() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+
+        storage.set_tag("myrepo", "mytag", &digest).await.unwrap();
+
+        // Exact contained path and body.
+        let tag_path = root.join("repos").join("myrepo").join("tags").join("mytag");
+        assert!(tag_path.exists(), "tag written at contained path");
+        let expected_body = format!("{}\n", digest.as_str());
+        assert_eq!(
+            std::fs::read(&tag_path).unwrap(),
+            expected_body.as_bytes(),
+            "on-disk body is `<digest.as_str()>\\n`"
+        );
+        // Freeze the concrete algorithm-prefixed layout the body relies on.
+        assert_eq!(digest.as_str(), format!("sha256:{HEX1}"));
+
+        // Temp-then-rename left no residue; the lock file persists.
+        let tags_dir = tag_path.parent().unwrap();
+        assert_eq!(
+            sorted_entry_names(tags_dir),
+            vec![".lock.mytag".to_string(), "mytag".to_string()],
+            "only the tag and its retained lock remain; no .tmp.* residue"
+        );
+
+        // Containment: nothing was written outside repos/.
+        assert_eq!(
+            sorted_entry_names(&root),
+            vec!["repos".to_string()],
+            "set_tag writes only under repos/"
+        );
+
+        // Round-trips through both point-read entry points.
+        assert_eq!(
+            storage.resolve_tag("myrepo", "mytag").await.unwrap(),
+            digest
+        );
+        let (rd, _ver) = storage
+            .get_tag_with_version("myrepo", "mytag")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rd, digest);
+    }
+
+    // Replace across create -> same-digest -> overwrite never leaves a temp
+    // file, the Unchanged case performs no write, and the lock file persists
+    // across all three.
+    #[tokio::test]
+    async fn test_mutate_tag_replace_temp_rename_leaves_no_residue() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let d1 = d(HEX1);
+        let d2 = d(HEX2);
+        let tags_dir = root.join("repos").join("myrepo").join("tags");
+
+        let created = storage
+            .mutate_tag("myrepo", "t", &d1, TagMutationPolicy::Replace)
+            .await
+            .unwrap();
+        assert_eq!(created, TagMutation::Created);
+        assert_eq!(
+            sorted_entry_names(&tags_dir),
+            vec![".lock.t".to_string(), "t".to_string()]
+        );
+
+        // Same digest short-circuits to Unchanged and rewrites nothing.
+        let before = std::fs::read(tags_dir.join("t")).unwrap();
+        let unchanged = storage
+            .mutate_tag("myrepo", "t", &d1, TagMutationPolicy::Replace)
+            .await
+            .unwrap();
+        assert_eq!(unchanged, TagMutation::Unchanged);
+        assert_eq!(
+            std::fs::read(tags_dir.join("t")).unwrap(),
+            before,
+            "Unchanged performs no write"
+        );
+        assert_eq!(
+            sorted_entry_names(&tags_dir),
+            vec![".lock.t".to_string(), "t".to_string()],
+            "Unchanged leaves no temp"
+        );
+
+        // Divergent digest overwrites and reports the prior digest.
+        let replaced = storage
+            .mutate_tag("myrepo", "t", &d2, TagMutationPolicy::Replace)
+            .await
+            .unwrap();
+        assert_eq!(replaced, TagMutation::Replaced { previous: d1 });
+        assert_eq!(
+            std::fs::read(tags_dir.join("t")).unwrap(),
+            format!("{}\n", d2.as_str()).as_bytes()
+        );
+        assert_eq!(
+            sorted_entry_names(&tags_dir),
+            vec![".lock.t".to_string(), "t".to_string()],
+            "Replace leaves no temp"
+        );
+    }
+
+    // The same-digest equality check runs BEFORE the CreateOnly existence
+    // check, so CreateOnly against an identical existing digest returns
+    // Unchanged, not TagAlreadyExists.
+    #[tokio::test]
+    async fn test_create_only_same_digest_returns_unchanged_not_conflict() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+
+        let first = storage
+            .mutate_tag("myrepo", "t", &digest, TagMutationPolicy::CreateOnly)
+            .await
+            .unwrap();
+        assert_eq!(first, TagMutation::Created);
+
+        let second = storage
+            .mutate_tag("myrepo", "t", &digest, TagMutationPolicy::CreateOnly)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            TagMutation::Unchanged,
+            "CreateOnly with the identical digest is Unchanged, not a conflict"
+        );
+    }
+
+    // CreateOnly against a DIFFERENT existing digest is a TagAlreadyExists
+    // error and leaves the existing tag byte-identical.
+    #[tokio::test]
+    async fn test_create_only_conflict_on_divergent_digest() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let d1 = d(HEX1);
+        let d2 = d(HEX2);
+        let tag_path = root.join("repos").join("myrepo").join("tags").join("t");
+
+        storage
+            .mutate_tag("myrepo", "t", &d1, TagMutationPolicy::CreateOnly)
+            .await
+            .unwrap();
+
+        let err = storage
+            .mutate_tag("myrepo", "t", &d2, TagMutationPolicy::CreateOnly)
+            .await
+            .expect_err("divergent CreateOnly must conflict");
+        assert!(
+            matches!(err, StorageError::TagAlreadyExists),
+            "expected TagAlreadyExists, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&tag_path).unwrap(),
+            format!("{}\n", d1.as_str()).as_bytes(),
+            "the existing tag is untouched by the failed CreateOnly"
+        );
+    }
+
+    // Existing tag bytes that do not parse as a digest are treated as absent:
+    // CreateOnly succeeds as Created and Replace reports Created (not
+    // Replaced), overwriting the corrupt content with the canonical body.
+    #[tokio::test]
+    async fn test_mutate_tag_treats_corrupt_existing_as_absent() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+        let tags_dir = root.join("repos").join("myrepo").join("tags");
+
+        // CreateOnly over corrupt bytes -> Created.
+        let corrupt_create = tags_dir.join("corrupt-create");
+        write_file(&corrupt_create, b"this is not a digest at all");
+        let created = storage
+            .mutate_tag(
+                "myrepo",
+                "corrupt-create",
+                &digest,
+                TagMutationPolicy::CreateOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            created,
+            TagMutation::Created,
+            "unparseable existing content is treated as no existing tag"
+        );
+        assert_eq!(
+            std::fs::read(&corrupt_create).unwrap(),
+            format!("{}\n", digest.as_str()).as_bytes(),
+            "corrupt content is overwritten with the canonical body"
+        );
+
+        // Replace over corrupt bytes -> Created (there is no `previous`).
+        let corrupt_replace = tags_dir.join("corrupt-replace");
+        write_file(&corrupt_replace, b"\xff\xfe garbage");
+        let replaced = storage
+            .mutate_tag(
+                "myrepo",
+                "corrupt-replace",
+                &digest,
+                TagMutationPolicy::Replace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced,
+            TagMutation::Created,
+            "Replace over corrupt content reports Created, not Replaced"
+        );
+    }
+
+    // delete_tag_conditional with expected_version = None deletes
+    // unconditionally; against an absent tag it reports NotFound.
+    #[tokio::test]
+    async fn test_delete_tag_conditional_unconditional_and_absent() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+        let tag_path = root.join("repos").join("myrepo").join("tags").join("t");
+
+        storage.set_tag("myrepo", "t", &digest).await.unwrap();
+        let res = storage
+            .delete_tag_conditional("myrepo", "t", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            ConditionalDeleteResult::Deleted,
+            "None precondition deletes unconditionally"
+        );
+        assert!(!tag_path.exists(), "tag file removed");
+
+        let absent = storage
+            .delete_tag_conditional("myrepo", "never-existed", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            absent,
+            ConditionalDeleteResult::NotFound,
+            "absent tag reports NotFound"
+        );
+    }
+
+    // Unconditional delete_tag removes an existing tag and maps an absent tag
+    // to StorageError::NotFound.
+    #[tokio::test]
+    async fn test_delete_tag_unconditional_success_and_absent() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+        let tag_path = root.join("repos").join("myrepo").join("tags").join("t");
+
+        storage.set_tag("myrepo", "t", &digest).await.unwrap();
+        storage.delete_tag("myrepo", "t").await.unwrap();
+        assert!(!tag_path.exists(), "delete_tag removes the tag file");
+
+        let err = storage
+            .delete_tag("myrepo", "never-existed")
+            .await
+            .expect_err("absent delete_tag must error");
+        assert!(
+            matches!(err, StorageError::NotFound),
+            "absent delete_tag maps to StorageError::NotFound, got {err:?}"
+        );
+    }
+}
+
+// Production-boundary regressions for the tag-mutation *write containment*
+// cutover (O-04). These exercise the real `FsStorage` boundary (not the
+// validator in isolation) and prove the properties the cutover claims:
+// namespace resolution is contained and fails closed on traversal/symlink
+// escape; the stable-top-level-`repos` + fresh-per-op resolution authority
+// model tolerates repository deletion/recreation without stale-inode writes;
+// and read/write namespace + version-token semantics remain coherent.
+mod tag_mutation_write_containment {
+    use super::*;
+    use crate::storage::{ConditionalDeleteResult, TagMutationPolicy};
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    fn d(hex: &str) -> Digest {
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    const HEX1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const HEX2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // A repository name whose component structure escapes (contains a `..`
+    // segment) is rejected structurally as InvalidRepoName BEFORE any
+    // filesystem authority is resolved — it never reaches the contained
+    // primitive, and nothing is written.
+    #[tokio::test]
+    async fn test_repo_traversal_component_rejected() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        for bad in ["../escape", "a/../../b", ".."] {
+            let err = storage
+                .set_tag(bad, "t", &d(HEX1))
+                .await
+                .expect_err("traversal repo name must be rejected");
+            assert!(
+                matches!(err, StorageError::InvalidRepoName(_)),
+                "repo {bad:?} -> InvalidRepoName, got {err:?}"
+            );
+        }
+        // Fails closed: no `repos/` tree materialized by the rejected calls.
+        assert!(
+            !root.join("repos").join("escape").exists() && !root.join("escape").exists(),
+            "no escape path was created"
+        );
+    }
+
+    // A structurally valid repository name that resolves through an on-disk
+    // symlink fails closed at the contained primitive (RESOLVE_NO_SYMLINKS):
+    // the mutation errors and does NOT write through the symlink to the
+    // external target.
+    #[tokio::test]
+    async fn test_repo_symlink_escape_fails_closed() {
+        let root = tmp_fs_root();
+        // External target the symlink points at; must remain untouched.
+        let external = tmp_fs_root();
+
+        // Pre-create repos/ and plant a symlink component `linkrepo` -> external.
+        let repos = root.join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        symlink(&external, repos.join("linkrepo")).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let err = storage
+            .set_tag("linkrepo", "t", &d(HEX1))
+            .await
+            .expect_err("symlinked repo component must fail closed");
+        // Contained primitives surface resolution rejection as an IO error
+        // (not a silent success and not a traversal).
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink escape -> Io error, got {err:?}"
+        );
+        // The external target was never written through.
+        assert_eq!(
+            sorted_entry_names(&external),
+            Vec::<String>::new(),
+            "no bytes written through the symlink to the external tree"
+        );
+    }
+
+    // A tag that would span path components (an interior slash, or a `..`
+    // segment) is rejected before any write; the tag leaf must stay a single
+    // contained component.
+    #[tokio::test]
+    async fn test_tag_path_component_escape_rejected() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        for bad in ["a/b", "..", "../x", "x/.."] {
+            let err = storage
+                .set_tag("myrepo", bad, &d(HEX1))
+                .await
+                .expect_err("multi-component / traversal tag must be rejected");
+            assert!(
+                matches!(err, StorageError::InvalidRepoName(_)),
+                "tag {bad:?} -> InvalidRepoName, got {err:?}"
+            );
+        }
+    }
+
+    // A valid nested repository name (interior slashes) resolves through the
+    // contained authority to the expected `repos/a/b/c/tags/<tag>` leaf, leaves
+    // only the tag and its retained lock, and round-trips through the read path.
+    #[tokio::test]
+    async fn test_nested_repo_happy_path() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+
+        storage.set_tag("a/b/c", "rel", &digest).await.unwrap();
+
+        let tags_dir = root
+            .join("repos")
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("tags");
+        assert_eq!(
+            std::fs::read(tags_dir.join("rel")).unwrap(),
+            format!("{}\n", digest.as_str()).as_bytes(),
+            "nested repo tag body is canonical"
+        );
+        assert_eq!(
+            sorted_entry_names(&tags_dir),
+            vec![".lock.rel".to_string(), "rel".to_string()],
+            "only the tag and retained lock; no temp residue"
+        );
+        assert_eq!(
+            storage.resolve_tag("a/b/c", "rel").await.unwrap(),
+            digest,
+            "read path resolves the same nested namespace"
+        );
+    }
+
+    // Repository deletion/recreation coherence: with only the fixed top-level
+    // `repos` authority pinned and the per-repo `tags` authority resolved fresh
+    // per operation, removing and recreating a repository beneath `repos`
+    // causes the next mutation to target the NEW inode (visible through the
+    // path), never a detached/stale old per-repo directory. This distinguishes
+    // the approved model from the rejected indefinitely-cached-per-repo design,
+    // which would have written into the unlinked old inode.
+    #[tokio::test]
+    async fn test_repo_deletion_recreation_no_stale_inode_write() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let repo_dir = root.join("repos").join("delrepo");
+
+        // (1) First op initializes and pins the top-level `repos` authority and
+        // creates repos/delrepo/tags/t1.
+        storage.set_tag("delrepo", "t1", &d(HEX1)).await.unwrap();
+        let old_inode = std::fs::metadata(&repo_dir).unwrap().ino();
+        assert!(repo_dir.join("tags").join("t1").exists());
+
+        // (2) Externally remove the whole repository namespace (its inode is now
+        // detached). A cached-per-repo authority would still point at it.
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+
+        // (3) Another mutation for the same logical repository.
+        storage.set_tag("delrepo", "t2", &d(HEX2)).await.unwrap();
+
+        // (4) It is visible through the newly named repository tree...
+        let new_inode = std::fs::metadata(&repo_dir).unwrap().ino();
+        assert_ne!(
+            old_inode, new_inode,
+            "repository was recreated as a fresh inode"
+        );
+        assert_eq!(
+            storage.resolve_tag("delrepo", "t2").await.unwrap(),
+            d(HEX2),
+            "the mutation is visible through the recreated repository"
+        );
+        // (5) ...and it did not resurrect the detached old tree: only t2 exists
+        // (plus its lock); t1 from the removed inode is gone.
+        let tags_dir = repo_dir.join("tags");
+        assert_eq!(
+            sorted_entry_names(&tags_dir),
+            vec![".lock.t2".to_string(), "t2".to_string()],
+            "write landed in the recreated tree, not a stale per-repo inode"
+        );
+    }
+
+    // Read/write namespace + version-token coherence: the raw-byte SHA-256
+    // token returned by `get_tag_with_version` after a contained mutation is
+    // byte-compatible with the token a conditional delete recomputes from the
+    // same leaf. A correct token deletes; a wrong token yields
+    // PreconditionFailed carrying that exact current token.
+    #[tokio::test]
+    async fn test_version_token_byte_compatible_with_conditional_delete() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(HEX1);
+
+        storage.set_tag("myrepo", "t", &digest).await.unwrap();
+
+        let (read_digest, version) = storage
+            .get_tag_with_version("myrepo", "t")
+            .await
+            .unwrap()
+            .expect("tag present");
+        assert_eq!(read_digest, digest, "get_tag sees the contained write");
+        // The version token is the SHA-256 over the exact on-disk bytes.
+        assert_eq!(
+            version,
+            hex_sha256(format!("{}\n", digest.as_str()).as_bytes()),
+            "version token is raw-byte SHA-256 of `sha256:<hex>\\n`"
+        );
+
+        // A wrong precondition preserves the tag and returns the SAME current
+        // token representation.
+        let mismatch = storage
+            .delete_tag_conditional("myrepo", "t", Some("deadbeef"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mismatch,
+            ConditionalDeleteResult::PreconditionFailed {
+                current_version: Some(version.clone()),
+            },
+            "mismatch reports the byte-compatible current token"
+        );
+        assert!(
+            root.join("repos")
+                .join("myrepo")
+                .join("tags")
+                .join("t")
+                .exists(),
+            "failed precondition leaves the tag in place"
+        );
+
+        // The token from get_tag_with_version drives a successful delete on the
+        // same namespace/leaf.
+        let deleted = storage
+            .delete_tag_conditional("myrepo", "t", Some(&version))
+            .await
+            .unwrap();
+        assert_eq!(deleted, ConditionalDeleteResult::Deleted);
+        assert!(
+            !root
+                .join("repos")
+                .join("myrepo")
+                .join("tags")
+                .join("t")
+                .exists(),
+            "matching precondition deleted the same leaf"
+        );
+    }
+
+    // A successful CreateOnly mutation at the real boundary leaves exactly the
+    // final leaf plus its retained lock and no `.tmp.*` residue, and writes
+    // nothing outside `repos/`.
+    #[tokio::test]
+    async fn test_successful_mutation_leaves_expected_leaf_and_lock_no_residue() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let created = storage
+            .mutate_tag("myrepo", "t", &d(HEX1), TagMutationPolicy::CreateOnly)
+            .await
+            .unwrap();
+        assert_eq!(created, crate::storage::TagMutation::Created);
+
+        let tags_dir = root.join("repos").join("myrepo").join("tags");
+        assert_eq!(
+            sorted_entry_names(&tags_dir),
+            vec![".lock.t".to_string(), "t".to_string()],
+            "final leaf + retained lock only; no temp residue"
+        );
+        assert_eq!(
+            sorted_entry_names(&root),
+            vec!["repos".to_string()],
+            "nothing written outside repos/"
+        );
+    }
+}
+
+// Production-boundary containment regressions for the manifest payload write
+// slice: `put_manifest` (formerly fully ambient) and the manifest-namespace
+// read+unlink inside `delete_manifest` (closing the R-18 subject pre-read) now
+// resolve through the pinned `repos` authority — fresh per operation, no
+// per-repo cache — exactly like the already-contained manifest reads. These
+// tests exercise the real `FsStorage` boundary.
+mod manifest_write_containment {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+    // 64 hex chars each — a valid `sha256:` digest body.
+    const MHEX1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MHEX2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn d(hex: &str) -> Digest {
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    // Valid OCI image manifest JSON carrying no `subject` field, so
+    // `extract_subject_digest` yields `None` (no referrer cleanup) and
+    // `detect_manifest_media_type` returns the OCI image manifest media type.
+    fn manifest_body() -> Vec<u8> {
+        br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#.to_vec()
+    }
+
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn manifest_leaf_path(root: &Path, repo: &str, digest: &Digest) -> PathBuf {
+        let mut p = root.join("repos");
+        for seg in repo.split('/') {
+            p = p.join(seg);
+        }
+        p.join("manifests").join(digest.hex())
+    }
+
+    // put_manifest persists the exact bytes at the contained
+    // `repos/<repo>/manifests/<hex>` leaf, reports faithful metadata, and the
+    // already-contained read path round-trips the same bytes (write/read
+    // coherence). Also freezes delta D1: the contained atomic write creates the
+    // leaf with mode 0o600 (repo-wide contract for every contained write).
+    #[tokio::test]
+    async fn test_put_manifest_writes_exact_bytes_at_contained_path_and_reads_back() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(MHEX1);
+        let body = manifest_body();
+
+        let meta = storage
+            .put_manifest("lib/app", &digest, bytes::Bytes::from(body.clone()))
+            .await
+            .expect("put_manifest");
+        assert_eq!(
+            meta.size,
+            body.len() as u64,
+            "reported size matches payload"
+        );
+        assert_eq!(
+            meta.media_type, "application/vnd.oci.image.manifest.v1+json",
+            "media type detected from payload"
+        );
+
+        let path = manifest_leaf_path(&root, "lib/app", &digest);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body,
+            "exact manifest bytes persisted at the contained path"
+        );
+        // D1: contained atomic write creates the leaf mode 0o600.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "contained manifest leaf mode is 0o600");
+
+        // Read/write coherence: the contained reader returns the same bytes.
+        let (rmeta, rbytes) = storage
+            .get_manifest("lib/app", &digest)
+            .await
+            .expect("get_manifest");
+        assert_eq!(rbytes.as_ref(), body.as_slice(), "read round-trips bytes");
+        assert_eq!(rmeta.size, body.len() as u64, "read size matches");
+    }
+
+    // A repository name whose component structure escapes (a `..` segment, an
+    // empty segment, or a lone `.`) is rejected structurally as
+    // InvalidRepoName by the shared manifest key grammar BEFORE any authority is
+    // resolved; nothing is written and no escape path is materialized.
+    #[tokio::test]
+    async fn test_put_manifest_repo_traversal_rejected_no_escape() {
+        let root = tmp_fs_root();
+        std::fs::create_dir_all(root.join("repos")).unwrap();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(MHEX1);
+
+        for bad in ["../escape", "a/../../b", "..", "a//b", "a/./b"] {
+            let err = storage
+                .put_manifest(bad, &digest, bytes::Bytes::from(manifest_body()))
+                .await
+                .expect_err("traversal repo name must be rejected");
+            assert!(
+                matches!(err, StorageError::InvalidRepoName(_)),
+                "repo {bad:?} -> InvalidRepoName, got {err:?}"
+            );
+        }
+        assert!(
+            !root.join("escape").exists() && !root.join("repos").join("escape").exists(),
+            "no escape path was created"
+        );
+    }
+
+    // A structurally valid repository name that resolves through an on-disk
+    // symlink fails closed at the contained primitive (RESOLVE_NO_SYMLINKS): the
+    // write errors and does NOT create a manifests tree in the external target.
+    #[tokio::test]
+    async fn test_put_manifest_repo_symlink_escape_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+
+        let repos = root.join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        symlink(&external, repos.join("linkrepo")).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let err = storage
+            .put_manifest("linkrepo", &d(MHEX1), bytes::Bytes::from(manifest_body()))
+            .await
+            .expect_err("symlinked repo component must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink escape -> Io error, got {err:?}"
+        );
+        assert_eq!(
+            sorted_entry_names(&external),
+            Vec::<String>::new(),
+            "no manifests tree written through the symlink to the external tree"
+        );
+    }
+
+    // The manifest write grammar equals the manifest READ grammar (manifest_key):
+    // both a deeply nested repo (`a/b/c`) and a colon-bearing repo (`C:/repo`,
+    // valid on Linux and accepted by the reader) write to the expected contained
+    // leaf AND round-trip through the contained read path. This proves the write
+    // accepts a name iff the matching read accepts it (no second grammar).
+    #[tokio::test]
+    async fn test_put_manifest_nested_and_colon_repo_coherent_with_read() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let body = manifest_body();
+
+        for repo in ["a/b/c", "C:/repo"] {
+            let digest = d(MHEX1);
+            storage
+                .put_manifest(repo, &digest, bytes::Bytes::from(body.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("put_manifest repo {repo:?}: {e:?}"));
+
+            let path = manifest_leaf_path(&root, repo, &digest);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                body,
+                "repo {repo:?} bytes at contained path"
+            );
+            let (_m, rb) = storage
+                .get_manifest(repo, &digest)
+                .await
+                .unwrap_or_else(|e| panic!("get_manifest repo {repo:?}: {e:?}"));
+            assert_eq!(
+                rb.as_ref(),
+                body.as_slice(),
+                "repo {repo:?} read/write coherent"
+            );
+        }
+    }
+
+    // After the fixed `repos` authority is pinned, removing and recreating a
+    // repository directory at the same pathname must NOT strand writes on a stale
+    // inode: because `repos/<repo>/manifests` is resolved fresh per operation, the
+    // next put lands under the NEW inode, visible via the current path. This
+    // distinguishes the stable-`repos`+fresh-resolution model from a rejected
+    // cached-per-repo authority.
+    #[tokio::test]
+    async fn test_put_manifest_repo_deletion_recreation_no_stale_inode_write() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let body = manifest_body();
+
+        // First put pins `repos` on first use and creates repos/delrepo/manifests.
+        storage
+            .put_manifest("delrepo", &d(MHEX1), bytes::Bytes::from(body.clone()))
+            .await
+            .expect("first put");
+        let first_inode = std::fs::metadata(root.join("repos").join("delrepo"))
+            .unwrap()
+            .ino();
+
+        // Remove and recreate the repository directory at the same pathname.
+        std::fs::remove_dir_all(root.join("repos").join("delrepo")).unwrap();
+        std::fs::create_dir_all(root.join("repos").join("delrepo")).unwrap();
+        let second_inode = std::fs::metadata(root.join("repos").join("delrepo"))
+            .unwrap()
+            .ino();
+        assert_ne!(
+            first_inode, second_inode,
+            "test precondition: recreated repository dir is a new inode"
+        );
+
+        // The next put must resolve fresh and land under the NEW inode.
+        let digest2 = d(MHEX2);
+        storage
+            .put_manifest("delrepo", &digest2, bytes::Bytes::from(body.clone()))
+            .await
+            .expect("second put after recreation");
+        let path2 = manifest_leaf_path(&root, "delrepo", &digest2);
+        assert_eq!(
+            std::fs::read(&path2).unwrap(),
+            body,
+            "second manifest visible via the recreated repository path (no stale-inode write)"
+        );
+    }
+
+    // A successful put leaves exactly the digest leaf in the manifests directory
+    // — the temp-then-rename atomic write leaves no `.tmp.*` residue.
+    #[tokio::test]
+    async fn test_put_manifest_leaves_only_digest_leaf_no_temp_residue() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(MHEX1);
+
+        storage
+            .put_manifest("repoX", &digest, bytes::Bytes::from(manifest_body()))
+            .await
+            .expect("put_manifest");
+
+        let manifests_dir = root.join("repos").join("repoX").join("manifests");
+        assert_eq!(
+            sorted_entry_names(&manifests_dir),
+            vec![digest.hex()],
+            "exactly the digest leaf; no temp residue"
+        );
+    }
+
+    // delete_manifest's subject pre-read is contained: a symlinked manifest leaf
+    // fails closed (RESOLVE_NO_SYMLINKS) BEFORE any unlink — the symlink is not
+    // followed for the read and not removed, and the external target is
+    // untouched. (Previously the ambient path followed the symlink to read the
+    // subject and then removed the link.)
+    #[tokio::test]
+    async fn test_delete_manifest_symlinked_leaf_fails_closed_no_unlink() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(MHEX1);
+
+        // Plant a symlinked manifest leaf pointing at an external file that holds
+        // valid manifest JSON (so only containment — not a parse error — can
+        // reject it).
+        let ext_target = external.join("outside_manifest.json");
+        write_file(&ext_target, &manifest_body());
+        let manifests_dir = root.join("repos").join("symrepo").join("manifests");
+        std::fs::create_dir_all(&manifests_dir).unwrap();
+        let leaf = manifests_dir.join(digest.hex());
+        symlink(&ext_target, &leaf).unwrap();
+
+        let err = storage
+            .delete_manifest("symrepo", &digest)
+            .await
+            .expect_err("symlinked manifest leaf must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink leaf -> Io error, got {err:?}"
+        );
+
+        // Fail closed: the symlink remains and the external target is untouched.
+        assert!(
+            std::fs::symlink_metadata(&leaf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "manifest symlink still present (not unlinked)"
+        );
+        assert_eq!(
+            std::fs::read(&ext_target).unwrap(),
+            manifest_body(),
+            "external target left unmodified"
+        );
+    }
+
+    // delete_manifest on an absent manifest maps the contained NotFound to
+    // StorageError::NotFound (the subject pre-read short-circuits before the tag
+    // and referrer cleanup).
+    #[tokio::test]
+    async fn test_delete_manifest_absent_returns_not_found() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let err = storage
+            .delete_manifest("norepo", &d(MHEX1))
+            .await
+            .expect_err("absent manifest -> NotFound");
+        assert!(
+            matches!(err, StorageError::NotFound),
+            "absent manifest -> NotFound, got {err:?}"
+        );
+    }
+
+    // delete_manifest round-trips a real manifest through the contained read +
+    // unlink: after deletion the leaf is gone and the reader reports NotFound,
+    // proving the subject pre-read and unlink act on the same pinned namespace.
+    #[tokio::test]
+    async fn test_delete_manifest_contained_read_then_unlink_removes_leaf() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d(MHEX1);
+
+        storage
+            .put_manifest("lib/app", &digest, bytes::Bytes::from(manifest_body()))
+            .await
+            .expect("put_manifest");
+        let path = manifest_leaf_path(&root, "lib/app", &digest);
+        assert!(path.exists(), "precondition: manifest present");
+
+        storage
+            .delete_manifest("lib/app", &digest)
+            .await
+            .expect("delete_manifest");
+
+        assert!(!path.exists(), "manifest leaf removed by contained unlink");
+        assert!(
+            matches!(
+                storage.get_manifest("lib/app", &digest).await,
+                Err(StorageError::NotFound)
+            ),
+            "reader reports NotFound after delete"
+        );
+    }
+}
+
+// Production-boundary containment regressions for the referrer write slice:
+// `add_referrer` and `remove_referrer` (formerly ambient `ensure_dir` +
+// reconstructed-path writes behind a contained read) now resolve a contained
+// `repos/<repo>/referrers` authority — fresh per operation, no per-repo cache,
+// validated by the referrers READ grammar — with the retained in-process shard
+// lock held across the full read/modify/write. These tests exercise the real
+// `FsStorage` boundary.
+mod referrer_write_containment {
+    use super::*;
+    use crate::storage::ReferrerDescriptor;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::sync::Arc;
+
+    fn subject() -> Digest {
+        Digest::parse("sha256:9999999999999999999999999999999999999999999999999999999999999999")
+            .unwrap()
+    }
+
+    fn desc(hex_prefix: char, size: u64) -> ReferrerDescriptor {
+        ReferrerDescriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: format!("sha256:{}", hex_prefix.to_string().repeat(64)),
+            size,
+            artifact_type: None,
+            annotations: None,
+        }
+    }
+
+    fn referrers_dir(root: &Path, repo: &str) -> PathBuf {
+        let mut p = root.join("repos");
+        for seg in repo.split('/') {
+            p = p.join(seg);
+        }
+        p.join("referrers")
+    }
+
+    fn index_path(root: &Path, repo: &str, subject: &Digest) -> PathBuf {
+        referrers_dir(root, repo).join(format!("{}.json", subject.hex()))
+    }
+
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // add_referrer persists the exact serde_json array at the contained
+    // `repos/<repo>/referrers/<hex>.json` leaf with mode 0o600, leaves no temp
+    // residue, and the contained read sees the write.
+    #[tokio::test]
+    async fn test_add_referrer_writes_exact_json_at_contained_path_and_reads_back() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let d1 = desc('a', 100);
+
+        storage
+            .add_referrer("lib/app", &s, d1.clone())
+            .await
+            .expect("add_referrer");
+
+        let path = index_path(&root, "lib/app", &s);
+        let expected = serde_json::to_vec(&vec![d1.clone()]).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "exact single-entry JSON array persisted at the contained path"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "contained referrers index mode is 0o600");
+        assert_eq!(
+            sorted_entry_names(&referrers_dir(&root, "lib/app")),
+            vec![format!("{}.json", s.hex())],
+            "exactly the index leaf; no temp residue"
+        );
+        assert_eq!(
+            storage.list_referrers("lib/app", &s).await.unwrap(),
+            vec![d1],
+            "contained read sees the contained write"
+        );
+    }
+
+    // A duplicate add does not grow the array; the (unchanged) single-entry
+    // array is rewritten, preserving the prior unconditional-rewrite semantics.
+    #[tokio::test]
+    async fn test_add_referrer_duplicate_is_idempotent_content() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let d1 = desc('a', 100);
+
+        storage.add_referrer("dup", &s, d1.clone()).await.unwrap();
+        storage.add_referrer("dup", &s, d1.clone()).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(index_path(&root, "dup", &s)).unwrap(),
+            serde_json::to_vec(&vec![d1.clone()]).unwrap(),
+            "duplicate add leaves exactly one entry with identical bytes"
+        );
+        assert_eq!(storage.list_referrers("dup", &s).await.unwrap(), vec![d1]);
+    }
+
+    // remove_referrer rewrites the exact remaining array; removing the last
+    // entry deletes the index leaf (empty-index unlink) while the referrers
+    // directory itself remains.
+    #[tokio::test]
+    async fn test_remove_referrer_rewrites_then_unlinks_empty_index() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let d1 = desc('a', 100);
+        let d2 = desc('b', 200);
+        let d1_digest = Digest::parse(&d1.digest).unwrap();
+        let d2_digest = Digest::parse(&d2.digest).unwrap();
+
+        storage.add_referrer("rm", &s, d1.clone()).await.unwrap();
+        storage.add_referrer("rm", &s, d2.clone()).await.unwrap();
+
+        storage
+            .remove_referrer("rm", &s, &d1_digest)
+            .await
+            .expect("remove first referrer");
+        let path = index_path(&root, "rm", &s);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec(&vec![d2.clone()]).unwrap(),
+            "remaining array rewritten with exact bytes"
+        );
+
+        storage
+            .remove_referrer("rm", &s, &d2_digest)
+            .await
+            .expect("remove last referrer");
+        assert!(!path.exists(), "empty index leaf is unlinked");
+        assert!(
+            referrers_dir(&root, "rm").is_dir(),
+            "referrers directory itself remains"
+        );
+        assert_eq!(
+            storage.list_referrers("rm", &s).await.unwrap(),
+            Vec::<ReferrerDescriptor>::new(),
+            "read reports empty after final removal"
+        );
+    }
+
+    // Removing an absent referrer is a no-op Ok: the index bytes are untouched
+    // (no rewrite). On a wholly absent repository the call also returns Ok;
+    // contained authority resolution ensures the (empty) referrers directory as
+    // a side effect — same class as the accepted delete_tag/delete_manifest
+    // ensure-on-absent behavior (frozen here as delta D-B).
+    #[tokio::test]
+    async fn test_remove_referrer_absent_is_ok_no_rewrite() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let d1 = desc('a', 100);
+        let missing = Digest::parse(&desc('f', 0).digest).unwrap();
+
+        storage.add_referrer("abs", &s, d1.clone()).await.unwrap();
+        let path = index_path(&root, "abs", &s);
+        let before = std::fs::read(&path).unwrap();
+        let ino_before = std::fs::metadata(&path).unwrap().ino();
+
+        storage
+            .remove_referrer("abs", &s, &missing)
+            .await
+            .expect("absent referrer removal is Ok");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "index bytes untouched by no-op removal"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            ino_before,
+            "no rewrite happened (same inode)"
+        );
+
+        // Absent repository: Ok, and the contained resolution leaves an empty
+        // referrers directory (D-B).
+        storage
+            .remove_referrer("neverseen", &s, &missing)
+            .await
+            .expect("absent repository removal is Ok");
+        let dir = referrers_dir(&root, "neverseen");
+        assert!(dir.is_dir(), "contained resolution ensured the directory");
+        assert_eq!(
+            sorted_entry_names(&dir),
+            Vec::<String>::new(),
+            "no index leaf was created"
+        );
+    }
+
+    // Traversal repository names are rejected as InvalidRepoName by the shared
+    // referrers grammar BEFORE any directory creation — for both mutations —
+    // and nothing escapes the fixture's repos/ tree.
+    #[tokio::test]
+    async fn test_referrer_mutation_repo_traversal_rejected_no_side_effect() {
+        let root = tmp_fs_root();
+        std::fs::create_dir_all(root.join("repos")).unwrap();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let ref_digest = Digest::parse(&desc('a', 0).digest).unwrap();
+
+        for bad in ["../escape", "a/../../b", "..", "a//b", "a/./b"] {
+            let err = storage
+                .add_referrer(bad, &s, desc('a', 1))
+                .await
+                .expect_err("traversal repo must be rejected by add_referrer");
+            assert!(
+                matches!(err, StorageError::InvalidRepoName(_)),
+                "add repo {bad:?} -> InvalidRepoName, got {err:?}"
+            );
+            let err = storage
+                .remove_referrer(bad, &s, &ref_digest)
+                .await
+                .expect_err("traversal repo must be rejected by remove_referrer");
+            assert!(
+                matches!(err, StorageError::InvalidRepoName(_)),
+                "remove repo {bad:?} -> InvalidRepoName, got {err:?}"
+            );
+        }
+        assert!(
+            !root.join("escape").exists() && !root.join("repos").join("escape").exists(),
+            "no escape path was created"
+        );
+    }
+
+    // A structurally valid repository name that resolves through an on-disk
+    // symlink fails closed at authority resolution (RESOLVE_NO_SYMLINKS): the
+    // mutation errors and the external target receives NO directories or bytes.
+    // (Previously the ambient ensure_dir followed the symlink and created a
+    // referrers/ directory inside the external tree before the read rejected.)
+    #[tokio::test]
+    async fn test_add_referrer_repo_symlink_escape_fails_closed_no_external_dirs() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+
+        let repos = root.join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        symlink(&external, repos.join("linkrepo")).unwrap();
+
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let err = storage
+            .add_referrer("linkrepo", &subject(), desc('a', 1))
+            .await
+            .expect_err("symlinked repo component must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink escape -> Io error, got {err:?}"
+        );
+        assert_eq!(
+            sorted_entry_names(&external),
+            Vec::<String>::new(),
+            "no referrers directory or bytes created inside the external tree"
+        );
+    }
+
+    // A nested repository resolves through the contained authority to
+    // `repos/a/b/c/referrers/<hex>.json` and round-trips through the read path.
+    #[tokio::test]
+    async fn test_nested_repo_happy_path() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let d1 = desc('a', 100);
+
+        storage.add_referrer("a/b/c", &s, d1.clone()).await.unwrap();
+        assert_eq!(
+            std::fs::read(index_path(&root, "a/b/c", &s)).unwrap(),
+            serde_json::to_vec(&vec![d1.clone()]).unwrap(),
+            "nested repo index at contained path"
+        );
+        assert_eq!(
+            storage.list_referrers("a/b/c", &s).await.unwrap(),
+            vec![d1],
+            "read resolves the same nested namespace"
+        );
+    }
+
+    // After the fixed `repos` authority is pinned, removing and recreating a
+    // repository directory must NOT strand writes on a stale inode: the fresh
+    // per-op resolution lands the next add under the NEW inode.
+    #[tokio::test]
+    async fn test_repo_deletion_recreation_no_stale_inode_write() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+
+        storage
+            .add_referrer("delrepo", &s, desc('a', 1))
+            .await
+            .expect("first add pins repos");
+        let first_inode = std::fs::metadata(root.join("repos").join("delrepo"))
+            .unwrap()
+            .ino();
+
+        std::fs::remove_dir_all(root.join("repos").join("delrepo")).unwrap();
+        std::fs::create_dir_all(root.join("repos").join("delrepo")).unwrap();
+        let second_inode = std::fs::metadata(root.join("repos").join("delrepo"))
+            .unwrap()
+            .ino();
+        assert_ne!(
+            first_inode, second_inode,
+            "test precondition: recreated repository dir is a new inode"
+        );
+
+        let d2 = desc('b', 2);
+        storage
+            .add_referrer("delrepo", &s, d2.clone())
+            .await
+            .expect("second add after recreation");
+        assert_eq!(
+            std::fs::read(index_path(&root, "delrepo", &s)).unwrap(),
+            serde_json::to_vec(&vec![d2]).unwrap(),
+            "index visible via the recreated repository path (no stale-inode write)"
+        );
+    }
+
+    // Whole-root replacement coherence: reads and writes both resolve through
+    // roots pinned at construction, so after the storage root is renamed away
+    // and recreated, a mutation lands in the OLD (pinned) tree, the contained
+    // read still sees it, and the replacement tree is left untouched.
+    #[tokio::test]
+    async fn test_root_replacement_read_write_coherent() {
+        let parent = tmp_fs_root();
+        let root = parent.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let d1 = desc('a', 100);
+        let d2 = desc('b', 200);
+
+        storage.add_referrer("repl", &s, d1.clone()).await.unwrap();
+
+        // Rename the whole root away and recreate a fresh tree at the old path.
+        let moved = parent.join("root.moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir_all(root.join("repos")).unwrap();
+
+        storage
+            .add_referrer("repl", &s, d2.clone())
+            .await
+            .expect("add after root replacement");
+
+        // The mutation landed in the pinned OLD tree...
+        assert_eq!(
+            std::fs::read(index_path(&moved, "repl", &s)).unwrap(),
+            serde_json::to_vec(&vec![d1.clone(), d2.clone()]).unwrap(),
+            "write resolved through the pinned old root"
+        );
+        // ...the pinned contained read sees both entries (coherence)...
+        assert_eq!(
+            storage.list_referrers("repl", &s).await.unwrap(),
+            vec![d1, d2],
+            "read/write coherent across root replacement"
+        );
+        // ...and the replacement tree was not written through ambiently.
+        assert!(
+            !index_path(&root, "repl", &s).exists(),
+            "replacement tree untouched (no ambient reconstruction)"
+        );
+    }
+
+    // The retained in-process shard lock serializes concurrent read/modify/write
+    // sequences on the same subject: N concurrent adds of distinct digests all
+    // survive into the final index (no lost update).
+    #[tokio::test]
+    async fn test_concurrent_adds_serialized_by_shard_lock() {
+        let root = tmp_fs_root();
+        let storage = Arc::new(FsStorage::new(root.clone(), 1024 * 1024));
+        let s = subject();
+
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let st = Arc::clone(&storage);
+            let subj = s.clone();
+            handles.push(tokio::spawn(async move {
+                let d = ReferrerDescriptor {
+                    media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                    digest: format!("sha256:{:064x}", u128::from(i) + 1),
+                    size: u64::from(i),
+                    artifact_type: None,
+                    annotations: None,
+                };
+                st.add_referrer("conc", &subj, d).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().expect("concurrent add succeeds");
+        }
+
+        let listed = storage.list_referrers("conc", &s).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            8,
+            "all 8 concurrent adds survive (locked read/modify/write, no lost update)"
+        );
+    }
+
+    // CRITICAL same-authority regression (add): a repository/referrers
+    // namespace replacement injected BETWEEN mutation-authority acquisition and
+    // mutation inspection must not split the tree that is inspected from the
+    // tree that is mutated.
+    //
+    // The injection point is the production seam itself: `add_referrer` is
+    // lock + `referrers_authority` + `add_referrer_locked`, and this test runs
+    // the replacement between those last two steps, then executes the exact
+    // production inner sequence on the retained authority.
+    //
+    // Distinguishes the shapes:
+    //   BROKEN:   authority A -> independent path re-resolution reads B -> write A
+    //             (index on A would become [B, C], losing descriptor A)
+    //   REQUIRED: authority A -> read A -> write A
+    //             (index on A becomes exactly [A, C]; tree B untouched)
+    #[tokio::test]
+    async fn test_add_referrer_same_authority_across_namespace_replacement() {
+        use storage_fs::FileName;
+
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let da = desc('a', 100);
+        let db = desc('b', 200);
+        let dc = desc('c', 300);
+
+        // Tree A holds descriptor A.
+        storage.add_referrer("race", &s, da.clone()).await.unwrap();
+
+        // Step 1 of the production sequence: acquire the mutation authority
+        // (resolves tree A).
+        let authority = storage.referrers_authority("race", &s).await.unwrap();
+        let leaf = FileName::new(format!("{}.json", s.hex())).unwrap();
+
+        // Injected boundary: replace the repository namespace so PATHNAME
+        // resolution now reaches tree B, whose index holds descriptor B.
+        let repo_dir = root.join("repos").join("race");
+        let moved_a = root.join("repos").join("race-tree-a");
+        std::fs::rename(&repo_dir, &moved_a).unwrap();
+        let tree_b_referrers = repo_dir.join("referrers");
+        std::fs::create_dir_all(&tree_b_referrers).unwrap();
+        let index_name = format!("{}.json", s.hex());
+        std::fs::write(
+            tree_b_referrers.join(&index_name),
+            serde_json::to_vec(&vec![db.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        // Negative control: at this boundary an INDEPENDENT path re-resolution
+        // (the read the broken two-resolution shape would consume) observes
+        // tree B — so a mutation reading that way would base its decision on
+        // [B] and write [B, C] onto tree A.
+        assert_eq!(
+            storage.list_referrers("race", &s).await.unwrap(),
+            vec![db.clone()],
+            "re-resolving read observes the replacement tree at the injected boundary"
+        );
+
+        // Step 2: continue the production inner sequence on the RETAINED
+        // authority (tree A).
+        storage
+            .add_referrer_locked(&authority, &leaf, dc.clone())
+            .await
+            .expect("locked add on retained authority");
+
+        // Inspection AND action stayed wholly on tree A: [A, C].
+        assert_eq!(
+            std::fs::read(moved_a.join("referrers").join(&index_name)).unwrap(),
+            serde_json::to_vec(&vec![da, dc]).unwrap(),
+            "read/modify/write remained on the retained authority's tree \
+             (a two-resolution implementation would have produced [B, C])"
+        );
+        // Tree B was not inspected into the result and not written.
+        assert_eq!(
+            std::fs::read(tree_b_referrers.join(&index_name)).unwrap(),
+            serde_json::to_vec(&vec![db]).unwrap(),
+            "replacement tree untouched by the in-flight mutation"
+        );
+    }
+
+    // CRITICAL same-authority regression (remove): same injected boundary as
+    // the add case. Removing the only descriptor of tree A must observe tree A
+    // through the retained authority (index becomes empty -> leaf unlinked ON
+    // TREE A). A two-resolution implementation would read tree B, find the
+    // digest absent, take the no-change short-circuit, and leave tree A's
+    // index in place.
+    #[tokio::test]
+    async fn test_remove_referrer_same_authority_across_namespace_replacement() {
+        use storage_fs::FileName;
+
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let s = subject();
+        let da = desc('a', 100);
+        let db = desc('b', 200);
+        let da_digest = Digest::parse(&da.digest).unwrap();
+
+        // Tree A holds only descriptor A.
+        storage
+            .add_referrer("race-rm", &s, da.clone())
+            .await
+            .unwrap();
+
+        // Acquire the mutation authority (tree A), then inject the namespace
+        // replacement before inspection.
+        let authority = storage.referrers_authority("race-rm", &s).await.unwrap();
+        let leaf = FileName::new(format!("{}.json", s.hex())).unwrap();
+
+        let repo_dir = root.join("repos").join("race-rm");
+        let moved_a = root.join("repos").join("race-rm-tree-a");
+        std::fs::rename(&repo_dir, &moved_a).unwrap();
+        let tree_b_referrers = repo_dir.join("referrers");
+        std::fs::create_dir_all(&tree_b_referrers).unwrap();
+        let index_name = format!("{}.json", s.hex());
+        std::fs::write(
+            tree_b_referrers.join(&index_name),
+            serde_json::to_vec(&vec![db.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        // Negative control: an independent re-resolution observes tree B, in
+        // which descriptor A is absent — the broken shape would therefore take
+        // the no-change short-circuit and leave tree A's index in place.
+        assert_eq!(
+            storage.list_referrers("race-rm", &s).await.unwrap(),
+            vec![db.clone()],
+            "re-resolving read observes the replacement tree at the injected boundary"
+        );
+
+        // Continue the production inner sequence on the RETAINED authority.
+        storage
+            .remove_referrer_locked(&authority, &leaf, &da_digest)
+            .await
+            .expect("locked remove on retained authority");
+
+        // Inspection saw tree A ([A]) and the empty-index unlink acted on tree
+        // A: its leaf is gone. A two-resolution implementation would have read
+        // tree B ([B]), hit the no-change short-circuit, and left this leaf
+        // in place.
+        assert!(
+            !moved_a.join("referrers").join(&index_name).exists(),
+            "empty-index unlink acted on the retained authority's tree"
+        );
+        // Tree B untouched: still exactly [B].
+        assert_eq!(
+            std::fs::read(tree_b_referrers.join(&index_name)).unwrap(),
+            serde_json::to_vec(&vec![db]).unwrap(),
+            "replacement tree untouched by the in-flight removal"
+        );
+    }
+}
+
+// Production-boundary containment regressions for the membership mutation
+// slice: `set_membership_candidate`, `clear_membership_candidate`, and
+// `unlink_repo_blob` (formerly ambient `repo_blob_path` + `tokio::fs`
+// read/write/remove) now resolve ONE contained authority for
+// `repo-memberships/by-repo/<key>/<algo>` beneath the pinned memberships root
+// — non-creating (absent components preserve the Ok(false) contract with zero
+// directory creation) — and retain it across each inspect/rewrite transition.
+// Membership records are regular JSON files (no hard links). There is NO lock
+// on these transitions (unchanged); no cross-process serialization is claimed.
+mod membership_mutation_containment {
+    use super::*;
+    use crate::storage::repo_membership::{
+        MembershipState, RepoBlobMembershipRecord, canonical_repo_membership_relpath,
+        encode_canonical_repo_key,
+    };
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use storage_fs::FileName;
+
+    fn d1() -> Digest {
+        Digest::parse("sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1")
+            .unwrap()
+    }
+
+    fn canonical(repo: &str) -> CanonicalRepoName {
+        CanonicalRepoName::parse(repo).unwrap()
+    }
+
+    fn record_path(root: &Path, repo: &str, digest: &Digest) -> PathBuf {
+        root.join(canonical_repo_membership_relpath(&canonical(repo), digest))
+    }
+
+    fn algo_dir(root: &Path, repo: &str) -> PathBuf {
+        root.join("repo-memberships")
+            .join("by-repo")
+            .join(encode_canonical_repo_key(&canonical(repo)))
+            .join("sha256")
+    }
+
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn link(storage: &FsStorage, repo: &str, digest: &Digest) -> RepoBlobMembershipRecord {
+        let rec = RepoBlobMembershipRecord::new_upload(canonical(repo), digest.clone(), None);
+        storage.link_repo_blob(&rec).await.expect("link_repo_blob");
+        rec
+    }
+
+    // Candidate set/clear write the exact serde bytes of the transitioned
+    // record at the contained path (mode 0o600), leave no temp residue, and
+    // the contained read seam observes each transition.
+    #[tokio::test]
+    async fn test_candidate_set_clear_exact_bytes_and_read_coherent() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+        let mut rec = link(&storage, "lib/app", &digest).await;
+
+        assert!(
+            storage
+                .set_membership_candidate("lib/app", &digest, 1234)
+                .await
+                .unwrap(),
+            "transition Active -> Candidate reports true"
+        );
+        rec.state = MembershipState::Candidate;
+        rec.unreferenced_since_unix_secs = Some(1234);
+        let path = record_path(&root, "lib/app", &digest);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec(&rec).unwrap(),
+            "exact candidate record bytes persisted at the contained path"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "contained rewrite mode is 0o600");
+        assert_eq!(
+            sorted_entry_names(&algo_dir(&root, "lib/app")),
+            vec![format!("{}.json", digest.hex())],
+            "exactly the record leaf; no temp residue"
+        );
+        let seen = storage
+            .get_repo_blob_membership("lib/app", &digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.state, MembershipState::Candidate);
+        assert_eq!(seen.unreferenced_since_unix_secs, Some(1234));
+
+        assert!(
+            storage
+                .clear_membership_candidate("lib/app", &digest)
+                .await
+                .unwrap(),
+            "transition Candidate -> Active reports true"
+        );
+        rec.state = MembershipState::Active;
+        rec.unreferenced_since_unix_secs = None;
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec(&rec).unwrap(),
+            "exact cleared record bytes persisted"
+        );
+    }
+
+    // Already-candidate set and already-active clear short-circuit with
+    // Ok(false) BEFORE any rewrite (same inode, same bytes).
+    #[tokio::test]
+    async fn test_candidate_transitions_idempotent_no_rewrite() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+        link(&storage, "idem", &digest).await;
+        let path = record_path(&root, "idem", &digest);
+
+        // Clear while already Active with no since: no-op.
+        let before = std::fs::read(&path).unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        assert!(
+            !storage
+                .clear_membership_candidate("idem", &digest)
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "bytes untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "no rewrite");
+
+        // Set twice: second is a no-op.
+        assert!(
+            storage
+                .set_membership_candidate("idem", &digest, 99)
+                .await
+                .unwrap()
+        );
+        let before = std::fs::read(&path).unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        assert!(
+            !storage
+                .set_membership_candidate("idem", &digest, 4242)
+                .await
+                .unwrap(),
+            "already-candidate set reports false"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "bytes untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "no rewrite");
+    }
+
+    // Absent record/repository: all three mutations preserve the Ok(false)
+    // contract AND (non-creating authority) leave ZERO directories behind —
+    // exactly the prior ambient behavior, with containment added.
+    #[tokio::test]
+    async fn test_mutations_absent_states_ok_false_zero_side_effects() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+
+        assert!(
+            !storage
+                .set_membership_candidate("ghost/repo", &digest, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .clear_membership_candidate("ghost/repo", &digest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .unlink_repo_blob("ghost/repo", &digest)
+                .await
+                .unwrap()
+        );
+
+        let by_repo = root.join("repo-memberships").join("by-repo");
+        assert!(
+            !by_repo
+                .join(encode_canonical_repo_key(&canonical("ghost/repo")))
+                .exists(),
+            "no repository key directory created by absent-state mutations"
+        );
+
+        // Absent leaf with existing directories: unlink is idempotent.
+        link(&storage, "once", &digest).await;
+        assert!(storage.unlink_repo_blob("once", &digest).await.unwrap());
+        assert!(
+            !storage.unlink_repo_blob("once", &digest).await.unwrap(),
+            "second unlink reports false"
+        );
+        assert!(
+            storage
+                .get_repo_blob_membership("once", &digest)
+                .await
+                .unwrap()
+                .is_none(),
+            "read seam agrees the record is gone"
+        );
+    }
+
+    // Structurally invalid repository names are rejected by the upstream
+    // CanonicalRepoName grammar as InvalidRepoName for all three mutations,
+    // with zero filesystem effect.
+    #[tokio::test]
+    async fn test_invalid_repo_rejected_no_side_effect() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+
+        for bad in ["../escape", "a//b", "", "UPPER/Repo"] {
+            assert!(
+                matches!(
+                    storage.set_membership_candidate(bad, &digest, 1).await,
+                    Err(StorageError::InvalidRepoName(_))
+                ),
+                "set: repo {bad:?} -> InvalidRepoName"
+            );
+            assert!(
+                matches!(
+                    storage.clear_membership_candidate(bad, &digest).await,
+                    Err(StorageError::InvalidRepoName(_))
+                ),
+                "clear: repo {bad:?} -> InvalidRepoName"
+            );
+            assert!(
+                matches!(
+                    storage.unlink_repo_blob(bad, &digest).await,
+                    Err(StorageError::InvalidRepoName(_))
+                ),
+                "unlink: repo {bad:?} -> InvalidRepoName"
+            );
+        }
+        assert!(
+            !root.join("repo-memberships").exists() && !root.join("escape").exists(),
+            "no membership tree or escape path created"
+        );
+    }
+
+    // A symlinked repository-key component fails closed at the non-creating
+    // contained resolution (RESOLVE_NO_SYMLINKS -> Io): the record inside the
+    // external tree is neither read into a decision nor mutated. (Previously
+    // the ambient read/write followed the symlink and transitioned the
+    // external record.)
+    #[tokio::test]
+    async fn test_symlinked_key_component_fails_closed_external_untouched() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+
+        // External tree holds a valid Active record.
+        let rec = RepoBlobMembershipRecord::new_upload(canonical("symrepo"), digest.clone(), None);
+        let ext_algo = external.join("sha256");
+        std::fs::create_dir_all(&ext_algo).unwrap();
+        let ext_leaf = ext_algo.join(format!("{}.json", digest.hex()));
+        std::fs::write(&ext_leaf, serde_json::to_vec(&rec).unwrap()).unwrap();
+
+        // Plant the key component as a symlink to the external tree.
+        let by_repo = root.join("repo-memberships").join("by-repo");
+        std::fs::create_dir_all(&by_repo).unwrap();
+        symlink(
+            &external,
+            by_repo.join(encode_canonical_repo_key(&canonical("symrepo"))),
+        )
+        .unwrap();
+
+        for (op, res) in [
+            (
+                "set",
+                storage
+                    .set_membership_candidate("symrepo", &digest, 7)
+                    .await,
+            ),
+            (
+                "clear",
+                storage.clear_membership_candidate("symrepo", &digest).await,
+            ),
+            ("unlink", storage.unlink_repo_blob("symrepo", &digest).await),
+        ] {
+            let err = res.expect_err("symlinked key component must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    StorageError::Internal {
+                        kind: crate::storage::StorageErrorKind::Io,
+                        ..
+                    }
+                ),
+                "{op}: symlink escape -> Io error, got {err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&ext_leaf).unwrap(),
+            serde_json::to_vec(&rec).unwrap(),
+            "external record neither mutated nor removed"
+        );
+    }
+
+    // Removing and recreating the repository's membership tree between
+    // operations: the next mutation freshly resolves the named repository and
+    // addresses the NEW tree (no stale per-repo authority is cached).
+    #[tokio::test]
+    async fn test_repo_membership_tree_delete_recreate_fresh_resolution() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+        link(&storage, "delrepo", &digest).await;
+        storage
+            .set_membership_candidate("delrepo", &digest, 5)
+            .await
+            .unwrap();
+
+        let key_dir = root
+            .join("repo-memberships")
+            .join("by-repo")
+            .join(encode_canonical_repo_key(&canonical("delrepo")));
+        let first_inode = std::fs::metadata(&key_dir).unwrap().ino();
+        std::fs::remove_dir_all(&key_dir).unwrap();
+
+        // Recreate via the production link path; new inode.
+        let mut rec = link(&storage, "delrepo", &digest).await;
+        assert_ne!(
+            std::fs::metadata(&key_dir).unwrap().ino(),
+            first_inode,
+            "test precondition: recreated key directory is a new inode"
+        );
+
+        // Fresh resolution addresses the NEW tree.
+        assert!(
+            storage
+                .set_membership_candidate("delrepo", &digest, 11)
+                .await
+                .unwrap()
+        );
+        rec.state = MembershipState::Candidate;
+        rec.unreferenced_since_unix_secs = Some(11);
+        assert_eq!(
+            std::fs::read(record_path(&root, "delrepo", &digest)).unwrap(),
+            serde_json::to_vec(&rec).unwrap(),
+            "mutation landed on the recreated tree via fresh resolution"
+        );
+    }
+
+    // CRITICAL same-authority regression (set): a membership-namespace
+    // replacement injected BETWEEN authority acquisition and inspection at the
+    // production seam (parse + membership_record_authority +
+    // set_membership_candidate_in) must not split the tree that is inspected
+    // from the tree that is mutated.
+    //
+    //   BROKEN:   authority A -> independent re-resolution reads B -> write A
+    //   REQUIRED: authority A -> read A -> write A (tree B untouched)
+    #[tokio::test]
+    async fn test_set_candidate_same_authority_across_namespace_replacement() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+        let rec_a = link(&storage, "race", &digest).await;
+
+        // Acquire the mutation authority (tree A).
+        let authority = storage
+            .membership_record_authority(&canonical("race"), &digest)
+            .await
+            .unwrap()
+            .expect("authority resolves for existing record");
+        let leaf = FileName::new(format!("{}.json", digest.hex())).unwrap();
+
+        // Injected boundary: replace the repository's membership namespace so
+        // pathname resolution now reaches tree B (distinguishable record).
+        let key_dir = root
+            .join("repo-memberships")
+            .join("by-repo")
+            .join(encode_canonical_repo_key(&canonical("race")));
+        let moved_a = key_dir.with_file_name("race-tree-a");
+        std::fs::rename(&key_dir, &moved_a).unwrap();
+        let mut rec_b = rec_a.clone();
+        rec_b.created_at_unix_secs = 42;
+        let tree_b_algo = key_dir.join("sha256");
+        std::fs::create_dir_all(&tree_b_algo).unwrap();
+        let leaf_name = format!("{}.json", digest.hex());
+        std::fs::write(
+            tree_b_algo.join(&leaf_name),
+            serde_json::to_vec(&rec_b).unwrap(),
+        )
+        .unwrap();
+
+        // Negative control: an independent re-resolution (the read a
+        // two-resolution shape would consume) observes tree B.
+        let re_read = storage
+            .get_repo_blob_membership("race", &digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            re_read.created_at_unix_secs, 42,
+            "re-resolving read observes the replacement tree at the injected boundary"
+        );
+
+        // Continue the production inner transition on the RETAINED authority.
+        assert!(
+            FsStorage::set_membership_candidate_in(&authority, &leaf, 777)
+                .await
+                .expect("inner set on retained authority"),
+            "transition applies against the retained tree"
+        );
+
+        // Inspection AND rewrite stayed wholly on tree A.
+        let mut expect_a = rec_a.clone();
+        expect_a.state = MembershipState::Candidate;
+        expect_a.unreferenced_since_unix_secs = Some(777);
+        assert_eq!(
+            std::fs::read(moved_a.join("sha256").join(&leaf_name)).unwrap(),
+            serde_json::to_vec(&expect_a).unwrap(),
+            "read/modify/write remained on the retained authority's tree"
+        );
+        // Tree B untouched (still Active, created_at 42).
+        assert_eq!(
+            std::fs::read(tree_b_algo.join(&leaf_name)).unwrap(),
+            serde_json::to_vec(&rec_b).unwrap(),
+            "replacement tree untouched by the in-flight transition"
+        );
+    }
+
+    // CRITICAL same-authority regression (clear): tree A holds a Candidate
+    // record; tree B (post-replacement) holds an Active/no-since record. A
+    // two-resolution implementation would read tree B, take the already-active
+    // no-change short-circuit (Ok(false)), and leave tree A's candidate in
+    // place. The retained authority must read tree A and rewrite it to Active.
+    #[tokio::test]
+    async fn test_clear_candidate_same_authority_across_namespace_replacement() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let digest = d1();
+        let rec_a = link(&storage, "race-clr", &digest).await;
+        storage
+            .set_membership_candidate("race-clr", &digest, 55)
+            .await
+            .unwrap();
+
+        let authority = storage
+            .membership_record_authority(&canonical("race-clr"), &digest)
+            .await
+            .unwrap()
+            .expect("authority resolves for existing record");
+        let leaf_name = format!("{}.json", digest.hex());
+        let leaf = FileName::new(leaf_name.clone()).unwrap();
+
+        // Replace with tree B: Active record, no since (the no-change state).
+        let key_dir = root
+            .join("repo-memberships")
+            .join("by-repo")
+            .join(encode_canonical_repo_key(&canonical("race-clr")));
+        let moved_a = key_dir.with_file_name("race-clr-tree-a");
+        std::fs::rename(&key_dir, &moved_a).unwrap();
+        let mut rec_b = rec_a.clone();
+        rec_b.created_at_unix_secs = 42;
+        let tree_b_algo = key_dir.join("sha256");
+        std::fs::create_dir_all(&tree_b_algo).unwrap();
+        std::fs::write(
+            tree_b_algo.join(&leaf_name),
+            serde_json::to_vec(&rec_b).unwrap(),
+        )
+        .unwrap();
+
+        // Negative control: independent re-resolution observes tree B's
+        // Active/no-since record — the state that would short-circuit.
+        let re_read = storage
+            .get_repo_blob_membership("race-clr", &digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(re_read.state, MembershipState::Active);
+        assert_eq!(re_read.unreferenced_since_unix_secs, None);
+
+        // The retained authority reads tree A's CANDIDATE record and rewrites it.
+        assert!(
+            FsStorage::clear_membership_candidate_in(&authority, &leaf)
+                .await
+                .expect("inner clear on retained authority"),
+            "clear applies against the retained tree (a tree-B read would have \
+             short-circuited with false)"
+        );
+
+        let mut expect_a = rec_a.clone();
+        expect_a.state = MembershipState::Active;
+        expect_a.unreferenced_since_unix_secs = None;
+        assert_eq!(
+            std::fs::read(moved_a.join("sha256").join(&leaf_name)).unwrap(),
+            serde_json::to_vec(&expect_a).unwrap(),
+            "candidate cleared on the retained authority's tree"
+        );
+        assert_eq!(
+            std::fs::read(tree_b_algo.join(&leaf_name)).unwrap(),
+            serde_json::to_vec(&rec_b).unwrap(),
+            "replacement tree untouched by the in-flight transition"
+        );
+    }
+}
+
+// Production-boundary containment regressions for the R-6 slice: the
+// `delete_manifest` tag-cleanup scan (formerly ambient `list_tag_files` +
+// `read_to_string` + ignored `remove_file`) now enumerates, inspects, and
+// deletes matching tags ALL through ONE retained contained `repos/<repo>/tags`
+// authority, resolved non-creating (absent tags directory -> empty scan with
+// zero directory creation). The scan takes no per-tag locks (unchanged
+// historical semantics) and delete_manifest's ordering (manifest unlink ->
+// tag scan -> referrer cleanup) is preserved.
+mod delete_manifest_tag_cleanup_containment {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    const DHEX: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+    const EHEX: &str = "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2";
+
+    fn d(hex: &str) -> Digest {
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    fn manifest_body() -> bytes::Bytes {
+        bytes::Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#,
+        )
+    }
+
+    async fn put(storage: &FsStorage, repo: &str, digest: &Digest) {
+        storage
+            .put_manifest(repo, digest, manifest_body())
+            .await
+            .expect("put_manifest");
+    }
+
+    fn tags_dir(root: &Path, repo: &str) -> PathBuf {
+        let mut p = root.join("repos");
+        for seg in repo.split('/') {
+            p = p.join(seg);
+        }
+        p.join("tags")
+    }
+
+    fn tag_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read tags dir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    // Deleting a manifest removes ALL tags pointing at its digest (created via
+    // the production set_tag, i.e. canonical `sha256:<hex>\n` bodies) and
+    // leaves unrelated tags untouched.
+    #[tokio::test]
+    async fn test_delete_manifest_removes_matching_tags_leaves_unrelated() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+        let de = d(EHEX);
+        put(&storage, "clean", &dd).await;
+        put(&storage, "clean", &de).await;
+
+        storage.set_tag("clean", "v1", &dd).await.unwrap();
+        storage.set_tag("clean", "v1-alias", &dd).await.unwrap();
+        storage.set_tag("clean", "other", &de).await.unwrap();
+
+        storage.delete_manifest("clean", &dd).await.unwrap();
+
+        assert_eq!(
+            tag_names(&tags_dir(&root, "clean")),
+            vec!["other".to_string()],
+            "both matching tags removed; unrelated tag remains"
+        );
+        assert_eq!(
+            storage.resolve_tag("clean", "other").await.unwrap(),
+            de,
+            "unrelated tag still resolves"
+        );
+        assert!(
+            matches!(
+                storage.resolve_tag("clean", "v1").await,
+                Err(StorageError::NotFound)
+            ),
+            "matching tag no longer resolves"
+        );
+    }
+
+    // Absent tags directory: the cleanup is an empty scan and — non-creating
+    // resolution — does NOT create the tags directory. Empty tags directory:
+    // no-op success.
+    #[tokio::test]
+    async fn test_delete_manifest_absent_and_empty_tags_dir_zero_side_effects() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+
+        // No tags directory at all.
+        put(&storage, "notags", &dd).await;
+        storage.delete_manifest("notags", &dd).await.unwrap();
+        assert!(
+            !tags_dir(&root, "notags").exists(),
+            "absent tags directory is not created by the cleanup scan"
+        );
+
+        // Empty tags directory.
+        let de = d(EHEX);
+        put(&storage, "emptytags", &de).await;
+        std::fs::create_dir_all(tags_dir(&root, "emptytags")).unwrap();
+        storage.delete_manifest("emptytags", &de).await.unwrap();
+        assert_eq!(
+            tag_names(&tags_dir(&root, "emptytags")),
+            Vec::<String>::new()
+        );
+    }
+
+    // Non-UTF-8 tag content propagates as an Io error (frozen taxonomy), and —
+    // frozen ordering — the manifest itself is already unlinked by then
+    // (partial cleanup is an accepted possibility; no rollback is claimed).
+    #[tokio::test]
+    async fn test_delete_manifest_malformed_tag_content_propagates_io_after_unlink() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+        put(&storage, "badtag", &dd).await;
+        let tdir = tags_dir(&root, "badtag");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join("broken"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+
+        let err = storage
+            .delete_manifest("badtag", &dd)
+            .await
+            .expect_err("non-UTF-8 tag content must propagate");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "non-UTF-8 tag content -> Io, got {err:?}"
+        );
+        // Ordering frozen: the manifest was unlinked before the tag scan.
+        let manifest_path = root
+            .join("repos")
+            .join("badtag")
+            .join("manifests")
+            .join(dd.hex());
+        assert!(
+            !manifest_path.exists(),
+            "manifest unlink precedes the tag scan (partial cleanup accepted)"
+        );
+    }
+
+    // A symlinked tag entry fails closed at the contained read (Io propagated):
+    // the symlink is neither followed for the match decision nor removed, and
+    // the external target is untouched. (Previously the ambient scan FOLLOWED
+    // the symlink and, on a content match, removed it.)
+    #[tokio::test]
+    async fn test_delete_manifest_symlinked_tag_entry_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+        put(&storage, "symtag", &dd).await;
+
+        // External target whose content WOULD match the deleted digest.
+        let ext_target = external.join("outside_tag");
+        std::fs::write(&ext_target, format!("{}\n", dd.as_str())).unwrap();
+        let tdir = tags_dir(&root, "symtag");
+        std::fs::create_dir_all(&tdir).unwrap();
+        let link = tdir.join("linked-tag");
+        symlink(&ext_target, &link).unwrap();
+
+        let err = storage
+            .delete_manifest("symtag", &dd)
+            .await
+            .expect_err("symlinked tag entry must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlinked tag -> Io, got {err:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink not removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ext_target).unwrap(),
+            format!("{}\n", dd.as_str()),
+            "external target untouched"
+        );
+    }
+
+    // Nested repository: the cleanup resolves `repos/a/b/c/tags` through the
+    // contained chain and removes the matching tag there.
+    #[tokio::test]
+    async fn test_delete_manifest_nested_repo_tag_cleanup() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+        put(&storage, "a/b/c", &dd).await;
+        storage.set_tag("a/b/c", "rel", &dd).await.unwrap();
+
+        storage.delete_manifest("a/b/c", &dd).await.unwrap();
+        assert_eq!(
+            tag_names(&tags_dir(&root, "a/b/c")),
+            Vec::<String>::new(),
+            "matching tag removed from the nested repository"
+        );
+    }
+
+    // Repository deletion/recreation BETWEEN operations: the next
+    // delete_manifest freshly resolves the named repository and cleans the NEW
+    // tree (no stale per-repo authority).
+    #[tokio::test]
+    async fn test_delete_manifest_tag_cleanup_repo_recreate_between_operations() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+        put(&storage, "recreate", &dd).await;
+        storage.set_tag("recreate", "v1", &dd).await.unwrap();
+        storage.delete_manifest("recreate", &dd).await.unwrap();
+
+        // Remove and recreate the whole repository, repopulate.
+        std::fs::remove_dir_all(root.join("repos").join("recreate")).unwrap();
+        put(&storage, "recreate", &dd).await;
+        storage.set_tag("recreate", "v2", &dd).await.unwrap();
+
+        storage.delete_manifest("recreate", &dd).await.unwrap();
+        assert_eq!(
+            tag_names(&tags_dir(&root, "recreate")),
+            Vec::<String>::new(),
+            "cleanup acted on the recreated repository tree"
+        );
+    }
+
+    // CRITICAL same-authority regression: a tags-namespace replacement injected
+    // BETWEEN authority acquisition and the enumeration/inspection/deletion
+    // pass (the production seam: open_tags_authority +
+    // delete_manifest_tag_cleanup_in) must not split the tree that is
+    // enumerated/inspected from the tree that is mutated.
+    //
+    //   BROKEN:   authority A -> enumerate/read/delete via re-resolved paths (B)
+    //   REQUIRED: authority A -> enumerate A -> read A -> delete on A;
+    //             replacement tree B untouched.
+    #[tokio::test]
+    async fn test_tag_cleanup_same_authority_across_namespace_replacement() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let dd = d(DHEX);
+        let de = d(EHEX);
+        put(&storage, "race", &dd).await;
+
+        // Tree A: one matching tag and one unrelated tag (raw canonical bodies).
+        let tree_a = tags_dir(&root, "race");
+        std::fs::create_dir_all(&tree_a).unwrap();
+        std::fs::write(tree_a.join("match-me"), format!("{}\n", dd.as_str())).unwrap();
+        std::fs::write(tree_a.join("keep-me"), format!("{}\n", de.as_str())).unwrap();
+
+        // Acquire the cleanup authority (tree A).
+        let authority = storage
+            .open_tags_authority("race")
+            .await
+            .unwrap()
+            .expect("tags authority resolves for existing tree");
+
+        // Injected boundary: replace the tags namespace so pathname resolution
+        // now reaches tree B, which ALSO contains a matching tag.
+        let moved_a = tree_a.with_file_name("tags-tree-a");
+        std::fs::rename(&tree_a, &moved_a).unwrap();
+        std::fs::create_dir_all(&tree_a).unwrap();
+        std::fs::write(tree_a.join("match-me"), format!("{}\n", dd.as_str())).unwrap();
+
+        // Negative control: an independent re-resolution (what the broken shape
+        // would consume) observes tree B's matching tag.
+        assert_eq!(
+            storage.resolve_tag("race", "match-me").await.unwrap(),
+            dd,
+            "re-resolving read observes the replacement tree at the injected boundary"
+        );
+
+        // Continue the production inner cleanup pass on the RETAINED authority.
+        FsStorage::delete_manifest_tag_cleanup_in(&authority, &dd.as_str())
+            .await
+            .expect("inner cleanup on retained authority");
+
+        // Enumeration, inspection, and deletion stayed wholly on tree A:
+        // the matching tag is gone THERE, the unrelated tag remains.
+        assert_eq!(
+            tag_names(&moved_a),
+            vec!["keep-me".to_string()],
+            "matching tag deleted on the retained authority's tree only"
+        );
+        // Tree B untouched: its matching tag is still present.
+        assert_eq!(
+            tag_names(&tree_a),
+            vec!["match-me".to_string()],
+            "replacement tree untouched by the in-flight cleanup"
+        );
+    }
+}
+
+// Production-boundary containment regressions for the GC quarantine protocol:
+// `quarantine_blob` / `restore_quarantined_blob` (contained cross-authority
+// rename between the pinned `blobs` and `quarantine` roots), the quarantine
+// timestamp helpers, and `delete_blob_conditional` (revalidation via fstat +
+// streaming hash on the fd opened through ONE retained quarantine shard
+// authority, unlink through that same authority). Shard resolution is
+// non-creating for inspection paths, so absent-state contracts keep zero
+// directory-creation side effects.
+mod gc_quarantine_containment {
+    use super::*;
+    use crate::storage::mutation_authority::RuntimeMutationAuthority;
+    use crate::storage::{BlobObjectVersion, GcDeleteResult, GcQuarantineResult, GcStorage};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    const QHEX: &str = "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5";
+
+    fn d(hex: &str) -> Digest {
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    fn cas_path(root: &Path, digest: &Digest) -> PathBuf {
+        root.join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex())
+    }
+
+    fn q_path(root: &Path, digest: &Digest) -> PathBuf {
+        root.join("quarantine")
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex())
+    }
+
+    fn ts_path(root: &Path, digest: &Digest) -> PathBuf {
+        root.join("quarantine")
+            .join("meta")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(format!("{}.ts", digest.hex()))
+    }
+
+    fn plant_cas_blob(root: &Path, digest: &Digest, bytes: &[u8]) {
+        let p = cas_path(root, digest);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+
+    async fn authority_for(root: &Path) -> RuntimeMutationAuthority {
+        RuntimeMutationAuthority::acquire(
+            Arc::new(FsStorage::new(root.to_path_buf(), 1024 * 1024)),
+            "gc-containment-test",
+        )
+        .await
+        .expect("acquire mutation authority")
+    }
+
+    fn dummy_version() -> BlobObjectVersion {
+        BlobObjectVersion("fs:0:0:dummy".to_string())
+    }
+
+    // Full protocol round trip with exact artifacts: quarantine moves the CAS
+    // leaf into the quarantine shard byte-identically, writes the `<secs>\n`
+    // timestamp (mode 0o600, no temp residue), the contained read seam
+    // observes the quarantined version, and the conditional delete removes the
+    // leaf and the timestamp.
+    #[tokio::test]
+    async fn test_quarantine_version_delete_roundtrip_exact_artifacts() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        let body = b"gc-quarantine-payload".to_vec();
+        plant_cas_blob(&root, &digest, &body);
+
+        let res = storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .expect("quarantine_blob");
+        assert_eq!(
+            res,
+            GcQuarantineResult::Quarantined {
+                size: body.len() as u64
+            },
+            "reports the pre-move size"
+        );
+        assert!(!cas_path(&root, &digest).exists(), "CAS leaf moved away");
+        assert_eq!(
+            std::fs::read(q_path(&root, &digest)).unwrap(),
+            body,
+            "quarantined bytes identical (rename, not copy)"
+        );
+
+        let tsp = ts_path(&root, &digest);
+        let ts_content = std::fs::read_to_string(&tsp).unwrap();
+        let secs: u64 = ts_content.trim().parse().expect("parseable seconds");
+        assert!(ts_content.ends_with('\n') && secs > 0, "canonical ts body");
+        assert_eq!(
+            std::fs::metadata(&tsp).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "contained ts write mode is 0o600"
+        );
+        // No temp residue in either shard directory.
+        for dir in [
+            q_path(&root, &digest).parent().unwrap().to_path_buf(),
+            tsp.parent().unwrap().to_path_buf(),
+        ] {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names.len(), 1, "exactly one leaf in {dir:?}: {names:?}");
+        }
+
+        let version = storage
+            .quarantined_blob_version(&digest)
+            .await
+            .unwrap()
+            .expect("contained read seam sees the quarantined blob");
+
+        let del = storage
+            .delete_blob_conditional(&permit, &digest, Some(&version))
+            .await
+            .expect("delete_blob_conditional");
+        assert_eq!(del, GcDeleteResult::Deleted);
+        assert!(!q_path(&root, &digest).exists(), "quarantined leaf removed");
+        assert!(!tsp.exists(), "timestamp removed after deletion");
+    }
+
+    // Rescue path: restore moves the quarantined leaf back into CAS
+    // byte-identically and removes the timestamp; a second restore is None.
+    #[tokio::test]
+    async fn test_restore_rescue_roundtrip() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        let body = b"rescued-payload".to_vec();
+        plant_cas_blob(&root, &digest, &body);
+
+        storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .unwrap();
+        assert!(ts_path(&root, &digest).exists());
+
+        let restored = storage
+            .restore_quarantined_blob(&permit, &digest)
+            .await
+            .expect("restore");
+        assert_eq!(restored, Some(body.len() as u64));
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            body,
+            "blob restored byte-identically"
+        );
+        assert!(!q_path(&root, &digest).exists(), "quarantine leaf gone");
+        assert!(!ts_path(&root, &digest).exists(), "timestamp removed");
+
+        assert_eq!(
+            storage
+                .restore_quarantined_blob(&permit, &digest)
+                .await
+                .unwrap(),
+            None,
+            "second restore reports absence"
+        );
+    }
+
+    // Absent-digest contracts keep their results AND (non-creating shard
+    // resolution) create no shard directories.
+    #[tokio::test]
+    async fn test_absent_states_preserved_zero_shard_side_effects() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+
+        assert_eq!(
+            storage
+                .quarantine_blob(&permit, &digest, &dummy_version())
+                .await
+                .unwrap(),
+            GcQuarantineResult::Skipped,
+            "absent CAS blob -> Skipped"
+        );
+        assert_eq!(
+            storage
+                .restore_quarantined_blob(&permit, &digest)
+                .await
+                .unwrap(),
+            None,
+            "absent quarantined blob -> None"
+        );
+        assert_eq!(
+            storage
+                .delete_blob_conditional(&permit, &digest, Some(&dummy_version()))
+                .await
+                .unwrap(),
+            GcDeleteResult::NotFound,
+            "absent quarantined blob -> NotFound"
+        );
+
+        for p in [
+            root.join("blobs").join("sha256"),
+            root.join("quarantine").join("blobs"),
+            root.join("quarantine").join("meta"),
+        ] {
+            assert!(
+                !p.exists(),
+                "no shard directories created by absent-state operations: {p:?}"
+            );
+        }
+    }
+
+    // The deletion predicate is preserved: a content change after version
+    // capture yields PreconditionFailed carrying the recomputed version, and
+    // neither the object nor its timestamp is touched.
+    #[tokio::test]
+    async fn test_delete_precondition_mismatch_preserves_object_and_ts() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"original");
+        storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .unwrap();
+        let stale_version = storage
+            .quarantined_blob_version(&digest)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Concurrent mutation of the quarantined object.
+        std::fs::write(q_path(&root, &digest), b"changed-content").unwrap();
+
+        let res = storage
+            .delete_blob_conditional(&permit, &digest, Some(&stale_version))
+            .await
+            .unwrap();
+        let GcDeleteResult::PreconditionFailed {
+            current_version: Some(current),
+        } = res
+        else {
+            panic!("expected PreconditionFailed with current version, got {res:?}");
+        };
+        assert_ne!(current, stale_version);
+        // Coherence: the returned current version equals the contained read
+        // seam's view of the same object.
+        assert_eq!(
+            storage
+                .quarantined_blob_version(&digest)
+                .await
+                .unwrap()
+                .unwrap(),
+            current,
+            "recomputed version coherent with the contained read seam"
+        );
+        assert_eq!(
+            std::fs::read(q_path(&root, &digest)).unwrap(),
+            b"changed-content",
+            "object preserved on precondition failure"
+        );
+        assert!(
+            ts_path(&root, &digest).exists(),
+            "timestamp preserved on precondition failure"
+        );
+    }
+
+    // Concurrent deletion by another worker: the conditional delete reports
+    // NotFound and cleans up the orphaned timestamp.
+    #[tokio::test]
+    async fn test_delete_already_deleted_by_other_worker() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"raced");
+        storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .unwrap();
+        let version = storage
+            .quarantined_blob_version(&digest)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Another worker wins the race.
+        std::fs::remove_file(q_path(&root, &digest)).unwrap();
+
+        assert_eq!(
+            storage
+                .delete_blob_conditional(&permit, &digest, Some(&version))
+                .await
+                .unwrap(),
+            GcDeleteResult::NotFound
+        );
+        assert!(
+            !ts_path(&root, &digest).exists(),
+            "orphaned timestamp cleaned up on NotFound"
+        );
+    }
+
+    // A symlinked quarantined leaf fails closed at the contained open: the
+    // revalidation never hashes the external target, nothing is unlinked, and
+    // the timestamp stays. (Previously the ambient stat+open+hash FOLLOWED the
+    // symlink and a matching version deleted the link.)
+    #[tokio::test]
+    async fn test_delete_symlinked_leaf_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+
+        let ext_target = external.join("outside_blob");
+        std::fs::write(&ext_target, b"external-bytes").unwrap();
+        let qp = q_path(&root, &digest);
+        std::fs::create_dir_all(qp.parent().unwrap()).unwrap();
+        symlink(&ext_target, &qp).unwrap();
+        let tsp = ts_path(&root, &digest);
+        std::fs::create_dir_all(tsp.parent().unwrap()).unwrap();
+        std::fs::write(&tsp, "1700000000\n").unwrap();
+
+        let err = storage
+            .delete_blob_conditional(&permit, &digest, Some(&dummy_version()))
+            .await
+            .expect_err("symlinked quarantined leaf must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink -> Io error, got {err:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&qp)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink not unlinked"
+        );
+        assert_eq!(
+            std::fs::read(&ext_target).unwrap(),
+            b"external-bytes",
+            "external target untouched"
+        );
+        assert!(tsp.exists(), "timestamp preserved on fail-closed abort");
+    }
+
+    // A symlinked CAS shard component fails closed for quarantine_blob: the
+    // external tree is neither inspected into a decision nor renamed from.
+    // (Previously the ambient metadata/rename followed the symlink.)
+    #[tokio::test]
+    async fn test_quarantine_blob_symlinked_shard_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+
+        // External dir holds a blob under the digest name.
+        std::fs::write(external.join(digest.hex()), b"external-blob").unwrap();
+        let algo_dir = root.join("blobs").join("sha256");
+        std::fs::create_dir_all(&algo_dir).unwrap();
+        symlink(&external, algo_dir.join(digest.prefix2())).unwrap();
+
+        let err = storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .expect_err("symlinked shard component must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink escape -> Io error, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(external.join(digest.hex())).unwrap(),
+            b"external-blob",
+            "external blob untouched"
+        );
+        assert!(
+            !root.join("quarantine").exists(),
+            "no quarantine tree created by the failed operation"
+        );
+    }
+
+    // CRITICAL same-authority regression (destructive delete): a quarantine
+    // shard replacement injected BETWEEN authority acquisition and the
+    // revalidate/unlink pass at the production seam (quarantine_blobs_shard +
+    // delete_blob_conditional_in) must not split the object that is
+    // revalidated from the leaf that is unlinked.
+    //
+    //   BROKEN:   authority A -> independent re-resolution revalidates B ->
+    //             version mismatch (or worse, unlink of B's leaf)
+    //   REQUIRED: authority A -> open/fstat/hash A's leaf -> match -> unlink
+    //             ON TREE A; replacement tree B untouched.
+    #[tokio::test]
+    async fn test_delete_same_authority_across_namespace_replacement() {
+        use storage_fs::FileName;
+
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"tree-a-content");
+        storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .unwrap();
+        let version_a = storage
+            .quarantined_blob_version(&digest)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Acquire the mutation authority (tree A's shard).
+        let shard = storage
+            .quarantine_blobs_shard(&digest, false)
+            .await
+            .unwrap()
+            .expect("shard resolves for the quarantined blob");
+        let leaf = FileName::new(digest.hex()).unwrap();
+
+        // Injected boundary: replace the shard so pathname resolution now
+        // reaches tree B with different content under the same digest name.
+        let shard_path = q_path(&root, &digest).parent().unwrap().to_path_buf();
+        let moved_a = shard_path.with_file_name("shard-tree-a");
+        std::fs::rename(&shard_path, &moved_a).unwrap();
+        std::fs::create_dir_all(&shard_path).unwrap();
+        std::fs::write(shard_path.join(digest.hex()), b"tree-b-content").unwrap();
+
+        // Negative control: an independent re-resolution (the read a
+        // two-resolution shape would consume) observes tree B's version.
+        let version_b = storage
+            .quarantined_blob_version(&digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            version_b, version_a,
+            "re-resolving read observes the replacement tree at the injected boundary"
+        );
+
+        // Continue the production inner sequence on the RETAINED authority.
+        let res = FsStorage::delete_blob_conditional_in(&shard, &leaf, &version_a)
+            .await
+            .expect("inner conditional delete on retained authority");
+        assert_eq!(
+            res,
+            GcDeleteResult::Deleted,
+            "revalidation matched tree A through the retained authority \
+             (a two-resolution implementation reads tree B and fails the precondition)"
+        );
+        assert!(
+            !moved_a.join(digest.hex()).exists(),
+            "unlink acted on the retained authority's tree"
+        );
+        assert_eq!(
+            std::fs::read(shard_path.join(digest.hex())).unwrap(),
+            b"tree-b-content",
+            "replacement tree untouched by the in-flight deletion"
+        );
+    }
+}
+
+// Production-boundary containment regressions for the legacy streaming upload
+// lifecycle (`create_upload` / `upload_status` / `append_upload` /
+// `finalize_upload` / `abort_upload` — the storage-trait contract retained for
+// both backends and used by tests as the supported fixture path; production
+// HTTP uploads flow through the PHASE5 coordinator/session API). The lifecycle
+// now operates entirely beneath the pinned `uploads` authority: the data leaf
+// is created/appended/read through contained opens (kernel `O_APPEND`
+// preserved), streaming I/O stays on the securely opened file description
+// inside owned blocking closures, and finalize publishes via the contained
+// cross-authority rename into the CAS shard. No locks existed on this legacy
+// path and none were added.
+mod legacy_streaming_upload_containment {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn digest_of(bytes: &[u8]) -> Digest {
+        Digest::parse(&format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(bytes))
+        ))
+        .unwrap()
+    }
+
+    fn upload_leaf_path(root: &Path, uuid: &str) -> PathBuf {
+        root.join("uploads").join(format!("{uuid}.data"))
+    }
+
+    fn hash_state_path(root: &Path, uuid: &str) -> PathBuf {
+        root.join("uploads").join(format!("{uuid}.sha256state"))
+    }
+
+    fn cas_path(root: &Path, digest: &Digest) -> PathBuf {
+        root.join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex())
+    }
+
+    // Full lifecycle with exact artifacts: chunked appends report exact
+    // offsets and persist exact bytes at the contained leaf; finalize verifies
+    // the digest, publishes the exact bytes into the CAS shard via rename, and
+    // removes the upload leaf and its hash-state cache with no residue.
+    #[tokio::test]
+    async fn test_create_append_finalize_roundtrip_exact_artifacts() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let meta = storage.create_upload().await.expect("create_upload");
+        assert_eq!(meta.offset, 0);
+        let uuid = meta.uuid.clone();
+        assert_eq!(
+            std::fs::read(upload_leaf_path(&root, &uuid)).unwrap(),
+            b"",
+            "created leaf is empty"
+        );
+        assert!(
+            hash_state_path(&root, &uuid).exists(),
+            "hash-state cache initialized"
+        );
+
+        let c1 = b"first-chunk-".to_vec();
+        let c2 = b"second-chunk".to_vec();
+        let m1 = storage
+            .append_upload(&uuid, Bytes::from(c1.clone()))
+            .await
+            .expect("append 1");
+        assert_eq!(m1.offset, c1.len() as u64, "exact offset after chunk 1");
+        let m2 = storage
+            .append_upload(&uuid, Bytes::from(c2.clone()))
+            .await
+            .expect("append 2");
+        assert_eq!(
+            m2.offset,
+            (c1.len() + c2.len()) as u64,
+            "exact offset after chunk 2"
+        );
+
+        let mut full = c1.clone();
+        full.extend_from_slice(&c2);
+        assert_eq!(
+            std::fs::read(upload_leaf_path(&root, &uuid)).unwrap(),
+            full,
+            "exact bytes at the contained upload leaf"
+        );
+
+        let digest = digest_of(&full);
+        let blob_meta = storage
+            .finalize_upload(&uuid, &digest)
+            .await
+            .expect("finalize");
+        assert_eq!(blob_meta.size, full.len() as u64);
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            full,
+            "exact bytes published into the CAS shard"
+        );
+        assert!(
+            !upload_leaf_path(&root, &uuid).exists(),
+            "upload leaf moved (rename, not copy)"
+        );
+        assert!(
+            !hash_state_path(&root, &uuid).exists(),
+            "hash-state cache removed"
+        );
+        let residue: Vec<String> = std::fs::read_dir(root.join("uploads"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "no residue in uploads/ after finalize: {residue:?}"
+        );
+    }
+
+    // Empty appends and status report exact lengths from the contained leaf.
+    #[tokio::test]
+    async fn test_empty_append_and_status() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let uuid = storage.create_upload().await.unwrap().uuid;
+
+        let m = storage
+            .append_upload(&uuid, Bytes::new())
+            .await
+            .expect("empty append");
+        assert_eq!(m.offset, 0);
+        assert_eq!(storage.upload_status(&uuid).await.unwrap().offset, 0);
+
+        storage
+            .append_upload(&uuid, Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        assert_eq!(storage.upload_status(&uuid).await.unwrap().offset, 3);
+    }
+
+    // Absent-upload contracts: NotFound for status/append/finalize; Ok for
+    // abort. TooLarge preserved before any write.
+    #[tokio::test]
+    async fn test_absent_upload_and_too_large_contracts() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 16);
+
+        for res in [
+            storage.upload_status("no-such-upload").await.err(),
+            storage
+                .append_upload("no-such-upload", Bytes::from_static(b"x"))
+                .await
+                .err(),
+            storage
+                .finalize_upload("no-such-upload", &digest_of(b"x"))
+                .await
+                .err(),
+        ] {
+            assert!(
+                matches!(res, Some(StorageError::NotFound)),
+                "absent upload -> NotFound, got {res:?}"
+            );
+        }
+        storage
+            .abort_upload("no-such-upload")
+            .await
+            .expect("absent abort is Ok");
+
+        // TooLarge: enforced before any byte is written.
+        let uuid = storage.create_upload().await.unwrap().uuid;
+        let err = storage
+            .append_upload(&uuid, Bytes::from(vec![0u8; 17]))
+            .await
+            .expect_err("over-limit append must fail");
+        assert!(matches!(err, StorageError::TooLarge));
+        assert_eq!(
+            std::fs::read(upload_leaf_path(&root, &uuid)).unwrap(),
+            b"",
+            "no bytes written by the rejected append"
+        );
+    }
+
+    // A caller-supplied identifier that cannot form a contained leaf is an
+    // absent upload — and, critically, ambient escapes are gone: an abort with
+    // a traversal identifier no longer deletes a file outside the uploads
+    // namespace (previously `remove_file(root/uploads/../victim.data)` removed
+    // `root/victim.data`).
+    #[tokio::test]
+    async fn test_traversal_uuid_treated_as_absent_no_escape() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        // Plant a victim file where the old ambient join would have resolved.
+        std::fs::write(root.join("victim.data"), b"do-not-delete").unwrap();
+
+        assert!(matches!(
+            storage.upload_status("../victim").await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            storage
+                .append_upload("../victim", Bytes::from_static(b"x"))
+                .await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            storage.finalize_upload("../victim", &digest_of(b"x")).await,
+            Err(StorageError::NotFound)
+        ));
+        storage
+            .abort_upload("../victim")
+            .await
+            .expect("traversal abort is an absent no-op");
+
+        assert_eq!(
+            std::fs::read(root.join("victim.data")).unwrap(),
+            b"do-not-delete",
+            "file outside the uploads namespace untouched by traversal identifiers"
+        );
+    }
+
+    // Digest mismatch aborts finalize BEFORE any publish: the upload leaf and
+    // its hash-state cache remain, and a retry with the correct digest
+    // succeeds.
+    #[tokio::test]
+    async fn test_finalize_digest_mismatch_preserves_upload() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let uuid = storage.create_upload().await.unwrap().uuid;
+        storage
+            .append_upload(&uuid, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let wrong = digest_of(b"different");
+        let err = storage
+            .finalize_upload(&uuid, &wrong)
+            .await
+            .expect_err("mismatch must fail");
+        assert!(matches!(err, StorageError::DigestMismatch));
+        assert_eq!(
+            std::fs::read(upload_leaf_path(&root, &uuid)).unwrap(),
+            b"payload",
+            "upload preserved on mismatch"
+        );
+        assert!(!cas_path(&root, &wrong).exists(), "nothing published");
+
+        let right = digest_of(b"payload");
+        storage
+            .finalize_upload(&uuid, &right)
+            .await
+            .expect("retry with correct digest succeeds");
+        assert_eq!(std::fs::read(cas_path(&root, &right)).unwrap(), b"payload");
+    }
+
+    // A symlinked upload leaf fails closed for the contained opens: append and
+    // finalize error with Io, status fails closed, and the external target is
+    // neither read, written, nor published. (Previously the ambient
+    // open/stat/hash followed the symlink.)
+    #[tokio::test]
+    async fn test_symlinked_upload_leaf_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let ext_target = external.join("outside_upload");
+        std::fs::write(&ext_target, b"external-bytes").unwrap();
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        std::fs::create_dir_all(root.join("uploads")).unwrap();
+        symlink(&ext_target, upload_leaf_path(&root, uuid)).unwrap();
+
+        for (op, err) in [
+            (
+                "append",
+                storage
+                    .append_upload(uuid, Bytes::from_static(b"x"))
+                    .await
+                    .expect_err("append through symlink must fail closed"),
+            ),
+            (
+                "finalize",
+                storage
+                    .finalize_upload(uuid, &digest_of(b"external-bytes"))
+                    .await
+                    .expect_err("finalize through symlink must fail closed"),
+            ),
+            (
+                "status",
+                storage
+                    .upload_status(uuid)
+                    .await
+                    .expect_err("status through symlink must fail closed"),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    StorageError::Internal {
+                        kind: crate::storage::StorageErrorKind::Io,
+                        ..
+                    }
+                ),
+                "{op}: symlinked leaf -> Io, got {err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&ext_target).unwrap(),
+            b"external-bytes",
+            "external target untouched"
+        );
+        assert!(
+            !cas_path(&root, &digest_of(b"external-bytes")).exists(),
+            "nothing published from the symlinked leaf"
+        );
+    }
+
+    // Kernel O_APPEND semantics preserved: bytes appended to the leaf by an
+    // external writer between two append_upload calls are not overwritten, and
+    // the returned offset is the true end-of-file after the kernel append.
+    #[tokio::test]
+    async fn test_append_kernel_o_append_semantics() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let uuid = storage.create_upload().await.unwrap().uuid;
+
+        storage
+            .append_upload(&uuid, Bytes::from_static(b"AAA"))
+            .await
+            .unwrap();
+
+        // External writer appends concurrently (simulated between calls).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(upload_leaf_path(&root, &uuid))
+                .unwrap();
+            f.write_all(b"XX").unwrap();
+        }
+
+        let m = storage
+            .append_upload(&uuid, Bytes::from_static(b"BBB"))
+            .await
+            .unwrap();
+        assert_eq!(
+            m.offset, 8,
+            "offset reflects true end-of-file under kernel O_APPEND"
+        );
+        assert_eq!(
+            std::fs::read(upload_leaf_path(&root, &uuid)).unwrap(),
+            b"AAAXXBBB",
+            "no external bytes overwritten (O_APPEND, not positional write)"
+        );
+    }
+
+    // Fixed-top-level authority boundary: the pinned `uploads` authority
+    // follows its inode. After the whole uploads directory is renamed away and
+    // recreated with a decoy leaf, the next append resolves through the PINNED
+    // old directory — the decoy tree receives no bytes.
+    #[tokio::test]
+    async fn test_uploads_replacement_append_stays_on_pinned_authority() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let uuid = storage.create_upload().await.unwrap().uuid;
+        storage
+            .append_upload(&uuid, Bytes::from_static(b"orig-"))
+            .await
+            .unwrap();
+
+        // Replace the fixed top-level uploads directory wholesale.
+        let uploads = root.join("uploads");
+        let moved = root.join("uploads-old");
+        std::fs::rename(&uploads, &moved).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        std::fs::write(uploads.join(format!("{uuid}.data")), b"decoy").unwrap();
+
+        let m = storage
+            .append_upload(&uuid, Bytes::from_static(b"more"))
+            .await
+            .expect("append via pinned authority");
+        assert_eq!(m.offset, 9, "offset from the pinned tree's leaf");
+        assert_eq!(
+            std::fs::read(moved.join(format!("{uuid}.data"))).unwrap(),
+            b"orig-more",
+            "write landed on the pinned (old) uploads tree"
+        );
+        assert_eq!(
+            std::fs::read(uploads.join(format!("{uuid}.data"))).unwrap(),
+            b"decoy",
+            "replacement tree untouched by the in-flight lifecycle"
         );
     }
 }

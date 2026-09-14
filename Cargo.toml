@@ -55,3 +55,7 @@ storage-s3 = []
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Enable the dependency's deterministic fault-injection seam for tests ONLY. With the
+# edition-2024 resolver, dev-dependency features are not unified into normal builds, so
+# production `FsStorage` never contains the seam.
+storage-fs = { path = "../storage-layer-rust/crates/storage-fs", features = ["fault-injection"] }

@@ -44,17 +44,25 @@
 //! - Non-Linux verification remains unperformed.
 //!
 //! # Mutation-Caller Read Semantics
-//! Production `FsStorage::list_referrers` routes through this module, so mutation workflows
-//! (`add_referrer`, `remove_referrer`, and `delete_manifest` via `remove_referrer`) consume
-//! contained reads as well:
-//! - `add_referrer` calls `ensure_dir` (uncontained `std::fs::create_dir_all`) *before* reading;
-//!   directory creation can fully or partially succeed before a read rejection, and it is not
-//!   rolled back when the contained read subsequently fails.
-//! - Read rejections (structural validation, symlink rejection, payload limits) abort mutations
+//! Ordinary reads (`FsStorage::list_referrers`) independently resolve through the contained
+//! object reader in this module. Mutations (`add_referrer`, `remove_referrer`, and
+//! `delete_manifest` via `remove_referrer`) do NOT re-resolve for their inspection: each
+//! mutation resolves ONE contained `repos/<repo>/referrers` authority (validation via
+//! [`referrers_key`], then `ensure_subdir` beneath the pinned `repos` root) and retains it
+//! across its entire inspection/action sequence, reading the index leaf through that same
+//! authority (deserialized by the shared [`parse_referrers_bytes`], preserving the legacy
+//! missing→empty / corrupt→Io / order-preserving contract):
+//! - Structurally invalid repository names are rejected without any directory creation, and
+//!   directory creation itself is contained (no ambient `create_dir_all`).
+//! - Read rejections (symlink rejection, non-regular leaves, parse failures) abort mutations
 //!   fail-closed via `?` before serialization or writeback.
+//! - Retaining one authority prevents a mutation from inspecting one replaceable lower-level
+//!   tree and acting on another after a repository/`referrers` namespace replacement. It does
+//!   NOT provide snapshot isolation or cross-process serialization; the in-process shard lock
+//!   only serializes same-instance mutations.
 //! - `delete_manifest` ignores `remove_referrer` failures; a rejected referrers read during
 //!   cleanup does not resurrect the already-removed manifest.
-//! - Write containment, locking, and durability remain governed by Quality Gate O-04.
+//! - Remaining durability questions are governed by Quality Gate O-04.
 
 use crate::registry::digest::Digest;
 use crate::storage::{ReferrerDescriptor, StorageError};
@@ -140,6 +148,17 @@ async fn drain_referrers_stream(
     }
 }
 
+/// Deserializes referrers index bytes with the legacy contract shared by the
+/// contained reader seam and the mutation-side authority read:
+/// corrupted JSON / invalid UTF-8 map to the legacy [`StorageErrorKind::Io`]
+/// taxonomy (carrying the serde message), the physical descriptor order of the
+/// stored array is preserved, and no normalization or deduplication is applied.
+///
+/// [`StorageErrorKind::Io`]: crate::storage::StorageErrorKind::Io
+pub(crate) fn parse_referrers_bytes(bytes: &[u8]) -> Result<Vec<ReferrerDescriptor>, StorageError> {
+    serde_json::from_slice(bytes).map_err(|err| StorageError::io(err.to_string()))
+}
+
 /// Reads and deserializes a referrers index file using descriptor-relative containment.
 ///
 /// Contract:
@@ -168,8 +187,7 @@ pub(crate) async fn read_referrers_contained(
 
     let bytes = drain_referrers_stream(payload, limits).await?;
 
-    let descriptors: Vec<ReferrerDescriptor> =
-        serde_json::from_slice(&bytes).map_err(|err| StorageError::io(err.to_string()))?;
+    let descriptors = parse_referrers_bytes(&bytes)?;
 
     if let Some(max_descriptors) = limits.max_descriptors {
         if descriptors.len() > max_descriptors {

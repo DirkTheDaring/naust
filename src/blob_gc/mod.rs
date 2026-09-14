@@ -402,20 +402,69 @@ async fn blob_gc_delete_fs_with_authority(
     quarantine_delay: Duration,
     limits: BlobGcLimits,
 ) -> Result<BlobGcStats, BlobGcError> {
+    use storage_fs::{DirEntryType, DirEnumerationLimits, FileName, FsMutateError};
+
     let mut stats = BlobGcStats::default();
 
     let t0 = Instant::now();
     let now = SystemTime::now();
 
+    // Pathname used only for error reporting; all traversal below is
+    // fd-relative beneath the sweep root pinned once per run.
     let root = cfg.fs_root.join("quarantine").join("blobs").join("sha256");
 
-    let mut prefixes = match tokio::fs::read_dir(&root).await {
+    // Pin the sweep root once (contained, non-creating). A missing storage
+    // root preserves the prior empty-sweep contract.
+    let sweep_root = match storage_fs::FsMetadataReader::open(&cfg.fs_root)
+        .map_err(|e| io::Error::other(e.to_string()))
+        .and_then(|r| {
+            r.open_contained_dir_sync("")
+                .map_err(|e| io::Error::other(e.to_string()))
+        }) {
         Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stats),
-        Err(source) => return Err(BlobGcError::FsReadDir { path: root, source }),
+        Err(source) => {
+            if !cfg.fs_root.exists() {
+                return Ok(stats);
+            }
+            return Err(BlobGcError::FsReadDir { path: root, source });
+        }
     };
 
-    while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
+    // Resolve quarantine/blobs/sha256 beneath the pinned sweep root without
+    // creating anything; absence of any component is the empty sweep, exactly
+    // like the prior ambient read_dir NotFound contract.
+    let mut q_root = sweep_root.clone();
+    for seg in ["quarantine", "blobs", "sha256"] {
+        let name = match FileName::new(seg) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(BlobGcError::FsReadDir {
+                    path: root,
+                    source: fs_mutate_to_io(e),
+                });
+            }
+        };
+        q_root = match q_root.open_subdir(&name).await {
+            Ok(d) => d,
+            Err(FsMutateError::NotFound) => return Ok(stats),
+            Err(e) => {
+                return Err(BlobGcError::FsReadDir {
+                    path: root,
+                    source: fs_mutate_to_io(e),
+                });
+            }
+        };
+    }
+
+    let prefixes = q_root
+        .list(DirEnumerationLimits::new(usize::MAX, usize::MAX))
+        .await
+        .map_err(|e| BlobGcError::FsReadDir {
+            path: root.clone(),
+            source: fs_mutate_to_io(e),
+        })?;
+
+    for prefix_ent in prefixes {
         if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
             break;
         }
@@ -426,26 +475,39 @@ async fn blob_gc_delete_fs_with_authority(
             break;
         }
 
-        let ft = match prefix_ent.file_type().await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
+        if prefix_ent.file_type() != DirEntryType::Directory {
             continue;
         }
+        // Non-UTF-8 prefix names cannot form a contained component and are
+        // skipped (previously such directories were traversed by raw path;
+        // valid hex shard prefixes are always UTF-8).
+        let Some(prefix_name) = prefix_ent.name().to_str() else {
+            continue;
+        };
+        let Ok(prefix_file_name) = FileName::new(prefix_name) else {
+            continue;
+        };
 
-        let prefix_path = prefix_ent.path();
-        let mut dir = match tokio::fs::read_dir(&prefix_path).await {
+        let prefix_path = root.join(prefix_name);
+        let prefix_dir = match q_root.open_subdir(&prefix_file_name).await {
             Ok(d) => d,
             Err(source) => {
                 return Err(BlobGcError::FsReadDir {
                     path: prefix_path,
-                    source,
+                    source: fs_mutate_to_io(source),
                 });
             }
         };
 
-        while let Ok(Some(ent)) = dir.next_entry().await {
+        let entries = prefix_dir
+            .list(DirEnumerationLimits::new(usize::MAX, usize::MAX))
+            .await
+            .map_err(|e| BlobGcError::FsReadDir {
+                path: prefix_path.clone(),
+                source: fs_mutate_to_io(e),
+            })?;
+
+        for ent in entries {
             if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
                 break;
             }
@@ -456,26 +518,22 @@ async fn blob_gc_delete_fs_with_authority(
                 break;
             }
 
-            let ft = match ent.file_type().await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if !ft.is_file() {
+            if ent.file_type() != DirEntryType::Regular {
                 continue;
             }
-
-            let path = ent.path();
-            let file_hex = match path.file_name().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
+            let Some(file_hex) = ent.name().to_str() else {
+                continue;
             };
             if file_hex.len() != 64 || !file_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
+            let Ok(leaf) = FileName::new(file_hex) else {
+                continue;
+            };
 
-            let meta = match ent.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
+            let size = match prefix_dir.inspect(&leaf).await {
+                Ok(Some(identity)) => identity.size,
+                Ok(None) | Err(_) => continue,
             };
 
             let digest = match Digest::parse(&format!("sha256:{file_hex}")) {
@@ -483,10 +541,10 @@ async fn blob_gc_delete_fs_with_authority(
                 Err(_) => continue,
             };
 
-            let q_at = match read_quarantine_time(cfg, &digest).await? {
+            let q_at = match read_quarantine_time(&sweep_root, cfg, &digest).await? {
                 Some(t) => t,
                 None => {
-                    let _ = write_quarantine_time(cfg, &digest, now).await;
+                    let _ = write_quarantine_time(&sweep_root, cfg, &digest, now).await;
                     continue;
                 }
             };
@@ -544,8 +602,13 @@ async fn blob_gc_delete_fs_with_authority(
 
             let candidate = storage::GcBlobCandidate {
                 digest: digest.clone(),
-                size: meta.len(),
-                last_modified: meta.modified().unwrap_or(UNIX_EPOCH),
+                size,
+                // The leaf mtime carried here previously is consumed by no
+                // step of this sweep (revalidation keys on digest/version,
+                // accounting on size; the FS age decision above uses the
+                // quarantine timestamp). Carry that same quarantine
+                // timestamp rather than re-opening the leaf ambiently.
+                last_modified: q_at,
                 version,
             };
 
@@ -755,18 +818,47 @@ fn quarantine_meta_path(cfg: &crate::config::Config, digest: &Digest) -> PathBuf
         .join(format!("{}.ts", digest.hex()))
 }
 
+/// Map a contained-primitive error into the `std::io::Error` payload carried by
+/// the frozen `BlobGcError::Fs*` variants (preserving the underlying error for
+/// `Io`, the `NotFound` kind for absence, and a descriptive message otherwise).
+fn fs_mutate_to_io(err: storage_fs::FsMutateError) -> std::io::Error {
+    match err {
+        storage_fs::FsMutateError::Io(e) => e,
+        storage_fs::FsMutateError::NotFound => {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "contained target not found")
+        }
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
 async fn write_quarantine_time(
+    root: &storage_fs::ContainedDir,
     cfg: &crate::config::Config,
     digest: &Digest,
     at: SystemTime,
 ) -> Result<(), BlobGcError> {
+    use storage_fs::FileName;
+
+    // Pathnames are used only in error reports; all directory creation and the
+    // write resolve fd-relative beneath the pinned sweep root.
     let path = quarantine_meta_path(cfg, digest);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
+    let parent = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.clone());
+
+    let mut dir = root.clone();
+    for seg in ["quarantine", "meta", digest.algorithm(), digest.prefix2()] {
+        let name = FileName::new(seg).map_err(|e| BlobGcError::FsWriteMeta {
+            path: parent.clone(),
+            source: fs_mutate_to_io(e),
+        })?;
+        dir = dir
+            .ensure_subdir(&name)
             .await
-            .map_err(|source| BlobGcError::FsWriteMeta {
-                path: parent.to_path_buf(),
-                source,
+            .map_err(|e| BlobGcError::FsWriteMeta {
+                path: parent.clone(),
+                source: fs_mutate_to_io(e),
             })?;
     }
 
@@ -774,29 +866,74 @@ async fn write_quarantine_time(
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs();
-    tokio::fs::write(&path, format!("{secs}\n"))
+    let leaf =
+        FileName::new(format!("{}.ts", digest.hex())).map_err(|e| BlobGcError::FsWriteMeta {
+            path: path.clone(),
+            source: fs_mutate_to_io(e),
+        })?;
+    dir.write_leaf_atomic(&leaf, format!("{secs}\n").into_bytes(), true)
         .await
-        .map_err(|source| BlobGcError::FsWriteMeta { path, source })?;
+        .map_err(|e| BlobGcError::FsWriteMeta {
+            path,
+            source: fs_mutate_to_io(e),
+        })?;
 
     Ok(())
 }
 
 async fn read_quarantine_time(
+    root: &storage_fs::ContainedDir,
     cfg: &crate::config::Config,
     digest: &Digest,
 ) -> Result<Option<SystemTime>, BlobGcError> {
-    // Narrow error-handling correction for this quarantine-age safety check
-    // (the read itself remains an ambient cfg-rooted path, documented as such):
-    // only genuine absence may report None — the sweep then initializes a new
-    // timestamp. Read failures and corrupt/unrepresentable stored values must
-    // not be conflated with absence, which previously overwrote the stored
-    // evidence with a fresh timestamp and restarted the deletion clock.
+    use storage_fs::{FileName, FsMutateError};
+
+    // Narrow error-handling contract for this quarantine-age safety check
+    // (the read resolves fd-relative beneath the pinned sweep root; the
+    // pathname below is used only in error reports): only genuine absence may
+    // report None — the sweep then initializes a new timestamp. Read failures
+    // and corrupt/unrepresentable stored values must not be conflated with
+    // absence, which previously overwrote the stored evidence with a fresh
+    // timestamp and restarted the deletion clock.
     let path = quarantine_meta_path(cfg, digest);
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(BlobGcError::FsReadMeta { path, source }),
+
+    let mut dir = root.clone();
+    for seg in ["quarantine", "meta", digest.algorithm(), digest.prefix2()] {
+        let name = FileName::new(seg).map_err(|e| BlobGcError::FsReadMeta {
+            path: path.clone(),
+            source: fs_mutate_to_io(e),
+        })?;
+        dir = match dir.open_subdir(&name).await {
+            Ok(d) => d,
+            Err(FsMutateError::NotFound) => return Ok(None),
+            Err(e) => {
+                return Err(BlobGcError::FsReadMeta {
+                    path,
+                    source: fs_mutate_to_io(e),
+                });
+            }
+        };
+    }
+
+    let leaf =
+        FileName::new(format!("{}.ts", digest.hex())).map_err(|e| BlobGcError::FsReadMeta {
+            path: path.clone(),
+            source: fs_mutate_to_io(e),
+        })?;
+    let bytes = match dir.read_leaf(&leaf, u64::MAX).await {
+        Ok(b) => b,
+        Err(FsMutateError::NotFound) => return Ok(None),
+        Err(e) => {
+            return Err(BlobGcError::FsReadMeta {
+                path,
+                source: fs_mutate_to_io(e),
+            });
+        }
     };
+    let content = String::from_utf8(bytes).map_err(|e| BlobGcError::FsReadMeta {
+        path: path.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+    })?;
     let secs: u64 = content
         .trim()
         .parse()
@@ -832,15 +969,38 @@ mod tests {
         let digest = Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
         let path = quarantine_meta_path(&cfg, &digest);
 
+        // Pinned sweep root, as blob_gc_delete_fs_with_authority resolves it.
+        let root = storage_fs::FsMetadataReader::open(&cfg.fs_root)
+            .unwrap()
+            .open_contained_dir_sync("")
+            .unwrap();
+
         // Genuine absence -> Ok(None) (the sweep may then initialize a fresh
         // timestamp; that write path is unchanged).
-        assert!(read_quarantine_time(&cfg, &digest).await.unwrap().is_none());
+        assert!(
+            read_quarantine_time(&root, &cfg, &digest)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        // Valid stored value round-trips.
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "1700000000\n").unwrap();
+        // Valid stored value round-trips (write via the contained helper,
+        // observed at the expected pathname).
+        write_quarantine_time(
+            &root,
+            &cfg,
+            &digest,
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            read_quarantine_time(&cfg, &digest).await.unwrap(),
+            std::fs::read_to_string(&path).unwrap(),
+            "1700000000\n",
+            "timestamp bytes at the expected pathname"
+        );
+        assert_eq!(
+            read_quarantine_time(&root, &cfg, &digest).await.unwrap(),
             Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
         );
 
@@ -848,7 +1008,7 @@ mod tests {
         // overwrote the stored evidence and restarted the deletion clock).
         std::fs::write(&path, "garbage").unwrap();
         assert!(matches!(
-            read_quarantine_time(&cfg, &digest).await,
+            read_quarantine_time(&root, &cfg, &digest).await,
             Err(BlobGcError::FsReadMeta { .. })
         ));
 
@@ -856,7 +1016,24 @@ mod tests {
         // (previously an unchecked UNIX_EPOCH + Duration addition).
         std::fs::write(&path, format!("{}\n", u64::MAX)).unwrap();
         assert!(matches!(
-            read_quarantine_time(&cfg, &digest).await,
+            read_quarantine_time(&root, &cfg, &digest).await,
+            Err(BlobGcError::FsReadMeta { .. })
+        ));
+
+        // A symlinked quarantine/meta shard component fails closed (Err, not
+        // None, and nothing is read through the link).
+        let digest2 = Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap();
+        let outside = temp.path().join("outside-meta");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join(format!("{}.ts", digest2.hex())),
+            "1700000000\n",
+        )
+        .unwrap();
+        let algo_dir = cfg.fs_root.join("quarantine").join("meta").join("sha256");
+        std::os::unix::fs::symlink(&outside, algo_dir.join(digest2.prefix2())).unwrap();
+        assert!(matches!(
+            read_quarantine_time(&root, &cfg, &digest2).await,
             Err(BlobGcError::FsReadMeta { .. })
         ));
     }

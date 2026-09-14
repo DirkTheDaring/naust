@@ -15,8 +15,11 @@ use sha2::Digest as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use storage_fs::{BlockingDir, ContainedDir, FileName, FsMutateError, LeafWriteMode};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::sync::{Mutex, OnceCell};
 
 const UPLOAD_SHA256_STATE_MAGIC: &[u8; 8] = b"RRSHA256";
 const UPLOAD_SHA256_STATE_VERSION: u8 = 1;
@@ -186,6 +189,256 @@ fn shard_index(key: &str, num_shards: usize) -> usize {
     std::hash::Hasher::finish(&hasher) as usize % num_shards
 }
 
+// ============================================================================
+// Contained upload-lifecycle authorities (Option A)
+// ============================================================================
+//
+// Every upload-lifecycle participant (session create/status/append/finalize/
+// commit/recover/abort, the expiry reaper, and the receipt/CAS/membership
+// helpers they call) resolves its targets beneath ONE shared authority per
+// subtree: the storage *root* is pinned once at construction, and each subtree
+// (`uploads`, `uploads/.finalized`, `blobs`, `repo-memberships`) is pinned
+// exactly once, lazily, and then shared for the process lifetime via
+// `Arc<UploadAuthorities>` (see `UploadAuthorities` below for the once-init and
+// guarantee-scope contract). Because a pinned descriptor follows the inode it
+// was opened on, replacing the *pathname* of a pinned ancestor cannot redirect a
+// later operation: inspection and the destructive actions it authorizes always
+// resolve through the same (possibly detached) tree, so a detached tree's expiry
+// can never drive deletion of a same-name record in a fresh replacement tree.
+// That an out-of-band pathname replacement is *not* silently adopted mid-flight
+// is the point — it is the invariant that keeps lock acquisition, reads, and
+// mutations coherent for the life of an authority; adopting a replacement is a
+// deliberate, explicit act (re-deriving the authorities, i.e. a restart), never
+// an implicit reopen. See
+// `docs/architecture/filesystem-upload-lifecycle-contained-cleanup.md`.
+
+/// Bounded read budgets for the small contained session records. Session data
+/// payloads are never slurped through these; they are streamed via owned
+/// descriptors.
+const SESSION_META_READ_LIMIT: u64 = 1 << 20;
+const SESSION_HASH_READ_LIMIT: u64 = 4096;
+const FINALIZED_RECEIPT_READ_LIMIT: u64 = 1 << 16;
+
+/// The contained upload-lifecycle authority.
+///
+/// The storage *root* descriptor is pinned once at construction. Each lifecycle
+/// subtree (`uploads`, `uploads/.finalized`, `blobs`, `repo-memberships`) is a
+/// distinct pinned authority that is initialized **exactly once, lazily, and
+/// shared** across every participant through a `tokio::sync::OnceCell`:
+///
+/// * The first operation that needs a subtree runs `ensure_subdir` beneath the
+///   pinned root (or, for `.finalized`, beneath the shared `uploads` authority)
+///   and installs the resulting pinned descriptor in the cell.
+/// * Every later call — from any task, on any `FsStorage` clone that shares this
+///   `Arc<UploadAuthorities>` — receives that *same cached descriptor*. Directory
+///   and lock identity are therefore stable across calls: once `uploads` is
+///   pinned, a later rename/replacement of the `uploads` *pathname* on disk
+///   cannot redirect any operation, because no operation re-resolves the pathname
+///   — every access, lock, read, write, recovery, abort, receipt, and
+///   publication step flows through the one cached inode.
+/// * `OnceCell::get_or_try_init` guarantees concurrent initializers cannot install
+///   competing authorities: exactly one initialization runs to success and every
+///   racing caller observes that one result. An initialization *failure* (a
+///   symlink squatting the subtree name, a permission error, …) is surfaced to
+///   the caller and leaves the cell empty, so a later attempt may retry;
+///   construction stays total and no directory is materialized until a real
+///   lifecycle operation demands it.
+///
+/// **Guarantee scope.** The sharing is *intra-instance*. All clones of one
+/// `FsStorage` (held behind an `Arc`) share these cells, so every task in one
+/// process operating through one `FsStorage` observes one coherent authority per
+/// subtree. Two independent `FsStorage` instances — or two OS processes — each
+/// pin their own root and their own cells and do **not** share cached
+/// descriptors; an `Arc` within one instance implies nothing about another
+/// instance. Cross-instance / cross-process mutual exclusion rests solely on the
+/// stable on-disk `.lock.{uuid}` flock domain (a kernel lock keyed by inode),
+/// not on any in-memory sharing. See
+/// `docs/architecture/filesystem-upload-lifecycle-contained-cleanup.md`.
+#[derive(Debug)]
+struct UploadAuthorities {
+    /// The pinned storage root. All lifecycle subtrees resolve beneath this fd.
+    root: ContainedDir,
+    /// `<root>/uploads`, pinned once and shared.
+    uploads: OnceCell<ContainedDir>,
+    /// `<root>/uploads/.finalized`, pinned once beneath the shared `uploads`.
+    finalized: OnceCell<ContainedDir>,
+    /// `<root>/blobs`, pinned once and shared.
+    blobs: OnceCell<ContainedDir>,
+    /// `<root>/repo-memberships`, pinned once and shared.
+    memberships: OnceCell<ContainedDir>,
+    /// `<root>/repos`, pinned once and shared. This is the fixed top-level
+    /// repository namespace root; per-`<repository>` authorities are **not**
+    /// cached — each tag mutation re-resolves `repos/<repo>/tags` freshly
+    /// beneath this pinned dir (see the tag-mutation contained-integration
+    /// design, Decision A). Caching stops at this never-deleted top level so a
+    /// deleted/recreated repository inode is always observed on the next
+    /// operation, keeping tag reads and writes coherent.
+    repos: OnceCell<ContainedDir>,
+    /// `<root>/quarantine`, pinned once and shared (GC quarantine payloads and
+    /// timestamp metadata).
+    quarantine: OnceCell<ContainedDir>,
+}
+
+impl UploadAuthorities {
+    /// Pin the storage root beneath `reader`. Fully synchronous (no runtime
+    /// required), so it is usable from the synchronous `FsStorage` constructors.
+    /// No subtree directories are created here: each is pinned lazily-once by its
+    /// accessor, resolving beneath the pinned root inode.
+    fn capture(reader: &storage_fs::FsMetadataReader) -> Result<Self, StorageError> {
+        let root = reader
+            .open_contained_dir_sync("")
+            .map_err(map_fs_mutate_startup_err)?;
+        Ok(Self {
+            root,
+            uploads: OnceCell::new(),
+            finalized: OnceCell::new(),
+            blobs: OnceCell::new(),
+            memberships: OnceCell::new(),
+            repos: OnceCell::new(),
+            quarantine: OnceCell::new(),
+        })
+    }
+
+    /// The shared `<root>/uploads` authority (session data/meta/hash leaves and
+    /// the lock domain). Pinned exactly once and shared thereafter.
+    async fn uploads(&self) -> Result<ContainedDir, FsMutateError> {
+        self.uploads
+            .get_or_try_init(|| {
+                let root = self.root.clone();
+                async move { root.ensure_subdir(&FileName::new("uploads")?).await }
+            })
+            .await
+            .map(ContainedDir::clone)
+    }
+
+    /// The shared `<root>/uploads/.finalized` authority (finalized receipts),
+    /// pinned beneath the shared `uploads` authority.
+    async fn finalized(&self) -> Result<ContainedDir, FsMutateError> {
+        let uploads = self.uploads().await?;
+        self.finalized
+            .get_or_try_init(|| async move {
+                uploads.ensure_subdir(&FileName::new(".finalized")?).await
+            })
+            .await
+            .map(ContainedDir::clone)
+    }
+
+    /// The shared `<root>/blobs` CAS authority.
+    async fn blobs(&self) -> Result<ContainedDir, FsMutateError> {
+        self.blobs
+            .get_or_try_init(|| {
+                let root = self.root.clone();
+                async move { root.ensure_subdir(&FileName::new("blobs")?).await }
+            })
+            .await
+            .map(ContainedDir::clone)
+    }
+
+    /// The shared `<root>/repo-memberships` authority.
+    async fn memberships(&self) -> Result<ContainedDir, FsMutateError> {
+        self.memberships
+            .get_or_try_init(|| {
+                let root = self.root.clone();
+                async move {
+                    root.ensure_subdir(&FileName::new("repo-memberships")?)
+                        .await
+                }
+            })
+            .await
+            .map(ContainedDir::clone)
+    }
+
+    /// The shared `<root>/repos` authority (fixed top-level repository namespace
+    /// root). Pinned exactly once; per-repository `tags` authorities are resolved
+    /// freshly beneath it per operation and never cached.
+    async fn repos(&self) -> Result<ContainedDir, FsMutateError> {
+        self.repos
+            .get_or_try_init(|| {
+                let root = self.root.clone();
+                async move { root.ensure_subdir(&FileName::new("repos")?).await }
+            })
+            .await
+            .map(ContainedDir::clone)
+    }
+
+    /// The shared `<root>/quarantine` authority (fixed top-level GC quarantine
+    /// namespace: `quarantine/blobs/...` payloads and `quarantine/meta/...`
+    /// timestamps). Pinned exactly once; per-digest shard directories are
+    /// resolved freshly beneath it per operation and never cached.
+    async fn quarantine(&self) -> Result<ContainedDir, FsMutateError> {
+        self.quarantine
+            .get_or_try_init(|| {
+                let root = self.root.clone();
+                async move { root.ensure_subdir(&FileName::new("quarantine")?).await }
+            })
+            .await
+            .map(ContainedDir::clone)
+    }
+}
+
+/// Validate a caller/record-derived single path component, mapping an invalid
+/// name to `NotFound` (an escape attempt is treated as an absent target rather
+/// than surfaced as an I/O error).
+fn session_name(name: impl Into<String>) -> Result<FileName, FsMutateError> {
+    FileName::new(name)
+}
+
+fn session_data_name(uuid: &str) -> Result<FileName, FsMutateError> {
+    session_name(format!("{uuid}.data"))
+}
+fn session_meta_name(uuid: &str) -> Result<FileName, FsMutateError> {
+    session_name(format!("{uuid}.meta.json"))
+}
+fn session_hash_name(uuid: &str, generation: u64) -> Result<FileName, FsMutateError> {
+    session_name(format!("{uuid}.hash.{generation}"))
+}
+fn session_lock_name(uuid: &str) -> Result<FileName, FsMutateError> {
+    session_name(format!(".lock.{uuid}"))
+}
+fn finalized_receipt_name(uuid: &str) -> Result<FileName, FsMutateError> {
+    session_name(format!("{uuid}.json"))
+}
+/// Legacy streaming-upload hash-state cache leaf (`{uuid}.sha256state`).
+fn upload_hash_state_name(uuid: &str) -> Result<FileName, FsMutateError> {
+    session_name(format!("{uuid}.sha256state"))
+}
+
+/// Convert a caller-supplied tag into a single contained leaf name.
+///
+/// Applies the same structural validation as the contained tag-read seam
+/// (`tag_read::validate_path_component`) and additionally requires the tag to be
+/// a single path segment: a tag is the final filesystem leaf and must not span
+/// directory components. Invalid tags map to `StorageError::InvalidRepoName`,
+/// matching the read seam's taxonomy rather than introducing a second grammar.
+fn tag_leaf_name(tag: &str) -> Result<FileName, StorageError> {
+    tag_read::validate_path_component(tag, "tag name")?;
+    FileName::new(tag).map_err(|_| {
+        StorageError::InvalidRepoName("tag name cannot span path components".to_string())
+    })
+}
+
+/// Map a mutation error surfaced during startup capture to a configuration/IO
+/// startup error.
+fn map_fs_mutate_startup_err(err: FsMutateError) -> StorageError {
+    match err {
+        FsMutateError::PlatformUnsupported => StorageError::configuration(
+            "contained upload lifecycle requires Linux openat2 (platform unsupported)",
+        ),
+        other => StorageError::io(format!("capturing upload authorities: {other}")),
+    }
+}
+
+/// Map a contained mutation error to a `StorageError`, preserving the disk-full
+/// signal and unwrapping a cleanup-failure to its primary cause.
+fn map_fs_mutate_err(err: FsMutateError) -> StorageError {
+    match err {
+        FsMutateError::Io(e) => map_fs_io_err(e),
+        FsMutateError::SyscallUnsupported(e) => map_fs_io_err(e),
+        FsMutateError::CleanupFailed { primary, .. } => map_fs_mutate_err(*primary),
+        other => StorageError::io(other.to_string()),
+    }
+}
+
 #[derive(Debug)]
 pub struct FsStorage {
     root: PathBuf,
@@ -195,10 +448,45 @@ pub struct FsStorage {
     repo_locks: std::sync::Mutex<std::collections::HashMap<String, std::fs::File>>,
     reader: std::sync::Arc<storage_fs::FsMetadataReader>,
     read_adapter: std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>>,
+    /// Pinned contained directory authorities shared by every upload-lifecycle
+    /// operation (Option A). Captured once at construction; see `UploadAuthorities`.
+    upload_authorities: std::sync::Arc<UploadAuthorities>,
     manifest_listing_limits: storage_fs::DirEnumerationLimits,
     gc_discovery_limits: repo_discovery::DiscoveryLimits,
     gc_ref_limits: manifest_refs::ManifestReferenceLimits,
     pub(crate) tag_listing_limits: tag_listing::TagListingLimits,
+    /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
+    /// at the boundary between a candidate's confirmed expiry decision and its
+    /// destructive action, with the candidate uuid. Lets a regression prove that no
+    /// cooperating update can slip in between the locked check and the action.
+    #[cfg(test)]
+    reaper_boundary_hook: ReaperBoundaryHookSlot,
+    /// Test-only synchronization seam invoked inside the reaper's held-lock closure
+    /// for the receipt-cleanup pass, right after the session lock is acquired and
+    /// BEFORE the receipt is re-read, with the candidate uuid. Lets a regression
+    /// mutate the on-disk receipt at that point (delete / republish / change identity)
+    /// and prove the reaper acts on the current under-lock state, not a listing-time
+    /// snapshot.
+    #[cfg(test)]
+    reaper_receipt_boundary_hook: ReaperBoundaryHookSlot,
+}
+
+/// See [`FsStorage::reaper_boundary_hook`]. The callback runs on the reaper's
+/// `spawn_blocking` worker while the session lock is held.
+#[cfg(test)]
+type ReaperBoundaryHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A `Debug`-transparent slot holding the optional reaper boundary hook so
+/// `FsStorage` can keep `#[derive(Debug)]` while the hook itself is not `Debug`.
+#[cfg(test)]
+#[derive(Default)]
+struct ReaperBoundaryHookSlot(std::sync::Mutex<Option<ReaperBoundaryHook>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for ReaperBoundaryHookSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReaperBoundaryHookSlot(..)")
+    }
 }
 
 impl FsStorage {
@@ -358,6 +646,7 @@ impl FsStorage {
         let read_adapter = std::sync::Arc::new(read_adapter::FsBlobCasReadAdapter::new(
             std::sync::Arc::clone(&reader),
         ));
+        let upload_authorities = std::sync::Arc::new(UploadAuthorities::capture(&reader)?);
 
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
@@ -375,10 +664,15 @@ impl FsStorage {
             repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reader,
             read_adapter,
+            upload_authorities,
             manifest_listing_limits,
             gc_discovery_limits,
             gc_ref_limits,
             tag_listing_limits,
+            #[cfg(test)]
+            reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
+            #[cfg(test)]
+            reaper_receipt_boundary_hook: ReaperBoundaryHookSlot::default(),
         })
     }
 
@@ -505,17 +799,17 @@ impl FsStorage {
         &self.referrer_locks[idx]
     }
 
-    fn upload_hash_path(&self, uuid: &str) -> PathBuf {
-        self.uploads_dir().join(format!("{uuid}.sha256state"))
-    }
-
     async fn load_upload_hash_state_from_disk(
         &self,
         uuid: &str,
         expected_len: u64,
     ) -> Option<SerializableSha256> {
-        let path = self.upload_hash_path(uuid);
-        let bytes = tokio::fs::read(&path).await.ok()?;
+        // Contained cache read beneath the pinned `uploads` authority; ANY
+        // failure (absence, containment rejection, corrupt bytes) is a cache
+        // miss, exactly as the prior ambient read's `.ok()?` behavior.
+        let uploads = self.upload_authorities.uploads().await.ok()?;
+        let leaf = upload_hash_state_name(uuid).ok()?;
+        let bytes = uploads.read_leaf(&leaf, u64::MAX).await.ok()?;
         let st = SerializableSha256::from_bytes(&bytes)?;
         if st.total_len != expected_len {
             return None;
@@ -528,9 +822,20 @@ impl FsStorage {
         uuid: &str,
         st: &SerializableSha256,
     ) -> Result<(), StorageError> {
-        let path = self.upload_hash_path(uuid);
-        let bytes = st.to_bytes();
-        atomic_write_file(&path, &bytes).await
+        // Contained atomic replace beneath the pinned `uploads` authority
+        // (non-durable: the prior ambient helper's directory fsync was
+        // best-effort/swallowed; every call site treats persistence as
+        // best-effort anyway).
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let leaf = upload_hash_state_name(uuid).map_err(map_fs_mutate_err)?;
+        uploads
+            .write_leaf_atomic(&leaf, st.to_bytes(), false)
+            .await
+            .map_err(map_fs_mutate_err)
     }
 
     async fn rebuild_upload_hash_state_from_data_file(
@@ -538,22 +843,36 @@ impl FsStorage {
         uuid: &str,
         observed_len: u64,
     ) -> Option<SerializableSha256> {
-        let path = self.upload_path(uuid);
-        let mut file = tokio::fs::File::open(&path).await.ok()?;
+        // Contained open through the pinned `uploads` authority; the
+        // stream-hash and the concurrent-growth re-check both run on the
+        // OPENED descriptor (the prior ambient re-stat by pathname served the
+        // same purpose against the same inode). Any failure -> None (cache
+        // rebuild miss), as before.
+        let uploads = self.upload_authorities.uploads().await.ok()?;
+        let leaf = session_data_name(uuid).ok()?;
+        let handle = uploads.open_leaf_read(&leaf).await.ok()?;
 
         let t = Instant::now();
-        let mut hasher = SerializableSha256::new();
-        let mut buf = vec![0u8; 1024 * 64];
-        loop {
-            let n = file.read(&mut buf).await.ok()?;
-            if n == 0 {
-                break;
+        let result = tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let mut file = handle.into_file();
+            let mut hasher = SerializableSha256::new();
+            let mut buf = vec![0u8; 1024 * 64];
+            loop {
+                let n = file.read(&mut buf).ok()?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
             }
-            hasher.update(&buf[..n]);
-        }
+            let file_len_now = file.metadata().ok()?.len();
+            Some((hasher, file_len_now))
+        })
+        .await
+        .ok()??;
+        let (hasher, file_len_now) = result;
 
         let elapsed = t.elapsed();
-        let file_len_now = tokio::fs::metadata(&path).await.ok()?.len();
         if file_len_now != observed_len {
             return None;
         }
@@ -619,6 +938,7 @@ impl FsStorage {
         Some(st)
     }
 
+    #[cfg(test)]
     fn blob_path(&self, digest: &Digest) -> PathBuf {
         // data/blobs/<algo>/ab/<hex>
         self.root
@@ -639,103 +959,420 @@ impl FsStorage {
             .join(digest.hex())
     }
 
-    fn manifest_path(&self, name: &str, digest: &Digest) -> PathBuf {
-        // data/repos/<name>/manifests/<hex>
-        self.root
-            .join("repos")
-            .join(name)
-            .join("manifests")
-            .join(digest.hex())
+    /// Resolve a fresh contained authority for `repos/<repo>/tags`, beneath the
+    /// stable pinned `repos` authority. The repository (which may be a nested,
+    /// slash-separated name) is re-resolved on every call: no per-repository
+    /// authority is cached, so a repository directory that is removed and
+    /// recreated at the same pathname is observed as its new inode on the next
+    /// operation — keeping tag writes coherent with the (already contained) tag
+    /// reads and preventing stale-inode writes into a detached tree.
+    ///
+    /// Repository names are validated with the same structural contract the
+    /// contained tag-read seam applies (`tag_read::validate_path_component`), so
+    /// reads and writes share one grammar and one error taxonomy
+    /// (`StorageError::InvalidRepoName`). Every directory component is traversed
+    /// through contained `ensure_subdir` primitives; the resulting authority (and
+    /// the lock/inspection/mutation performed through it) never reconstructs an
+    /// ambient path.
+    async fn tags_authority(&self, repo: &str) -> Result<ContainedDir, StorageError> {
+        tag_read::validate_path_component(repo, "repository name")?;
+        let mut dir = self
+            .upload_authorities
+            .repos()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for segment in repo.split('/') {
+            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
+            dir = dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?;
+        }
+        let tags = FileName::new("tags").map_err(map_fs_mutate_err)?;
+        dir.ensure_subdir(&tags).await.map_err(map_fs_mutate_err)
     }
 
-    fn tag_path(&self, name: &str, tag: &str) -> PathBuf {
-        // data/repos/<name>/tags/<tag>
-        self.root.join("repos").join(name).join("tags").join(tag)
+    /// Non-creating variant of [`Self::tags_authority`]: resolves the contained
+    /// authority for `repos/<repo>/tags` via `open_subdir` and returns
+    /// `Ok(None)` when any component is absent. Used by the `delete_manifest`
+    /// tag-cleanup scan, whose frozen contract on an absent tags directory is
+    /// an empty scan with ZERO directory creation. Same pinned `repos` root,
+    /// same structural validation, same fresh-per-operation resolution — not a
+    /// second grammar or authority model.
+    async fn open_tags_authority(&self, repo: &str) -> Result<Option<ContainedDir>, StorageError> {
+        tag_read::validate_path_component(repo, "repository name")?;
+        let mut dir = self
+            .upload_authorities
+            .repos()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for segment in repo.split('/').chain(std::iter::once("tags")) {
+            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
+            dir = match dir.open_subdir(&name).await {
+                Ok(d) => d,
+                Err(FsMutateError::NotFound) => return Ok(None),
+                Err(err) => return Err(map_fs_mutate_err(err)),
+            };
+        }
+        Ok(Some(dir))
     }
 
-    fn repo_blobs_dir(&self, repo: &CanonicalRepoName, algorithm: &str) -> PathBuf {
-        self.root
-            .join("repo-memberships")
-            .join("by-repo")
-            .join(crate::storage::repo_membership::encode_canonical_repo_key(
-                repo,
+    /// Inner `delete_manifest` tag-cleanup pass: enumerate, inspect, and delete
+    /// matching tag leaves ALL through the ONE retained `tags` authority (no
+    /// independent path re-resolution between enumeration, read, and unlink).
+    /// This seam is also exercised directly by the same-authority replacement
+    /// regression.
+    ///
+    /// Frozen scan contract (previously the ambient `list_tag_files` +
+    /// `read_to_string` + ignored `remove_file` loop): dot-entries and
+    /// non-UTF-8 entry names are skipped silently; a leaf that vanishes between
+    /// enumeration and read is tolerated (`continue`); other read failures
+    /// (including non-regular or — new, fail-closed — symlinked entries) and
+    /// non-UTF-8 tag content propagate as Io; a tag whose trimmed content
+    /// equals the deleted digest is unlinked best-effort (result ignored). The
+    /// scan takes NO per-tag locks — the historical `delete_manifest` cleanup
+    /// is deliberately lock-free and its read/match/unlink race profile against
+    /// concurrent tag mutation is unchanged. Enumeration is unbounded
+    /// (`usize::MAX` limits), matching the prior unbounded `read_dir`.
+    async fn delete_manifest_tag_cleanup_in(
+        tags: &ContainedDir,
+        digest_str: &str,
+    ) -> Result<(), StorageError> {
+        let entries = tags
+            .list(storage_fs::DirEnumerationLimits::new(
+                usize::MAX,
+                usize::MAX,
             ))
-            .join(algorithm)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for entry in entries {
+            let Some(entry_name) = entry.name().to_str() else {
+                continue;
+            };
+            if entry_name.starts_with('.') {
+                continue;
+            }
+            let leaf = FileName::new(entry_name).map_err(map_fs_mutate_err)?;
+            let bytes = match tags.read_leaf(&leaf, u64::MAX).await {
+                Ok(b) => b,
+                Err(FsMutateError::NotFound) => continue,
+                Err(err) => return Err(map_fs_mutate_err(err)),
+            };
+            let content = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(err) => return Err(StorageError::io(err.to_string())),
+            };
+            if content.trim() == digest_str {
+                let _ = tags.unlink(&leaf, true).await;
+            }
+        }
+        Ok(())
     }
 
-    fn repo_blob_path(&self, repo: &CanonicalRepoName, digest: &Digest) -> PathBuf {
-        self.root
-            .join(crate::storage::repo_membership::canonical_repo_membership_relpath(repo, digest))
+    /// Resolve a fresh contained authority for `repos/<repo>/manifests`, beneath
+    /// the stable pinned `repos` authority — the manifest-namespace analogue of
+    /// [`Self::tags_authority`]. The repository is re-resolved on every call (no
+    /// per-repository authority is cached), so a repository directory removed and
+    /// recreated at the same pathname is observed as its new inode on the next
+    /// operation, keeping manifest writes coherent with the already-contained
+    /// manifest reads and preventing stale-inode writes into a detached tree.
+    ///
+    /// Validation reuses the manifest read seam's own grammar
+    /// ([`manifest::manifest_key`]) rather than the tag validator: the read path
+    /// accepts colon-bearing segments such as `C:/repo`, so validating writes with
+    /// the same function keeps manifest reads and writes on one grammar and one
+    /// error taxonomy ([`StorageError::InvalidRepoName`]). Every directory
+    /// component is traversed through contained `ensure_subdir` primitives; the
+    /// resulting authority never reconstructs an ambient path.
+    async fn manifests_authority(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<ContainedDir, StorageError> {
+        // Reuse the manifest read grammar (rejects `..`/`.`/empty segments,
+        // control characters, backslashes, leading/trailing slashes; accepts
+        // nested and colon-bearing segments) so a write is accepted iff the
+        // matching read is. The composed key is discarded; only its validation
+        // side effect is required here.
+        manifest::manifest_key(repo, digest)?;
+        let mut dir = self
+            .upload_authorities
+            .repos()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for segment in repo.split('/') {
+            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
+            dir = dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?;
+        }
+        let manifests = FileName::new("manifests").map_err(map_fs_mutate_err)?;
+        dir.ensure_subdir(&manifests)
+            .await
+            .map_err(map_fs_mutate_err)
     }
 
-    fn referrers_path(&self, name: &str, subject: &Digest) -> PathBuf {
-        // data/repos/<name>/referrers/<hex>.json
-        self.root
-            .join("repos")
-            .join(name)
-            .join("referrers")
-            .join(format!("{}.json", subject.hex()))
+    /// Resolves the contained authority for `repos/<repo>/referrers`, creating
+    /// missing directories beneath the pinned `repos` root.
+    ///
+    /// Reuses the referrers READ grammar (`referrers_read::referrers_key`:
+    /// `tag_read::validate_path_component` + `ObjectKey` composition) so a
+    /// mutation is accepted iff the matching contained read accepts the same
+    /// repository name. The composed key is discarded; only its validation side
+    /// effect is required here. Resolution is fresh per operation — no
+    /// per-repository authority caching — so repository deletion/recreation is
+    /// observed and read/write namespace resolution stays coherent.
+    async fn referrers_authority(
+        &self,
+        repo: &str,
+        subject: &Digest,
+    ) -> Result<ContainedDir, StorageError> {
+        referrers_read::referrers_key(repo, subject)?;
+        let mut dir = self
+            .upload_authorities
+            .repos()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for segment in repo.split('/') {
+            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
+            dir = dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?;
+        }
+        let referrers = FileName::new("referrers").map_err(map_fs_mutate_err)?;
+        dir.ensure_subdir(&referrers)
+            .await
+            .map_err(map_fs_mutate_err)
     }
 
+    /// Reads and parses the referrers index leaf through an ALREADY-RESOLVED
+    /// contained authority, so a mutation's inspection and action share one
+    /// resolution (no independent path re-resolution between them).
+    ///
+    /// Preserves the mutation-read contract of the contained reader seam:
+    /// missing leaf → empty vector; corrupt JSON / invalid UTF-8 → legacy Io
+    /// taxonomy via the shared `referrers_read::parse_referrers_bytes`;
+    /// physical descriptor order preserved; no normalization or deduplication.
+    /// Symlinked or non-regular leaves fail closed at the contained primitive.
+    async fn read_referrers_from_authority(
+        referrers: &ContainedDir,
+        leaf: &FileName,
+    ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
+        match referrers.read_leaf(leaf, u64::MAX).await {
+            Ok(bytes) => referrers_read::parse_referrers_bytes(&bytes),
+            Err(FsMutateError::NotFound) => Ok(Vec::new()),
+            Err(err) => Err(map_fs_mutate_err(err)),
+        }
+    }
+
+    /// Inner `add_referrer` sequence, run under the caller-held shard lock:
+    /// inspect, modify, and write all through the ONE retained `referrers`
+    /// authority. This seam is also exercised directly by the same-authority
+    /// replacement regressions.
+    async fn add_referrer_locked(
+        &self,
+        referrers: &ContainedDir,
+        leaf: &FileName,
+        descriptor: ReferrerDescriptor,
+    ) -> Result<(), StorageError> {
+        let mut existing = Self::read_referrers_from_authority(referrers, leaf).await?;
+        if !existing.iter().any(|d| d.digest == descriptor.digest) {
+            existing.push(descriptor);
+        }
+
+        // A duplicate add still rewrites the (unchanged) array, as before.
+        let bytes = serde_json::to_vec(&existing)
+            .map_err(|err| StorageError::serialization(err.to_string()))?;
+        referrers
+            .write_leaf_atomic(leaf, bytes, true)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        Ok(())
+    }
+
+    /// Inner `remove_referrer` sequence, run under the caller-held shard lock:
+    /// inspect, decide (no-change / rewrite / empty unlink), and act all
+    /// through the ONE retained `referrers` authority.
+    async fn remove_referrer_locked(
+        &self,
+        referrers: &ContainedDir,
+        leaf: &FileName,
+        referrer: &Digest,
+    ) -> Result<(), StorageError> {
+        let mut existing = Self::read_referrers_from_authority(referrers, leaf).await?;
+        let orig_len = existing.len();
+        let referrer_str = referrer.as_str();
+        existing.retain(|d| d.digest != referrer_str);
+        if existing.len() == orig_len {
+            return Ok(());
+        }
+
+        if existing.is_empty() {
+            // Best-effort removal of the now-empty index (result ignored, as
+            // before) plus best-effort directory-entry durability.
+            let _ = referrers.unlink(leaf, true).await;
+            let _ = referrers.sync().await;
+        } else {
+            let bytes = serde_json::to_vec(&existing)
+                .map_err(|err| StorageError::serialization(err.to_string()))?;
+            referrers
+                .write_leaf_atomic(leaf, bytes, true)
+                .await
+                .map_err(map_fs_mutate_err)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves the contained authority for the membership record directory
+    /// `repo-memberships/by-repo/<key>/<algo>` beneath the pinned memberships
+    /// root WITHOUT creating missing components: returns `Ok(None)` when any
+    /// component is absent, preserving the exact absent-record contract of the
+    /// candidate/unlink mutations (`Ok(false)`) with zero directory-creation
+    /// side effects.
+    ///
+    /// Repository grammar is the upstream-validated [`CanonicalRepoName`]
+    /// (parsed by the callers); the encoded key is a single base64url
+    /// component. This is the same layout `link_repo_blob` writes and the
+    /// contained membership reads resolve. Resolution is fresh per operation.
+    async fn membership_record_authority(
+        &self,
+        canonical: &CanonicalRepoName,
+        digest: &Digest,
+    ) -> Result<Option<ContainedDir>, StorageError> {
+        let mut dir = self
+            .upload_authorities
+            .memberships()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let key = crate::storage::repo_membership::encode_canonical_repo_key(canonical);
+        for segment in ["by-repo", key.as_str(), digest.algorithm()] {
+            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
+            dir = match dir.open_subdir(&name).await {
+                Ok(d) => d,
+                Err(FsMutateError::NotFound) => return Ok(None),
+                Err(err) => return Err(map_fs_mutate_err(err)),
+            };
+        }
+        Ok(Some(dir))
+    }
+
+    /// Reads and parses the membership record leaf through an ALREADY-RESOLVED
+    /// contained authority. Missing leaf → `Ok(None)`; corrupt JSON keeps the
+    /// frozen `corrupt membership record: ...` `CorruptData` taxonomy.
+    async fn read_membership_record_from_authority(
+        dir: &ContainedDir,
+        leaf: &FileName,
+    ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
+    {
+        let bytes = match dir.read_leaf(leaf, u64::MAX).await {
+            Ok(b) => b,
+            Err(FsMutateError::NotFound) => return Ok(None),
+            Err(err) => return Err(map_fs_mutate_err(err)),
+        };
+        let record = serde_json::from_slice::<
+            crate::storage::repo_membership::RepoBlobMembershipRecord,
+        >(&bytes)
+        .map_err(|e| StorageError::corrupt_data(format!("corrupt membership record: {e}")))?;
+        Ok(Some(record))
+    }
+
+    /// Inner `set_membership_candidate` transition: inspect, decide, and
+    /// rewrite all through the ONE retained membership authority (there is no
+    /// lock on candidate transitions — unchanged). This seam is also exercised
+    /// directly by the same-authority replacement regression.
+    async fn set_membership_candidate_in(
+        dir: &ContainedDir,
+        leaf: &FileName,
+        since_unix_secs: u64,
+    ) -> Result<bool, StorageError> {
+        let Some(mut record) = Self::read_membership_record_from_authority(dir, leaf).await? else {
+            return Ok(false);
+        };
+        if record.state == crate::storage::repo_membership::MembershipState::Candidate {
+            return Ok(false);
+        }
+        record.state = crate::storage::repo_membership::MembershipState::Candidate;
+        record.unreferenced_since_unix_secs = Some(since_unix_secs);
+        let updated_bytes = serde_json::to_vec(&record)
+            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
+        dir.write_leaf_atomic(leaf, updated_bytes, true)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        Ok(true)
+    }
+
+    /// Inner `clear_membership_candidate` transition: same retained-authority
+    /// inspect/decide/rewrite shape as the set transition.
+    async fn clear_membership_candidate_in(
+        dir: &ContainedDir,
+        leaf: &FileName,
+    ) -> Result<bool, StorageError> {
+        let Some(mut record) = Self::read_membership_record_from_authority(dir, leaf).await? else {
+            return Ok(false);
+        };
+        if record.state == crate::storage::repo_membership::MembershipState::Active
+            && record.unreferenced_since_unix_secs.is_none()
+        {
+            return Ok(false);
+        }
+        record.state = crate::storage::repo_membership::MembershipState::Active;
+        record.unreferenced_since_unix_secs = None;
+        let updated_bytes = serde_json::to_vec(&record)
+            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
+        dir.write_leaf_atomic(leaf, updated_bytes, true)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        Ok(true)
+    }
+
+    /// Leaf name for a membership record: `<hex>.json`.
+    fn membership_leaf_name(digest: &Digest) -> Result<FileName, StorageError> {
+        FileName::new(format!("{}.json", digest.hex())).map_err(map_fs_mutate_err)
+    }
+
+    #[cfg(test)]
     fn uploads_dir(&self) -> PathBuf {
         self.root.join("uploads")
     }
 
-    fn upload_path(&self, uuid: &str) -> PathBuf {
-        self.uploads_dir().join(format!("{uuid}.data"))
-    }
-
+    #[cfg(test)]
     fn session_data_path(&self, uuid: &str) -> PathBuf {
         self.uploads_dir().join(format!("{uuid}.data"))
     }
 
+    #[cfg(test)]
     fn session_meta_path(&self, uuid: &str) -> PathBuf {
         self.uploads_dir().join(format!("{uuid}.meta.json"))
     }
 
+    #[cfg(test)]
     fn session_hash_path(&self, uuid: &str, generation: u64) -> PathBuf {
         self.uploads_dir().join(format!("{uuid}.hash.{generation}"))
     }
 
+    #[cfg(test)]
     fn session_lock_path(&self, uuid: &str) -> PathBuf {
         self.uploads_dir().join(format!(".lock.{uuid}"))
     }
 
+    #[cfg(test)]
     fn finalized_dir(&self) -> PathBuf {
         self.uploads_dir().join(".finalized")
     }
 
+    #[cfg(test)]
     fn finalized_receipt_path(&self, uuid: &str) -> PathBuf {
         self.finalized_dir().join(format!("{uuid}.json"))
     }
 
-    async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        manifest::detect_manifest_media_type(bytes)
+    /// Install the test-only reaper boundary hook (see `reaper_boundary_hook`).
+    #[cfg(test)]
+    fn set_reaper_boundary_hook(&self, hook: ReaperBoundaryHook) {
+        *self.reaper_boundary_hook.0.lock().unwrap() = Some(hook);
     }
 
-    async fn list_tag_files(&self, name: &str) -> Result<Vec<PathBuf>, StorageError> {
-        let tags_dir = self.root.join("repos").join(name).join("tags");
-        let mut dir = match tokio::fs::read_dir(&tags_dir).await {
-            Ok(d) => d,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
+    /// Install the test-only reaper receipt-cleanup boundary hook
+    /// (see `reaper_receipt_boundary_hook`).
+    #[cfg(test)]
+    fn set_reaper_receipt_boundary_hook(&self, hook: ReaperBoundaryHook) {
+        *self.reaper_receipt_boundary_hook.0.lock().unwrap() = Some(hook);
+    }
 
-        let mut files = Vec::new();
-        loop {
-            match dir.next_entry().await {
-                Ok(Some(entry)) => {
-                    if let Some(file_name) = entry.file_name().to_str() {
-                        if !file_name.starts_with('.') {
-                            files.push(entry.path());
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => return Err(StorageError::io(err.to_string())),
-            }
-        }
-        Ok(files)
+    async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
+        manifest::detect_manifest_media_type(bytes)
     }
 
     async fn list_repo_names(&self) -> Result<Vec<String>, StorageError> {
@@ -908,17 +1545,23 @@ impl Storage for FsStorage {
         digest: &Digest,
         bytes: Bytes,
     ) -> Result<ManifestMeta, StorageError> {
-        let dir = self.root.join("repos").join(name).join("manifests");
-        ensure_dir(&dir)?;
+        // Contained authority for `repos/<repo>/manifests` (fresh per op, no
+        // per-repo cache), resolved beneath the pinned `repos` root — matching the
+        // already-contained manifest reads and replacing the prior ambient
+        // `self.root.join(...)` reconstruction. Resolving the authority also ensures
+        // the `manifests` directory, mirroring the previous `ensure_dir`, so the
+        // create/detect/write ordering is preserved.
+        let manifests = self.manifests_authority(name, digest).await?;
 
         let media_type = self.detect_manifest_media_type(&bytes).await?;
-        let path = dir.join(digest.hex());
-        atomic_write_file(&path, &bytes).await?;
+        let size = bytes.len() as u64;
+        let leaf = FileName::new(digest.hex()).map_err(map_fs_mutate_err)?;
+        manifests
+            .write_leaf_atomic(&leaf, bytes.to_vec(), true)
+            .await
+            .map_err(map_fs_mutate_err)?;
 
-        Ok(ManifestMeta {
-            size: bytes.len() as u64,
-            media_type,
-        })
+        Ok(ManifestMeta { size, media_type })
     }
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
@@ -934,123 +1577,76 @@ impl Storage for FsStorage {
         digest: &Digest,
         policy: super::TagMutationPolicy,
     ) -> Result<super::TagMutation, StorageError> {
-        let dir = self.root.join("repos").join(name).join("tags");
-        ensure_dir(&dir)?;
-        let path = dir.join(tag);
-        let lock_path = dir.join(format!(".lock.{tag}"));
-        let body = format!("{}\n", digest.as_str());
-        let tag_name = tag.to_string();
+        // Fresh contained authority for `repos/<repo>/tags` (no per-repo cache).
+        let tags = self.tags_authority(name).await?;
+        let leaf = tag_leaf_name(tag)?;
+        let lock_name = FileName::new(format!(".lock.{tag}")).map_err(map_fs_mutate_err)?;
+        let body = format!("{}\n", digest.as_str()).into_bytes();
         let digest_clone = digest.clone();
 
-        tokio::task::spawn_blocking(move || {
-            use fs2::FileExt;
-            use std::io::Write;
+        // Acquire the retained `.lock.<tag>` exclusive lock, then perform the
+        // inspection and mutation under that lock, on the same pinned authority.
+        let guard = tags.lock(&lock_name).await.map_err(map_fs_mutate_err)?;
+        tags.run_locked(guard, move |dir, _g| {
+            // Read the existing leaf: absent → None; readable-but-unparseable
+            // (corrupt) → None; any other error (incl. a non-regular/symlink
+            // leaf rejected by containment) propagates.
+            let existing_d = match dir.read_leaf(&leaf, u64::MAX) {
+                Ok(existing_bytes) => {
+                    let s = String::from_utf8_lossy(&existing_bytes);
+                    Digest::parse(s.trim()).ok()
+                }
+                Err(FsMutateError::NotFound) => None,
+                Err(e) => return Err(e),
+            };
 
-            let lock_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)
-                .map_err(map_fs_io_err)?;
+            // Same-digest short-circuit runs BEFORE mutation-policy rejection.
+            if let Some(ref prev) = existing_d {
+                if *prev == digest_clone {
+                    return Ok(Ok(super::TagMutation::Unchanged));
+                }
+            }
 
-            lock_file.lock_exclusive().map_err(map_fs_io_err)?;
-
-            let res: Result<super::TagMutation, StorageError> = (|| {
-                let existing_d = match std::fs::read(&path) {
-                    Ok(existing_bytes) => {
-                        let s = String::from_utf8_lossy(&existing_bytes);
-                        Digest::parse(s.trim()).ok()
+            let outcome: Result<super::TagMutation, StorageError> = match policy {
+                super::TagMutationPolicy::CreateOnly => {
+                    if existing_d.is_some() {
+                        return Ok(Err(StorageError::TagAlreadyExists));
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(err) => return Err(map_fs_io_err(err)),
-                };
-
-                if let Some(ref prev) = existing_d {
-                    if *prev == digest_clone {
-                        return Ok(super::TagMutation::Unchanged);
+                    dir.write_leaf_atomic(&leaf, &body, true)?;
+                    Ok(super::TagMutation::Created)
+                }
+                super::TagMutationPolicy::Replace => {
+                    dir.write_leaf_atomic(&leaf, &body, true)?;
+                    match existing_d {
+                        Some(prev) => Ok(super::TagMutation::Replaced { previous: prev }),
+                        None => Ok(super::TagMutation::Created),
                     }
                 }
-
-                match policy {
-                    super::TagMutationPolicy::CreateOnly => {
-                        if existing_d.is_some() {
-                            return Err(StorageError::TagAlreadyExists);
-                        }
-
-                        let tmp_name = format!(".tmp.{tag_name}.{}", uuid::Uuid::new_v4());
-                        let tmp_path = dir.join(tmp_name);
-
-                        let mut file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&tmp_path)
-                            .map_err(map_fs_io_err)?;
-                        file.write_all(body.as_bytes()).map_err(map_fs_io_err)?;
-                        file.flush().map_err(map_fs_io_err)?;
-                        file.sync_all().map_err(map_fs_io_err)?;
-                        drop(file);
-
-                        if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(map_fs_io_err(e));
-                        }
-
-                        if let Ok(dir_file) = std::fs::File::open(&dir) {
-                            let _ = dir_file.sync_all();
-                        }
-
-                        Ok(super::TagMutation::Created)
-                    }
-                    super::TagMutationPolicy::Replace => {
-                        let tmp_name = format!(".tmp.{tag_name}.{}", uuid::Uuid::new_v4());
-                        let tmp_path = dir.join(tmp_name);
-
-                        let mut file = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&tmp_path)
-                            .map_err(map_fs_io_err)?;
-                        file.write_all(body.as_bytes()).map_err(map_fs_io_err)?;
-                        file.flush().map_err(map_fs_io_err)?;
-                        file.sync_all().map_err(map_fs_io_err)?;
-                        drop(file);
-
-                        if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(map_fs_io_err(e));
-                        }
-
-                        if let Ok(dir_file) = std::fs::File::open(&dir) {
-                            let _ = dir_file.sync_all();
-                        }
-
-                        match existing_d {
-                            Some(prev) => Ok(super::TagMutation::Replaced { previous: prev }),
-                            None => Ok(super::TagMutation::Created),
-                        }
-                    }
-                }
-            })();
-
-            let _ = lock_file.unlock();
-            res
+            };
+            Ok(outcome)
         })
         .await
-        .map_err(map_blocking_join_error)?
+        .map_err(map_fs_mutate_err)?
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
-        let tag_file = self.tag_path(name, tag);
-        match tokio::fs::remove_file(&tag_file).await {
-            Ok(_) => {
-                let tags_dir = self.root.join("repos").join(name).join("tags");
-                let _ = fsync_dir(tags_dir.as_path()).await;
+        // Fresh contained authority for `repos/<repo>/tags` (no per-repo cache).
+        // The reviewed design intentionally does not introduce locking here: the
+        // prior ambient `delete_tag` performed an unserialized `remove_file`, so
+        // we preserve that (no `.lock.<tag>`) and only contain the unlink+sync.
+        let tags = self.tags_authority(name).await?;
+        let leaf = tag_leaf_name(tag)?;
+        let blocking = tags.blocking();
+        tokio::task::spawn_blocking(move || match blocking.unlink(&leaf, false) {
+            Ok(()) => {
+                let _ = blocking.sync();
                 Ok(())
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(StorageError::NotFound),
-            Err(err) => Err(StorageError::io(err.to_string())),
-        }
+            Err(FsMutateError::NotFound) => Err(StorageError::NotFound),
+            Err(e) => Err(map_fs_mutate_err(e)),
+        })
+        .await
+        .map_err(map_blocking_join_error)?
     }
 
     async fn list_manifest_digests_page(
@@ -1139,64 +1735,45 @@ impl Storage for FsStorage {
         tag: &str,
         expected_version: Option<&str>,
     ) -> Result<super::ConditionalDeleteResult, StorageError> {
-        let dir = self.root.join("repos").join(repo).join("tags");
-        let path = self.tag_path(repo, tag);
-        let lock_path = dir.join(format!(".lock.{tag}"));
+        // Fresh contained authority for `repos/<repo>/tags` (no per-repo cache).
+        let tags = self.tags_authority(repo).await?;
+        let leaf = tag_leaf_name(tag)?;
+        let lock_name = FileName::new(format!(".lock.{tag}")).map_err(map_fs_mutate_err)?;
         let exp_v = expected_version.map(|s| s.to_string());
 
-        tokio::task::spawn_blocking(move || {
-            use fs2::FileExt;
-            if let Some(parent) = lock_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let lock_file = match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)
-            {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // Acquire the retained `.lock.<tag>` and perform the whole
+        // inspect/precondition/delete sequence under that lock on the same
+        // pinned authority.
+        let guard = tags.lock(&lock_name).await.map_err(map_fs_mutate_err)?;
+        tags.run_locked(guard, move |dir, _g| {
+            // Read the exact leaf bytes; absent → NotFound.
+            let bytes = match dir.read_leaf(&leaf, u64::MAX) {
+                Ok(b) => b,
+                Err(FsMutateError::NotFound) => {
                     return Ok(super::ConditionalDeleteResult::NotFound);
                 }
-                Err(e) => return Err(map_fs_io_err(e)),
+                Err(e) => return Err(e),
             };
 
-            lock_file.lock_exclusive().map_err(map_fs_io_err)?;
-
-            let res = (|| {
-                let bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(super::ConditionalDeleteResult::NotFound);
-                    }
-                    Err(e) => return Err(map_fs_io_err(e)),
-                };
-
-                if let Some(ref exp) = exp_v {
-                    let mut hasher = sha2::Sha256::new();
-                    hasher.update(&bytes);
-                    let current_version = hex::encode(hasher.finalize());
-                    if current_version != *exp {
-                        return Ok(super::ConditionalDeleteResult::PreconditionFailed {
-                            current_version: Some(current_version),
-                        });
-                    }
+            // Precondition: SHA-256 over the exact raw bytes read (never a
+            // reparsed/reformatted digest), matching `get_tag_with_version`.
+            if let Some(ref exp) = exp_v {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&bytes);
+                let current_version = hex::encode(hasher.finalize());
+                if current_version != *exp {
+                    return Ok(super::ConditionalDeleteResult::PreconditionFailed {
+                        current_version: Some(current_version),
+                    });
                 }
+            }
 
-                std::fs::remove_file(&path).map_err(map_fs_io_err)?;
-                if let Ok(dir_file) = std::fs::File::open(&dir) {
-                    let _ = dir_file.sync_all();
-                }
-                Ok(super::ConditionalDeleteResult::Deleted)
-            })();
-
-            let _ = lock_file.unlock();
-            res
+            dir.unlink(&leaf, false)?;
+            let _ = dir.sync();
+            Ok(super::ConditionalDeleteResult::Deleted)
         })
         .await
-        .map_err(map_blocking_join_error)?
+        .map_err(map_fs_mutate_err)
     }
 
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
@@ -1291,15 +1868,21 @@ impl Storage for FsStorage {
     }
 
     async fn create_upload(&self) -> Result<super::UploadMeta, StorageError> {
-        let dir = self.uploads_dir();
-        ensure_dir(&dir)?;
-
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let path = self.upload_path(&uuid);
-
-        tokio::fs::File::create(&path)
+        // Contained: the shared pinned `uploads` authority (ensured once, as
+        // the prior ambient ensure_dir did) and a create-or-truncate open of
+        // the data leaf through it (`O_CREAT|O_TRUNC`, mode 0o644 — the exact
+        // `File::create` semantics, including truncation of an existing leaf).
+        let uploads = self
+            .upload_authorities
+            .uploads()
             .await
-            .map_err(map_fs_io_err)?;
+            .map_err(map_fs_mutate_err)?;
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let leaf = session_data_name(&uuid).map_err(map_fs_mutate_err)?;
+        uploads
+            .open_leaf_write(&leaf, LeafWriteMode::CreateOrTruncate)
+            .await
+            .map_err(map_fs_mutate_err)?;
 
         // Track + persist hash state from the beginning so resumes after restart are cheap.
         let st = SerializableSha256::new();
@@ -1312,18 +1895,24 @@ impl Storage for FsStorage {
     }
 
     async fn upload_status(&self, uuid: &str) -> Result<super::UploadMeta, StorageError> {
-        let path = self.upload_path(uuid);
-        let meta = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        // A caller-supplied identifier that cannot form a contained leaf is an
+        // absent upload (never an ambient path).
+        let Ok(leaf) = session_data_name(uuid) else {
+            return Err(StorageError::NotFound);
         };
-        Ok(super::UploadMeta {
-            uuid: uuid.to_string(),
-            offset: meta.len(),
-        })
+        match uploads.inspect(&leaf).await {
+            Ok(Some(identity)) => Ok(super::UploadMeta {
+                uuid: uuid.to_string(),
+                offset: identity.size,
+            }),
+            Ok(None) => Err(StorageError::NotFound),
+            Err(err) => Err(map_fs_mutate_err(err)),
+        }
     }
 
     async fn append_upload(
@@ -1332,30 +1921,44 @@ impl Storage for FsStorage {
         chunk: Bytes,
     ) -> Result<super::UploadMeta, StorageError> {
         let t_total = Instant::now();
-        let path = self.upload_path(uuid);
-
-        let current_len = match tokio::fs::metadata(&path).await {
-            Ok(m) => m.len(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let Ok(leaf) = session_data_name(uuid) else {
+            return Err(StorageError::NotFound);
         };
 
-        let next_len = current_len.saturating_add(chunk.len() as u64);
-        if next_len > self.max_upload_bytes {
-            return Err(StorageError::TooLarge);
-        }
-
-        let mut file = match tokio::fs::OpenOptions::new().append(true).open(&path).await {
-            Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
+        // ONE contained `O_APPEND` open (kernel append semantics preserved);
+        // the length inspection, size-limit check, write, and final offset all
+        // operate on this securely opened file description (previously the
+        // pre-write length came from a separate pathname stat). The blocking
+        // closure OWNS the handle, the chunk, and the limit, so caller
+        // cancellation cannot strand borrowed state.
+        let handle = match uploads.open_leaf_write(&leaf, LeafWriteMode::Append).await {
+            Ok(h) => h,
+            Err(FsMutateError::NotFound) => return Err(StorageError::NotFound),
+            Err(err) => return Err(map_fs_mutate_err(err)),
         };
-        file.write_all(&chunk).await.map_err(map_fs_io_err)?;
-        file.flush().await.map_err(map_fs_io_err)?;
+        let max_upload_bytes = self.max_upload_bytes;
+        let chunk_for_write = chunk.clone();
+        let (current_len, new_len) =
+            tokio::task::spawn_blocking(move || -> Result<(u64, u64), StorageError> {
+                use std::io::Write as _;
+                let mut file = handle.into_file();
+                let current_len = file.metadata().map_err(map_fs_io_err)?.len();
+                let next_len = current_len.saturating_add(chunk_for_write.len() as u64);
+                if next_len > max_upload_bytes {
+                    return Err(StorageError::TooLarge);
+                }
+                file.write_all(&chunk_for_write).map_err(map_fs_io_err)?;
+                file.flush().map_err(map_fs_io_err)?;
+                let new_len = file.metadata().map_err(map_fs_io_err)?.len();
+                Ok((current_len, new_len))
+            })
+            .await
+            .map_err(map_blocking_join_error)??;
 
         // Update hash state (persisted). If we can't keep it consistent, drop state and fall back.
         let shard = self.upload_hash_shard(uuid);
@@ -1390,34 +1993,47 @@ impl Storage for FsStorage {
             );
         }
 
-        let meta = file
-            .metadata()
-            .await
-            .map_err(|err| StorageError::io(err.to_string()))?;
         Ok(super::UploadMeta {
             uuid: uuid.to_string(),
-            offset: meta.len(),
+            offset: new_len,
         })
     }
 
     async fn finalize_upload(&self, uuid: &str, digest: &Digest) -> Result<BlobMeta, StorageError> {
-        let upload_path = self.upload_path(uuid);
-        let upload_hash_path = self.upload_hash_path(uuid);
-
-        let t_total = Instant::now();
-        let mut file = match tokio::fs::File::open(&upload_path).await {
-            Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
+        // Contained finalize: ONE secure open of the upload leaf beneath the
+        // pinned `uploads` authority; the size inspection, digest hashing (when
+        // a reread is needed), and the pre-publish `sync_all` all operate on
+        // that opened file description. The CAS publish is a contained
+        // cross-authority rename (uploads -> blobs shard) followed by
+        // propagated directory syncs of both pinned directories, exactly as
+        // the prior ambient fsync_dir pair. Blocking segments own their file
+        // handle (caller cancellation cannot strand borrowed state).
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let Ok(upload_leaf) = session_data_name(uuid) else {
+            return Err(StorageError::NotFound);
         };
 
-        let upload_size_bytes = file
-            .metadata()
+        let t_total = Instant::now();
+        let handle = match uploads.open_leaf_read(&upload_leaf).await {
+            Ok(h) => h,
+            Err(FsMutateError::NotFound) => return Err(StorageError::NotFound),
+            Err(err) => return Err(map_fs_mutate_err(err)),
+        };
+        let (file, upload_size_bytes) =
+            tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64), StorageError> {
+                let file = handle.into_file();
+                let len = file
+                    .metadata()
+                    .map_err(|err| StorageError::io(err.to_string()))?
+                    .len();
+                Ok((file, len))
+            })
             .await
-            .map_err(|err| StorageError::io(err.to_string()))?
-            .len();
+            .map_err(map_blocking_join_error)??;
 
         let mut hash_source = "file_reread";
         let t_hash = Instant::now();
@@ -1434,56 +2050,51 @@ impl Storage for FsStorage {
             _ => self.ensure_upload_hash_state(uuid, upload_size_bytes).await,
         };
 
-        let (computed_hex, hash_elapsed) = if digest.algorithm() == "sha512" {
-            let mut hasher = sha2::Sha512::new();
-            let mut buf = vec![0u8; 1024 * 64];
-            loop {
-                let n = file
-                    .read(&mut buf)
-                    .await
-                    .map_err(|err| StorageError::io(err.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            (hex::encode(hasher.finalize()), t_hash.elapsed())
-        } else if let Some(st) = state {
-            if st.total_len == upload_size_bytes {
-                hash_source = "saved_state";
-                (st.finalize_hex(), t_hash.elapsed())
-            } else {
-                // Unexpected mismatch; fall back.
-                let mut hasher = sha2::Sha256::new();
-                let mut buf = vec![0u8; 1024 * 64];
-                loop {
-                    let n = file
-                        .read(&mut buf)
-                        .await
-                        .map_err(|err| StorageError::io(err.to_string()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                (hex::encode(hasher.finalize()), t_hash.elapsed())
-            }
+        let use_sha512 = digest.algorithm() == "sha512";
+        let (computed_hex, file) = if !use_sha512
+            && let Some(st) = state.as_ref()
+            && st.total_len == upload_size_bytes
+        {
+            hash_source = "saved_state";
+            (st.finalize_hex(), file)
         } else {
-            // No usable state: hash the file now.
-            let mut hasher = sha2::Sha256::new();
-            let mut buf = vec![0u8; 1024 * 64];
-            loop {
-                let n = file
-                    .read(&mut buf)
-                    .await
-                    .map_err(|err| StorageError::io(err.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            (hex::encode(hasher.finalize()), t_hash.elapsed())
+            // Stream-hash from the already-opened descriptor (owned by the
+            // blocking closure, returned for the subsequent sync).
+            tokio::task::spawn_blocking(move || -> Result<(String, std::fs::File), StorageError> {
+                use std::io::Read as _;
+                let mut file = file;
+                let mut buf = vec![0u8; 1024 * 64];
+                let hex_out = if use_sha512 {
+                    let mut hasher = sha2::Sha512::new();
+                    loop {
+                        let n = file
+                            .read(&mut buf)
+                            .map_err(|err| StorageError::io(err.to_string()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    hex::encode(hasher.finalize())
+                } else {
+                    let mut hasher = sha2::Sha256::new();
+                    loop {
+                        let n = file
+                            .read(&mut buf)
+                            .map_err(|err| StorageError::io(err.to_string()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    hex::encode(hasher.finalize())
+                };
+                Ok((hex_out, file))
+            })
+            .await
+            .map_err(map_blocking_join_error)??
         };
+        let hash_elapsed = t_hash.elapsed();
 
         if computed_hex != digest.hex() {
             return Err(StorageError::DigestMismatch);
@@ -1491,29 +2102,29 @@ impl Storage for FsStorage {
 
         // Ensure the uploaded data is durable before we make it visible in the blob store.
         let t_sync = Instant::now();
-        file.sync_all().await.map_err(map_fs_io_err)?;
-        let sync_elapsed = t_sync.elapsed();
-        drop(file);
-
-        // Move into blob store.
-        let dest_dir = self
-            .root
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2());
-        ensure_dir(&dest_dir)?;
-
-        let dest_path = dest_dir.join(digest.hex());
-        let t_rename = Instant::now();
-        tokio::fs::rename(&upload_path, &dest_path)
+        tokio::task::spawn_blocking(move || file.sync_all().map_err(map_fs_io_err))
             .await
-            .map_err(map_fs_io_err)?;
+            .map_err(map_blocking_join_error)??;
+        let sync_elapsed = t_sync.elapsed();
+
+        // Move into blob store: contained cross-authority rename into the
+        // ensured CAS shard.
+        let dest = self
+            .cas_blobs_shard(digest, true)
+            .await?
+            .expect("ensure-mode shard resolution always yields an authority");
+        let blob_leaf = Self::blob_leaf(digest)?;
+        let t_rename = Instant::now();
+        uploads
+            .rename_leaf(&upload_leaf, &dest, &blob_leaf)
+            .await
+            .map_err(map_fs_mutate_err)?;
         let rename_elapsed = t_rename.elapsed();
 
         // Make the rename durable (both directories are updated by rename).
         let t_fsync = Instant::now();
-        fsync_dir(self.uploads_dir().as_path()).await?;
-        fsync_dir(dest_dir.as_path()).await?;
+        uploads.sync().await.map_err(map_fs_mutate_err)?;
+        dest.sync().await.map_err(map_fs_mutate_err)?;
         let fsync_elapsed = t_fsync.elapsed();
 
         // Info-level summary for operators: where did the time go?
@@ -1540,12 +2151,21 @@ impl Storage for FsStorage {
         );
 
         // Best-effort cleanup: remove persisted hash state.
-        let _ = tokio::fs::remove_file(&upload_hash_path).await;
+        if let Ok(state_leaf) = upload_hash_state_name(uuid) {
+            let _ = uploads.unlink(&state_leaf, true).await;
+        }
 
-        let meta = tokio::fs::metadata(&dest_path)
-            .await
-            .map_err(|err| StorageError::io(err.to_string()))?;
-        Ok(BlobMeta { size: meta.len() })
+        let size = match dest.inspect(&blob_leaf).await {
+            Ok(Some(identity)) => identity.size,
+            Ok(None) => {
+                return Err(StorageError::io(format!(
+                    "finalized blob missing after rename: {}",
+                    digest.as_str()
+                )));
+            }
+            Err(err) => return Err(map_fs_mutate_err(err)),
+        };
+        Ok(BlobMeta { size })
     }
 
     async fn abort_upload(&self, uuid: &str) -> Result<(), StorageError> {
@@ -1556,15 +2176,27 @@ impl Storage for FsStorage {
             map.remove(uuid);
         }
 
-        // Best-effort cleanup: remove persisted hash state.
-        let hash_path = self.upload_hash_path(uuid);
-        let _ = tokio::fs::remove_file(&hash_path).await;
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
 
-        let path = self.upload_path(uuid);
-        match tokio::fs::remove_file(&path).await {
+        // Best-effort cleanup: remove persisted hash state (result ignored, as
+        // before).
+        if let Ok(state_leaf) = upload_hash_state_name(uuid) {
+            let _ = uploads.unlink(&state_leaf, true).await;
+        }
+
+        // An identifier that cannot form a contained leaf is an absent upload:
+        // absent aborts are Ok.
+        let Ok(leaf) = session_data_name(uuid) else {
+            return Ok(());
+        };
+        match uploads.unlink(&leaf, false).await {
             Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(StorageError::io(err.to_string())),
+            Err(FsMutateError::NotFound) => Ok(()),
+            Err(err) => Err(map_fs_mutate_err(err)),
         }
     }
 
@@ -1588,20 +2220,20 @@ impl Storage for FsStorage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
+        // Retained in-process shard lock (same identity/scope as before) held
+        // across the full read/modify/write sequence. ONE contained
+        // `repos/<repo>/referrers` authority is resolved (validate-then-ensure
+        // beneath the pinned `repos` root) and retained across inspection AND
+        // write, so a repository/referrers namespace replacement mid-operation
+        // cannot split the tree that is inspected from the tree that is
+        // mutated. Ordinary reads still resolve independently through the
+        // contained reader seam; no snapshot isolation or cross-process
+        // serialization is claimed.
         let _lock = self.referrer_lock_shard(name, subject).lock().await;
-        let dir = self.root.join("repos").join(name).join("referrers");
-        ensure_dir(&dir)?;
-
-        let path = self.referrers_path(name, subject);
-        let mut existing = self.list_referrers(name, subject).await?;
-        if !existing.iter().any(|d| d.digest == descriptor.digest) {
-            existing.push(descriptor);
-        }
-
-        let bytes = serde_json::to_vec(&existing)
-            .map_err(|err| StorageError::serialization(err.to_string()))?;
-        atomic_write_file(&path, &bytes).await?;
-        Ok(())
+        let referrers = self.referrers_authority(name, subject).await?;
+        let leaf = FileName::new(format!("{}.json", subject.hex())).map_err(map_fs_mutate_err)?;
+        self.add_referrer_locked(&referrers, &leaf, descriptor)
+            .await
     }
 
     async fn remove_referrer(
@@ -1610,36 +2242,35 @@ impl Storage for FsStorage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
+        // Same retained shard lock and single retained contained authority as
+        // `add_referrer`; read, decision, rewrite, and empty-index unlink all
+        // act on that one resolution.
         let _lock = self.referrer_lock_shard(name, subject).lock().await;
-        let path = self.referrers_path(name, subject);
-        let mut existing = self.list_referrers(name, subject).await?;
-        let orig_len = existing.len();
-        let referrer_str = referrer.as_str();
-        existing.retain(|d| d.digest != referrer_str);
-        if existing.len() == orig_len {
-            return Ok(());
-        }
-
-        if existing.is_empty() {
-            let _ = tokio::fs::remove_file(&path).await;
-        } else {
-            let bytes = serde_json::to_vec(&existing)
-                .map_err(|err| StorageError::serialization(err.to_string()))?;
-            atomic_write_file(&path, &bytes).await?;
-        }
-        Ok(())
+        let referrers = self.referrers_authority(name, subject).await?;
+        let leaf = FileName::new(format!("{}.json", subject.hex())).map_err(map_fs_mutate_err)?;
+        self.remove_referrer_locked(&referrers, &leaf, referrer)
+            .await
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
-        let manifest_path = self.manifest_path(name, digest);
+        // Contained authority for `repos/<repo>/manifests`; replaces the prior
+        // ambient read+remove of the reconstructed manifest path. Both the subject
+        // pre-read and the unlink resolve through this single pinned authority (no
+        // ambient reconstruction; a symlinked or root-replaced manifest leaf fails
+        // closed). The tag cleanup below runs on one retained contained tags
+        // authority and the referrer cleanup is contained via the contained
+        // `remove_referrer` seam — every namespace this operation touches is
+        // contained. Ordering (manifest unlink -> tag scan -> referrer cleanup),
+        // error propagation/suppression, and the possibility of partial cleanup
+        // after the manifest unlink are unchanged; this is not a transaction.
+        let manifests = self.manifests_authority(name, digest).await?;
+        let leaf = FileName::new(digest.hex()).map_err(map_fs_mutate_err)?;
 
         // Pre-read manifest bytes to extract subject if present for referrers cleanup.
-        let bytes = match tokio::fs::read(&manifest_path).await {
+        let bytes = match manifests.read_leaf(&leaf, u64::MAX).await {
             Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
+            Err(FsMutateError::NotFound) => return Err(StorageError::NotFound),
+            Err(err) => return Err(map_fs_mutate_err(err)),
         };
 
         let maybe_subject = crate::manifest_refs::extract_subject_digest(&bytes).map_err(|e| {
@@ -1648,25 +2279,22 @@ impl Storage for FsStorage {
             ))
         })?;
 
-        match tokio::fs::remove_file(&manifest_path).await {
+        match manifests.unlink(&leaf, false).await {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(err) => return Err(StorageError::io(err.to_string())),
+            Err(FsMutateError::NotFound) => return Err(StorageError::NotFound),
+            Err(err) => return Err(map_fs_mutate_err(err)),
         }
+        // Best-effort durability of the directory-entry removal (result ignored, as
+        // with the contained `delete_tag`); no success/error-path change.
+        let _ = manifests.sync().await;
 
-        // Remove any tags pointing to this digest.
+        // Remove any tags pointing to this digest — enumeration, inspection, and
+        // deletion all through ONE retained contained tags authority, resolved
+        // non-creating (an absent tags directory preserves the empty-scan
+        // contract with zero directory creation).
         let digest_str = digest.as_str();
-        for path in self.list_tag_files(name).await? {
-            let content = match tokio::fs::read_to_string(&path).await {
-                Ok(s) => s,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(StorageError::io(err.to_string())),
-            };
-            if content.trim() == digest_str {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
+        if let Some(tags) = self.open_tags_authority(name).await? {
+            Self::delete_manifest_tag_cleanup_in(&tags, &digest_str).await?;
         }
 
         // Clean up from referrers list if this manifest referenced a subject.
@@ -1699,11 +2327,17 @@ struct FsFinalizingInfo {
     pub finalizing_at_unix_secs: u64,
 }
 
+/// Legacy ambient (fs2-based) session lock guard. Retained only for the regression
+/// test that verifies the contained reaper honors an externally held advisory lock on
+/// the same `.lock.{uuid}` inode (an fs2 exclusive flock conflicts with the authority's
+/// contained flock across OFDs on the same inode).
+#[cfg(test)]
 struct FsSessionLockGuard {
     file: Option<std::fs::File>,
     _path: PathBuf,
 }
 
+#[cfg(test)]
 impl Drop for FsSessionLockGuard {
     fn drop(&mut self) {
         if let Some(f) = self.file.take() {
@@ -1713,6 +2347,7 @@ impl Drop for FsSessionLockGuard {
     }
 }
 
+#[cfg(test)]
 async fn acquire_fs_session_lock(lock_path: PathBuf) -> Result<FsSessionLockGuard, StorageError> {
     if let Some(parent) = lock_path.parent() {
         ensure_dir(parent)?;
@@ -1738,32 +2373,519 @@ async fn acquire_fs_session_lock(lock_path: PathBuf) -> Result<FsSessionLockGuar
     .map_err(map_blocking_join_error)?
 }
 
-async fn try_acquire_fs_session_lock(
-    lock_path: PathBuf,
-) -> Result<Option<FsSessionLockGuard>, StorageError> {
-    if let Some(parent) = lock_path.parent() {
-        ensure_dir(parent)?;
+// ============================================================================
+// Contained upload-lifecycle record helpers
+// ============================================================================
+//
+// These operate on the pinned `UploadAuthorities` directory descriptors. The sync
+// helpers (`*_sync`) run inside `run_locked` bodies on a `BlockingDir`; the async
+// helper (`rebuild_hash_async`) runs in the streaming append/finalize paths on a
+// `ContainedDir`. All resolution is descriptor-relative and beneath the pinned root.
+
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+
+fn is_regular(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFREG
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Wrap a `Display` error as a generic contained I/O failure. Used for
+/// serialize/logic failures surfaced from inside a `run_locked` body, whose error
+/// type is fixed to `FsMutateError`.
+fn body_io_err<E: std::fmt::Display>(e: E) -> FsMutateError {
+    FsMutateError::Io(std::io::Error::other(e.to_string()))
+}
+
+fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, FsMutateError> {
+    serde_json::to_vec(value).map_err(body_io_err)
+}
+
+/// Outcome of a synchronous session-meta read beneath the uploads authority.
+enum SessionMetaOutcome {
+    Present(FsSessionMetaRecord),
+    /// Malformed record; carries the deserialization error message so callers can
+    /// surface the same corrupt-data detail the ambient reads did.
+    Corrupt(String),
+    Absent,
+}
+
+fn read_session_meta_sync(
+    uploads: &BlockingDir,
+    uuid: &str,
+) -> Result<SessionMetaOutcome, FsMutateError> {
+    let name = session_meta_name(uuid)?;
+    match uploads.read_leaf(&name, SESSION_META_READ_LIMIT) {
+        Ok(bytes) => match serde_json::from_slice::<FsSessionMetaRecord>(&bytes) {
+            Ok(meta) => Ok(SessionMetaOutcome::Present(meta)),
+            Err(e) => Ok(SessionMetaOutcome::Corrupt(e.to_string())),
+        },
+        Err(FsMutateError::NotFound) => Ok(SessionMetaOutcome::Absent),
+        Err(FsMutateError::InvalidName { .. }) => Ok(SessionMetaOutcome::Absent),
+        Err(e) => Err(e),
     }
-    tokio::task::spawn_blocking(move || {
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                StorageError::io(format!("failed to open lock file {lock_path:?}: {e}"))
-            })?;
-        match fs2::FileExt::try_lock_exclusive(&f) {
-            Ok(()) => Ok(Some(FsSessionLockGuard {
-                file: Some(f),
-                _path: lock_path,
-            })),
-            Err(_) => Ok(None),
+}
+
+fn write_session_meta_sync(
+    uploads: &BlockingDir,
+    meta: &FsSessionMetaRecord,
+) -> Result<(), FsMutateError> {
+    let name = session_meta_name(&meta.uuid)?;
+    let bytes = json_bytes(meta)?;
+    uploads.write_leaf_atomic(&name, &bytes, true)
+}
+
+fn read_receipt_sync(
+    finalized: &BlockingDir,
+    uuid: &str,
+) -> Result<Option<FinalizedReceipt>, FsMutateError> {
+    let name = finalized_receipt_name(uuid)?;
+    match finalized.read_leaf(&name, FINALIZED_RECEIPT_READ_LIMIT) {
+        // A corrupt receipt is treated as absent, matching the lenient ambient reads.
+        Ok(bytes) => Ok(serde_json::from_slice::<FinalizedReceipt>(&bytes).ok()),
+        Err(FsMutateError::NotFound) => Ok(None),
+        Err(FsMutateError::InvalidName { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_receipt_sync(
+    finalized: &BlockingDir,
+    receipt: &FinalizedReceipt,
+) -> Result<(), FsMutateError> {
+    let name = finalized_receipt_name(&receipt.uuid)?;
+    let bytes = json_bytes(receipt)?;
+    finalized.write_leaf_atomic(&name, &bytes, true)
+}
+
+/// Durably write a repository blob membership record beneath the memberships
+/// authority, creating the `by-repo/{key}/{algo}` subtree as needed. Mirrors
+/// `canonical_repo_membership_relpath`.
+fn write_membership_sync(
+    memberships: &BlockingDir,
+    record: &crate::storage::repo_membership::RepoBlobMembershipRecord,
+) -> Result<(), FsMutateError> {
+    let key = crate::storage::repo_membership::encode_canonical_repo_key(&record.repo);
+    let by_repo = memberships.ensure_subdir(&FileName::new("by-repo")?)?;
+    let repo_dir = by_repo.ensure_subdir(&FileName::new(key)?)?;
+    let algo_dir = repo_dir.ensure_subdir(&FileName::new(record.digest.algorithm())?)?;
+    let leaf = FileName::new(format!("{}.json", record.digest.hex()))?;
+    let bytes = json_bytes(record)?;
+    algo_dir.write_leaf_atomic(&leaf, &bytes, true)
+}
+
+/// Inspect the CAS leaf for `digest` beneath the blobs authority
+/// (`{algo}/{prefix2}/{hex}`), returning its identity if present.
+fn cas_blob_present_sync(
+    blobs: &BlockingDir,
+    digest: &Digest,
+) -> Result<Option<storage_fs::FsFileIdentity>, FsMutateError> {
+    let algo = match blobs.open_subdir(&FileName::new(digest.algorithm())?) {
+        Ok(d) => d,
+        Err(FsMutateError::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let shard = match algo.open_subdir(&FileName::new(digest.prefix2())?) {
+        Ok(d) => d,
+        Err(FsMutateError::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    shard.inspect(&FileName::new(digest.hex())?)
+}
+
+/// Rebuild a rolling SHA-256 state by reading up to `upto` bytes of `data_name`
+/// beneath the uploads authority through a contained read descriptor.
+fn rebuild_hash_sync(
+    uploads: &BlockingDir,
+    data_name: &FileName,
+    upto: u64,
+) -> Result<SerializableSha256, FsMutateError> {
+    use std::io::Read as _;
+    let mut file = uploads.open_leaf_read(data_name)?.into_file();
+    let mut st = SerializableSha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut read_total = 0u64;
+    while read_total < upto {
+        let to_read = ((upto - read_total).min(buf.len() as u64)) as usize;
+        let n = file.read(&mut buf[..to_read]).map_err(FsMutateError::Io)?;
+        if n == 0 {
+            break;
         }
+        st.update(&buf[..n]);
+        read_total += n as u64;
+    }
+    Ok(st)
+}
+
+/// Per-candidate result of one reaper iteration, distinguishing confirmed cleanups
+/// from the non-failure reasons a candidate is left alone. Genuine I/O failures are
+/// surfaced as `Err` out of `run_locked` and never collapse into these variants.
+enum ReapOutcome {
+    /// A confirmed cleanup: an abort completed, a Finalizing session rolled forward,
+    /// or a past-TTL receipt was unlinked. Counted.
+    CleanedUp,
+    /// Not yet past its TTL (session `last_active` / receipt `finalized_at`).
+    NotExpired,
+    /// An expired `Finalizing` session whose CAS blob is not yet published: recovery
+    /// left it intact for later completion. Diagnosed, **not** counted, and never
+    /// aborted — containment does not authorize destroying in-flight finalizations.
+    PendingFinalization,
+    /// The record vanished between enumeration and the locked re-read.
+    Absent,
+    /// The session meta was present but unparseable (diagnostic recorded).
+    Corrupt(String),
+    /// A receipt whose stored identity no longer matches its leaf name.
+    Changed,
+}
+
+/// Outcome of a locked-inner recovery (`recover_session_locked`) run beneath an
+/// already-held session lock.
+enum RecoverLocked {
+    /// A `Finalizing` session whose CAS blob is fully published was rolled *forward*:
+    /// membership and receipt are now durably (re)written. This is a completed
+    /// finalization, not merely an inspection.
+    RolledForward {
+        committed_offset: u64,
+        created: u64,
+        last_active: u64,
+    },
+    /// The meta record was present and coherent but there was nothing to finalize
+    /// (an `Appending` tail was truncated to the committed offset, or a `Finalizing`
+    /// session whose CAS blob is *not* yet published). The session still exists.
+    Pending {
+        state: UploadSessionState,
+        committed_offset: u64,
+        created: u64,
+        last_active: u64,
+    },
+    /// Neither a meta record nor a finalized receipt exists: nothing to recover.
+    NotFound,
+    /// The meta record was present but could not be parsed.
+    Corrupt(String),
+}
+
+/// Perform `Finalizing` roll-forward or `Appending` torn-tail recovery for one
+/// session **beneath an already-held session lock**. Every directory operation
+/// resolves through the caller-provided pinned authorities (`dir` = uploads,
+/// plus the sibling `finalized` / `blobs` / `memberships` views); the caller
+/// retains the matching [`ContainedLockGuard`] for the whole call. This function
+/// never acquires or releases a lock, so inspection, decision, and mutation are one
+/// continuously-locked operation.
+///
+/// Unlike a best-effort sweep, a membership or receipt write failure during
+/// roll-forward is **propagated**, not swallowed: the caller must not treat a failed
+/// roll-forward as a completed cleanup.
+fn recover_session_locked(
+    dir: &BlockingDir,
+    finalized: &BlockingDir,
+    blobs: &BlockingDir,
+    memberships: &BlockingDir,
+    repo: &CanonicalRepoName,
+    uuid: &str,
+) -> Result<RecoverLocked, FsMutateError> {
+    let meta = match read_session_meta_sync(dir, uuid)? {
+        SessionMetaOutcome::Present(m) => m,
+        SessionMetaOutcome::Corrupt(msg) => return Ok(RecoverLocked::Corrupt(msg)),
+        SessionMetaOutcome::Absent => {
+            // A receipt without a meta record is an already-completed finalization.
+            if let Some(receipt) = read_receipt_sync(finalized, uuid)? {
+                return Ok(RecoverLocked::RolledForward {
+                    committed_offset: receipt.size,
+                    created: receipt.finalized_at_unix_secs,
+                    last_active: receipt.finalized_at_unix_secs,
+                });
+            }
+            return Ok(RecoverLocked::NotFound);
+        }
+    };
+
+    if meta.state == UploadSessionState::Finalizing {
+        if let Some(ref fin_info) = meta.finalizing_info
+            && let Ok(digest) = Digest::parse(&fin_info.expected_digest)
+            && let Some(id) = cas_blob_present_sync(blobs, &digest)?
+            && id.size == fin_info.size
+        {
+            // Roll forward only when the CAS blob is fully published. Membership is
+            // written BEFORE the receipt and both failures are propagated.
+            let membership = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+                repo.clone(),
+                digest.clone(),
+                Some(uuid.to_string()),
+            );
+            write_membership_sync(memberships, &membership)?;
+            let receipt = FinalizedReceipt {
+                repo: repo.clone(),
+                uuid: uuid.to_string(),
+                digest: fin_info.expected_digest.clone(),
+                size: fin_info.size,
+                finalized_at_unix_secs: fin_info.finalizing_at_unix_secs,
+                format_version: 1,
+            };
+            write_receipt_sync(finalized, &receipt)?;
+            return Ok(RecoverLocked::RolledForward {
+                committed_offset: fin_info.size,
+                created: meta.created_at_unix_secs,
+                last_active: fin_info.finalizing_at_unix_secs,
+            });
+        }
+    } else {
+        // Torn-tail recovery: truncate any bytes past the committed offset.
+        let data_name = session_data_name(uuid)?;
+        if let Some(id) = dir.inspect(&data_name)?
+            && id.size > meta.committed_offset
+        {
+            dir.truncate(&data_name, meta.committed_offset)?;
+        }
+    }
+
+    Ok(RecoverLocked::Pending {
+        state: meta.state,
+        committed_offset: meta.committed_offset,
+        created: meta.created_at_unix_secs,
+        last_active: meta.last_active_at_unix_secs,
     })
-    .await
-    .map_err(map_blocking_join_error)?
+}
+
+/// Abort one session **beneath an already-held session lock**: remove the staging
+/// data leaf and every hash generation, then remove the meta record LAST so a crash
+/// mid-abort leaves a still-recoverable session rather than orphaned staging data.
+/// The stable `.lock.{uuid}` file is intentionally never unlinked. Resolves through
+/// the caller-provided pinned uploads `dir`; never acquires or releases a lock.
+///
+/// Failure boundary (matches the abort guarantee):
+/// * A genuinely missing data/hash/meta leaf is idempotent absence (`missing_ok`),
+///   not a failure.
+/// * Any other data or hash cleanup failure is **propagated before the meta is
+///   removed**, so the meta record survives, the session stays recoverable, and the
+///   caller never counts an incomplete abort as a completed cleanup.
+/// * The final meta removal is propagated so the caller can confirm the effect.
+///
+/// Hash-generation discovery enumerates what is actually on disk rather than a window
+/// derived from `meta.hash_generation`. That window is **not** a sound bound: the
+/// generation-advancing paths (`append_if_offset`, the `begin_finalize` trailing
+/// stream) write generation `G+1`, persist the meta at `G+1`, then clean up the old
+/// `G` leaf with a *suppressed*, best-effort unlink (`let _ = dir.unlink(...)`). A
+/// real, non-`ENOENT` unlink failure there leaves `G` behind while the recorded
+/// generation advances past it, and subsequent appends can advance the recorded
+/// generation arbitrarily far without ever revisiting that residual. Repeated
+/// failures can leave arbitrarily older generations, so no `{G-1, G, G+1}` (or any
+/// other fixed) window is complete. Completeness therefore requires enumerating this
+/// session's own `{uuid}.hash.{n}` leaves directly (`session_hash_generations_by_scan`)
+/// under the held `.lock.{uuid}` — no concurrent append can add a generation
+/// mid-abort — and the `{uuid}.hash.` prefix keeps another session's files out of
+/// scope. The same enumeration is used regardless of the meta state, so residual hash
+/// leaves are cleaned even when the meta is corrupt or already absent.
+fn abort_session_locked(dir: &BlockingDir, uuid: &str) -> Result<(), FsMutateError> {
+    let data_name = session_data_name(uuid)?;
+    let meta_name = session_meta_name(uuid)?;
+
+    // Enumerate EVERY residual hash leaf for this session directly from disk. A listing
+    // failure (an I/O error, or a directory too large to enumerate under the limits) is
+    // a required cleanup failure: it is propagated here, before anything is removed, so
+    // the meta survives and a later retry can complete the abort.
+    let hash_generations = session_hash_generations_by_scan(dir, uuid)?;
+
+    // Remove the staging data leaf. A genuine miss is idempotent; any other failure is
+    // propagated here, before the meta is touched, so the session remains recoverable.
+    dir.unlink(&data_name, true)?;
+
+    // Remove every residual hash generation (ascending, for deterministic behaviour).
+    // A genuine miss is idempotent; any other failure is propagated before the meta is
+    // removed. Because the meta survives, a later retry re-scans and completes cleanup.
+    for generation in hash_generations {
+        let hash_name = session_hash_name(uuid, generation)?;
+        dir.unlink(&hash_name, true)?;
+    }
+
+    // Remove the meta record LAST so a crash mid-abort leaves a still-recoverable
+    // session rather than orphaned staging data.
+    dir.unlink(&meta_name, true)?;
+    Ok(())
+}
+
+/// Enumerate the hash generations that currently exist for `uuid` by scanning the
+/// pinned uploads directory for this session's own `{uuid}.hash.{n}` leaves, returned
+/// in ascending order. This is the authoritative residual set for abort cleanup: it
+/// reflects whatever leaves are actually present, including generations orphaned by a
+/// failed best-effort old-hash unlink in `append_if_offset` / `begin_finalize`. The
+/// `{uuid}.hash.` prefix and the strict `u64` suffix parse keep the scan
+/// session-specific, so no unrelated file (another session's leaf, a rename temp such
+/// as `{uuid}.hash.{n}.<rand>`, or the `{uuid}.data` / `{uuid}.meta.json` leaves) is
+/// ever considered. A directory too large to enumerate under the limits surfaces as an
+/// error rather than a silently truncated (and therefore incomplete) listing.
+fn session_hash_generations_by_scan(
+    dir: &BlockingDir,
+    uuid: &str,
+) -> Result<Vec<u64>, FsMutateError> {
+    let prefix = format!("{uuid}.hash.");
+    let entries = dir.list(storage_fs::DirEnumerationLimits::new(
+        1_048_576,
+        256 * 1024 * 1024,
+    ))?;
+    let mut generations = Vec::new();
+    for entry in entries {
+        let name = entry.name().to_string_lossy();
+        if let Some(rest) = name.strip_prefix(&prefix)
+            && let Ok(generation) = rest.parse::<u64>()
+        {
+            generations.push(generation);
+        }
+    }
+    generations.sort_unstable();
+    Ok(generations)
+}
+
+// ============================================================================
+// Supervised streaming owner
+// ============================================================================
+//
+// The streaming append/finalize operations cannot move an async byte stream into
+// a synchronous `run_locked` body directly, but they must still guarantee that
+// every outstanding file mutation either completes while the session lock is held
+// or is definitively stopped before that lock is released. They achieve this by
+// splitting into two halves connected by a bounded channel:
+//
+// * An async **feeder** (part of the request future) pulls chunks from the byte
+//   stream and forwards them to the worker, sending an explicit terminal message
+//   (`Finish` on clean end, `StreamError` on producer error). Backpressure is
+//   provided by the bounded channel.
+// * A synchronous **worker** runs inside `ContainedDir::run_locked`, so it owns
+//   the session lock on a `spawn_blocking` thread. It drains chunks with
+//   `blocking_recv`, performs all writes synchronously on its own thread (no
+//   detached Tokio blocking op can outlive it), and only then releases the lock
+//   (the guard is dropped at the end of the `run_locked` body).
+//
+// Cancellation safety: if the request future is dropped, the feeder is dropped
+// with it, closing the channel *without* a terminal message. `run_locked` awaits
+// a `spawn_blocking` join handle, and dropping that await does **not** abort the
+// blocking task — so the worker keeps running, observes the closed channel
+// (`blocking_recv` -> `None`), rolls the data file back to the last committed
+// offset, and releases the lock. No mutation from the cancelled operation can act
+// after the lock is released, and the worker never waits forever on a cancelled
+// producer (channel closure wakes `blocking_recv` immediately). A competing
+// append/finalize/abort/reaper operation blocks on the same session lock until
+// the worker's rollback (or commit) has completed.
+
+/// A message from the async feeder to the synchronous append worker.
+enum StreamMsg {
+    /// A non-terminal payload chunk to append.
+    Chunk(Bytes),
+    /// The producer finished the byte stream cleanly; the worker should commit.
+    Finish,
+    /// The producer observed a stream error; the worker should roll back.
+    StreamError,
+}
+
+/// The result of draining the chunk channel into an open append descriptor.
+enum DrainOutcome {
+    /// The producer finished cleanly; `written` bytes were appended and synced.
+    Finished { written: u64 },
+    /// The producer reported a stream error; the file was rolled back.
+    StreamAborted,
+    /// The caller was cancelled (channel closed without a terminal message); the
+    /// file was rolled back to the committed offset.
+    Cancelled,
+    /// The upload exceeded the byte limit; the file was rolled back.
+    TooLarge,
+    /// A write/sync I/O error occurred; the file was rolled back.
+    Io(std::io::Error),
+}
+
+/// Bounded chunk-channel capacity. Small enough to bound buffered memory, large
+/// enough to keep the blocking worker fed without lock-step stalls.
+const STREAM_CHANNEL_CAP: usize = 16;
+
+/// Drain the chunk channel into `file` (opened for contained append), rolling the
+/// SHA-256 state forward and enforcing `limit`. On any non-`Finished` outcome the
+/// file is truncated back to `committed_offset` before returning, so the lock the
+/// caller still holds is released over a file that is at the committed length.
+/// Runs entirely on the calling (blocking) thread.
+fn drain_append_blocking(
+    file: &mut std::fs::File,
+    rx: &mut tokio::sync::mpsc::Receiver<StreamMsg>,
+    hash_st: &mut SerializableSha256,
+    committed_offset: u64,
+    limit: u64,
+) -> DrainOutcome {
+    use std::io::Write as _;
+    let mut written = 0u64;
+    loop {
+        match rx.blocking_recv() {
+            Some(StreamMsg::Chunk(chunk)) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let next_total = committed_offset
+                    .saturating_add(written)
+                    .saturating_add(chunk.len() as u64);
+                if limit > 0 && next_total > limit {
+                    let _ = file.set_len(committed_offset);
+                    let _ = file.sync_data();
+                    return DrainOutcome::TooLarge;
+                }
+                if let Err(e) = file.write_all(&chunk) {
+                    let _ = file.set_len(committed_offset);
+                    let _ = file.sync_data();
+                    return DrainOutcome::Io(e);
+                }
+                hash_st.update(&chunk);
+                written = written.saturating_add(chunk.len() as u64);
+            }
+            Some(StreamMsg::Finish) => {
+                if let Err(e) = file.sync_data() {
+                    let _ = file.set_len(committed_offset);
+                    return DrainOutcome::Io(e);
+                }
+                return DrainOutcome::Finished { written };
+            }
+            Some(StreamMsg::StreamError) => {
+                let _ = file.set_len(committed_offset);
+                let _ = file.sync_data();
+                return DrainOutcome::StreamAborted;
+            }
+            None => {
+                // Channel closed without a terminal message: the request future was
+                // dropped (caller cancellation). Roll back and release the lock.
+                let _ = file.set_len(committed_offset);
+                let _ = file.sync_data();
+                return DrainOutcome::Cancelled;
+            }
+        }
+    }
+}
+
+/// Pump `stream` into `tx`, translating each item into a [`StreamMsg`] and sending
+/// an explicit terminal message. Returns any producer stream error by value (it is
+/// not `Clone`, so it cannot be carried through the worker). If the worker has gone
+/// away (receiver dropped), the pump stops early. If this future is itself dropped
+/// (caller cancellation), `tx` drops with it and the worker observes a closed
+/// channel without a terminal message.
+async fn feed_stream(
+    mut stream: UploadByteStream,
+    tx: tokio::sync::mpsc::Sender<StreamMsg>,
+) -> Option<UploadStreamError> {
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => {
+                if tx.send(StreamMsg::Chunk(chunk)).await.is_err() {
+                    // Worker returned early and dropped the receiver; stop pumping.
+                    return None;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(StreamMsg::StreamError).await;
+                return Some(e);
+            }
+        }
+    }
+    let _ = tx.send(StreamMsg::Finish).await;
+    None
 }
 
 async fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
@@ -1796,27 +2918,18 @@ impl UploadSessionStorage for FsStorage {
     async fn create_session(&self, repo: &str) -> Result<UploadSessionId, StorageError> {
         let canonical_repo = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let dir = self.uploads_dir();
-        ensure_dir(&dir)?;
         let uuid = uuid::Uuid::new_v4().to_string();
         let session = UploadSessionId::new(canonical_repo.clone(), &uuid);
-        let lock_path = self.session_lock_path(&uuid);
-        let _lock = acquire_fs_session_lock(lock_path).await?;
 
-        let data_path = self.session_data_path(&uuid);
-        tokio::fs::File::create(&data_path)
+        let uploads = self
+            .upload_authorities
+            .uploads()
             .await
-            .map_err(map_fs_io_err)?;
+            .map_err(map_fs_mutate_err)?;
+        let lock_name = session_lock_name(&uuid).map_err(map_fs_mutate_err)?;
+        let guard = uploads.lock(&lock_name).await.map_err(map_fs_mutate_err)?;
 
-        let hash_st = SerializableSha256::new();
-        let hash_path = self.session_hash_path(&uuid, 0);
-        write_atomic_file(&hash_path, &hash_st.to_bytes()).await?;
-
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
+        let now = now_unix_secs();
         let meta = FsSessionMetaRecord {
             format_version: 1,
             repo: canonical_repo,
@@ -1828,10 +2941,26 @@ impl UploadSessionStorage for FsStorage {
             last_active_at_unix_secs: now,
             finalizing_info: None,
         };
-        let meta_json =
-            serde_json::to_vec(&meta).map_err(|e| StorageError::serialization(e.to_string()))?;
-        let meta_path = self.session_meta_path(&uuid);
-        write_atomic_file(&meta_path, &meta_json).await?;
+        let meta_bytes = json_bytes(&meta).map_err(map_fs_mutate_err)?;
+        let hash_bytes = SerializableSha256::new().to_bytes();
+        let data_name = session_data_name(&uuid).map_err(map_fs_mutate_err)?;
+        let hash_name = session_hash_name(&uuid, 0).map_err(map_fs_mutate_err)?;
+        let meta_name = session_meta_name(&uuid).map_err(map_fs_mutate_err)?;
+
+        uploads
+            .run_locked(guard, move |dir, _g| {
+                // Create the empty data leaf (exclusive; tolerate an existing empty leaf
+                // from a crash-retry of the same uuid).
+                match dir.open_leaf_write(&data_name, LeafWriteMode::CreateNew) {
+                    Ok(_) | Err(FsMutateError::AlreadyExists) => {}
+                    Err(e) => return Err(e),
+                }
+                dir.write_leaf_atomic(&hash_name, &hash_bytes, true)?;
+                dir.write_leaf_atomic(&meta_name, &meta_bytes, true)?;
+                Ok(())
+            })
+            .await
+            .map_err(map_fs_mutate_err)?;
 
         Ok(session)
     }
@@ -1840,310 +2969,312 @@ impl UploadSessionStorage for FsStorage {
         &self,
         session: &UploadSessionId,
     ) -> Result<UploadSessionStatus, UploadTransitionError> {
-        let lock_path = self.session_lock_path(&session.uuid);
-        let _lock = acquire_fs_session_lock(lock_path).await?;
-
-        let meta_path = self.session_meta_path(&session.uuid);
-        let meta_bytes = match tokio::fs::read(&meta_path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(receipt) = self
-                    .get_finalized_receipt(session)
-                    .await
-                    .map_err(UploadTransitionError::Storage)?
-                {
-                    return Ok(UploadSessionStatus {
-                        session: session.clone(),
-                        state: UploadSessionState::Finalizing,
-                        committed_offset: receipt.size,
-                        created_at: std::time::UNIX_EPOCH
-                            + Duration::from_secs(receipt.finalized_at_unix_secs),
-                        last_active_at: std::time::UNIX_EPOCH
-                            + Duration::from_secs(receipt.finalized_at_unix_secs),
-                    });
-                }
-
-                // Check for legacy file migration on first access
-                let legacy_path = self.uploads_dir().join(&session.uuid);
-                let data_path = self.session_data_path(&session.uuid);
-
-                let legacy_exists = match tokio::fs::metadata(&legacy_path).await {
-                    Ok(m) if m.is_file() => true,
-                    _ => false,
-                };
-                let data_exists = match tokio::fs::metadata(&data_path).await {
-                    Ok(m) if m.is_file() => true,
-                    _ => false,
-                };
-
-                if legacy_exists || data_exists {
-                    if legacy_exists && !data_exists {
-                        let _ = tokio::fs::rename(&legacy_path, &data_path).await;
-                    }
-
-                    if let Ok(data_meta) = tokio::fs::metadata(&data_path).await {
-                        let size = data_meta.len();
-                        let now = SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
-                        // Try loading legacy .sha256state or rebuild
-                        let old_sidecar = self.upload_hash_path(&session.uuid);
-                        let hash_st = match tokio::fs::read(&old_sidecar).await {
-                            Ok(b) => SerializableSha256::from_bytes(&b),
-                            Err(_) => None,
-                        };
-                        let hash_st = match hash_st {
-                            Some(st) if st.total_len == size => st,
-                            _ => {
-                                let mut st = SerializableSha256::new();
-                                if let Ok(mut f) = tokio::fs::File::open(&data_path).await {
-                                    let mut buf = vec![0u8; 64 * 1024];
-                                    let mut read_total = 0u64;
-                                    while read_total < size {
-                                        let to_read =
-                                            (size - read_total).min(buf.len() as u64) as usize;
-                                        if let Ok(n) = f.read(&mut buf[..to_read]).await {
-                                            if n == 0 {
-                                                break;
-                                            }
-                                            st.update(&buf[..n]);
-                                            read_total += n as u64;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-                                st
-                            }
-                        };
-
-                        let hash_path = self.session_hash_path(&session.uuid, 0);
-                        let _ = write_atomic_file(&hash_path, &hash_st.to_bytes()).await;
-                        let _ = tokio::fs::remove_file(&old_sidecar).await;
-
-                        let migrated_meta = FsSessionMetaRecord {
-                            format_version: 1,
-                            repo: session.repo.clone(),
-                            uuid: session.uuid.clone(),
-                            state: UploadSessionState::Active,
-                            committed_offset: size,
-                            hash_generation: 0,
-                            created_at_unix_secs: now,
-                            last_active_at_unix_secs: now,
-                            finalizing_info: None,
-                        };
-                        let _ = write_atomic_file(
-                            &meta_path,
-                            &serde_json::to_vec(&migrated_meta).unwrap(),
-                        )
-                        .await;
-
-                        return Ok(UploadSessionStatus {
-                            session: session.clone(),
-                            state: UploadSessionState::Active,
-                            committed_offset: size,
-                            created_at: std::time::UNIX_EPOCH + Duration::from_secs(now),
-                            last_active_at: std::time::UNIX_EPOCH + Duration::from_secs(now),
-                        });
-                    }
-                }
-
-                return Err(UploadTransitionError::NotFound);
-            }
-            Err(err) => {
-                return Err(UploadTransitionError::Storage(StorageError::io(
-                    err.to_string(),
-                )));
-            }
-        };
-        let meta: FsSessionMetaRecord = serde_json::from_slice(&meta_bytes).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::corrupt_data(e.to_string()))
-        })?;
-        if meta.repo != session.repo || meta.uuid != session.uuid {
-            return Err(UploadTransitionError::NotFound);
+        enum StatusOutcome {
+            Status {
+                state: UploadSessionState,
+                committed_offset: u64,
+                created: u64,
+                last_active: u64,
+            },
+            NotFound,
+            Corrupt(String),
         }
 
-        Ok(UploadSessionStatus {
-            session: session.clone(),
-            state: meta.state,
-            committed_offset: meta.committed_offset,
-            created_at: std::time::UNIX_EPOCH + Duration::from_secs(meta.created_at_unix_secs),
-            last_active_at: std::time::UNIX_EPOCH
-                + Duration::from_secs(meta.last_active_at_unix_secs),
-        })
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(|e| UploadTransitionError::Storage(map_fs_mutate_err(e)))?;
+        // Pre-initialize the shared `.finalized` authority in the async context and
+        // move its blocking view into the owned-boundary body: the body operates on
+        // the same cached descriptor rather than reopening a replacement subtree.
+        let finalized = self
+            .upload_authorities
+            .finalized()
+            .await
+            .map_err(|e| UploadTransitionError::Storage(map_fs_mutate_err(e)))?
+            .blocking();
+        let repo = session.repo.clone();
+        let uuid = session.uuid.clone();
+
+        let lock_name = session_lock_name(&uuid)
+            .map_err(|e| UploadTransitionError::Storage(map_fs_mutate_err(e)))?;
+        let guard = uploads
+            .lock(&lock_name)
+            .await
+            .map_err(|e| UploadTransitionError::Storage(map_fs_mutate_err(e)))?;
+
+        let outcome = uploads
+            .run_locked(guard, move |dir, _g| {
+                match read_session_meta_sync(&dir, &uuid)? {
+                    SessionMetaOutcome::Present(meta) => {
+                        if meta.repo != repo || meta.uuid != uuid {
+                            return Ok(StatusOutcome::NotFound);
+                        }
+                        Ok(StatusOutcome::Status {
+                            state: meta.state,
+                            committed_offset: meta.committed_offset,
+                            created: meta.created_at_unix_secs,
+                            last_active: meta.last_active_at_unix_secs,
+                        })
+                    }
+                    SessionMetaOutcome::Corrupt(msg) => Ok(StatusOutcome::Corrupt(msg)),
+                    SessionMetaOutcome::Absent => {
+                        // Already finalized? Read the receipt through the pinned
+                        // finalized authority.
+                        if let Some(receipt) = read_receipt_sync(&finalized, &uuid)? {
+                            return Ok(StatusOutcome::Status {
+                                state: UploadSessionState::Finalizing,
+                                committed_offset: receipt.size,
+                                created: receipt.finalized_at_unix_secs,
+                                last_active: receipt.finalized_at_unix_secs,
+                            });
+                        }
+
+                        // Legacy first-access migration: a bare `{uuid}` data file and/or
+                        // a `.sha256state` sidecar written by an older format.
+                        let legacy_name = match FileName::new(uuid.clone()) {
+                            Ok(n) => n,
+                            Err(_) => return Ok(StatusOutcome::NotFound),
+                        };
+                        let data_name = session_data_name(&uuid)?;
+                        let legacy_regular = dir
+                            .inspect(&legacy_name)
+                            .ok()
+                            .flatten()
+                            .map(|id| is_regular(id.mode))
+                            .unwrap_or(false);
+                        let mut data_regular = dir
+                            .inspect(&data_name)
+                            .ok()
+                            .flatten()
+                            .map(|id| is_regular(id.mode))
+                            .unwrap_or(false);
+
+                        if legacy_regular || data_regular {
+                            if legacy_regular && !data_regular {
+                                let _ = dir.rename_leaf(&legacy_name, &dir, &data_name);
+                                data_regular = dir
+                                    .inspect(&data_name)
+                                    .ok()
+                                    .flatten()
+                                    .map(|id| is_regular(id.mode))
+                                    .unwrap_or(false);
+                            }
+
+                            if data_regular && let Some(id) = dir.inspect(&data_name)? {
+                                let size = id.size;
+                                let now = now_unix_secs();
+
+                                let sidecar_name =
+                                    FileName::new(format!("{uuid}.sha256state")).ok();
+                                let sidecar_state = sidecar_name.as_ref().and_then(|n| {
+                                    dir.read_leaf(n, SESSION_HASH_READ_LIMIT)
+                                        .ok()
+                                        .and_then(|b| SerializableSha256::from_bytes(&b))
+                                });
+                                let hash_st = match sidecar_state {
+                                    Some(st) if st.total_len == size => st,
+                                    _ => rebuild_hash_sync(&dir, &data_name, size)?,
+                                };
+
+                                let hash_name = session_hash_name(&uuid, 0)?;
+                                dir.write_leaf_atomic(&hash_name, &hash_st.to_bytes(), true)?;
+                                if let Some(n) = sidecar_name.as_ref() {
+                                    let _ = dir.unlink(n, true);
+                                }
+
+                                let migrated = FsSessionMetaRecord {
+                                    format_version: 1,
+                                    repo: repo.clone(),
+                                    uuid: uuid.clone(),
+                                    state: UploadSessionState::Active,
+                                    committed_offset: size,
+                                    hash_generation: 0,
+                                    created_at_unix_secs: now,
+                                    last_active_at_unix_secs: now,
+                                    finalizing_info: None,
+                                };
+                                write_session_meta_sync(&dir, &migrated)?;
+
+                                return Ok(StatusOutcome::Status {
+                                    state: UploadSessionState::Active,
+                                    committed_offset: size,
+                                    created: now,
+                                    last_active: now,
+                                });
+                            }
+                        }
+
+                        Ok(StatusOutcome::NotFound)
+                    }
+                }
+            })
+            .await
+            .map_err(|e| UploadTransitionError::Storage(map_fs_mutate_err(e)))?;
+
+        match outcome {
+            StatusOutcome::Status {
+                state,
+                committed_offset,
+                created,
+                last_active,
+            } => Ok(UploadSessionStatus {
+                session: session.clone(),
+                state,
+                committed_offset,
+                created_at: UNIX_EPOCH + Duration::from_secs(created),
+                last_active_at: UNIX_EPOCH + Duration::from_secs(last_active),
+            }),
+            StatusOutcome::NotFound => Err(UploadTransitionError::NotFound),
+            StatusOutcome::Corrupt(msg) => Err(UploadTransitionError::Storage(
+                StorageError::corrupt_data(msg),
+            )),
+        }
     }
 
     async fn append_if_offset(
         &self,
         session: &UploadSessionId,
         expected_offset: UploadOffsetPrecondition,
-        mut stream: UploadByteStream,
+        stream: UploadByteStream,
         max_upload_bytes: u64,
     ) -> Result<UploadAppendResult, UploadTransitionError> {
-        let lock_path = self.session_lock_path(&session.uuid);
-        let _lock = acquire_fs_session_lock(lock_path).await?;
+        let se = |e: FsMutateError| UploadTransitionError::Storage(map_fs_mutate_err(e));
+        let uploads = self.upload_authorities.uploads().await.map_err(se)?;
 
-        let meta_path = self.session_meta_path(&session.uuid);
-        let meta_bytes = match tokio::fs::read(&meta_path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(UploadTransitionError::NotFound);
-            }
-            Err(err) => {
-                return Err(UploadTransitionError::Storage(StorageError::io(
-                    err.to_string(),
-                )));
-            }
-        };
-        let mut meta: FsSessionMetaRecord = serde_json::from_slice(&meta_bytes).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::corrupt_data(e.to_string()))
-        })?;
-        if meta.repo != session.repo || meta.uuid != session.uuid {
-            return Err(UploadTransitionError::NotFound);
-        }
+        let lock_name = session_lock_name(&session.uuid).map_err(se)?;
+        let guard = uploads.lock(&lock_name).await.map_err(se)?;
 
-        if meta.state != UploadSessionState::Active {
-            return Ok(UploadAppendResult::Conflict);
-        }
-
-        let data_path = self.session_data_path(&session.uuid);
-
-        // Crash recovery: recover physical file size if needed
-        if let Ok(file_meta) = tokio::fs::metadata(&data_path).await {
-            if file_meta.len() > meta.committed_offset {
-                if let Ok(f) = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&data_path)
-                    .await
-                {
-                    let _ = f.set_len(meta.committed_offset).await;
-                    let _ = f.sync_data().await;
-                }
-            }
-        }
-
-        match expected_offset {
-            UploadOffsetPrecondition::Exact(off) => {
-                if off != meta.committed_offset {
-                    return Ok(UploadAppendResult::OffsetMismatch {
-                        current_offset: meta.committed_offset,
-                    });
-                }
-            }
-            UploadOffsetPrecondition::CurrentForServerComposedMonolithicOperation => {}
-        }
-
-        // Load or recover hash state
-        let hash_path = self.session_hash_path(&session.uuid, meta.hash_generation);
-        let hash_st = match tokio::fs::read(&hash_path).await {
-            Ok(b) => SerializableSha256::from_bytes(&b),
-            Err(_) => None,
-        };
-        let mut hash_st = match hash_st {
-            Some(st) if st.total_len == meta.committed_offset => st,
-            _ => {
-                let mut st = SerializableSha256::new();
-                if let Ok(mut f) = tokio::fs::File::open(&data_path).await {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let mut read_total = 0u64;
-                    while read_total < meta.committed_offset {
-                        let to_read =
-                            (meta.committed_offset - read_total).min(buf.len() as u64) as usize;
-                        let n = f.read(&mut buf[..to_read]).await.map_err(|e| {
-                            UploadTransitionError::Storage(StorageError::io(e.to_string()))
-                        })?;
-                        if n == 0 {
-                            break;
-                        }
-                        st.update(&buf[..n]);
-                        read_total += n as u64;
-                    }
-                }
-                st
-            }
-        };
-
-        let mut file = match tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&data_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(err) => return Err(UploadTransitionError::Storage(map_fs_io_err(err))),
-        };
-
+        // Supervised owner: the whole inspect -> recover -> append -> commit body runs
+        // inside `run_locked` on a blocking thread that holds the session lock until
+        // the mutation commits or is rolled back, even if this request future is
+        // cancelled. See the "Supervised streaming owner" section above.
+        let repo = session.repo.clone();
+        let uuid = session.uuid.clone();
         let limit = if max_upload_bytes > 0 {
             max_upload_bytes
         } else {
             self.max_upload_bytes
         };
-        let mut written = 0u64;
 
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(err) => {
-                    let _ = file.set_len(meta.committed_offset).await;
-                    let _ = file.sync_data().await;
-                    return Err(UploadTransitionError::Stream(err));
-                }
+        enum AppendOutcome {
+            Committed { new_offset: u64 },
+            OffsetMismatch { current_offset: u64 },
+            Conflict,
+            NotFound,
+            Corrupt(String),
+            TooLarge,
+            StreamAborted,
+            Cancelled,
+            Io(StorageError),
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamMsg>(STREAM_CHANNEL_CAP);
+        let worker = uploads.run_locked(guard, move |dir, _g| {
+            let mut rx = rx;
+            let data_name = session_data_name(&uuid)?;
+
+            let mut meta = match read_session_meta_sync(&dir, &uuid)? {
+                SessionMetaOutcome::Present(m) => m,
+                SessionMetaOutcome::Corrupt(msg) => return Ok(AppendOutcome::Corrupt(msg)),
+                SessionMetaOutcome::Absent => return Ok(AppendOutcome::NotFound),
             };
-            if chunk.is_empty() {
-                continue;
+            if meta.repo != repo || meta.uuid != uuid {
+                return Ok(AppendOutcome::NotFound);
             }
-            let next_total = meta
-                .committed_offset
-                .saturating_add(written)
-                .saturating_add(chunk.len() as u64);
-            if limit > 0 && next_total > limit {
-                let _ = file.set_len(meta.committed_offset).await;
-                let _ = file.sync_data().await;
-                return Err(UploadTransitionError::TooLarge);
+            if meta.state != UploadSessionState::Active {
+                return Ok(AppendOutcome::Conflict);
             }
-            if let Err(err) = file.write_all(&chunk).await {
-                let _ = file.set_len(meta.committed_offset).await;
-                let _ = file.sync_data().await;
-                return Err(UploadTransitionError::Storage(map_fs_io_err(err)));
+
+            // Recovery-on-entry: drop any torn tail past the committed offset.
+            if let Some(id) = dir.inspect(&data_name)?
+                && id.size > meta.committed_offset
+            {
+                dir.truncate(&data_name, meta.committed_offset)?;
             }
-            hash_st.update(&chunk);
-            written = written.saturating_add(chunk.len() as u64);
+
+            match expected_offset {
+                UploadOffsetPrecondition::Exact(off) => {
+                    if off != meta.committed_offset {
+                        return Ok(AppendOutcome::OffsetMismatch {
+                            current_offset: meta.committed_offset,
+                        });
+                    }
+                }
+                UploadOffsetPrecondition::CurrentForServerComposedMonolithicOperation => {}
+            }
+
+            // Load or rebuild the rolling hash for the committed prefix.
+            let hash_name = session_hash_name(&uuid, meta.hash_generation)?;
+            let loaded = match dir.read_leaf(&hash_name, SESSION_HASH_READ_LIMIT) {
+                Ok(b) => SerializableSha256::from_bytes(&b),
+                Err(_) => None,
+            };
+            let mut hash_st = match loaded {
+                Some(st) if st.total_len == meta.committed_offset => st,
+                _ => rebuild_hash_sync(&dir, &data_name, meta.committed_offset)?,
+            };
+
+            let mut file = dir
+                .open_leaf_write(&data_name, LeafWriteMode::Append)?
+                .into_file();
+            let drain = drain_append_blocking(
+                &mut file,
+                &mut rx,
+                &mut hash_st,
+                meta.committed_offset,
+                limit,
+            );
+            drop(file);
+
+            let written = match drain {
+                DrainOutcome::Finished { written } => written,
+                DrainOutcome::TooLarge => return Ok(AppendOutcome::TooLarge),
+                DrainOutcome::StreamAborted => return Ok(AppendOutcome::StreamAborted),
+                DrainOutcome::Cancelled => return Ok(AppendOutcome::Cancelled),
+                DrainOutcome::Io(e) => return Ok(AppendOutcome::Io(map_fs_io_err(e))),
+            };
+
+            // Commit: advance hash generation and meta.
+            let next_gen = meta.hash_generation.saturating_add(1);
+            let next_hash_name = session_hash_name(&uuid, next_gen)?;
+            dir.write_leaf_atomic(&next_hash_name, &hash_st.to_bytes(), true)?;
+
+            let now = now_unix_secs();
+            meta.committed_offset = meta.committed_offset.saturating_add(written);
+            meta.hash_generation = next_gen;
+            meta.last_active_at_unix_secs = now;
+            write_session_meta_sync(&dir, &meta)?;
+            let _ = dir.unlink(&hash_name, true);
+
+            Ok(AppendOutcome::Committed {
+                new_offset: meta.committed_offset,
+            })
+        });
+
+        let (feed_res, worker_res) = tokio::join!(feed_stream(stream, tx), worker);
+        match worker_res.map_err(se)? {
+            AppendOutcome::Committed { new_offset } => {
+                Ok(UploadAppendResult::Committed { new_offset })
+            }
+            AppendOutcome::OffsetMismatch { current_offset } => {
+                Ok(UploadAppendResult::OffsetMismatch { current_offset })
+            }
+            AppendOutcome::Conflict => Ok(UploadAppendResult::Conflict),
+            AppendOutcome::NotFound => Err(UploadTransitionError::NotFound),
+            AppendOutcome::Corrupt(msg) => Err(UploadTransitionError::Storage(
+                StorageError::corrupt_data(msg),
+            )),
+            AppendOutcome::TooLarge => Err(UploadTransitionError::TooLarge),
+            AppendOutcome::StreamAborted => Err(UploadTransitionError::Stream(
+                feed_res.unwrap_or(UploadStreamError::IdleTimeout),
+            )),
+            AppendOutcome::Cancelled => Err(UploadTransitionError::Storage(StorageError::io(
+                "append cancelled before completion",
+            ))),
+            AppendOutcome::Io(e) => Err(UploadTransitionError::Storage(e)),
         }
-
-        if let Err(err) = file.sync_data().await {
-            let _ = file.set_len(meta.committed_offset).await;
-            return Err(UploadTransitionError::Storage(map_fs_io_err(err)));
-        }
-        drop(file);
-
-        let next_gen = meta.hash_generation.saturating_add(1);
-        let next_hash_path = self.session_hash_path(&session.uuid, next_gen);
-        write_atomic_file(&next_hash_path, &hash_st.to_bytes())
-            .await
-            .map_err(UploadTransitionError::Storage)?;
-
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        meta.committed_offset = meta.committed_offset.saturating_add(written);
-        meta.hash_generation = next_gen;
-        meta.last_active_at_unix_secs = now;
-
-        let meta_json = serde_json::to_vec(&meta).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::serialization(e.to_string()))
-        })?;
-        write_atomic_file(&meta_path, &meta_json)
-            .await
-            .map_err(UploadTransitionError::Storage)?;
-
-        let _ = tokio::fs::remove_file(&hash_path).await;
-
-        Ok(UploadAppendResult::Committed {
-            new_offset: meta.committed_offset,
-        })
     }
 
     async fn begin_finalize(
@@ -2155,375 +3286,430 @@ impl UploadSessionStorage for FsStorage {
         max_upload_bytes: u64,
         abort_on_digest_mismatch: bool,
     ) -> Result<PreparedFinalize, UploadTransitionError> {
-        let lock_path = self.session_lock_path(&session.uuid);
-        let _lock = acquire_fs_session_lock(lock_path).await?;
+        let se = |e: FsMutateError| UploadTransitionError::Storage(map_fs_mutate_err(e));
+        let uploads = self.upload_authorities.uploads().await.map_err(se)?;
+        // Pre-initialize the shared `.finalized` authority and hand its blocking view
+        // to the supervised worker, which owns the lock across the (optional) trailing
+        // stream, the digest verification, and the Finalizing persist.
+        let finalized = self
+            .upload_authorities
+            .finalized()
+            .await
+            .map_err(se)?
+            .blocking();
 
-        let meta_path = self.session_meta_path(&session.uuid);
-        let meta_bytes = match tokio::fs::read(&meta_path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(receipt) = self
-                    .get_finalized_receipt(session)
-                    .await
-                    .map_err(UploadTransitionError::Storage)?
-                {
-                    if receipt.digest == expected_digest.as_str() {
-                        return Ok(PreparedFinalize {
-                            session: session.clone(),
-                            operation_id: "already-finalized".to_string(),
-                            expected_digest: expected_digest.clone(),
-                            committed_offset: receipt.size,
-                            size: receipt.size,
-                        });
-                    } else {
-                        return Err(UploadTransitionError::DigestMismatch {
-                            expected: expected_digest.clone(),
-                            computed: receipt.digest.clone(),
-                        });
-                    }
-                }
-                return Err(UploadTransitionError::NotFound);
-            }
-            Err(err) => {
-                return Err(UploadTransitionError::Storage(StorageError::io(
-                    err.to_string(),
-                )));
-            }
-        };
-        let mut meta: FsSessionMetaRecord = serde_json::from_slice(&meta_bytes).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::corrupt_data(e.to_string()))
-        })?;
-        if meta.repo != session.repo || meta.uuid != session.uuid {
-            return Err(UploadTransitionError::NotFound);
-        }
+        let lock_name = session_lock_name(&session.uuid).map_err(se)?;
+        let guard = uploads.lock(&lock_name).await.map_err(se)?;
 
-        if meta.state != UploadSessionState::Active {
-            return Err(UploadTransitionError::Conflict);
-        }
-
-        let data_path = self.session_data_path(&session.uuid);
-
-        if let Some(mut stream) = trailing_stream {
-            let mut file = tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&data_path)
-                .await
-                .map_err(|e| UploadTransitionError::Storage(map_fs_io_err(e)))?;
-            let limit = if max_upload_bytes > 0 {
-                max_upload_bytes
-            } else {
-                self.max_upload_bytes
-            };
-            let mut written = 0u64;
-
-            let hash_path = self.session_hash_path(&session.uuid, meta.hash_generation);
-            let mut hash_st = match tokio::fs::read(&hash_path).await {
-                Ok(b) => SerializableSha256::from_bytes(&b),
-                Err(_) => None,
-            }
-            .unwrap_or_else(SerializableSha256::new);
-
-            while let Some(chunk_res) = stream.next().await {
-                let chunk = match chunk_res {
-                    Ok(c) => c,
-                    Err(err) => {
-                        let _ = file.set_len(meta.committed_offset).await;
-                        let _ = file.sync_data().await;
-                        return Err(UploadTransitionError::Stream(err));
-                    }
-                };
-                if chunk.is_empty() {
-                    continue;
-                }
-                let next_total = meta
-                    .committed_offset
-                    .saturating_add(written)
-                    .saturating_add(chunk.len() as u64);
-                if limit > 0 && next_total > limit {
-                    let _ = file.set_len(meta.committed_offset).await;
-                    let _ = file.sync_data().await;
-                    return Err(UploadTransitionError::TooLarge);
-                }
-                if let Err(err) = file.write_all(&chunk).await {
-                    let _ = file.set_len(meta.committed_offset).await;
-                    let _ = file.sync_data().await;
-                    return Err(UploadTransitionError::Storage(map_fs_io_err(err)));
-                }
-                hash_st.update(&chunk);
-                written = written.saturating_add(chunk.len() as u64);
-            }
-            if let Err(err) = file.sync_data().await {
-                let _ = file.set_len(meta.committed_offset).await;
-                return Err(UploadTransitionError::Storage(map_fs_io_err(err)));
-            }
-            drop(file);
-
-            let next_gen = meta.hash_generation.saturating_add(1);
-            let next_hash_path = self.session_hash_path(&session.uuid, next_gen);
-            write_atomic_file(&next_hash_path, &hash_st.to_bytes())
-                .await
-                .map_err(UploadTransitionError::Storage)?;
-
-            meta.committed_offset = meta.committed_offset.saturating_add(written);
-            meta.hash_generation = next_gen;
-            let _ = tokio::fs::remove_file(&hash_path).await;
-        }
-
-        match expected_offset {
-            UploadOffsetPrecondition::Exact(off) => {
-                if off != meta.committed_offset {
-                    return Err(UploadTransitionError::OffsetMismatch {
-                        expected: expected_offset,
-                        current: meta.committed_offset,
-                    });
-                }
-            }
-            UploadOffsetPrecondition::CurrentForServerComposedMonolithicOperation => {}
-        }
-
-        // Verify digest
-        let computed_hex = if expected_digest.algorithm() == "sha512" {
-            let mut hasher = sha2::Sha512::new();
-            let mut file = tokio::fs::File::open(&data_path)
-                .await
-                .map_err(|e| UploadTransitionError::Storage(map_fs_io_err(e)))?;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = file
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| UploadTransitionError::Storage(map_fs_io_err(e)))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            hex::encode(hasher.finalize())
+        let repo = session.repo.clone();
+        let uuid = session.uuid.clone();
+        let expected_digest_owned = expected_digest.clone();
+        let limit = if max_upload_bytes > 0 {
+            max_upload_bytes
         } else {
-            let hash_path = self.session_hash_path(&session.uuid, meta.hash_generation);
-            let hash_st = match tokio::fs::read(&hash_path).await {
-                Ok(b) => SerializableSha256::from_bytes(&b),
-                Err(_) => None,
-            };
-            let st = match hash_st {
-                Some(s) if s.total_len == meta.committed_offset => s,
-                _ => {
-                    let mut s = SerializableSha256::new();
-                    let mut file = tokio::fs::File::open(&data_path)
-                        .await
-                        .map_err(|e| UploadTransitionError::Storage(map_fs_io_err(e)))?;
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        let n = file
-                            .read(&mut buf)
-                            .await
-                            .map_err(|e| UploadTransitionError::Storage(map_fs_io_err(e)))?;
-                        if n == 0 {
-                            break;
-                        }
-                        s.update(&buf[..n]);
-                    }
-                    s
-                }
-            };
-            st.finalize_hex()
+            self.max_upload_bytes
         };
 
-        if computed_hex != expected_digest.hex() {
-            if abort_on_digest_mismatch {
-                let _ = tokio::fs::remove_file(&data_path).await;
-                let _ = tokio::fs::remove_file(&meta_path).await;
-                let hash_path = self.session_hash_path(&session.uuid, meta.hash_generation);
-                let _ = tokio::fs::remove_file(&hash_path).await;
-            }
-            return Err(UploadTransitionError::DigestMismatch {
-                expected: expected_digest.clone(),
-                computed: computed_hex,
-            });
+        enum FinOutcome {
+            Prepared {
+                operation_id: String,
+                committed_offset: u64,
+            },
+            AlreadyFinalizedReplay {
+                size: u64,
+            },
+            NotFound,
+            Conflict,
+            Corrupt(String),
+            OffsetMismatch {
+                current: u64,
+            },
+            DigestMismatch {
+                computed: String,
+            },
+            TooLarge,
+            StreamAborted,
+            Cancelled,
+            Io(StorageError),
         }
 
-        // Persist Finalizing state
-        let operation_id = uuid::Uuid::new_v4().to_string();
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // A channel is created only when there is a trailing stream to drain.
+        let (tx, rx_opt) = match &trailing_stream {
+            Some(_) => {
+                let (tx, rx) = tokio::sync::mpsc::channel::<StreamMsg>(STREAM_CHANNEL_CAP);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
 
-        meta.state = UploadSessionState::Finalizing;
-        meta.finalizing_info = Some(FsFinalizingInfo {
-            operation_id: operation_id.clone(),
-            expected_digest: expected_digest.as_str().to_string(),
-            size: meta.committed_offset,
-            finalizing_at_unix_secs: now,
+        let worker = uploads.run_locked(guard, move |dir, _g| {
+            let data_name = session_data_name(&uuid)?;
+            let meta_name = session_meta_name(&uuid)?;
+
+            let mut meta = match read_session_meta_sync(&dir, &uuid)? {
+                SessionMetaOutcome::Present(m) => m,
+                SessionMetaOutcome::Corrupt(msg) => return Ok(FinOutcome::Corrupt(msg)),
+                SessionMetaOutcome::Absent => {
+                    // Meta absent: consult the finalized receipt for idempotent replay.
+                    return match read_receipt_sync(&finalized, &uuid)? {
+                        Some(receipt) => {
+                            if receipt.digest == expected_digest_owned.as_str() {
+                                Ok(FinOutcome::AlreadyFinalizedReplay { size: receipt.size })
+                            } else {
+                                Ok(FinOutcome::DigestMismatch {
+                                    computed: receipt.digest.clone(),
+                                })
+                            }
+                        }
+                        None => Ok(FinOutcome::NotFound),
+                    };
+                }
+            };
+            if meta.repo != repo || meta.uuid != uuid {
+                return Ok(FinOutcome::NotFound);
+            }
+            if meta.state != UploadSessionState::Active {
+                return Ok(FinOutcome::Conflict);
+            }
+
+            // Recovery-on-entry: drop any torn tail past the committed offset.
+            if let Some(id) = dir.inspect(&data_name)?
+                && id.size > meta.committed_offset
+            {
+                dir.truncate(&data_name, meta.committed_offset)?;
+            }
+
+            // Optional trailing stream: append and roll the committed hash forward.
+            if let Some(mut rx) = rx_opt {
+                let hash_name = session_hash_name(&uuid, meta.hash_generation)?;
+                let loaded = match dir.read_leaf(&hash_name, SESSION_HASH_READ_LIMIT) {
+                    Ok(b) => SerializableSha256::from_bytes(&b),
+                    Err(_) => None,
+                };
+                let mut hash_st = match loaded {
+                    Some(st) if st.total_len == meta.committed_offset => st,
+                    _ => rebuild_hash_sync(&dir, &data_name, meta.committed_offset)?,
+                };
+                let mut file = dir
+                    .open_leaf_write(&data_name, LeafWriteMode::Append)?
+                    .into_file();
+                let drain = drain_append_blocking(
+                    &mut file,
+                    &mut rx,
+                    &mut hash_st,
+                    meta.committed_offset,
+                    limit,
+                );
+                drop(file);
+                let written = match drain {
+                    DrainOutcome::Finished { written } => written,
+                    DrainOutcome::TooLarge => return Ok(FinOutcome::TooLarge),
+                    DrainOutcome::StreamAborted => return Ok(FinOutcome::StreamAborted),
+                    DrainOutcome::Cancelled => return Ok(FinOutcome::Cancelled),
+                    DrainOutcome::Io(e) => return Ok(FinOutcome::Io(map_fs_io_err(e))),
+                };
+                let next_gen = meta.hash_generation.saturating_add(1);
+                let next_hash_name = session_hash_name(&uuid, next_gen)?;
+                dir.write_leaf_atomic(&next_hash_name, &hash_st.to_bytes(), true)?;
+                meta.committed_offset = meta.committed_offset.saturating_add(written);
+                meta.hash_generation = next_gen;
+                let _ = dir.unlink(&hash_name, true);
+            }
+
+            match expected_offset {
+                UploadOffsetPrecondition::Exact(off) => {
+                    if off != meta.committed_offset {
+                        return Ok(FinOutcome::OffsetMismatch {
+                            current: meta.committed_offset,
+                        });
+                    }
+                }
+                UploadOffsetPrecondition::CurrentForServerComposedMonolithicOperation => {}
+            }
+
+            // Verify the digest over the committed prefix.
+            let computed_hex = if expected_digest_owned.algorithm() == "sha512" {
+                use std::io::Read as _;
+                let mut file = dir.open_leaf_read(&data_name)?.into_file();
+                let mut hasher = sha2::Sha512::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut read_total = 0u64;
+                while read_total < meta.committed_offset {
+                    let to_read =
+                        ((meta.committed_offset - read_total).min(buf.len() as u64)) as usize;
+                    let n = file.read(&mut buf[..to_read]).map_err(FsMutateError::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                    read_total += n as u64;
+                }
+                hex::encode(hasher.finalize())
+            } else {
+                let hash_name = session_hash_name(&uuid, meta.hash_generation)?;
+                let loaded = match dir.read_leaf(&hash_name, SESSION_HASH_READ_LIMIT) {
+                    Ok(b) => SerializableSha256::from_bytes(&b),
+                    Err(_) => None,
+                };
+                let st = match loaded {
+                    Some(s) if s.total_len == meta.committed_offset => s,
+                    _ => rebuild_hash_sync(&dir, &data_name, meta.committed_offset)?,
+                };
+                st.finalize_hex()
+            };
+
+            if computed_hex != expected_digest_owned.hex() {
+                if abort_on_digest_mismatch {
+                    let _ = dir.unlink(&data_name, true);
+                    let _ = dir.unlink(&meta_name, true);
+                    let hash_name = session_hash_name(&uuid, meta.hash_generation)?;
+                    let _ = dir.unlink(&hash_name, true);
+                }
+                return Ok(FinOutcome::DigestMismatch {
+                    computed: computed_hex,
+                });
+            }
+
+            // Persist Finalizing state.
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let now = now_unix_secs();
+            meta.state = UploadSessionState::Finalizing;
+            meta.finalizing_info = Some(FsFinalizingInfo {
+                operation_id: operation_id.clone(),
+                expected_digest: expected_digest_owned.as_str().to_string(),
+                size: meta.committed_offset,
+                finalizing_at_unix_secs: now,
+            });
+            meta.last_active_at_unix_secs = now;
+            write_session_meta_sync(&dir, &meta)?;
+
+            Ok(FinOutcome::Prepared {
+                operation_id,
+                committed_offset: meta.committed_offset,
+            })
         });
 
-        let meta_json = serde_json::to_vec(&meta).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::serialization(e.to_string()))
-        })?;
-        write_atomic_file(&meta_path, &meta_json)
-            .await
-            .map_err(UploadTransitionError::Storage)?;
+        let (feed_res, worker_res) = if let Some(stream) = trailing_stream {
+            let tx = tx.expect("channel sender present when trailing stream present");
+            tokio::join!(feed_stream(stream, tx), worker)
+        } else {
+            (None, worker.await)
+        };
 
-        Ok(PreparedFinalize {
-            session: session.clone(),
-            operation_id,
-            expected_digest: expected_digest.clone(),
-            committed_offset: meta.committed_offset,
-            size: meta.committed_offset,
-        })
+        match worker_res.map_err(se)? {
+            FinOutcome::Prepared {
+                operation_id,
+                committed_offset,
+            } => Ok(PreparedFinalize {
+                session: session.clone(),
+                operation_id,
+                expected_digest: expected_digest.clone(),
+                committed_offset,
+                size: committed_offset,
+            }),
+            FinOutcome::AlreadyFinalizedReplay { size } => Ok(PreparedFinalize {
+                session: session.clone(),
+                operation_id: "already-finalized".to_string(),
+                expected_digest: expected_digest.clone(),
+                committed_offset: size,
+                size,
+            }),
+            FinOutcome::NotFound => Err(UploadTransitionError::NotFound),
+            FinOutcome::Conflict => Err(UploadTransitionError::Conflict),
+            FinOutcome::Corrupt(msg) => Err(UploadTransitionError::Storage(
+                StorageError::corrupt_data(msg),
+            )),
+            FinOutcome::OffsetMismatch { current } => Err(UploadTransitionError::OffsetMismatch {
+                expected: expected_offset,
+                current,
+            }),
+            FinOutcome::DigestMismatch { computed } => Err(UploadTransitionError::DigestMismatch {
+                expected: expected_digest.clone(),
+                computed,
+            }),
+            FinOutcome::TooLarge => Err(UploadTransitionError::TooLarge),
+            FinOutcome::StreamAborted => Err(UploadTransitionError::Stream(
+                feed_res.unwrap_or(UploadStreamError::IdleTimeout),
+            )),
+            FinOutcome::Cancelled => Err(UploadTransitionError::Storage(StorageError::io(
+                "finalize cancelled before completion",
+            ))),
+            FinOutcome::Io(e) => Err(UploadTransitionError::Storage(e)),
+        }
     }
 
     async fn commit_finalize(
         &self,
         prepared: &PreparedFinalize,
     ) -> Result<FinalizeOutcome, UploadTransitionError> {
-        let lock_path = self.session_lock_path(&prepared.session.uuid);
-        let _lock = acquire_fs_session_lock(lock_path).await?;
-
-        // 1. Check if receipt already exists (idempotent retry)
-        let receipt_path = self.finalized_receipt_path(&prepared.session.uuid);
-        if let Ok(receipt_bytes) = tokio::fs::read(&receipt_path).await {
-            if let Ok(receipt) = serde_json::from_slice::<FinalizedReceipt>(&receipt_bytes) {
-                if receipt.digest == prepared.expected_digest.as_str() {
-                    return Ok(FinalizeOutcome::AlreadyFinalized(BlobMeta {
-                        size: receipt.size,
-                    }));
-                }
-            }
+        enum CommitOutcome {
+            Published(u64),
+            AlreadyFinalized(u64),
+            NotFound,
+            Invalid,
+            Corrupt(String),
         }
 
-        // 2. Validate session metadata
-        let meta_path = self.session_meta_path(&prepared.session.uuid);
-        let data_path = self.session_data_path(&prepared.session.uuid);
+        let prepared = prepared.clone();
+        let se = |e: FsMutateError| UploadTransitionError::Storage(map_fs_mutate_err(e));
+        let uploads = self.upload_authorities.uploads().await.map_err(se)?;
+        // Pre-initialize the shared sibling authorities in the async context so the
+        // owned-boundary body operates on the same cached descriptors; nothing in the
+        // body reopens a (possibly replaced) subtree by pathname.
+        let finalized = self
+            .upload_authorities
+            .finalized()
+            .await
+            .map_err(se)?
+            .blocking();
+        let blobs = self
+            .upload_authorities
+            .blobs()
+            .await
+            .map_err(se)?
+            .blocking();
+        let memberships = self
+            .upload_authorities
+            .memberships()
+            .await
+            .map_err(se)?
+            .blocking();
 
-        let meta_bytes = match tokio::fs::read(&meta_path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let dest_path = self.blob_path(&prepared.expected_digest);
-                if let Ok(cas_meta) = tokio::fs::metadata(&dest_path).await {
-                    if cas_meta.len() == prepared.size {
-                        let receipt = FinalizedReceipt {
-                            repo: prepared.session.repo.clone(),
-                            uuid: prepared.session.uuid.clone(),
-                            digest: prepared.expected_digest.as_str().to_string(),
-                            size: prepared.size,
-                            finalized_at_unix_secs: SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            format_version: 1,
-                        };
-                        let _ = write_atomic_file(
-                            &receipt_path,
-                            &serde_json::to_vec(&receipt).unwrap(),
-                        )
-                        .await;
-                        return Ok(FinalizeOutcome::AlreadyFinalized(BlobMeta {
-                            size: prepared.size,
-                        }));
+        let lock_name = session_lock_name(&prepared.session.uuid).map_err(se)?;
+        let guard = uploads.lock(&lock_name).await.map_err(se)?;
+
+        let outcome = uploads
+            .run_locked(guard, move |dir, _g| {
+                let uuid = &prepared.session.uuid;
+                let digest = &prepared.expected_digest;
+
+                // 1. Idempotent replay: a matching receipt already exists.
+                if let Some(receipt) = read_receipt_sync(&finalized, uuid)?
+                    && receipt.digest == digest.as_str()
+                {
+                    return Ok(CommitOutcome::AlreadyFinalized(receipt.size));
+                }
+
+                // 2. Validate the session metadata.
+                let data_name = session_data_name(uuid)?;
+                let meta = match read_session_meta_sync(&dir, uuid)? {
+                    SessionMetaOutcome::Present(m) => m,
+                    SessionMetaOutcome::Corrupt(msg) => return Ok(CommitOutcome::Corrupt(msg)),
+                    SessionMetaOutcome::Absent => {
+                        // Meta gone: if the CAS blob is already published at the
+                        // expected size, (re)assert membership + receipt and report
+                        // an idempotent success rather than a spurious NotFound.
+                        if let Some(id) = cas_blob_present_sync(&blobs, digest)?
+                            && id.size == prepared.size
+                        {
+                            let membership =
+                                crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+                                    prepared.session.repo.clone(),
+                                    digest.clone(),
+                                    Some(uuid.clone()),
+                                );
+                            write_membership_sync(&memberships, &membership)?;
+                            let receipt = FinalizedReceipt {
+                                repo: prepared.session.repo.clone(),
+                                uuid: uuid.clone(),
+                                digest: digest.as_str().to_string(),
+                                size: prepared.size,
+                                finalized_at_unix_secs: now_unix_secs(),
+                                format_version: 1,
+                            };
+                            write_receipt_sync(&finalized, &receipt)?;
+                            return Ok(CommitOutcome::AlreadyFinalized(prepared.size));
+                        }
+                        return Ok(CommitOutcome::NotFound);
+                    }
+                };
+
+                if meta.state != UploadSessionState::Finalizing {
+                    return Ok(CommitOutcome::Invalid);
+                }
+                let Some(ref fin_info) = meta.finalizing_info else {
+                    return Ok(CommitOutcome::Invalid);
+                };
+                if fin_info.operation_id != prepared.operation_id
+                    || fin_info.expected_digest != digest.as_str()
+                {
+                    return Ok(CommitOutcome::Invalid);
+                }
+
+                // 3. Publish to CAS: blobs/{algo}/{prefix2}/{hex} via contained rename.
+                let algo_dir = blobs.ensure_subdir(&FileName::new(digest.algorithm())?)?;
+                let shard_dir = algo_dir.ensure_subdir(&FileName::new(digest.prefix2())?)?;
+                let hex_name = FileName::new(digest.hex())?;
+                if let Err(err) = dir.rename_leaf(&data_name, &shard_dir, &hex_name) {
+                    // Tolerate a prior partial publication only when the destination
+                    // already holds a blob of the expected size.
+                    match shard_dir.inspect(&hex_name)? {
+                        Some(id) if id.size == prepared.size => {}
+                        _ => return Err(err),
                     }
                 }
-                return Err(UploadTransitionError::NotFound);
-            }
-            Err(err) => {
-                return Err(UploadTransitionError::Storage(StorageError::io(
-                    err.to_string(),
-                )));
-            }
-        };
+                let _ = dir.sync();
+                let _ = shard_dir.sync();
 
-        let meta: FsSessionMetaRecord = serde_json::from_slice(&meta_bytes).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::corrupt_data(e.to_string()))
-        })?;
+                // 4. Durable target-repository membership BEFORE the receipt.
+                let membership =
+                    crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+                        prepared.session.repo.clone(),
+                        digest.clone(),
+                        Some(uuid.clone()),
+                    );
+                write_membership_sync(&memberships, &membership)?;
 
-        if meta.state != UploadSessionState::Finalizing {
-            return Err(UploadTransitionError::InvalidPreparedHandle);
-        }
-        let Some(ref fin_info) = meta.finalizing_info else {
-            return Err(UploadTransitionError::InvalidPreparedHandle);
-        };
-        if fin_info.operation_id != prepared.operation_id
-            || fin_info.expected_digest != prepared.expected_digest.as_str()
-        {
-            return Err(UploadTransitionError::InvalidPreparedHandle);
-        }
+                // 5. Finalized receipt.
+                let receipt = FinalizedReceipt {
+                    repo: prepared.session.repo.clone(),
+                    uuid: uuid.clone(),
+                    digest: digest.as_str().to_string(),
+                    size: prepared.size,
+                    finalized_at_unix_secs: now_unix_secs(),
+                    format_version: 1,
+                };
+                write_receipt_sync(&finalized, &receipt)?;
 
-        // Publish to CAS blob store
-        let dest_dir = self
-            .root
-            .join("blobs")
-            .join(prepared.expected_digest.algorithm())
-            .join(prepared.expected_digest.prefix2());
-        ensure_dir(&dest_dir).map_err(UploadTransitionError::Storage)?;
-        let dest_path = dest_dir.join(prepared.expected_digest.hex());
+                // 6. Remove the staging meta + hash LAST.
+                let meta_name = session_meta_name(uuid)?;
+                let _ = dir.unlink(&meta_name, true);
+                let hash_name = session_hash_name(uuid, meta.hash_generation)?;
+                let _ = dir.unlink(&hash_name, true);
 
-        if let Err(err) = tokio::fs::rename(&data_path, &dest_path).await {
-            if tokio::fs::metadata(&dest_path).await.is_err() {
-                return Err(UploadTransitionError::Storage(map_fs_io_err(err)));
-            }
-        }
-        let _ = fsync_dir(self.uploads_dir().as_path()).await;
-        let _ = fsync_dir(dest_dir.as_path()).await;
-
-        // STEP 5: Durably create target repository membership BEFORE receipt
-        let membership = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-            prepared.session.repo.clone(),
-            prepared.expected_digest.clone(),
-            Some(prepared.session.uuid.clone()),
-        );
-        self.link_repo_blob(&membership)
+                Ok(CommitOutcome::Published(prepared.size))
+            })
             .await
-            .map_err(UploadTransitionError::Storage)?;
+            .map_err(se)?;
 
-        // Write finalized receipt
-        ensure_dir(&self.finalized_dir()).map_err(UploadTransitionError::Storage)?;
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let receipt = FinalizedReceipt {
-            repo: prepared.session.repo.clone(),
-            uuid: prepared.session.uuid.clone(),
-            digest: prepared.expected_digest.as_str().to_string(),
-            size: prepared.size,
-            finalized_at_unix_secs: now,
-            format_version: 1,
-        };
-        let receipt_json = serde_json::to_vec(&receipt).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::serialization(e.to_string()))
-        })?;
-        write_atomic_file(&receipt_path, &receipt_json)
-            .await
-            .map_err(UploadTransitionError::Storage)?;
-
-        // Clean staging meta and hash files
-        let _ = tokio::fs::remove_file(&meta_path).await;
-        let hash_path = self.session_hash_path(&prepared.session.uuid, meta.hash_generation);
-        let _ = tokio::fs::remove_file(&hash_path).await;
-
-        Ok(FinalizeOutcome::Published(BlobMeta {
-            size: prepared.size,
-        }))
+        match outcome {
+            CommitOutcome::Published(size) => Ok(FinalizeOutcome::Published(BlobMeta { size })),
+            CommitOutcome::AlreadyFinalized(size) => {
+                Ok(FinalizeOutcome::AlreadyFinalized(BlobMeta { size }))
+            }
+            CommitOutcome::NotFound => Err(UploadTransitionError::NotFound),
+            CommitOutcome::Invalid => Err(UploadTransitionError::InvalidPreparedHandle),
+            CommitOutcome::Corrupt(msg) => Err(UploadTransitionError::Storage(
+                StorageError::corrupt_data(msg),
+            )),
+        }
     }
 
     async fn abort_session(&self, session: &UploadSessionId) -> Result<(), StorageError> {
-        let lock_path = self.session_lock_path(&session.uuid);
-        let _lock = acquire_fs_session_lock(lock_path.clone()).await?;
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let uuid = session.uuid.clone();
 
-        let data_path = self.session_data_path(&session.uuid);
-        let meta_path = self.session_meta_path(&session.uuid);
+        let lock_name = session_lock_name(&uuid).map_err(map_fs_mutate_err)?;
+        let guard = uploads.lock(&lock_name).await.map_err(map_fs_mutate_err)?;
 
-        let _ = tokio::fs::remove_file(&data_path).await;
-        let _ = tokio::fs::remove_file(&meta_path).await;
-
-        // Best effort clean any hash gen files
-        for generation in 0..100 {
-            let hash_path = self.session_hash_path(&session.uuid, generation);
-            if tokio::fs::remove_file(&hash_path).await.is_err() && generation > 10 {
-                break;
-            }
-        }
-        let _ = tokio::fs::remove_file(&lock_path).await;
+        uploads
+            .run_locked(guard, move |dir, _g| abort_session_locked(&dir, &uuid))
+            .await
+            .map_err(map_fs_mutate_err)?;
 
         Ok(())
     }
@@ -2532,100 +3718,72 @@ impl UploadSessionStorage for FsStorage {
         &self,
         session: &UploadSessionId,
     ) -> Result<UploadSessionStatus, UploadTransitionError> {
-        let lock_path = self.session_lock_path(&session.uuid);
-        let _lock = acquire_fs_session_lock(lock_path).await?;
+        let repo = session.repo.clone();
+        let uuid = session.uuid.clone();
+        let se = |e: FsMutateError| UploadTransitionError::Storage(map_fs_mutate_err(e));
+        let uploads = self.upload_authorities.uploads().await.map_err(se)?;
+        // Pre-initialize the shared sibling authorities in the async context; the body
+        // then operates on the same cached descriptors under the held lock.
+        let finalized = self
+            .upload_authorities
+            .finalized()
+            .await
+            .map_err(se)?
+            .blocking();
+        let blobs = self
+            .upload_authorities
+            .blobs()
+            .await
+            .map_err(se)?
+            .blocking();
+        let memberships = self
+            .upload_authorities
+            .memberships()
+            .await
+            .map_err(se)?
+            .blocking();
 
-        let meta_path = self.session_meta_path(&session.uuid);
-        let meta_bytes = match tokio::fs::read(&meta_path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Check if already finalized
-                if let Some(receipt) = self
-                    .get_finalized_receipt(session)
-                    .await
-                    .map_err(UploadTransitionError::Storage)?
-                {
-                    return Ok(UploadSessionStatus {
-                        session: session.clone(),
-                        state: UploadSessionState::Finalizing,
-                        committed_offset: receipt.size,
-                        created_at: UNIX_EPOCH
-                            + Duration::from_secs(receipt.finalized_at_unix_secs),
-                        last_active_at: UNIX_EPOCH
-                            + Duration::from_secs(receipt.finalized_at_unix_secs),
-                    });
-                }
-                return Err(UploadTransitionError::NotFound);
-            }
-            Err(err) => {
-                return Err(UploadTransitionError::Storage(StorageError::io(
-                    err.to_string(),
+        let lock_name = session_lock_name(&uuid).map_err(se)?;
+        let guard = uploads.lock(&lock_name).await.map_err(se)?;
+
+        let outcome = uploads
+            .run_locked(guard, move |dir, _g| {
+                recover_session_locked(&dir, &finalized, &blobs, &memberships, &repo, &uuid)
+            })
+            .await
+            .map_err(se)?;
+
+        let (state, committed_offset, created, last_active) = match outcome {
+            RecoverLocked::RolledForward {
+                committed_offset,
+                created,
+                last_active,
+            } => (
+                UploadSessionState::Finalizing,
+                committed_offset,
+                created,
+                last_active,
+            ),
+            RecoverLocked::Pending {
+                state,
+                committed_offset,
+                created,
+                last_active,
+            } => (state, committed_offset, created, last_active),
+            RecoverLocked::NotFound => return Err(UploadTransitionError::NotFound),
+            RecoverLocked::Corrupt(msg) => {
+                return Err(UploadTransitionError::Storage(StorageError::corrupt_data(
+                    msg,
                 )));
             }
         };
 
-        let meta: FsSessionMetaRecord = serde_json::from_slice(&meta_bytes).map_err(|e| {
-            UploadTransitionError::Storage(StorageError::corrupt_data(e.to_string()))
-        })?;
-
-        if meta.state == UploadSessionState::Finalizing {
-            if let Some(ref fin_info) = meta.finalizing_info
-                && let Ok(digest) = Digest::parse(&fin_info.expected_digest)
-            {
-                let dest_path = self.blob_path(&digest);
-                if let Ok(cas_meta) = tokio::fs::metadata(&dest_path).await
-                    && cas_meta.len() == fin_info.size
-                {
-                    let membership =
-                        crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
-                            session.repo.clone(),
-                            digest.clone(),
-                            Some(session.uuid.clone()),
-                        );
-                    let _ = self.link_repo_blob(&membership).await;
-
-                    let receipt_path = self.finalized_receipt_path(&session.uuid);
-                    let receipt = FinalizedReceipt {
-                        repo: session.repo.clone(),
-                        uuid: session.uuid.clone(),
-                        digest: fin_info.expected_digest.clone(),
-                        size: fin_info.size,
-                        finalized_at_unix_secs: fin_info.finalizing_at_unix_secs,
-                        format_version: 1,
-                    };
-                    let _ =
-                        write_atomic_file(&receipt_path, &serde_json::to_vec(&receipt).unwrap())
-                            .await;
-                    return Ok(UploadSessionStatus {
-                        session: session.clone(),
-                        state: UploadSessionState::Finalizing,
-                        committed_offset: fin_info.size,
-                        created_at: UNIX_EPOCH + Duration::from_secs(meta.created_at_unix_secs),
-                        last_active_at: UNIX_EPOCH
-                            + Duration::from_secs(fin_info.finalizing_at_unix_secs),
-                    });
-                }
-            }
-        } else {
-            let data_path = self.session_data_path(&session.uuid);
-            if let Ok(file_meta) = tokio::fs::metadata(&data_path).await
-                && file_meta.len() > meta.committed_offset
-                && let Ok(f) = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&data_path)
-                    .await
-            {
-                let _ = f.set_len(meta.committed_offset).await;
-                let _ = f.sync_data().await;
-            }
-        }
-
         Ok(UploadSessionStatus {
             session: session.clone(),
-            state: meta.state,
-            committed_offset: meta.committed_offset,
-            created_at: UNIX_EPOCH + Duration::from_secs(meta.created_at_unix_secs),
-            last_active_at: UNIX_EPOCH + Duration::from_secs(meta.last_active_at_unix_secs),
+            state,
+            committed_offset,
+            created_at: UNIX_EPOCH + Duration::from_secs(created),
+            last_active_at: UNIX_EPOCH + Duration::from_secs(last_active),
         })
     }
 
@@ -2633,7 +3791,42 @@ impl UploadSessionStorage for FsStorage {
         &self,
         session: &UploadSessionId,
     ) -> Result<Option<FinalizedReceipt>, StorageError> {
-        upload_quarantine_read::get_finalized_receipt_impl(self.reader.as_ref(), session).await
+        // Route the public lookup through the SAME pinned finalized authority the
+        // writers (`commit_finalize`, recovery roll-forward) publish through, rather
+        // than re-resolving `uploads/.finalized` from the pinned root on each call.
+        // This keeps reader and writer in agreement after a `.finalized` (or
+        // `uploads`) pathname replacement. Repository/UUID validation, missing-file
+        // behavior, and corrupt/error semantics are preserved.
+        tag_read::validate_path_component(&session.uuid, "upload session id")?;
+        let finalized = self
+            .upload_authorities
+            .finalized()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let name = match finalized_receipt_name(&session.uuid) {
+            Ok(n) => n,
+            // A uuid that passed component validation but is not a single contained
+            // leaf name has no receipt for THIS session.
+            Err(_) => return Ok(None),
+        };
+        let bytes = match finalized
+            .read_leaf(&name, FINALIZED_RECEIPT_READ_LIMIT)
+            .await
+        {
+            Ok(b) => b,
+            Err(FsMutateError::NotFound) => return Ok(None),
+            Err(FsMutateError::InvalidName { .. }) => return Ok(None),
+            Err(e) => return Err(map_fs_mutate_err(e)),
+        };
+        let receipt: FinalizedReceipt = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageError::corrupt_data(e.to_string()))?;
+        // Preserved identity semantics: a receipt for another repository/session is
+        // "no receipt for THIS session", never an accepted foreign receipt.
+        if receipt.repo == session.repo && receipt.uuid == session.uuid {
+            Ok(Some(receipt))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn reap_expired_sessions(
@@ -2641,79 +3834,237 @@ impl UploadSessionStorage for FsStorage {
         max_age_secs: u64,
         receipt_ttl_secs: u64,
     ) -> Result<usize, StorageError> {
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut count = 0;
+        let now = now_unix_secs();
+        let mut count = 0usize;
 
-        // DEFERRED CONTAINMENT (see the quarantine/upload inspection record and
-        // the post-batch gap assessment): the reaper's inspection reads are NOT
-        // routed through the pinned reader. Inspection and the destructive
-        // actions it authorizes (session lock, `recover_session`,
-        // `abort_session` meta/data unlink, receipt `remove_file`) must resolve
-        // through one and the same tree. Routing inspection through the pinned
-        // reader while these mutations resolve fresh ambient pathnames lets a
-        // detached original tree's expiry drive deletion of a same-UUID
-        // REPLACEMENT record in the current tree (regression:
-        // `upload_quarantine_read::tests::real_fs_tests::
-        // test_real_reaper_root_replacement_acts_only_on_current_tree`). Binding
-        // inspection to the mutations requires write-side containment (O-04),
-        // out of this batch's scope, so this body stays on its pre-batch
-        // internally-coherent ambient implementation: it reads AND acts through
-        // the same ambient pathnames. The returned count tallies cleanup
-        // ATTEMPTS (recovery/abort and receipt-unlink results are intentionally
-        // ignored), not confirmed successes.
+        let uploads = self
+            .upload_authorities
+            .uploads()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let finalized = self
+            .upload_authorities
+            .finalized()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let blobs = self
+            .upload_authorities
+            .blobs()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let memberships = self
+            .upload_authorities
+            .memberships()
+            .await
+            .map_err(map_fs_mutate_err)?;
 
-        // 1. Scan sessions in uploads_dir
-        let uploads_dir = self.uploads_dir();
-        if let Ok(mut entries) = tokio::fs::read_dir(&uploads_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.ends_with(".meta.json") {
-                    let uuid = file_name.trim_end_matches(".meta.json");
-                    let lock_path = self.session_lock_path(uuid);
-                    let lock_opt = match try_acquire_fs_session_lock(lock_path).await {
-                        Ok(Some(g)) => Some(g),
-                        _ => None,
+        #[cfg(test)]
+        let boundary_hook = self.reaper_boundary_hook.0.lock().unwrap().clone();
+        #[cfg(test)]
+        let receipt_boundary_hook = self.reaper_receipt_boundary_hook.0.lock().unwrap().clone();
+
+        // Sessions: enumerate `{uuid}.meta.json` under the pinned uploads authority.
+        // Each candidate's fresh inspection, expiry decision, revalidation, and
+        // destructive action run inside ONE `run_locked` body under a single
+        // continuously-held `.lock.{uuid}` — the lock is acquired once via `try_lock`
+        // and never dropped-and-reacquired, so no cooperating update can slip between
+        // the locked check and the action. Inspection and every destructive action
+        // resolve through the SAME pinned subtree, so a detached original tree's
+        // expiry can never drive deletion of a same-UUID replacement in a fresh tree.
+        // `count` tallies only CONFIRMED cleanups; busy / not-expired / absent /
+        // corrupt / changed candidates are distinguished from failures, per-candidate
+        // failures are logged and skipped, and a fatal listing failure is surfaced.
+        let session_entries = uploads
+            .list(storage_fs::DirEnumerationLimits::new(
+                1_048_576,
+                256 * 1024 * 1024,
+            ))
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for entry in session_entries {
+            let file_name = entry.name().to_string_lossy().into_owned();
+            let Some(uuid) = file_name.strip_suffix(".meta.json") else {
+                continue;
+            };
+            let uuid = uuid.to_string();
+
+            let Ok(lock_name) = session_lock_name(&uuid) else {
+                continue;
+            };
+
+            // Acquire the session lock ONCE and hold it across inspection, expiry
+            // decision, revalidation, and action. A live participant holding the lock
+            // (Busy / None) means the session is not ours to reap.
+            let guard = match uploads.try_lock(&lock_name).await {
+                Ok(Some(g)) => g,
+                Ok(None) | Err(FsMutateError::Busy) => continue,
+                Err(err) => {
+                    tracing::warn!(uuid = %uuid, error = %err, "reaper: session lock probe failed");
+                    continue;
+                }
+            };
+
+            let finalized_view = finalized.blocking();
+            let blobs_view = blobs.blocking();
+            let memberships_view = memberships.blocking();
+            let uuid_body = uuid.clone();
+            #[cfg(test)]
+            let hook = boundary_hook.clone();
+
+            let outcome = uploads
+                .run_locked(guard, move |dir, _g| {
+                    let uuid = uuid_body;
+                    // Fresh meta read UNDER the lock — never a stale pre-lock decision.
+                    let meta = match read_session_meta_sync(&dir, &uuid)? {
+                        SessionMetaOutcome::Present(m) => m,
+                        SessionMetaOutcome::Corrupt(msg) => {
+                            return Ok(ReapOutcome::Corrupt(msg));
+                        }
+                        SessionMetaOutcome::Absent => return Ok(ReapOutcome::Absent),
                     };
-                    if let Some(_guard) = lock_opt
-                        && let Ok(bytes) = tokio::fs::read(entry.path()).await
-                        && let Ok(meta) = serde_json::from_slice::<FsSessionMetaRecord>(&bytes)
-                        && now.saturating_sub(meta.last_active_at_unix_secs) >= max_age_secs
-                    {
-                        let session = UploadSessionId::new(meta.repo.clone(), uuid);
-                        drop(_guard);
-                        if meta.state == UploadSessionState::Finalizing {
-                            let _ = self.recover_session(&session).await;
-                            count += 1;
-                        } else if meta.state == UploadSessionState::Appending {
-                            let _ = self.recover_session(&session).await;
-                            let _ = self.abort_session(&session).await;
-                            count += 1;
-                        } else {
-                            let _ = self.abort_session(&session).await;
-                            count += 1;
+                    // Expiry decided against the freshly-read `last_active`.
+                    if now.saturating_sub(meta.last_active_at_unix_secs) < max_age_secs {
+                        return Ok(ReapOutcome::NotExpired);
+                    }
+
+                    // Boundary between the confirmed expiry decision and the
+                    // destructive action. The lock is still held here; a cooperating
+                    // update cannot proceed until this closure returns.
+                    #[cfg(test)]
+                    if let Some(hook) = &hook {
+                        hook(&uuid);
+                    }
+
+                    match meta.state {
+                        UploadSessionState::Finalizing => {
+                            // Baseline policy: attempt recovery for an expired
+                            // Finalizing session, but NEVER abort it. Containment did
+                            // not authorize a new destructive expiry policy.
+                            //   * A fully-published CAS blob rolls forward (a completed
+                            //     finalization) and counts as a cleanup.
+                            //   * A not-yet-published finalization stays intact and
+                            //     available for later completion/recovery; it is not
+                            //     counted and its staging data + meta survive.
+                            //   * A corrupt/failed recovery is diagnosed and must not
+                            //     authorize deletion.
+                            match recover_session_locked(
+                                &dir,
+                                &finalized_view,
+                                &blobs_view,
+                                &memberships_view,
+                                &meta.repo,
+                                &uuid,
+                            )? {
+                                RecoverLocked::RolledForward { .. } => Ok(ReapOutcome::CleanedUp),
+                                RecoverLocked::Pending { .. } => {
+                                    Ok(ReapOutcome::PendingFinalization)
+                                }
+                                RecoverLocked::Corrupt(msg) => Ok(ReapOutcome::Corrupt(msg)),
+                                RecoverLocked::NotFound => Ok(ReapOutcome::Absent),
+                            }
+                        }
+                        // Any other expired state (Appending, …) is aborted directly.
+                        // Abort removes the staging data regardless of a torn tail, so
+                        // a preceding recovery would be redundant; the state machine
+                        // for an expired non-finalizing session is simply "abort".
+                        _ => {
+                            abort_session_locked(&dir, &uuid)?;
+                            Ok(ReapOutcome::CleanedUp)
                         }
                     }
+                })
+                .await;
+
+            match outcome {
+                Ok(ReapOutcome::CleanedUp) => count += 1,
+                Ok(ReapOutcome::PendingFinalization) => {
+                    tracing::debug!(
+                        uuid = %uuid,
+                        "reaper: expired finalizing session left intact for later completion"
+                    );
+                }
+                Ok(ReapOutcome::Corrupt(msg)) => {
+                    tracing::warn!(uuid = %uuid, detail = %msg, "reaper: skipped corrupt session meta");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(uuid = %uuid, error = %err, "reaper: session cleanup failed");
                 }
             }
         }
 
-        // 2. Scan finalized receipts
-        let finalized_dir = self.finalized_dir();
-        if let Ok(mut entries) = tokio::fs::read_dir(&finalized_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.ends_with(".json")
-                    && let Ok(receipt_bytes) = tokio::fs::read(entry.path()).await
-                    && let Ok(receipt) = serde_json::from_slice::<FinalizedReceipt>(&receipt_bytes)
-                {
-                    let age = now.saturating_sub(receipt.finalized_at_unix_secs);
-                    if age >= receipt_ttl_secs {
-                        let _ = tokio::fs::remove_file(entry.path()).await;
-                        count += 1;
+        // Receipts: enumerate `{uuid}.json` under the pinned finalized authority.
+        // Each receipt is unlinked only under the matching `.lock.{uuid}` session
+        // lock, re-reading it under the lock so a concurrently (re)published or
+        // identity-changed receipt, or a fresh same-UUID session, is respected.
+        let receipt_entries = finalized
+            .list(storage_fs::DirEnumerationLimits::new(
+                1_048_576,
+                256 * 1024 * 1024,
+            ))
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for entry in receipt_entries {
+            let file_name = entry.name().to_string_lossy().into_owned();
+            let Some(uuid) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            let uuid = uuid.to_string();
+
+            let Ok(lock_name) = session_lock_name(&uuid) else {
+                continue;
+            };
+
+            // Hold the session lock across the receipt re-read, TTL decision, and
+            // unlink. A busy lock means a live same-UUID session owns it — leave its
+            // receipt in place.
+            let guard = match uploads.try_lock(&lock_name).await {
+                Ok(Some(g)) => g,
+                Ok(None) | Err(FsMutateError::Busy) => continue,
+                Err(err) => {
+                    tracing::warn!(uuid = %uuid, error = %err, "reaper: receipt lock probe failed");
+                    continue;
+                }
+            };
+
+            let finalized_view = finalized.blocking();
+            let uuid_body = uuid.clone();
+            #[cfg(test)]
+            let hook = receipt_boundary_hook.clone();
+            let outcome = uploads
+                .run_locked(guard, move |_dir, _g| {
+                    let uuid = uuid_body;
+                    // Boundary under the held lock, before the receipt re-read. A
+                    // regression may mutate the on-disk receipt here (delete /
+                    // republish fresh / change identity) to prove the reaper acts on
+                    // the CURRENT under-lock state, not a stale listing-time snapshot.
+                    #[cfg(test)]
+                    if let Some(hook) = &hook {
+                        hook(&uuid);
                     }
+                    // Re-read the CURRENT receipt under the lock.
+                    let Some(receipt) = read_receipt_sync(&finalized_view, &uuid)? else {
+                        return Ok(ReapOutcome::Absent);
+                    };
+                    // Identity revalidation: a receipt whose stored uuid no longer
+                    // matches the leaf name has been replaced; do not delete it.
+                    if receipt.uuid != uuid {
+                        return Ok(ReapOutcome::Changed);
+                    }
+                    if now.saturating_sub(receipt.finalized_at_unix_secs) < receipt_ttl_secs {
+                        return Ok(ReapOutcome::NotExpired);
+                    }
+                    let name = finalized_receipt_name(&uuid)?;
+                    finalized_view.unlink(&name, true)?;
+                    Ok(ReapOutcome::CleanedUp)
+                })
+                .await;
+
+            match outcome {
+                Ok(ReapOutcome::CleanedUp) => count += 1,
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(uuid = %uuid, error = %err, "reaper: receipt cleanup failed");
                 }
             }
         }
@@ -2737,12 +4088,38 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         &self,
         record: &crate::storage::repo_membership::RepoBlobMembershipRecord,
     ) -> Result<(), StorageError> {
-        let dir = self.repo_blobs_dir(&record.repo, record.digest.algorithm());
-        ensure_dir(&dir)?;
-        let path = self.repo_blob_path(&record.repo, &record.digest);
+        // Route the durable membership write through the pinned memberships authority,
+        // mirroring `canonical_repo_membership_relpath`
+        // (`repo-memberships/by-repo/{key}/{algo}/{hex}.json`). The candidate
+        // transitions and `unlink_repo_blob` resolve the same layout through the
+        // non-creating `membership_record_authority`; reads resolve independently
+        // through the contained reader seam.
+        let memberships = self
+            .upload_authorities
+            .memberships()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let key = crate::storage::repo_membership::encode_canonical_repo_key(&record.repo);
+        let by_repo = memberships
+            .ensure_subdir(&FileName::new("by-repo").map_err(map_fs_mutate_err)?)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let repo_dir = by_repo
+            .ensure_subdir(&FileName::new(key).map_err(map_fs_mutate_err)?)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let algo_dir = repo_dir
+            .ensure_subdir(&FileName::new(record.digest.algorithm()).map_err(map_fs_mutate_err)?)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let leaf =
+            FileName::new(format!("{}.json", record.digest.hex())).map_err(map_fs_mutate_err)?;
         let bytes = serde_json::to_vec(record)
             .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
-        write_atomic_file(&path, &bytes).await?;
+        algo_dir
+            .write_leaf_atomic(&leaf, bytes, true)
+            .await
+            .map_err(map_fs_mutate_err)?;
         Ok(())
     }
 
@@ -2752,27 +4129,18 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         digest: &Digest,
         since_unix_secs: u64,
     ) -> Result<bool, StorageError> {
+        // ONE contained membership authority (resolved non-creating beneath the
+        // pinned memberships root) retained across the inspect/rewrite
+        // transition; absent components preserve the Ok(false) contract with
+        // zero directory creation. No lock exists on candidate transitions —
+        // unchanged; no cross-process serialization is claimed.
         let canonical = CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let path = self.repo_blob_path(&canonical, digest);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        let mut record = serde_json::from_slice::<
-            crate::storage::repo_membership::RepoBlobMembershipRecord,
-        >(&bytes)
-        .map_err(|e| StorageError::corrupt_data(format!("corrupt membership record: {e}")))?;
-        if record.state == crate::storage::repo_membership::MembershipState::Candidate {
+        let Some(dir) = self.membership_record_authority(&canonical, digest).await? else {
             return Ok(false);
-        }
-        record.state = crate::storage::repo_membership::MembershipState::Candidate;
-        record.unreferenced_since_unix_secs = Some(since_unix_secs);
-        let updated_bytes = serde_json::to_vec(&record)
-            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
-        write_atomic_file(&path, &updated_bytes).await?;
-        Ok(true)
+        };
+        let leaf = Self::membership_leaf_name(digest)?;
+        Self::set_membership_candidate_in(&dir, &leaf, since_unix_secs).await
     }
 
     async fn clear_membership_candidate(
@@ -2780,39 +4148,34 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
+        // Same retained single-authority shape as `set_membership_candidate`.
         let canonical = CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let path = self.repo_blob_path(&canonical, digest);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(StorageError::io(err.to_string())),
-        };
-        let mut record = serde_json::from_slice::<
-            crate::storage::repo_membership::RepoBlobMembershipRecord,
-        >(&bytes)
-        .map_err(|e| StorageError::corrupt_data(format!("corrupt membership record: {e}")))?;
-        if record.state == crate::storage::repo_membership::MembershipState::Active
-            && record.unreferenced_since_unix_secs.is_none()
-        {
+        let Some(dir) = self.membership_record_authority(&canonical, digest).await? else {
             return Ok(false);
-        }
-        record.state = crate::storage::repo_membership::MembershipState::Active;
-        record.unreferenced_since_unix_secs = None;
-        let updated_bytes = serde_json::to_vec(&record)
-            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
-        write_atomic_file(&path, &updated_bytes).await?;
-        Ok(true)
+        };
+        let leaf = Self::membership_leaf_name(digest)?;
+        Self::clear_membership_candidate_in(&dir, &leaf).await
     }
 
     async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
+        // Single contained unlink through the non-creating membership
+        // authority; absent components or leaf preserve the Ok(false) contract.
         let canonical = CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let path = self.repo_blob_path(&canonical, digest);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(StorageError::io(err.to_string())),
+        let Some(dir) = self.membership_record_authority(&canonical, digest).await? else {
+            return Ok(false);
+        };
+        let leaf = Self::membership_leaf_name(digest)?;
+        match dir.unlink(&leaf, false).await {
+            Ok(()) => {
+                // Best-effort directory-entry durability (result ignored), as
+                // with the other contained deletes; no observable change.
+                let _ = dir.sync().await;
+                Ok(true)
+            }
+            Err(FsMutateError::NotFound) => Ok(false),
+            Err(err) => Err(map_fs_mutate_err(err)),
         }
     }
 
@@ -2939,27 +4302,152 @@ impl RepositoryBlobMembershipStorage for FsStorage {
     }
 }
 
+/// Resolve a sharded GC leaf directory (`<base>/<segments...>`) beneath a
+/// pinned fixed top-level authority. `create = false` opens without creating
+/// (`Ok(None)` when any component is absent, preserving absent-state
+/// contracts with zero directory creation); `create = true` ensures the shard
+/// directories. Fresh resolution per operation; never cached.
+async fn gc_shard_authority(
+    base: &ContainedDir,
+    segments: &[&str],
+    create: bool,
+) -> Result<Option<ContainedDir>, StorageError> {
+    let mut dir = base.clone();
+    for segment in segments {
+        let name = FileName::new(*segment).map_err(map_fs_mutate_err)?;
+        dir = if create {
+            dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?
+        } else {
+            match dir.open_subdir(&name).await {
+                Ok(d) => d,
+                Err(FsMutateError::NotFound) => return Ok(None),
+                Err(err) => return Err(map_fs_mutate_err(err)),
+            }
+        };
+    }
+    Ok(Some(dir))
+}
+
 impl FsStorage {
+    /// Contained shard authority for `blobs/<algo>/<prefix2>` (CAS side of the
+    /// quarantine protocol).
+    async fn cas_blobs_shard(
+        &self,
+        digest: &Digest,
+        create: bool,
+    ) -> Result<Option<ContainedDir>, StorageError> {
+        let blobs = self
+            .upload_authorities
+            .blobs()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        gc_shard_authority(&blobs, &[digest.algorithm(), digest.prefix2()], create).await
+    }
+
+    /// Contained shard authority for `quarantine/blobs/<algo>/<prefix2>`.
+    async fn quarantine_blobs_shard(
+        &self,
+        digest: &Digest,
+        create: bool,
+    ) -> Result<Option<ContainedDir>, StorageError> {
+        let quarantine = self
+            .upload_authorities
+            .quarantine()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        gc_shard_authority(
+            &quarantine,
+            &["blobs", digest.algorithm(), digest.prefix2()],
+            create,
+        )
+        .await
+    }
+
+    /// Contained shard authority for `quarantine/meta/<algo>/<prefix2>`.
+    async fn quarantine_meta_shard(
+        &self,
+        digest: &Digest,
+        create: bool,
+    ) -> Result<Option<ContainedDir>, StorageError> {
+        let quarantine = self
+            .upload_authorities
+            .quarantine()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        gc_shard_authority(
+            &quarantine,
+            &["meta", digest.algorithm(), digest.prefix2()],
+            create,
+        )
+        .await
+    }
+
+    fn quarantine_ts_leaf(digest: &Digest) -> Result<FileName, StorageError> {
+        FileName::new(format!("{}.ts", digest.hex())).map_err(map_fs_mutate_err)
+    }
+
+    fn blob_leaf(digest: &Digest) -> Result<FileName, StorageError> {
+        FileName::new(digest.hex()).map_err(map_fs_mutate_err)
+    }
+
+    /// Inner conditional-delete sequence on an ALREADY-RESOLVED quarantine
+    /// shard authority: open the leaf through that authority, recompute the
+    /// version on the OPENED descriptor (fstat + streaming hash — revalidation
+    /// refers to exactly the inode the unlink targets), compare, and unlink
+    /// through the SAME authority. A namespace replacement after resolution
+    /// cannot split the object that is revalidated from the leaf that is
+    /// unlinked, and a symlinked leaf fails closed instead of being followed.
+    /// This seam is also exercised directly by the same-authority replacement
+    /// regression. Timestamp cleanup is handled by the caller.
+    async fn delete_blob_conditional_in(
+        shard: &ContainedDir,
+        leaf: &FileName,
+        expected_version: &BlobObjectVersion,
+    ) -> Result<GcDeleteResult, StorageError> {
+        let handle = match shard.open_leaf_read(leaf).await {
+            Ok(h) => h,
+            Err(FsMutateError::NotFound) => return Ok(GcDeleteResult::NotFound),
+            Err(err) => return Err(map_fs_mutate_err(err)),
+        };
+
+        let current_version = tokio::task::spawn_blocking(move || {
+            let mut file = handle.into_file();
+            compute_blob_version_from_file(&mut file)
+        })
+        .await
+        .map_err(map_blocking_join_error)??;
+        if &current_version != expected_version {
+            return Ok(GcDeleteResult::PreconditionFailed {
+                current_version: Some(current_version),
+            });
+        }
+
+        match shard.unlink(leaf, false).await {
+            Ok(()) => Ok(GcDeleteResult::Deleted),
+            Err(FsMutateError::NotFound) => Ok(GcDeleteResult::NotFound),
+            Err(err) => Err(map_fs_mutate_err(err)),
+        }
+    }
+
     pub async fn write_quarantine_timestamp(
         &self,
         digest: &Digest,
         timestamp: SystemTime,
     ) -> Result<(), StorageError> {
-        let ts_dir = self
-            .root
-            .join("quarantine")
-            .join("meta")
-            .join(digest.algorithm())
-            .join(digest.prefix2());
-        tokio::fs::create_dir_all(&ts_dir)
-            .await
-            .map_err(|e| StorageError::io(format!("mkdir {}: {e}", ts_dir.display())))?;
-        let ts_path = ts_dir.join(format!("{}.ts", digest.hex()));
+        // Contained: ensure `quarantine/meta/<algo>/<p2>` beneath the pinned
+        // quarantine authority (was: ambient create_dir_all + write_atomic_file).
+        let meta = self
+            .quarantine_meta_shard(digest, true)
+            .await?
+            .expect("ensure-mode shard resolution always yields an authority");
+        let leaf = Self::quarantine_ts_leaf(digest)?;
         let secs = timestamp
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        write_atomic_file(&ts_path, format!("{secs}\n").as_bytes()).await?;
+        meta.write_leaf_atomic(&leaf, format!("{secs}\n").into_bytes(), true)
+            .await
+            .map_err(map_fs_mutate_err)?;
         Ok(())
     }
 
@@ -2971,18 +4459,24 @@ impl FsStorage {
     }
 
     pub async fn remove_quarantine_timestamp(&self, digest: &Digest) -> Result<(), StorageError> {
-        let ts_path = self
-            .root
-            .join("quarantine")
-            .join("meta")
-            .join(digest.algorithm())
-            .join(digest.prefix2())
-            .join(format!("{}.ts", digest.hex()));
-        let _ = tokio::fs::remove_file(&ts_path).await;
+        // Best-effort (result fully ignored, as before: the ambient path did
+        // `let _ = remove_file(..)` and always returned Ok). Resolution is
+        // contained and non-creating; on any resolution failure (including a
+        // fail-closed symlink rejection) nothing is removed and Ok is returned.
+        if let Ok(Some(meta)) = self.quarantine_meta_shard(digest, false).await
+            && let Ok(leaf) = Self::quarantine_ts_leaf(digest)
+        {
+            let _ = meta.unlink(&leaf, true).await;
+        }
         Ok(())
     }
 }
 
+/// Reference implementation of the conditional-delete version token from an
+/// ambient path (metadata + streaming SHA-256). Retained ONLY for byte-identity
+/// equivalence tests against the contained implementations; production paths
+/// compute versions through contained authorities.
+#[cfg(test)]
 pub(crate) async fn compute_fs_blob_version(
     path: &Path,
 ) -> Result<BlobObjectVersion, StorageError> {
@@ -3002,6 +4496,40 @@ pub(crate) async fn compute_fs_blob_version(
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf).await.map_err(map_fs_io_err)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hex::encode(hasher.finalize());
+    Ok(BlobObjectVersion(format!("fs:{len}:{mtime}:{hash}")))
+}
+
+/// Compute the conditional-delete version token from an ALREADY-OPENED
+/// contained leaf descriptor: `fstat` (length + mtime) and a streaming
+/// SHA-256 read on the SAME fd, so revalidation refers to exactly the inode
+/// the retained authority will unlink. Token bytes are identical to the
+/// contained read seam and the legacy ambient helper:
+/// `fs:{len}:{mtime_nanos}:{sha256hex}` (pre-epoch or unavailable mtime maps
+/// to 0). Blocking I/O — call from `spawn_blocking`.
+fn compute_blob_version_from_file(
+    file: &mut std::fs::File,
+) -> Result<BlobObjectVersion, StorageError> {
+    use std::io::Read as _;
+    let meta = file.metadata().map_err(map_fs_io_err)?;
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .map(|t| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        })
+        .unwrap_or(0);
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(map_fs_io_err)?;
         if n == 0 {
             break;
         }
@@ -3039,50 +4567,40 @@ impl GcStorage for FsStorage {
             ));
         }
 
-        let src = self
-            .root
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2())
-            .join(digest.hex());
-
-        let meta = match tokio::fs::metadata(&src).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(GcQuarantineResult::Skipped);
-            }
-            Err(e) => {
-                return Err(StorageError::io(format!("metadata {}: {e}", src.display())));
-            }
+        // Contained CAS shard (non-creating: an absent shard means an absent
+        // blob -> Skipped, exactly the prior ambient NotFound contract).
+        let Some(src) = self.cas_blobs_shard(digest, false).await? else {
+            return Ok(GcQuarantineResult::Skipped);
+        };
+        let leaf = Self::blob_leaf(digest)?;
+        let size = match src.inspect(&leaf).await {
+            Ok(Some(identity)) => identity.size,
+            Ok(None) => return Ok(GcQuarantineResult::Skipped),
+            Err(err) => return Err(map_fs_mutate_err(err)),
         };
 
-        let dest_dir = self
-            .root
-            .join("quarantine")
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2());
-        tokio::fs::create_dir_all(&dest_dir)
-            .await
-            .map_err(|e| StorageError::io(format!("mkdir {}: {e}", dest_dir.display())))?;
-
-        let dest = dest_dir.join(digest.hex());
-        if tokio::fs::metadata(&dest).await.is_ok() {
-            return Ok(GcQuarantineResult::Skipped);
+        // Contained quarantine destination shard (created if missing, as the
+        // prior create_dir_all did).
+        let dest = self
+            .quarantine_blobs_shard(digest, true)
+            .await?
+            .expect("ensure-mode shard resolution always yields an authority");
+        match dest.inspect(&leaf).await {
+            Ok(Some(_)) => return Ok(GcQuarantineResult::Skipped),
+            Ok(None) => {}
+            Err(err) => return Err(map_fs_mutate_err(err)),
         }
 
-        match tokio::fs::rename(&src, &dest).await {
+        // Contained cross-authority rename (renameat between the two pinned
+        // shard fds; no ambient path reconstruction).
+        match src.rename_leaf(&leaf, &dest, &leaf).await {
             Ok(()) => {
                 let now = SystemTime::now();
                 self.write_quarantine_timestamp(digest, now).await?;
-                Ok(GcQuarantineResult::Quarantined { size: meta.len() })
+                Ok(GcQuarantineResult::Quarantined { size })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GcQuarantineResult::Skipped),
-            Err(e) => Err(StorageError::io(format!(
-                "rename {} -> {}: {e}",
-                src.display(),
-                dest.display()
-            ))),
+            Err(FsMutateError::NotFound) => Ok(GcQuarantineResult::Skipped),
+            Err(err) => Err(map_fs_mutate_err(err)),
         }
     }
 
@@ -3097,49 +4615,39 @@ impl GcStorage for FsStorage {
             ));
         }
 
-        let src = self
-            .root
-            .join("quarantine")
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2())
-            .join(digest.hex());
-
-        let meta = match tokio::fs::metadata(&src).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(StorageError::io(format!("metadata {}: {e}", src.display())));
-            }
+        let Some(src) = self.quarantine_blobs_shard(digest, false).await? else {
+            return Ok(None);
+        };
+        let leaf = Self::blob_leaf(digest)?;
+        let size = match src.inspect(&leaf).await {
+            Ok(Some(identity)) => identity.size,
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(map_fs_mutate_err(err)),
         };
 
-        let dest_dir = self
-            .root
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2());
-        tokio::fs::create_dir_all(&dest_dir)
-            .await
-            .map_err(|e| StorageError::io(format!("mkdir {}: {e}", dest_dir.display())))?;
-        let dest = dest_dir.join(digest.hex());
-
-        if tokio::fs::metadata(&dest).await.is_ok() {
-            let _ = tokio::fs::remove_file(&src).await;
-            let _ = self.remove_quarantine_timestamp(digest).await;
-            return Ok(Some(meta.len()));
+        let dest = self
+            .cas_blobs_shard(digest, true)
+            .await?
+            .expect("ensure-mode shard resolution always yields an authority");
+        match dest.inspect(&leaf).await {
+            Ok(Some(_)) => {
+                // CAS copy already present: drop the quarantined duplicate and
+                // its timestamp best-effort, as before.
+                let _ = src.unlink(&leaf, true).await;
+                let _ = self.remove_quarantine_timestamp(digest).await;
+                return Ok(Some(size));
+            }
+            Ok(None) => {}
+            Err(err) => return Err(map_fs_mutate_err(err)),
         }
 
-        match tokio::fs::rename(&src, &dest).await {
+        match src.rename_leaf(&leaf, &dest, &leaf).await {
             Ok(()) => {
                 let _ = self.remove_quarantine_timestamp(digest).await;
-                Ok(Some(meta.len()))
+                Ok(Some(size))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(StorageError::io(format!(
-                "rename {} -> {}: {e}",
-                src.display(),
-                dest.display()
-            ))),
+            Err(FsMutateError::NotFound) => Ok(None),
+            Err(err) => Err(map_fs_mutate_err(err)),
         }
     }
 
@@ -3168,40 +4676,21 @@ impl GcStorage for FsStorage {
             ));
         };
 
-        let path = self
-            .root
-            .join("quarantine")
-            .join("blobs")
-            .join(digest.algorithm())
-            .join(digest.prefix2())
-            .join(digest.hex());
-
-        if tokio::fs::metadata(&path).await.is_err() {
+        // ONE retained contained quarantine shard authority across
+        // revalidation and unlink (see `delete_blob_conditional_in`).
+        let Some(shard) = self.quarantine_blobs_shard(digest, false).await? else {
             let _ = self.remove_quarantine_timestamp(digest).await;
             return Ok(GcDeleteResult::NotFound);
-        }
-
-        let current_version = compute_fs_blob_version(&path).await?;
-        if &current_version != expected_version {
-            return Ok(GcDeleteResult::PreconditionFailed {
-                current_version: Some(current_version),
-            });
-        }
-
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {
+        };
+        let leaf = Self::blob_leaf(digest)?;
+        let result = Self::delete_blob_conditional_in(&shard, &leaf, expected_version).await?;
+        match &result {
+            GcDeleteResult::Deleted | GcDeleteResult::NotFound => {
                 let _ = self.remove_quarantine_timestamp(digest).await;
-                Ok(GcDeleteResult::Deleted)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = self.remove_quarantine_timestamp(digest).await;
-                Ok(GcDeleteResult::NotFound)
-            }
-            Err(e) => Err(StorageError::io(format!(
-                "remove_file {}: {e}",
-                path.display()
-            ))),
+            GcDeleteResult::PreconditionFailed { .. } => {}
         }
+        Ok(result)
     }
 
     fn gc_strategy(&self) -> GcStorageStrategy {

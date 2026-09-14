@@ -39,11 +39,16 @@
 //! - Once acquired, a file descriptor refers to that opened object, but concurrent modification of its
 //!   contents can still affect reading.
 //! - Root pinning provides neither a namespace snapshot nor read/write coherence.
-//! - Mutating operations (`set_tag`, `delete_tag_conditional`, `put_manifest`) continue to resolve
-//!   ambient pathnames starting from `self.root`.
-//! - Pathname mutation divergence is a current residual limitation under the operational
-//!   namespace-stability assumption: if the root path is replaced concurrently, pinned reads continue
-//!   to resolve beneath the originally opened root, while pathname mutations operate on the replacement tree.
+//! - Tag mutations (`set_tag`, `mutate_tag`, `delete_tag`, `delete_tag_conditional`) resolve through
+//!   the same pinned `repos` authority as tag reads (O-04 write-containment cutover), so they observe
+//!   the same pinned root: a version token read from a tag drives a matching conditional delete on the
+//!   same leaf even across a whole-root rename/replace. Tag read and write are therefore coherent.
+//! - Other mutating operations (e.g. `put_manifest`) still resolve ambient pathnames starting from
+//!   `self.root`; their pathname-mutation divergence is a residual limitation addressed by separate
+//!   O-04 write-containment slices, not this tag slice.
+//! - Pathname mutation divergence (for the still-ambient operations above) means that, if the root
+//!   path is replaced concurrently, pinned reads continue to resolve beneath the originally opened
+//!   root while those pathname mutations operate on the replacement tree.
 //! - Read operations do not serialize with advisory locks (`.lock.{tag}`).
 //! - Payload reads do not provide snapshot isolation: concurrent writes or file truncation during stream
 //!   draining may return changed or partial bytes; detection is not guaranteed.
@@ -1448,8 +1453,17 @@ mod tests {
             assert!(matches!(err2, StorageError::InvalidRepoName(_)));
         }
 
+        // After the O-04 tag-mutation write-containment cutover, tag mutations
+        // resolve through the same pinned `repos` authority (rooted at the same
+        // pinned root fd) that the read seam uses. This test — formerly a
+        // divergence demonstration where the ambient write path saw a replaced
+        // root while the pinned reader did not — now proves read/write
+        // COHERENCE across a whole-root rename+recreate: both the reader and the
+        // contained conditional-delete observe the pinned OLD root, so a version
+        // token obtained from the read path drives a matching (Deleted)
+        // conditional delete on the very same leaf.
         #[tokio::test]
-        async fn test_seam_real_root_replacement_divergence_demonstrated() {
+        async fn test_seam_real_root_replacement_read_write_coherent() {
             let (fixture, root) = create_test_root();
             let storage = FsStorage::try_new(root.clone(), 1024 * 1024).expect("storage init");
 
@@ -1514,17 +1528,32 @@ mod tests {
             assert_eq!(d_prod_get.hex(), hex_old);
             assert_eq!(v_prod, v_contained);
 
-            // 3. Pathname mutations operate on the replacement tree at self.root, demonstrating divergence
+            // 3. Contained mutations also resolve through the pinned root, so a
+            //    conditional delete carrying the token read from the pinned old
+            //    root MATCHES that same leaf and deletes it — read and write are
+            //    coherent (no ambient reconstruction onto the replacement tree).
             let del_res = storage
                 .delete_tag_conditional("myrepo", "target", Some(&v_contained))
                 .await
                 .unwrap();
             assert!(
-                matches!(
-                    del_res,
-                    crate::storage::ConditionalDeleteResult::PreconditionFailed { .. }
-                ),
-                "pathname mutation on replacement tree sees hex_new and fails precondition against hex_old version"
+                matches!(del_res, crate::storage::ConditionalDeleteResult::Deleted),
+                "contained mutation observes the same pinned old root as the read seam: \
+                 the old-root version token matches and the leaf is deleted"
+            );
+
+            // The delete landed on the pinned old root, NOT on the ambient
+            // replacement tree at `self.root`: the recreated tree's leaf (with
+            // hex_new) is untouched, confirming no ambient path reconstruction.
+            let replacement_leaf = root
+                .join("repos")
+                .join("myrepo")
+                .join("tags")
+                .join("target");
+            assert_eq!(
+                std::fs::read(&replacement_leaf).unwrap(),
+                format!("sha256:{hex_new}\n").as_bytes(),
+                "the replacement tree leaf is untouched; the contained delete hit the pinned old root"
             );
         }
 
