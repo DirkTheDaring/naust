@@ -1014,6 +1014,38 @@ impl FsStorage {
         Ok(Some(dir))
     }
 
+    /// Contained authority for `repos/<repo>/meta` (the lifecycle-journal
+    /// namespace), beneath the pinned `repos` root. `create = false` opens
+    /// without creating (`Ok(None)` on absence, preserving absent-state
+    /// contracts); `create = true` ensures the chain (newly created directory
+    /// entries are persisted by the primitive). The repository grammar is the
+    /// upstream-validated `CanonicalRepoName`, matching the contained journal
+    /// reader's key construction.
+    async fn journal_meta_authority(
+        &self,
+        canonical: &CanonicalRepoName,
+        create: bool,
+    ) -> Result<Option<ContainedDir>, StorageError> {
+        let mut dir = self
+            .upload_authorities
+            .repos()
+            .await
+            .map_err(map_fs_mutate_err)?;
+        for segment in canonical.as_str().split('/').chain(std::iter::once("meta")) {
+            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
+            dir = if create {
+                dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?
+            } else {
+                match dir.open_subdir(&name).await {
+                    Ok(d) => d,
+                    Err(FsMutateError::NotFound) => return Ok(None),
+                    Err(err) => return Err(map_fs_mutate_err(err)),
+                }
+            };
+        }
+        Ok(Some(dir))
+    }
+
     /// Inner `delete_manifest` tag-cleanup pass: enumerate, inspect, and delete
     /// matching tag leaves ALL through the ONE retained `tags` authority (no
     /// independent path re-resolution between enumeration, read, and unlink).
@@ -1781,34 +1813,45 @@ impl Storage for FsStorage {
     }
 
     async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
+        // The lifecycle journal is authoritative recovery state: GC's pre-delete
+        // revalidation treats its presence as protection for in-flight manifest
+        // lifecycle operations. Write it contained (beneath the pinned `repos`
+        // authority, same `repos/<repo>/meta/lifecycle_journal.json` key the
+        // contained reader resolves) and durably (temp fsync + rename + parent
+        // dir fsync, all propagated) - the prior ambient temp+rename never
+        // fsynced the file content at all, so a crash could publish an
+        // unpersisted journal.
         let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let meta_dir = fs_repo_dir(&self.root, &canonical)?.join("meta");
-        ensure_dir(&meta_dir)?;
-        let path = meta_dir.join("lifecycle_journal.json");
-        let tmp_path = meta_dir.join(format!(".tmp.journal.{}", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp_path, &data)
+        let meta = self
+            .journal_meta_authority(&canonical, true)
+            .await?
+            .expect("ensure-mode resolution always yields an authority");
+        let leaf = FileName::new("lifecycle_journal.json").map_err(map_fs_mutate_err)?;
+        meta.write_leaf_atomic(&leaf, data.to_vec(), true)
             .await
-            .map_err(|e| StorageError::io(e.to_string()))?;
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .map_err(|e| StorageError::io(e.to_string()))?;
-        let _ = fsync_dir(&meta_dir).await;
+            .map_err(map_fs_mutate_err)?;
         Ok(())
     }
 
     async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
+        // Contained, non-creating; absent components preserve the Ok contract.
+        // Directory-entry persistence of the removal stays best-effort, exactly
+        // as the prior ambient fsync (journal resurrection after a crash only
+        // makes GC more conservative).
         let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let meta_dir = fs_repo_dir(&self.root, &canonical)?.join("meta");
-        let path = meta_dir.join("lifecycle_journal.json");
-        match tokio::fs::remove_file(&path).await {
-            Ok(_) => {
-                let _ = fsync_dir(&meta_dir).await;
+        let Some(meta) = self.journal_meta_authority(&canonical, false).await? else {
+            return Ok(());
+        };
+        let leaf = FileName::new("lifecycle_journal.json").map_err(map_fs_mutate_err)?;
+        match meta.unlink(&leaf, false).await {
+            Ok(()) => {
+                let _ = meta.sync().await;
                 Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StorageError::io(e.to_string())),
+            Err(FsMutateError::NotFound) => Ok(()),
+            Err(err) => Err(map_fs_mutate_err(err)),
         }
     }
 
@@ -2888,31 +2931,6 @@ async fn feed_stream(
     None
 }
 
-async fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    let tmp_path = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(".tmp.{file_name}.{}", uuid::Uuid::new_v4()));
-
-    tokio::fs::write(&tmp_path, bytes)
-        .await
-        .map_err(map_fs_io_err)?;
-    if let Ok(f) = tokio::fs::File::open(&tmp_path).await {
-        let _ = f.sync_all().await;
-    }
-    tokio::fs::rename(&tmp_path, path)
-        .await
-        .map_err(map_fs_io_err)?;
-    if let Some(parent) = path.parent() {
-        let _ = fsync_dir(parent).await;
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl UploadSessionStorage for FsStorage {
     async fn create_session(&self, repo: &str) -> Result<UploadSessionId, StorageError> {
@@ -3648,8 +3666,14 @@ impl UploadSessionStorage for FsStorage {
                         _ => return Err(err),
                     }
                 }
-                let _ = dir.sync();
-                let _ = shard_dir.sync();
+                // Publication persistence barrier, ordered BEFORE the durable
+                // membership and receipt below: the receipt must never be
+                // persisted while the CAS entry transition is not. (The blob
+                // CONTENT was already fdatasynced by every committed append.)
+                // On failure the rename is already visible - this is not a
+                // rollback; the retry path tolerates a published destination.
+                dir.sync()?;
+                shard_dir.sync()?;
 
                 // 4. Durable target-repository membership BEFORE the receipt.
                 let membership =
@@ -4297,7 +4321,11 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         let bytes = serde_json::to_vec(checkpoint).map_err(|e| {
             StorageError::serialization(format!("serialize migration checkpoint: {e}"))
         })?;
-        write_atomic_file(&path, &bytes).await?;
+        // The checkpoint is the migration protocol's authoritative progress /
+        // phase record (readiness gating reads it): persist it like the ready
+        // marker (file fsync + rename + parent dir fsync, all propagated)
+        // rather than the previous best-effort-sync helper.
+        atomic_write_file(&path, &bytes).await?;
         Ok(())
     }
 }
@@ -4643,6 +4671,13 @@ impl GcStorage for FsStorage {
 
         match src.rename_leaf(&leaf, &dest, &leaf).await {
             Ok(()) => {
+                // CAS re-publication persistence barrier (matching the finalize
+                // publication pattern): the rescued blob's availability in the
+                // CAS namespace is what readers depend on, so persist both
+                // directory transitions before reporting the restore. Errors
+                // propagate; the rename is already visible (no rollback).
+                src.sync().await.map_err(map_fs_mutate_err)?;
+                dest.sync().await.map_err(map_fs_mutate_err)?;
                 let _ = self.remove_quarantine_timestamp(digest).await;
                 Ok(Some(size))
             }

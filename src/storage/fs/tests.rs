@@ -16579,3 +16579,267 @@ mod legacy_streaming_upload_containment {
         );
     }
 }
+
+// Durability-barrier regressions from the repository-wide fsync audit: the CAS
+// publication barriers in PHASE5 commit (now propagated, ordered before the
+// durable membership/receipt), the GC restore re-publication barriers, and the
+// contained + durable lifecycle journal. Fault injection demonstrates
+// mutation -> failed sync -> returned error with the mutation still visible
+// (no rollback fiction) and, for commit, that the retry path heals.
+mod durability_barriers {
+    use super::*;
+    use crate::storage::mutation_authority::RuntimeMutationAuthority;
+    use crate::storage::{GcQuarantineResult, GcStorage};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+
+    // A failed publication directory sync in commit_finalize propagates BEFORE
+    // the membership/receipt writes: the CAS entry is already visible (rename
+    // happened; no rollback), no receipt or membership was persisted, the
+    // staging state survives, and a retry heals to a successful publication.
+    #[tokio::test]
+    async fn test_commit_publication_dir_sync_failure_propagates_and_retry_heals() {
+        let _g = fault_test_guard();
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let data = b"DURABILITY_COMMIT_BARRIER";
+        let (session, prepared, digest) =
+            prepare_finalizable_session(&storage, "myrepo", data).await;
+
+        // Fail the blobs-shard directory sync (the second barrier), once.
+        arm(FaultPoint::DirSync, Some("blobs"), 1, libc::EIO);
+        let err = storage.commit_finalize(&prepared).await;
+        assert!(err.is_err(), "publication sync failure must propagate");
+
+        // The rename already happened: the CAS entry is visible (no rollback).
+        let cas_path = root
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex());
+        assert!(
+            cas_path.exists(),
+            "publication is visible despite the error"
+        );
+        // The barrier is ordered BEFORE membership + receipt: neither exists.
+        assert!(
+            storage
+                .get_finalized_receipt(&session)
+                .await
+                .unwrap()
+                .is_none(),
+            "no receipt may be persisted when the publication barrier failed"
+        );
+        assert!(
+            !membership_record_path(&root, "myrepo", &digest).exists(),
+            "no membership may be persisted when the publication barrier failed"
+        );
+
+        // Retry (fault consumed): heals via the tolerated-existing branch.
+        let outcome = storage
+            .commit_finalize(&prepared)
+            .await
+            .expect("retry after barrier failure heals");
+        assert_eq!(
+            outcome,
+            FinalizeOutcome::Published(BlobMeta {
+                size: data.len() as u64
+            })
+        );
+        assert!(
+            storage
+                .get_finalized_receipt(&session)
+                .await
+                .unwrap()
+                .is_some(),
+            "receipt persisted on the healed retry"
+        );
+        storage_fs::mutate::fault::reset();
+    }
+
+    // A failed directory sync in restore_quarantined_blob propagates while the
+    // restored blob is already visible in the CAS namespace (no rollback).
+    #[tokio::test]
+    async fn test_restore_dir_sync_failure_propagates_blob_visible() {
+        let _g = fault_test_guard();
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = RuntimeMutationAuthority::acquire(
+            Arc::new(FsStorage::new(root.clone(), 1024 * 1024)),
+            "durability-test",
+        )
+        .await
+        .expect("acquire mutation authority");
+        let permit = authority.gc_mutation_permit();
+        let digest = Digest::parse(&format!("sha256:{}", "e7".repeat(32))).unwrap();
+
+        // Plant + quarantine a CAS blob.
+        let cas_path = root
+            .join("blobs")
+            .join(digest.algorithm())
+            .join(digest.prefix2())
+            .join(digest.hex());
+        std::fs::create_dir_all(cas_path.parent().unwrap()).unwrap();
+        std::fs::write(&cas_path, b"restore-barrier-payload").unwrap();
+        let q = storage
+            .quarantine_blob(&permit, &digest, &BlobObjectVersion("fs:0:0:d".into()))
+            .await
+            .unwrap();
+        assert!(matches!(q, GcQuarantineResult::Quarantined { .. }));
+
+        // Fail the quarantine-shard (source) directory sync, once.
+        arm(FaultPoint::DirSync, Some("quarantine"), 1, libc::EIO);
+        let err = storage
+            .restore_quarantined_blob(&permit, &digest)
+            .await
+            .expect_err("restore barrier failure must propagate");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "restore sync failure -> Io, got {err:?}"
+        );
+        // The rename already happened: blob is back in CAS (no rollback), gone
+        // from quarantine.
+        assert_eq!(
+            std::fs::read(&cas_path).unwrap(),
+            b"restore-barrier-payload",
+            "restored blob visible despite the barrier error"
+        );
+        assert!(
+            !root
+                .join("quarantine")
+                .join("blobs")
+                .join(digest.algorithm())
+                .join(digest.prefix2())
+                .join(digest.hex())
+                .exists(),
+            "quarantine leaf gone (rename visible)"
+        );
+        storage_fs::mutate::fault::reset();
+    }
+
+    // The lifecycle journal (authoritative GC-protection recovery state) is now
+    // written contained and durably: exact bytes at the contained key, mode
+    // 0o600, coherent with the contained reader; deletion is contained with the
+    // frozen absent contract.
+    #[tokio::test]
+    async fn test_lifecycle_journal_contained_durable_roundtrip() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let repo = "lib/journaled";
+        let body = br#"{"target_digest":"sha256:aa","phase":"prepare"}"#.to_vec();
+
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(body.clone()))
+            .await
+            .expect("journal write");
+        let path = root
+            .join("repos")
+            .join("lib")
+            .join("journaled")
+            .join("meta")
+            .join("lifecycle_journal.json");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body,
+            "exact journal bytes at the contained key"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "contained durable write mode"
+        );
+        assert_eq!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            body.as_slice(),
+            "contained reader observes the write"
+        );
+
+        // Replacement write.
+        let body2 = br#"{"target_digest":"sha256:bb","phase":"commit"}"#.to_vec();
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(body2.clone()))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body2);
+
+        // Contained deletion; absent deletion stays Ok.
+        storage.delete_lifecycle_journal(repo).await.unwrap();
+        assert!(!path.exists(), "journal removed");
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        storage
+            .delete_lifecycle_journal(repo)
+            .await
+            .expect("absent journal deletion is Ok");
+        storage
+            .delete_lifecycle_journal("never/existed")
+            .await
+            .expect("absent repository deletion is Ok");
+    }
+
+    // A symlinked `meta` component fails closed for both journal mutations: the
+    // external tree is neither written through nor unlinked from. (Previously
+    // the ambient write/remove followed the symlink.)
+    #[tokio::test]
+    async fn test_lifecycle_journal_symlinked_meta_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+
+        let ext_journal = external.join("lifecycle_journal.json");
+        std::fs::write(&ext_journal, b"external").unwrap();
+        let repo_dir = root.join("repos").join("symjournal");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        symlink(&external, repo_dir.join("meta")).unwrap();
+
+        let err = storage
+            .write_lifecycle_journal("symjournal", Bytes::from_static(b"x"))
+            .await
+            .expect_err("symlinked meta must fail closed on write");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "write -> Io, got {err:?}"
+        );
+        let err = storage
+            .delete_lifecycle_journal("symjournal")
+            .await
+            .expect_err("symlinked meta must fail closed on delete");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "delete -> Io, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&ext_journal).unwrap(),
+            b"external",
+            "external journal untouched"
+        );
+    }
+}
