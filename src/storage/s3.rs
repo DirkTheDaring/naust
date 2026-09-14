@@ -506,8 +506,17 @@ impl S3Driver for AwsS3Driver {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         let client = self.client().await?;
-        let _ = client.delete_object().bucket(bucket).key(key).send().await;
-        Ok(())
+        match client.delete_object().bucket(bucket).key(key).send().await {
+            Ok(_) => Ok(()),
+            Err(e) => match &e {
+                aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                    let status = se.raw().status().as_u16();
+                    let code = se.err().meta().code().unwrap_or("");
+                    classify_s3_unconditional_delete_error(status, code, e.to_string())
+                }
+                _ => Err(StorageError::backend(e.to_string())),
+            },
+        }
     }
 
     async fn delete_object_conditional(
@@ -1168,6 +1177,28 @@ pub(crate) fn classify_s3_delete_service_error(
         })
     } else if status == 404 || code == "NoSuchKey" || code == "NotFound" {
         Ok(super::ConditionalDeleteResult::NotFound)
+    } else if status == 403 || code == "AccessDenied" {
+        Err(StorageError::permission_denied(raw_message))
+    } else {
+        Err(StorageError::backend(raw_message))
+    }
+}
+
+/// Classification for UNCONDITIONAL S3 object deletion outcomes
+/// (`S3Driver::delete_object`). Deleting an absent object is idempotent
+/// success (native S3 answers 204 for it; some S3-compatible backends answer
+/// 404/NoSuchKey instead). Every other service failure must surface to the
+/// caller: a swallowed deletion failure would let a caller-visible deletion
+/// (e.g. `delete_manifest`'s primary object delete, `delete_tag`) report
+/// success while the object survives — a false deletion success the
+/// filesystem backend correctly refuses.
+pub(crate) fn classify_s3_unconditional_delete_error(
+    status: u16,
+    code: &str,
+    raw_message: String,
+) -> Result<(), StorageError> {
+    if status == 404 || code == "NoSuchKey" || code == "NotFound" {
+        Ok(())
     } else if status == 403 || code == "AccessDenied" {
         Err(StorageError::permission_denied(raw_message))
     } else {
@@ -1859,8 +1890,25 @@ impl Storage for S3Storage {
                 Some(t) => t.to_string(),
                 None => continue,
             };
+            // Structural non-tag entries (empty or nested keys beneath the tag
+            // prefix) are skipped — the analogue of the filesystem listing
+            // skipping subdirectories/non-regular entries.
+            if tag_name.is_empty() || tag_name.contains('/') {
+                continue;
+            }
             if let Some((bytes, _etag)) = self.driver.get_object(bucket, &obj.key).await? {
-                let s = String::from_utf8_lossy(&bytes);
+                // Fail-closed parity with the contained filesystem listing:
+                // invalid UTF-8 in a registry-owned tag payload is corrupt
+                // authoritative state and must not silently vanish from a
+                // listing that feeds reference/deletion proofs. (Empty or
+                // malformed digest TEXT is omitted on both backends — the
+                // documented shared contract; an object deleted between the
+                // listing and the read is skipped as genuinely absent.)
+                let s = std::str::from_utf8(&bytes).map_err(|err| {
+                    StorageError::corrupt_data(format!(
+                        "invalid UTF-8 in tag payload {tag_name}: {err}"
+                    ))
+                })?;
                 if let Ok(d) = Digest::parse(s.trim()) {
                     tags_with_digest.push((tag_name, d));
                 }
@@ -3669,8 +3717,34 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         let canonical = CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
         let key = self.repo_blob_key(&canonical, digest);
-        let _ = self.driver.delete_object(bucket, &key).await;
-        Ok(true)
+
+        // Filesystem-parity contract: Ok(true) only when an EXISTING membership
+        // record was removed; Ok(false) when absent; deletion failures
+        // propagate (the ledger gates reverse-index removal on `true`). The
+        // removal is conditional on the observed ETag, so a record replaced
+        // between the read and the delete can never be deleted under this
+        // observation. Within the supported coordination model (every
+        // membership mutation serialized by the consistency coordinator under
+        // the exclusive deployment writer lock) the precondition cannot fail;
+        // outside it the operation fails closed instead of deleting a
+        // replacement object.
+        let Some((_bytes, etag)) = self.driver.get_object(bucket, &key).await? else {
+            return Ok(false);
+        };
+        match self
+            .driver
+            .delete_object_conditional(bucket, &key, Some(etag))
+            .await?
+        {
+            super::ConditionalDeleteResult::Deleted => Ok(true),
+            super::ConditionalDeleteResult::NotFound => Ok(false),
+            super::ConditionalDeleteResult::PreconditionFailed { current_version } => {
+                Err(StorageError::conflict(format!(
+                    "membership record {key} changed concurrently during unlink \
+                     (current version {current_version:?})"
+                )))
+            }
+        }
     }
 
     async fn list_repo_blob_memberships_page(

@@ -3448,9 +3448,13 @@ async fn test_s3_no_normal_membership_op_reads_or_deletes_legacy_markers() {
         .unwrap();
     assert!(mem.is_none(), "Normal read must not query legacy key");
 
-    // Normal unlink must NOT delete legacy key
+    // Normal unlink must NOT delete legacy key; with no CANONICAL record
+    // present it reports Ok(false) (FS-parity absent semantics).
     let unlinked = storage.unlink_repo_blob(repo, &digest).await.unwrap();
-    assert!(unlinked);
+    assert!(
+        !unlinked,
+        "absent canonical membership record must report false"
+    );
 
     // Legacy key must remain intact in driver
     let objects = driver.objects.lock().unwrap();
@@ -4795,4 +4799,464 @@ fn test_map_sdk_err_transport_error_maps_to_backend_and_preserves_message() {
         storage_err.to_string(),
         format!("internal error: {expected_message}")
     );
+}
+
+// ==========================================
+// STORAGE-PARITY: unconditional object-deletion failures must surface
+// (`S3Driver::delete_object` classification + storage-boundary propagation).
+// The filesystem backend propagates deletion failures (`delete_manifest`
+// unlink errors, `delete_tag` errors); the S3 backend must not convert a
+// failed DeleteObject into a false deletion success. Absent-object deletion
+// stays idempotent success (native S3 answers 204; some S3-compatible
+// backends answer 404/NoSuchKey).
+// ==========================================
+
+#[test]
+fn test_classify_s3_unconditional_delete_error_taxonomy() {
+    // Absent object: idempotent success in every spelled form.
+    assert!(classify_s3_unconditional_delete_error(404, "", "gone".to_string()).is_ok());
+    assert!(classify_s3_unconditional_delete_error(200, "NoSuchKey", "gone".to_string()).is_ok());
+    assert!(classify_s3_unconditional_delete_error(200, "NotFound", "gone".to_string()).is_ok());
+
+    // Permission failures classify as PermissionDenied.
+    for (status, code) in [(403u16, ""), (200u16, "AccessDenied")] {
+        let err = classify_s3_unconditional_delete_error(status, code, "denied".to_string())
+            .expect_err("permission failure must surface");
+        assert_eq!(
+            err.internal_kind(),
+            Some(crate::storage::StorageErrorKind::PermissionDenied),
+            "({status}, {code}) must classify as PermissionDenied"
+        );
+    }
+
+    // Everything else (throttling, internal errors, unexpected preconditions)
+    // is a backend failure — never silent success.
+    for (status, code) in [
+        (500u16, ""),
+        (503u16, "SlowDown"),
+        (412u16, "PreconditionFailed"),
+    ] {
+        let err = classify_s3_unconditional_delete_error(status, code, "boom".to_string())
+            .expect_err("service failure must surface");
+        assert_eq!(
+            err.internal_kind(),
+            Some(crate::storage::StorageErrorKind::Backend),
+            "({status}, {code}) must classify as Backend"
+        );
+    }
+}
+
+fn parity_manifest_json() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": 2,
+            "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "size": 3,
+            "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }]
+    }))
+    .unwrap()
+}
+
+// A failed DeleteObject on the manifest's primary object must propagate out of
+// `delete_manifest` as an error, leaving the manifest present — never a false
+// deletion success (the lifecycle advances its journal and decrements
+// BlobRefIndex accounting only on success, exactly as on the filesystem
+// backend).
+#[tokio::test]
+async fn test_s3_delete_manifest_propagates_object_delete_failure() {
+    let (storage, driver) = create_mock_storage();
+    let hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let digest = Digest::parse(&format!("sha256:{hex}")).unwrap();
+    let manifest_key = format!("repos/parity-repo/manifests/{hex}");
+    driver.objects.lock().unwrap().insert(
+        manifest_key.clone(),
+        (Bytes::from(parity_manifest_json()), "\"m1\"".to_string()),
+    );
+
+    // Fail ONLY the DeleteObject of the manifest key; reads stay healthy.
+    let failing_key = manifest_key.clone();
+    driver.set_hook_before(move |method, key| {
+        if method == "delete_object" && key == failing_key {
+            Some(StorageError::backend("injected DeleteObject failure"))
+        } else {
+            None
+        }
+    });
+
+    let err = storage
+        .delete_manifest("parity-repo", &digest)
+        .await
+        .expect_err("failed object deletion must not report deletion success");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend),
+        "propagates the backend classification, got {err:?}"
+    );
+    assert!(
+        driver.objects.lock().unwrap().contains_key(&manifest_key),
+        "manifest object survives the failed deletion"
+    );
+
+    // Negative control: once the fault clears, the same deletion succeeds and
+    // the object is gone.
+    driver.clear_hooks();
+    storage
+        .delete_manifest("parity-repo", &digest)
+        .await
+        .expect("deletion succeeds without the injected fault");
+    assert!(
+        !driver.objects.lock().unwrap().contains_key(&manifest_key),
+        "manifest object removed on success"
+    );
+}
+
+// `delete_tag` parity: a failed DeleteObject surfaces (as on the filesystem
+// backend); deleting an ABSENT tag remains S3-native idempotent success —
+// a documented intentional difference from the filesystem's NotFound, visible
+// only on the unconditional trait method (production tag deletion flows
+// through `delete_tag_conditional`, which reports NotFound identically on
+// both backends).
+#[tokio::test]
+async fn test_s3_delete_tag_propagates_failure_and_absent_is_idempotent_ok() {
+    let (storage, driver) = create_mock_storage();
+    let tag_key = "repos/parity-repo/tags/v1".to_string();
+    driver.objects.lock().unwrap().insert(
+        tag_key.clone(),
+        (
+            Bytes::from_static(
+                b"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+            ),
+            "\"t1\"".to_string(),
+        ),
+    );
+
+    let failing_key = tag_key.clone();
+    driver.set_hook_before(move |method, key| {
+        if method == "delete_object" && key == failing_key {
+            Some(StorageError::backend("injected DeleteObject failure"))
+        } else {
+            None
+        }
+    });
+
+    let err = storage
+        .delete_tag("parity-repo", "v1")
+        .await
+        .expect_err("failed tag deletion must not report success");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert!(
+        driver.objects.lock().unwrap().contains_key(&tag_key),
+        "tag object survives the failed deletion"
+    );
+
+    driver.clear_hooks();
+    storage
+        .delete_tag("parity-repo", "v1")
+        .await
+        .expect("tag deletion succeeds without the fault");
+    assert!(!driver.objects.lock().unwrap().contains_key(&tag_key));
+
+    // Absent tag: idempotent success (S3-native DeleteObject semantics).
+    storage
+        .delete_tag("parity-repo", "v1")
+        .await
+        .expect("deleting an absent tag is idempotent success on S3");
+}
+
+// ==========================================
+// STORAGE-PARITY-CLOSURE Part A: S3-LISTING-FAIL-CLOSED
+// Shared `list_tags_page` contract (established from the contained
+// filesystem implementation and its tests): valid tags listed sorted with
+// strictly-after tokens; empty/malformed digest TEXT omitted; structural
+// non-tag entries skipped; objects vanished between listing and read
+// skipped; read failures propagate; INVALID UTF-8 in a registry-owned tag
+// payload FAILS CLOSED (it must not silently disappear from a listing that
+// feeds BlobRefIndex sync/rebuild and POLICY-B delete-safety proofs).
+// ==========================================
+
+#[tokio::test]
+async fn test_s3_list_tags_page_invalid_utf8_payload_fails_closed() {
+    let (storage, driver) = create_mock_storage();
+    let valid_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    {
+        let mut objs = driver.objects.lock().unwrap();
+        objs.insert(
+            "repos/parity-repo/tags/good".to_string(),
+            (
+                Bytes::from(format!("sha256:{valid_hex}\n")),
+                "\"t1\"".to_string(),
+            ),
+        );
+        objs.insert(
+            "repos/parity-repo/tags/broken".to_string(),
+            (
+                Bytes::from_static(&[0xff, 0xfe, 0xfd]),
+                "\"t2\"".to_string(),
+            ),
+        );
+    }
+
+    let err = storage
+        .list_tags_page("parity-repo", None, 10)
+        .await
+        .expect_err("invalid UTF-8 tag payload must fail the listing closed");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::CorruptData),
+        "corrupt registry-owned tag payload classifies as CorruptData, got {err:?}"
+    );
+
+    // Once the corrupt object is repaired, the listing succeeds again.
+    driver.objects.lock().unwrap().insert(
+        "repos/parity-repo/tags/broken".to_string(),
+        (
+            Bytes::from(format!("sha256:{valid_hex}\n")),
+            "\"t3\"".to_string(),
+        ),
+    );
+    let (page, next) = storage
+        .list_tags_page("parity-repo", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["broken", "good"]
+    );
+    assert!(next.is_none());
+}
+
+#[tokio::test]
+async fn test_s3_list_tags_page_shared_omission_and_pagination_contract() {
+    let (storage, driver) = create_mock_storage();
+    let valid_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    {
+        let mut objs = driver.objects.lock().unwrap();
+        // Valid tags (sorted order: a1, b2, c3).
+        for name in ["a1", "b2", "c3"] {
+            objs.insert(
+                format!("repos/parity-repo/tags/{name}"),
+                (
+                    Bytes::from(format!("sha256:{valid_hex}\n")),
+                    "\"e\"".to_string(),
+                ),
+            );
+        }
+        // Malformed digest TEXT (valid UTF-8): omitted on both backends.
+        objs.insert(
+            "repos/parity-repo/tags/malformed".to_string(),
+            (Bytes::from_static(b"not-a-digest"), "\"e\"".to_string()),
+        );
+        // Empty payload: omitted on both backends.
+        objs.insert(
+            "repos/parity-repo/tags/empty".to_string(),
+            (Bytes::from_static(b""), "\"e\"".to_string()),
+        );
+        // Structural non-tag entry (nested key beneath the prefix): skipped,
+        // the analogue of the filesystem listing skipping subdirectories.
+        objs.insert(
+            "repos/parity-repo/tags/nested/entry".to_string(),
+            (
+                Bytes::from(format!("sha256:{valid_hex}\n")),
+                "\"e\"".to_string(),
+            ),
+        );
+        // Unrelated out-of-namespace object: never part of the listing.
+        objs.insert(
+            "unrelated/top-level-object".to_string(),
+            (Bytes::from_static(b"noise"), "\"e\"".to_string()),
+        );
+    }
+
+    // Page 1: strictly-after token semantics over the VALID tags only.
+    let (page1, tok1) = storage
+        .list_tags_page("parity-repo", None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        page1.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["a1", "b2"]
+    );
+    let tok1 = tok1.expect("continuation token for remaining tag");
+    assert_eq!(tok1, "b2");
+
+    let (page2, tok2) = storage
+        .list_tags_page("parity-repo", Some(&tok1), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["c3"]
+    );
+    assert!(tok2.is_none(), "no token past the final page");
+
+    // Absent repository: empty page, no token (parity with FS absent dir).
+    let (empty_page, empty_tok) = storage
+        .list_tags_page("absent-repo", None, 5)
+        .await
+        .unwrap();
+    assert!(empty_page.is_empty());
+    assert!(empty_tok.is_none());
+}
+
+// ==========================================
+// STORAGE-PARITY-CLOSURE Part B: S3-MEMBERSHIP-UNLINK-PARITY
+// Shared `unlink_repo_blob` contract (established from the FS
+// implementation and the ledger consumer that gates reverse-index removal
+// on the returned bool): present+removed -> Ok(true); absent -> Ok(false);
+// repeated unlink -> true then false; deletion failure -> Err; and a record
+// replaced inside the unlink window must never be deleted under the stale
+// observation (ETag-conditional removal).
+// ==========================================
+
+fn parity_membership_record(
+    repo: &str,
+    digest: &Digest,
+) -> crate::storage::repo_membership::RepoBlobMembershipRecord {
+    crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
+        crate::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap(),
+        digest.clone(),
+        Some("parity-upload".to_string()),
+    )
+}
+
+#[tokio::test]
+async fn test_s3_unlink_repo_blob_contract_present_absent_repeat() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let (storage, _driver) = create_mock_storage();
+    let digest =
+        Digest::parse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+
+    // Absent record: Ok(false) — FS parity.
+    assert!(
+        !storage
+            .unlink_repo_blob("parity/repo", &digest)
+            .await
+            .unwrap()
+    );
+
+    // Present record: removed -> Ok(true); repeat -> Ok(false).
+    storage
+        .link_repo_blob(&parity_membership_record("parity/repo", &digest))
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .get_repo_blob_membership("parity/repo", &digest)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        storage
+            .unlink_repo_blob("parity/repo", &digest)
+            .await
+            .unwrap()
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership("parity/repo", &digest)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !storage
+            .unlink_repo_blob("parity/repo", &digest)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_s3_unlink_repo_blob_failure_propagates_and_replacement_not_deleted() {
+    use crate::storage::repo_membership::RepositoryBlobMembershipStorage;
+    let (storage, driver) = create_mock_storage();
+    let digest =
+        Digest::parse("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+    storage
+        .link_repo_blob(&parity_membership_record("parity/repo", &digest))
+        .await
+        .unwrap();
+    let record_key = {
+        let objs = driver.objects.lock().unwrap();
+        objs.keys()
+            .find(|k| k.contains("bbbb"))
+            .expect("membership record key present")
+            .clone()
+    };
+
+    // 1. Deletion failure propagates as Err (never a false `true`).
+    let failing_key = record_key.clone();
+    driver.set_hook_before(move |method, key| {
+        if method == "delete_object" && key == failing_key {
+            Some(StorageError::backend("injected membership delete failure"))
+        } else {
+            None
+        }
+    });
+    let err = storage
+        .unlink_repo_blob("parity/repo", &digest)
+        .await
+        .expect_err("failed membership deletion must surface");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Backend)
+    );
+    assert!(
+        driver.objects.lock().unwrap().contains_key(&record_key),
+        "record survives the failed deletion"
+    );
+    driver.clear_hooks();
+
+    // 2. Deterministic replacement race: the record is REPLACED (new content,
+    //    new ETag) inside the unlink window, between the observation read and
+    //    the conditional delete. The stale observation must not delete the
+    //    replacement: the unlink fails closed with a conflict and the
+    //    replacement survives byte-identically. (Within the supported
+    //    coordination model — every membership mutation serialized by the
+    //    consistency coordinator under the exclusive deployment writer lock —
+    //    this interleaving cannot occur; this proves the mechanical guarantee
+    //    anyway.) Negative control: a naive unconditional delete would have
+    //    removed the replacement here.
+    let race_key = record_key.clone();
+    let race_driver = driver.clone();
+    driver.set_hook_before(move |method, key| {
+        if method == "delete_object" && key == race_key {
+            race_driver.objects.lock().unwrap().insert(
+                race_key.clone(),
+                (
+                    Bytes::from_static(b"{\"replacement\":\"generation\"}"),
+                    "\"replaced-etag\"".to_string(),
+                ),
+            );
+        }
+        None
+    });
+    let err = storage
+        .unlink_repo_blob("parity/repo", &digest)
+        .await
+        .expect_err("replacement inside the unlink window must fail closed");
+    assert_eq!(
+        err.internal_kind(),
+        Some(crate::storage::StorageErrorKind::Conflict),
+        "stale-observation unlink classifies as Conflict, got {err:?}"
+    );
+    assert_eq!(
+        driver.objects.lock().unwrap().get(&record_key).unwrap().0,
+        Bytes::from_static(b"{\"replacement\":\"generation\"}"),
+        "the replacement record is NOT deleted under the stale observation"
+    );
+    driver.clear_hooks();
 }
