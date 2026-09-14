@@ -403,20 +403,6 @@ fn upload_hash_state_name(uuid: &str) -> Result<FileName, FsMutateError> {
     session_name(format!("{uuid}.sha256state"))
 }
 
-/// Convert a caller-supplied tag into a single contained leaf name.
-///
-/// Applies the same structural validation as the contained tag-read seam
-/// (`tag_read::validate_path_component`) and additionally requires the tag to be
-/// a single path segment: a tag is the final filesystem leaf and must not span
-/// directory components. Invalid tags map to `StorageError::InvalidRepoName`,
-/// matching the read seam's taxonomy rather than introducing a second grammar.
-fn tag_leaf_name(tag: &str) -> Result<FileName, StorageError> {
-    tag_read::validate_path_component(tag, "tag name")?;
-    FileName::new(tag).map_err(|_| {
-        StorageError::InvalidRepoName("tag name cannot span path components".to_string())
-    })
-}
-
 /// Map a mutation error surfaced during startup capture to a configuration/IO
 /// startup error.
 fn map_fs_mutate_startup_err(err: FsMutateError) -> StorageError {
@@ -454,7 +440,13 @@ pub struct FsStorage {
     manifest_listing_limits: storage_fs::DirEnumerationLimits,
     gc_discovery_limits: repo_discovery::DiscoveryLimits,
     gc_ref_limits: manifest_refs::ManifestReferenceLimits,
-    pub(crate) tag_listing_limits: tag_listing::TagListingLimits,
+    /// Phase 3 tag-family cutover: the shared backend-neutral tag-domain
+    /// implementation over an `FsObjectStore` pinned to the same storage
+    /// root as `reader` (identity key mapping — every tag stays at
+    /// `repos/<repo>/tags/<tag>` under the pinned root, byte-for-byte the
+    /// old physical layout). Unmigrated families continue on the retained
+    /// contained authorities above.
+    tag_domain: crate::storage::tag_domain::TagDomain,
     /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
     /// at the boundary between a candidate's confirmed expiry decision and its
     /// destructive action, with the candidate uuid. Lets a regression prove that no
@@ -657,6 +649,30 @@ impl FsStorage {
         ));
         let upload_authorities = std::sync::Arc::new(UploadAuthorities::capture(&reader)?);
 
+        // Phase 3 tag-family cutover: pin a backend-neutral object store at
+        // the SAME storage root (identity key mapping preserves the physical
+        // tag layout exactly), budgeted with the configured tag listing
+        // limits, and wire the shared tag domain over it. The repository
+        // existence probe reuses the contained metadata reader — repository
+        // existence is repository-family state, deferred to a later phase.
+        let tag_store = storage_fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::io(format!("open tag object store root: {e}")))?
+            .with_enumeration_limits(tag_listing_limits.tags_dir_limits);
+        let tag_domain = crate::storage::tag_domain::TagDomain::new(
+            std::sync::Arc::new(tag_store),
+            crate::storage::tag_domain::TagDomainConfig {
+                max_payload_bytes: tag_listing_limits
+                    .payload_limits
+                    .max_payload_bytes
+                    .unwrap_or(tag_listing::DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES),
+                max_listing_entries: tag_listing_limits.tags_dir_limits.max_entries(),
+            },
+            std::sync::Arc::new(tag_listing::FsTagRepoProbe::new(
+                std::sync::Arc::clone(&reader),
+                tag_listing_limits.repo_probe_limits,
+            )),
+        );
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
@@ -677,7 +693,7 @@ impl FsStorage {
             manifest_listing_limits,
             gc_discovery_limits,
             gc_ref_limits,
-            tag_listing_limits,
+            tag_domain,
             #[cfg(test)]
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
@@ -751,13 +767,6 @@ impl FsStorage {
     #[cfg(test)]
     pub(crate) fn manifest_listing_limits(&self) -> storage_fs::DirEnumerationLimits {
         self.manifest_listing_limits
-    }
-
-    /// Returns configured limits for contained tag listing.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn tag_listing_limits(&self) -> &tag_listing::TagListingLimits {
-        &self.tag_listing_limits
     }
 
     /// Internal test helper to list manifest digests with explicitly injected limits.
@@ -970,61 +979,6 @@ impl FsStorage {
             .join(digest.hex())
     }
 
-    /// Resolve a fresh contained authority for `repos/<repo>/tags`, beneath the
-    /// stable pinned `repos` authority. The repository (which may be a nested,
-    /// slash-separated name) is re-resolved on every call: no per-repository
-    /// authority is cached, so a repository directory that is removed and
-    /// recreated at the same pathname is observed as its new inode on the next
-    /// operation — keeping tag writes coherent with the (already contained) tag
-    /// reads and preventing stale-inode writes into a detached tree.
-    ///
-    /// Repository names are validated with the same structural contract the
-    /// contained tag-read seam applies (`tag_read::validate_path_component`), so
-    /// reads and writes share one grammar and one error taxonomy
-    /// (`StorageError::InvalidRepoName`). Every directory component is traversed
-    /// through contained `ensure_subdir` primitives; the resulting authority (and
-    /// the lock/inspection/mutation performed through it) never reconstructs an
-    /// ambient path.
-    async fn tags_authority(&self, repo: &str) -> Result<ContainedDir, StorageError> {
-        tag_read::validate_path_component(repo, "repository name")?;
-        let mut dir = self
-            .upload_authorities
-            .repos()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for segment in repo.split('/') {
-            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
-            dir = dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?;
-        }
-        let tags = FileName::new("tags").map_err(map_fs_mutate_err)?;
-        dir.ensure_subdir(&tags).await.map_err(map_fs_mutate_err)
-    }
-
-    /// Non-creating variant of [`Self::tags_authority`]: resolves the contained
-    /// authority for `repos/<repo>/tags` via `open_subdir` and returns
-    /// `Ok(None)` when any component is absent. Used by the `delete_manifest`
-    /// tag-cleanup scan, whose frozen contract on an absent tags directory is
-    /// an empty scan with ZERO directory creation. Same pinned `repos` root,
-    /// same structural validation, same fresh-per-operation resolution — not a
-    /// second grammar or authority model.
-    async fn open_tags_authority(&self, repo: &str) -> Result<Option<ContainedDir>, StorageError> {
-        tag_read::validate_path_component(repo, "repository name")?;
-        let mut dir = self
-            .upload_authorities
-            .repos()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for segment in repo.split('/').chain(std::iter::once("tags")) {
-            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
-            dir = match dir.open_subdir(&name).await {
-                Ok(d) => d,
-                Err(FsMutateError::NotFound) => return Ok(None),
-                Err(err) => return Err(map_fs_mutate_err(err)),
-            };
-        }
-        Ok(Some(dir))
-    }
-
     /// Contained authority for `repos/<repo>/meta` (the lifecycle-journal
     /// namespace), beneath the pinned `repos` root. `create = false` opens
     /// without creating (`Ok(None)` on absence, preserving absent-state
@@ -1055,58 +1009,6 @@ impl FsStorage {
             };
         }
         Ok(Some(dir))
-    }
-
-    /// Inner `delete_manifest` tag-cleanup pass: enumerate, inspect, and delete
-    /// matching tag leaves ALL through the ONE retained `tags` authority (no
-    /// independent path re-resolution between enumeration, read, and unlink).
-    /// This seam is also exercised directly by the same-authority replacement
-    /// regression.
-    ///
-    /// Frozen scan contract (previously the ambient `list_tag_files` +
-    /// `read_to_string` + ignored `remove_file` loop): dot-entries and
-    /// non-UTF-8 entry names are skipped silently; a leaf that vanishes between
-    /// enumeration and read is tolerated (`continue`); other read failures
-    /// (including non-regular or — new, fail-closed — symlinked entries) and
-    /// non-UTF-8 tag content propagate as Io; a tag whose trimmed content
-    /// equals the deleted digest is unlinked best-effort (result ignored). The
-    /// scan takes NO per-tag locks — the historical `delete_manifest` cleanup
-    /// is deliberately lock-free and its read/match/unlink race profile against
-    /// concurrent tag mutation is unchanged. Enumeration is unbounded
-    /// (`usize::MAX` limits), matching the prior unbounded `read_dir`.
-    async fn delete_manifest_tag_cleanup_in(
-        tags: &ContainedDir,
-        digest_str: &str,
-    ) -> Result<(), StorageError> {
-        let entries = tags
-            .list(storage_fs::DirEnumerationLimits::new(
-                usize::MAX,
-                usize::MAX,
-            ))
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for entry in entries {
-            let Some(entry_name) = entry.name().to_str() else {
-                continue;
-            };
-            if entry_name.starts_with('.') {
-                continue;
-            }
-            let leaf = FileName::new(entry_name).map_err(map_fs_mutate_err)?;
-            let bytes = match tags.read_leaf(&leaf, u64::MAX).await {
-                Ok(b) => b,
-                Err(FsMutateError::NotFound) => continue,
-                Err(err) => return Err(map_fs_mutate_err(err)),
-            };
-            let content = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(err) => return Err(StorageError::io(err.to_string())),
-            };
-            if content.trim() == digest_str {
-                let _ = tags.unlink(&leaf, true).await;
-            }
-        }
-        Ok(())
     }
 
     /// Resolve a fresh contained authority for `repos/<repo>/manifests`, beneath
@@ -1154,7 +1056,7 @@ impl FsStorage {
     /// missing directories beneath the pinned `repos` root.
     ///
     /// Reuses the referrers READ grammar (`referrers_read::referrers_key`:
-    /// `tag_read::validate_path_component` + `ObjectKey` composition) so a
+    /// `tag_domain::validate_path_component` + `ObjectKey` composition) so a
     /// mutation is accepted iff the matching contained read accepts the same
     /// repository name. The composed key is discarded; only its validation side
     /// effect is required here. Resolution is fresh per operation — no
@@ -1554,23 +1456,11 @@ impl Storage for FsStorage {
     }
 
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
-        tag_read::resolve_tag(
-            self.reader.as_ref(),
-            name,
-            tag,
-            &tag_read::TagReadLimits::default(),
-        )
-        .await
+        self.tag_domain.resolve_tag(name, tag).await
     }
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
-        tag_listing::contained_list_tags_seam(
-            self.reader.as_ref(),
-            name,
-            self.tag_listing_limits.repo_probe_limits,
-            self.tag_listing_limits.tags_dir_limits,
-        )
-        .await
+        self.tag_domain.list_tags(name).await
     }
 
     async fn head_manifest(
@@ -1627,76 +1517,19 @@ impl Storage for FsStorage {
         digest: &Digest,
         policy: super::TagMutationPolicy,
     ) -> Result<super::TagMutation, StorageError> {
-        // Fresh contained authority for `repos/<repo>/tags` (no per-repo cache).
-        let tags = self.tags_authority(name).await?;
-        let leaf = tag_leaf_name(tag)?;
-        let lock_name = FileName::new(format!(".lock.{tag}")).map_err(map_fs_mutate_err)?;
-        let body = format!("{}\n", digest.as_str()).into_bytes();
-        let digest_clone = digest.clone();
-
-        // Acquire the retained `.lock.<tag>` exclusive lock, then perform the
-        // inspection and mutation under that lock, on the same pinned authority.
-        let guard = tags.lock(&lock_name).await.map_err(map_fs_mutate_err)?;
-        tags.run_locked(guard, move |dir, _g| {
-            // Read the existing leaf: absent → None; readable-but-unparseable
-            // (corrupt) → None; any other error (incl. a non-regular/symlink
-            // leaf rejected by containment) propagates.
-            let existing_d = match dir.read_leaf(&leaf, u64::MAX) {
-                Ok(existing_bytes) => {
-                    let s = String::from_utf8_lossy(&existing_bytes);
-                    Digest::parse(s.trim()).ok()
-                }
-                Err(FsMutateError::NotFound) => None,
-                Err(e) => return Err(e),
-            };
-
-            // Same-digest short-circuit runs BEFORE mutation-policy rejection.
-            if let Some(ref prev) = existing_d {
-                if *prev == digest_clone {
-                    return Ok(Ok(super::TagMutation::Unchanged));
-                }
-            }
-
-            let outcome: Result<super::TagMutation, StorageError> = match policy {
-                super::TagMutationPolicy::CreateOnly => {
-                    if existing_d.is_some() {
-                        return Ok(Err(StorageError::TagAlreadyExists));
-                    }
-                    dir.write_leaf_atomic(&leaf, &body, true)?;
-                    Ok(super::TagMutation::Created)
-                }
-                super::TagMutationPolicy::Replace => {
-                    dir.write_leaf_atomic(&leaf, &body, true)?;
-                    match existing_d {
-                        Some(prev) => Ok(super::TagMutation::Replaced { previous: prev }),
-                        None => Ok(super::TagMutation::Created),
-                    }
-                }
-            };
-            Ok(outcome)
-        })
-        .await
-        .map_err(map_fs_mutate_err)?
+        // Phase 3: shared tag domain over the pinned FS object store. The
+        // retained `.lock.<tag>` advisory lock is retired — each publication
+        // is atomic below the ObjectStore boundary and CreateOnly's
+        // one-creator guarantee rides on `write_if_absent` (see the tag
+        // locking analysis in the Phase 3 evidence).
+        self.tag_domain.mutate_tag(name, tag, digest, policy).await
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
-        // Fresh contained authority for `repos/<repo>/tags` (no per-repo cache).
-        // The reviewed design intentionally does not introduce locking here: the
-        // prior ambient `delete_tag` performed an unserialized `remove_file`, so
-        // we preserve that (no `.lock.<tag>`) and only contain the unlink+sync.
-        let tags = self.tags_authority(name).await?;
-        let leaf = tag_leaf_name(tag)?;
-        let blocking = tags.blocking();
-        tokio::task::spawn_blocking(move || match blocking.unlink(&leaf, false) {
-            Ok(()) => {
-                let _ = blocking.sync();
-                Ok(())
-            }
-            Err(FsMutateError::NotFound) => Err(StorageError::NotFound),
-            Err(e) => Err(map_fs_mutate_err(e)),
-        })
-        .await
-        .map_err(map_blocking_join_error)?
+        // Frozen contract: absent -> NotFound, present -> immediate namespace
+        // mutation with the P1 delete-durability policy (no new
+        // crash-persistence promise). Unserialized, as before.
+        self.tag_domain.delete_tag(name, tag).await
     }
 
     async fn list_manifest_digests_page(
@@ -1721,17 +1554,9 @@ impl Storage for FsStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
-        tag_listing::contained_list_tags_page_seam(
-            self.reader.as_ref(),
-            self.reader.as_ref(),
-            repo,
-            continuation_token,
-            page_limit,
-            self.tag_listing_limits.repo_probe_limits,
-            self.tag_listing_limits.tags_dir_limits,
-            self.tag_listing_limits.payload_limits.clone(),
-        )
-        .await
+        self.tag_domain
+            .list_tags_page(repo, continuation_token, page_limit)
+            .await
     }
 
     async fn list_referrers_page(
@@ -1770,13 +1595,7 @@ impl Storage for FsStorage {
         repo: &str,
         tag: &str,
     ) -> Result<Option<(Digest, String)>, StorageError> {
-        tag_read::get_tag_with_version(
-            self.reader.as_ref(),
-            repo,
-            tag,
-            &tag_read::TagReadLimits::default(),
-        )
-        .await
+        self.tag_domain.get_tag_with_version(repo, tag).await
     }
 
     async fn delete_tag_conditional(
@@ -1785,45 +1604,12 @@ impl Storage for FsStorage {
         tag: &str,
         expected_version: Option<&str>,
     ) -> Result<super::ConditionalDeleteResult, StorageError> {
-        // Fresh contained authority for `repos/<repo>/tags` (no per-repo cache).
-        let tags = self.tags_authority(repo).await?;
-        let leaf = tag_leaf_name(tag)?;
-        let lock_name = FileName::new(format!(".lock.{tag}")).map_err(map_fs_mutate_err)?;
-        let exp_v = expected_version.map(|s| s.to_string());
-
-        // Acquire the retained `.lock.<tag>` and perform the whole
-        // inspect/precondition/delete sequence under that lock on the same
-        // pinned authority.
-        let guard = tags.lock(&lock_name).await.map_err(map_fs_mutate_err)?;
-        tags.run_locked(guard, move |dir, _g| {
-            // Read the exact leaf bytes; absent → NotFound.
-            let bytes = match dir.read_leaf(&leaf, u64::MAX) {
-                Ok(b) => b,
-                Err(FsMutateError::NotFound) => {
-                    return Ok(super::ConditionalDeleteResult::NotFound);
-                }
-                Err(e) => return Err(e),
-            };
-
-            // Precondition: SHA-256 over the exact raw bytes read (never a
-            // reparsed/reformatted digest), matching `get_tag_with_version`.
-            if let Some(ref exp) = exp_v {
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(&bytes);
-                let current_version = hex::encode(hasher.finalize());
-                if current_version != *exp {
-                    return Ok(super::ConditionalDeleteResult::PreconditionFailed {
-                        current_version: Some(current_version),
-                    });
-                }
-            }
-
-            dir.unlink(&leaf, false)?;
-            let _ = dir.sync();
-            Ok(super::ConditionalDeleteResult::Deleted)
-        })
-        .await
-        .map_err(map_fs_mutate_err)
+        // Registry version precondition (raw-byte SHA-256) composed over
+        // read_with_version + delete_if_version: a stale token can never
+        // delete a replacement generation.
+        self.tag_domain
+            .delete_tag_conditional(repo, tag, expected_version)
+            .await
     }
 
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
@@ -2353,10 +2139,13 @@ impl Storage for FsStorage {
         // deletion all through ONE retained contained tags authority, resolved
         // non-creating (an absent tags directory preserves the empty-scan
         // contract with zero directory creation).
+        // Shared backend-neutral tag-domain cleanup (Phase 3): same frozen
+        // lock-free scan contract, over the generic object store. An absent
+        // tags namespace is an empty scan with zero directory creation.
         let digest_str = digest.as_str();
-        if let Some(tags) = self.open_tags_authority(name).await? {
-            Self::delete_manifest_tag_cleanup_in(&tags, &digest_str).await?;
-        }
+        self.tag_domain
+            .delete_manifest_tag_cleanup(name, &digest_str)
+            .await?;
 
         // Clean up from referrers list if this manifest referenced a subject.
         if let Some(subject) = maybe_subject {
@@ -3839,7 +3628,7 @@ impl UploadSessionStorage for FsStorage {
         // This keeps reader and writer in agreement after a `.finalized` (or
         // `uploads`) pathname replacement. Repository/UUID validation, missing-file
         // behavior, and corrupt/error semantics are preserved.
-        tag_read::validate_path_component(&session.uuid, "upload session id")?;
+        crate::storage::tag_domain::validate_path_component(&session.uuid, "upload session id")?;
         let finalized = self
             .upload_authorities
             .finalized()
@@ -4891,9 +4680,6 @@ pub(crate) mod manifest_refs;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use manifest_refs as manifest_refs_seam;
-
-#[path = "fs/tag_read.rs"]
-pub(crate) mod tag_read;
 
 #[path = "fs/tag_listing.rs"]
 pub(crate) mod tag_listing;

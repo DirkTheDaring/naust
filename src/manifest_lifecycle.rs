@@ -1733,6 +1733,11 @@ mod tests {
         corrupt_manifest: AtomicBool,
         immediate_cycle: AtomicBool,
         multi_cycle: AtomicBool,
+        /// Force the next conditional tag delete to observe a replacement
+        /// (PreconditionFailed) — deterministic coverage of the lifecycle
+        /// cleanup branch now that the coherent tag path cannot produce a
+        /// spurious precondition failure outside a true concurrent race.
+        force_tag_precondition_failed: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -1903,6 +1908,16 @@ mod tests {
             tag: &str,
             expected_version: Option<&str>,
         ) -> Result<crate::storage::ConditionalDeleteResult, StorageError> {
+            if self
+                .force_tag_precondition_failed
+                .swap(false, Ordering::SeqCst)
+            {
+                return Ok(
+                    crate::storage::ConditionalDeleteResult::PreconditionFailed {
+                        current_version: Some("interposed-replacement-version".to_string()),
+                    },
+                );
+            }
             self.inner
                 .delete_tag_conditional(repo, tag, expected_version)
                 .await
@@ -2059,6 +2074,7 @@ mod tests {
             corrupt_manifest: AtomicBool::new(false),
             immediate_cycle: AtomicBool::new(false),
             multi_cycle: AtomicBool::new(false),
+            force_tag_precondition_failed: AtomicBool::new(false),
         });
         let coordinator = ConsistencyCoordinator::new();
         let service = ManifestLifecycleService::new(mock_storage.clone(), None, coordinator);
@@ -2225,6 +2241,55 @@ mod tests {
             .unwrap();
 
         assert!(res);
+    }
+
+    /// Deterministic coverage of the delete_tag PreconditionFailed cleanup
+    /// branch: a replacement interposed between the version snapshot and the
+    /// conditional delete (forced through the wrapper — the coherent Phase 3
+    /// tag path only produces this under a true concurrent race) must yield
+    /// TagPreconditionFailed with the journal cleaned up and the tag intact.
+    #[tokio::test]
+    async fn test_delete_tag_precondition_failed_cleanup_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mock, service) = setup_mock_service(&dir);
+        let repo = "cleanup-branch-repo";
+
+        let cfg_digest = test_digest("11");
+        let target_blob = test_digest("99");
+        let manifest_bytes = Bytes::from(format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"digest":"{}","size":2}},"layers":[{{"digest":"{}","size":10}}]}}"#,
+            cfg_digest.as_str(),
+            target_blob.as_str()
+        ));
+        let m_d = test_digest("cleanup_branch_manifest");
+        mock.inner
+            .put_manifest(repo, &m_d, manifest_bytes)
+            .await
+            .unwrap();
+        mock.inner.set_tag(repo, "latest", &m_d).await.unwrap();
+
+        mock.force_tag_precondition_failed
+            .store(true, Ordering::SeqCst);
+        let res = service.delete_tag(repo, "latest").await;
+        assert!(
+            matches!(res, Err(ManifestLifecycleError::TagPreconditionFailed)),
+            "expected TagPreconditionFailed, got {res:?}"
+        );
+
+        // Cleanup branch: journal deleted, tag preserved with intact bytes.
+        assert!(
+            mock.inner
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "journal must be deleted on TagPreconditionFailed cleanup"
+        );
+        assert_eq!(
+            mock.inner.resolve_tag(repo, "latest").await.unwrap(),
+            m_d,
+            "tag must be preserved on precondition failure"
+        );
     }
 
     #[tokio::test]

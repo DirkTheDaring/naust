@@ -17,6 +17,7 @@ pub mod mutation_authority;
 pub mod ports;
 pub mod repo_membership;
 pub mod s3;
+pub(crate) mod tag_domain;
 pub mod upload_session;
 
 #[allow(unused_imports)]
@@ -880,7 +881,7 @@ pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, 
                     config.fs_tag_listing_max_entries,
                     config.fs_tag_listing_max_name_bytes,
                 ),
-                payload_limits: fs::tag_read::TagReadLimits {
+                payload_limits: fs::tag_listing::TagReadLimits {
                     max_payload_bytes: Some(config.fs_tag_listing_max_payload_bytes),
                 },
             };
@@ -962,7 +963,7 @@ pub fn proxy_cache_storage_try_from_config(
                     config.fs_tag_listing_max_entries,
                     config.fs_tag_listing_max_name_bytes,
                 ),
-                payload_limits: fs::tag_read::TagReadLimits {
+                payload_limits: fs::tag_listing::TagReadLimits {
                     max_payload_bytes: Some(config.fs_tag_listing_max_payload_bytes),
                 },
             };

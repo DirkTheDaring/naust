@@ -94,7 +94,7 @@ pub(crate) struct ReferrersReadLimits {
 /// permitted at this boundary. The subject filename is derived from the strongly typed
 /// [`Digest`] hex encoding and supports both SHA-256 and SHA-512 digests.
 pub(crate) fn referrers_key(repo: &str, subject: &Digest) -> Result<ObjectKey, StorageError> {
-    super::tag_read::validate_path_component(repo, "repository name")?;
+    crate::storage::tag_domain::validate_path_component(repo, "repository name")?;
 
     let key_str = format!("repos/{repo}/referrers/{}.json", subject.hex());
     ObjectKey::parse(&key_str).map_err(|e| StorageError::InvalidRepoName(e.to_string()))

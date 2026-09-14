@@ -324,16 +324,32 @@ async fn test_fs_direct_concurrent_replacements_chain() {
     let res1 = r1.unwrap().unwrap();
     let res2 = r2.unwrap().unwrap();
 
-    // One of them was Created (first), and the other was Overwritten with the first's digest!
+    // Phase 3 converged contract: each publication is atomic, the final
+    // state is exactly ONE writer's canonical bytes, and any Replaced
+    // outcome truthfully names the other writer's digest. Outcome
+    // ATTRIBUTION under a race is best-effort (the retired advisory
+    // .lock.<tag> serialization is gone; the only production caller
+    // discards the outcome), so both writers may observe absence and report
+    // Created.
     let final_d = storage.resolve_tag("repo", "tag").await.unwrap();
+    assert!(
+        final_d == d1 || final_d == d2,
+        "final state is one writer's digest"
+    );
 
-    if final_d == d2 {
-        assert_eq!(res1, crate::storage::TagMutation::Created);
-        assert_eq!(res2, crate::storage::TagMutation::Replaced { previous: d1 });
-    } else {
-        assert_eq!(final_d, d1);
-        assert_eq!(res2, crate::storage::TagMutation::Created);
-        assert_eq!(res1, crate::storage::TagMutation::Replaced { previous: d2 });
+    for (res, own, other) in [(&res1, &d1, &d2), (&res2, &d2, &d1)] {
+        match res {
+            crate::storage::TagMutation::Created => {}
+            crate::storage::TagMutation::Unchanged => {
+                panic!("distinct digests can never report Unchanged: {own}")
+            }
+            crate::storage::TagMutation::Replaced { previous } => {
+                assert_eq!(
+                    previous, other,
+                    "a Replaced outcome names the competing writer's digest"
+                );
+            }
+        }
     }
 }
 
@@ -8825,15 +8841,16 @@ async fn test_tag_read_empty_malformed_digest_and_invalid_utf8() {
     let invalid_utf8_bytes = b"\xff\xfe\xfd";
     write_file(&tags_dir.join("tag_invalid_utf8"), invalid_utf8_bytes);
 
-    // resolve_tag uses tokio::fs::read_to_string -> fails with std::io::ErrorKind::InvalidData -> StorageErrorKind::Io
+    // Phase 3 converged: invalid UTF-8 in a stored tag payload is
+    // CorruptData on every tag read path (the retired FS seam used Io).
     let err_resolve = storage
         .resolve_tag("myrepo", "tag_invalid_utf8")
         .await
         .unwrap_err();
     match err_resolve {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
         other => {
-            panic!("expected StorageErrorKind::Io for read_to_string invalid UTF-8, got {other:?}")
+            panic!("expected StorageErrorKind::CorruptData for invalid UTF-8, got {other:?}")
         }
     }
 
@@ -8938,9 +8955,11 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_resolve {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => {
-            panic!("expected StorageErrorKind::Io for symlink_internal resolve_tag, got {other:?}")
+            panic!(
+                "expected StorageErrorKind::PermissionDenied for symlink_internal resolve_tag, got {other:?}"
+            )
         }
     }
     let err_version = storage
@@ -8948,9 +8967,9 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_version {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => panic!(
-            "expected StorageErrorKind::Io for symlink_internal get_tag_with_version, got {other:?}"
+            "expected StorageErrorKind::PermissionDenied for symlink_internal get_tag_with_version, got {other:?}"
         ),
     }
 
@@ -8964,9 +8983,11 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_ext {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => {
-            panic!("expected StorageErrorKind::Io for symlink_external resolve_tag, got {other:?}")
+            panic!(
+                "expected StorageErrorKind::PermissionDenied for symlink_external resolve_tag, got {other:?}"
+            )
         }
     }
     let err_ext_v = storage
@@ -8974,9 +8995,9 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_ext_v {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => panic!(
-            "expected StorageErrorKind::Io for symlink_external get_tag_with_version, got {other:?}"
+            "expected StorageErrorKind::PermissionDenied for symlink_external get_tag_with_version, got {other:?}"
         ),
     }
 
@@ -8997,9 +9018,11 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_anc {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => {
-            panic!("expected StorageErrorKind::Io for ancestor symlink resolve_tag, got {other:?}")
+            panic!(
+                "expected StorageErrorKind::PermissionDenied for ancestor symlink resolve_tag, got {other:?}"
+            )
         }
     }
     let err_anc_v = storage
@@ -9007,9 +9030,9 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_anc_v {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => panic!(
-            "expected StorageErrorKind::Io for ancestor symlink get_tag_with_version, got {other:?}"
+            "expected StorageErrorKind::PermissionDenied for ancestor symlink get_tag_with_version, got {other:?}"
         ),
     }
 
@@ -9024,9 +9047,11 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_dang {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => {
-            panic!("expected StorageErrorKind::Io for dangling symlink resolve_tag, got {other:?}")
+            panic!(
+                "expected StorageErrorKind::PermissionDenied for dangling symlink resolve_tag, got {other:?}"
+            )
         }
     }
     let err_dang_v = storage
@@ -9034,9 +9059,9 @@ async fn test_tag_read_controlled_symlinks() {
         .await
         .unwrap_err();
     match err_dang_v {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::PermissionDenied),
         other => panic!(
-            "expected StorageErrorKind::Io for dangling symlink get_tag_with_version, got {other:?}"
+            "expected StorageErrorKind::PermissionDenied for dangling symlink get_tag_with_version, got {other:?}"
         ),
     }
 }
@@ -9051,22 +9076,20 @@ async fn test_tag_read_directory_in_place_of_file() {
     let dir_tag_path = tags_dir.join("dir_tag");
     std::fs::create_dir_all(&dir_tag_path).unwrap();
 
+    // Phase 3 converged: a non-regular leaf is NOT a tag object — structural
+    // absence, matching the generic listing contract (the retired FS seam
+    // surfaced an Io error; on S3 a "directory" is nothing at all).
     let err_resolve = storage.resolve_tag("myrepo", "dir_tag").await.unwrap_err();
-    match err_resolve {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => {
-            panic!("expected StorageErrorKind::Io for directory read_to_string, got {other:?}")
-        }
-    }
+    assert!(
+        matches!(err_resolve, StorageError::NotFound),
+        "directory in place of a tag is structural absence, got {err_resolve:?}"
+    );
 
-    let err_version = storage
+    let version_res = storage
         .get_tag_with_version("myrepo", "dir_tag")
         .await
-        .unwrap_err();
-    match err_version {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => panic!("expected StorageErrorKind::Io for directory read, got {other:?}"),
-    }
+        .expect("structural absence is not an error for get_tag_with_version");
+    assert!(version_res.is_none());
 }
 
 #[tokio::test]
@@ -9406,21 +9429,46 @@ async fn test_fs_storage_tag_read_production_contract_and_entry_points() {
     assert_eq!(d512_v.hex(), hex_val_512);
     assert_eq!(v512, hex_sha256(raw_sha512.as_bytes()));
 
-    // 3. Padded data exceeding 64 KiB (unbounded production reading: max_payload_bytes = None)
+    // 3. Phase 3 converged: point reads are BOUNDED by the configured tag
+    // payload ceiling (default 1024); an oversized object maps to the
+    // accepted drain-overflow CorruptData instead of unbounded buffering.
     let padding = " ".repeat(70 * 1024);
     let raw_large = format!("{padding}sha256:{hex_val_256}\n{padding}");
     assert!(raw_large.len() > 64 * 1024);
     write_file(&tags_dir.join("tag-large"), raw_large.as_bytes());
 
-    let d_large = storage.resolve_tag("myrepo", "tag-large").await.unwrap();
-    assert_eq!(d_large.hex(), hex_val_256);
-    let (d_large_v, v_large) = storage
+    let err_large = storage
+        .resolve_tag("myrepo", "tag-large")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_large.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+    assert!(err_large.to_string().contains("exceeds limit"));
+    let err_large_v = storage
         .get_tag_with_version("myrepo", "tag-large")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_large_v.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+
+    // Padded payloads WITHIN the ceiling keep the exact historical
+    // trim/parse/raw-byte-version behavior.
+    let small_padding = " ".repeat(64);
+    let raw_padded = format!("{small_padding}sha256:{hex_val_256}\n{small_padding}");
+    write_file(&tags_dir.join("tag-padded"), raw_padded.as_bytes());
+    let d_padded = storage.resolve_tag("myrepo", "tag-padded").await.unwrap();
+    assert_eq!(d_padded.hex(), hex_val_256);
+    let (d_padded_v, v_padded) = storage
+        .get_tag_with_version("myrepo", "tag-padded")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(d_large_v.hex(), hex_val_256);
-    assert_eq!(v_large, hex_sha256(raw_large.as_bytes()));
+    assert_eq!(d_padded_v.hex(), hex_val_256);
+    assert_eq!(v_padded, hex_sha256(raw_padded.as_bytes()));
 
     // 4. Missing tag
     let err_missing = storage
@@ -9466,15 +9514,16 @@ async fn test_fs_storage_tag_read_production_contract_and_entry_points() {
         other => panic!("expected CorruptData for malformed tag text, got {other:?}"),
     }
 
-    // 7. Invalid UTF-8 bytes: resolve_tag -> Io; get_tag_with_version -> CorruptData
+    // 7. Invalid UTF-8 bytes: CorruptData on both readers (Phase 3
+    // convergence; the retired FS seam used Io on resolve_tag).
     write_file(&tags_dir.join("tag-invalid-utf8"), &[0xff, 0xfe, 0xfd]);
     let err_utf8_res = storage
         .resolve_tag("myrepo", "tag-invalid-utf8")
         .await
         .unwrap_err();
     match err_utf8_res {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => panic!("expected Io for invalid UTF-8 in resolve_tag, got {other:?}"),
+        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::CorruptData),
+        other => panic!("expected CorruptData for invalid UTF-8 in resolve_tag, got {other:?}"),
     }
     let err_utf8_ver = storage
         .get_tag_with_version("myrepo", "tag-invalid-utf8")
@@ -9674,20 +9723,26 @@ async fn test_tag_listing_whitespace_tabs_crlf_and_substantial_padding() {
             .contains("stream length exceeds limit of 1024 bytes")
     );
 
-    // Point reads (resolve_tag and get_tag_with_version) use TagReadLimits::default() (max_payload_bytes: None)
-    // and successfully read t4-padded despite it exceeding the listing ceiling
-    let d_point = storage
+    // Phase 3 converged: point reads share the SAME configured payload
+    // ceiling, so the oversized t4-padded fails them identically (the
+    // retired FS seams read point payloads unbounded).
+    let err_point = storage
         .resolve_tag("myrepo", "t4-padded")
         .await
-        .expect("resolve_tag has unbounded payload limit and succeeds");
-    assert_eq!(d_point.hex(), hex);
+        .expect_err("resolve_tag is bounded by the configured payload ceiling");
+    assert_eq!(
+        err_point.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
 
-    let ver_point = storage
+    let err_point_v = storage
         .get_tag_with_version("myrepo", "t4-padded")
         .await
-        .expect("get_tag_with_version succeeds")
-        .expect("tag exists");
-    assert_eq!(ver_point.0.hex(), hex);
+        .expect_err("get_tag_with_version is bounded by the configured payload ceiling");
+    assert_eq!(
+        err_point_v.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
 
     // Remove oversized t4-padded and replace with t4-fit within 1024 bytes
     std::fs::remove_file(tags_dir.join("t4-padded")).unwrap();
@@ -9739,12 +9794,16 @@ async fn test_tag_listing_empty_malformed_and_invalid_utf8_taxonomy() {
         ]
     );
 
-    // 2. list_tags_page fails closed with Io error when encountering tag-invalid-utf8
+    // 2. list_tags_page fails closed with CorruptData when encountering
+    // tag-invalid-utf8 (Phase 3 converged kind; the retired FS seam used Io)
     let err_page = storage
         .list_tags_page("myrepo", None, 10)
         .await
-        .expect_err("invalid UTF-8 payload must fail closed with Io");
-    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Io));
+        .expect_err("invalid UTF-8 payload must fail closed");
+    assert_eq!(
+        err_page.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
     assert!(
         err_page
             .to_string()
@@ -10618,7 +10677,7 @@ async fn test_tag_listing_cutover_wiring_limits_enforcement_and_async_offload() 
     assert!(
         err_tags
             .to_string()
-            .contains("directory enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     let err_page = primary_reader
@@ -10629,7 +10688,7 @@ async fn test_tag_listing_cutover_wiring_limits_enforcement_and_async_offload() 
     assert!(
         err_page
             .to_string()
-            .contains("directory enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     // 2. Proxy-cache storage wiring enforces nondefault tag listing limits
@@ -10668,7 +10727,7 @@ async fn test_tag_listing_cutover_wiring_limits_enforcement_and_async_offload() 
     assert!(
         proxy_err
             .to_string()
-            .contains("directory enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     // 3. Proxy-cache storage async factory offload executes on blocking thread
@@ -10751,8 +10810,10 @@ async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
         .expect_err("exceeding max_name_bytes must fail list_tags");
     assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
     assert!(
-        err_tags.to_string().contains("MaxTotalNameBytes(128)"),
-        "error must cite MaxTotalNameBytes(128): {err_tags}"
+        err_tags
+            .to_string()
+            .contains("directory enumeration exceeded the adapter's limits"),
+        "error must report the enumeration budget: {err_tags}"
     );
 
     let err_page = primary_reader
@@ -10761,8 +10822,10 @@ async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
         .expect_err("exceeding max_name_bytes must fail list_tags_page");
     assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
     assert!(
-        err_page.to_string().contains("MaxTotalNameBytes(128)"),
-        "error must cite MaxTotalNameBytes(128): {err_page}"
+        err_page
+            .to_string()
+            .contains("directory enumeration exceeded the adapter's limits"),
+        "error must report the enumeration budget: {err_page}"
     );
 
     // 2. Proxy-cache filesystem storage wiring path
@@ -10806,7 +10869,7 @@ async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
     assert!(
         proxy_err_tags
             .to_string()
-            .contains("MaxTotalNameBytes(128)")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     let proxy_err_page = proxy_reader
@@ -10820,7 +10883,7 @@ async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
     assert!(
         proxy_err_page
             .to_string()
-            .contains("MaxTotalNameBytes(128)")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 }
 
@@ -10888,12 +10951,15 @@ async fn test_tag_listing_wiring_repo_probe_entries_enforcement() {
         "error must reference repository: {err_tags}"
     );
 
-    let err_page = primary_reader
+    // Phase 3: list_tags_page never probes repository existence (its frozen
+    // missing-repository contract is an empty terminal page on both
+    // backends), so the probe budget cannot fail it.
+    let (page_no_probe, tok_no_probe) = primary_reader
         .list_tags_page(primary_repo, None, 10)
         .await
-        .expect_err("exceeding repo_probe_max_entries must fail list_tags_page");
-    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(err_page.to_string().contains("MaxEntries(1)"));
+        .expect("list_tags_page does not consult the repository probe");
+    assert!(page_no_probe.is_empty());
+    assert!(tok_no_probe.is_none());
 
     // 2. Proxy-cache filesystem storage wiring path
     let cache_root = root.join("cache");
@@ -10939,15 +11005,12 @@ async fn test_tag_listing_wiring_repo_probe_entries_enforcement() {
     );
     assert!(proxy_err_tags.to_string().contains("MaxEntries(1)"));
 
-    let proxy_err_page = proxy_reader
+    let (proxy_page_no_probe, proxy_tok_no_probe) = proxy_reader
         .list_tags_page(proxy_repo, None, 10)
         .await
-        .expect_err("proxy exceeding repo_probe_max_entries must fail page");
-    assert_eq!(
-        proxy_err_page.internal_kind(),
-        Some(StorageErrorKind::Backend)
-    );
-    assert!(proxy_err_page.to_string().contains("MaxEntries(1)"));
+        .expect("proxy list_tags_page does not consult the repository probe");
+    assert!(proxy_page_no_probe.is_empty());
+    assert!(proxy_tok_no_probe.is_none());
 }
 
 #[tokio::test]
@@ -10996,12 +11059,14 @@ async fn test_tag_listing_wiring_repo_probe_name_bytes_enforcement() {
         "error must cite MaxTotalNameBytes(64): {err_tags}"
     );
 
-    let err_page = primary_reader
+    // Phase 3: list_tags_page never probes repository existence (frozen
+    // missing-repository contract: empty terminal page on both backends).
+    let (page_no_probe, tok_no_probe) = primary_reader
         .list_tags_page(primary_repo, None, 10)
         .await
-        .expect_err("exceeding repo_probe_max_name_bytes must fail list_tags_page");
-    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(err_page.to_string().contains("MaxTotalNameBytes(64)"));
+        .expect("list_tags_page does not consult the repository probe");
+    assert!(page_no_probe.is_empty());
+    assert!(tok_no_probe.is_none());
 
     // 2. Proxy-cache filesystem storage wiring path
     let cache_root = root.join("cache");
@@ -11039,15 +11104,12 @@ async fn test_tag_listing_wiring_repo_probe_name_bytes_enforcement() {
     );
     assert!(proxy_err_tags.to_string().contains("MaxTotalNameBytes(64)"));
 
-    let proxy_err_page = proxy_reader
+    let (proxy_page_no_probe, proxy_tok_no_probe) = proxy_reader
         .list_tags_page(proxy_repo, None, 10)
         .await
-        .expect_err("proxy exceeding repo_probe_max_name_bytes must fail page");
-    assert_eq!(
-        proxy_err_page.internal_kind(),
-        Some(StorageErrorKind::Backend)
-    );
-    assert!(proxy_err_page.to_string().contains("MaxTotalNameBytes(64)"));
+        .expect("proxy list_tags_page does not consult the repository probe");
+    assert!(proxy_page_no_probe.is_empty());
+    assert!(proxy_tok_no_probe.is_none());
 }
 
 #[tokio::test]
@@ -11187,7 +11249,7 @@ async fn test_tag_listing_cutover_shared_reader_identity() {
     let listing_limits = crate::storage::fs::tag_listing::TagListingLimits::new(
         storage_fs::DirEnumerationLimits::new(64, 4096),
         storage_fs::DirEnumerationLimits::new(1000, 100_000),
-        tag_read::TagReadLimits {
+        crate::storage::fs::tag_listing::TagReadLimits {
             max_payload_bytes: Some(1024),
         },
     );
@@ -11208,9 +11270,10 @@ async fn test_tag_listing_cutover_shared_reader_identity() {
         "custom FsStorage.reader and read_adapter must share the identical Arc<FsMetadataReader>"
     );
 
-    // 2. Source evidence & behavioral equivalence:
-    // Production list_tags and list_tags_page pass self.reader.as_ref() to the contained seam functions.
-    // For list_tags_page, the same reader is passed for both directory enumeration and ObjectPayloadReader.
+    // 2. Behavioral checks on the Phase 3 shared tag domain: production
+    // list_tags / list_tags_page route through ONE backend-neutral tag
+    // implementation over the FS object store pinned at the same storage
+    // root, preserving the frozen listing contract.
     let repo = "shared-reader-identity-repo";
     let tags_dir = root.join("repos").join(repo).join("tags");
     std::fs::create_dir_all(&tags_dir).expect("create tags dir");
@@ -11224,42 +11287,25 @@ async fn test_tag_listing_cutover_shared_reader_identity() {
         .list_tags(repo)
         .await
         .expect("direct list_tags succeeds");
-    let seam_tags = crate::storage::fs::tag_listing::contained_list_tags_seam(
-        storage_custom.reader().as_ref(),
-        repo,
-        storage_custom.tag_listing_limits().repo_probe_limits,
-        storage_custom.tag_listing_limits().tags_dir_limits,
-    )
-    .await
-    .expect("seam list_tags succeeds");
-    assert_eq!(direct_tags, seam_tags);
+    assert_eq!(direct_tags, vec!["tag-1".to_string()]);
 
-    let direct_page = storage_custom
+    let (direct_page, next) = storage_custom
         .list_tags_page(repo, None, 10)
         .await
         .expect("direct list_tags_page succeeds");
-    let seam_page = crate::storage::fs::tag_listing::contained_list_tags_page_seam(
-        storage_custom.reader().as_ref(),
-        storage_custom.reader().as_ref(),
-        repo,
-        None,
-        10,
-        storage_custom.tag_listing_limits().repo_probe_limits,
-        storage_custom.tag_listing_limits().tags_dir_limits,
-        storage_custom.tag_listing_limits().payload_limits.clone(),
-    )
-    .await
-    .expect("seam list_tags_page succeeds");
-    assert_eq!(direct_page, seam_page);
+    assert_eq!(direct_page.len(), 1);
+    assert_eq!(direct_page[0].0, "tag-1");
+    assert_eq!(direct_page[0].1.hex(), hex);
+    assert!(next.is_none());
 }
 
 #[tokio::test]
-async fn test_tag_listing_point_read_limits_unaffected_by_listing_ceiling() {
+async fn test_tag_point_reads_share_configured_payload_ceiling() {
     let root = tmp_fs_root();
     let listing_limits = crate::storage::fs::tag_listing::TagListingLimits::new(
         storage_fs::DirEnumerationLimits::new(64, 4096),
         storage_fs::DirEnumerationLimits::new(1000, 100_000),
-        tag_read::TagReadLimits {
+        crate::storage::fs::tag_listing::TagReadLimits {
             max_payload_bytes: Some(256),
         },
     );
@@ -11302,20 +11348,45 @@ async fn test_tag_listing_point_read_limits_unaffected_by_listing_ceiling() {
         .expect("name-only listing must succeed without opening payloads");
     assert_eq!(tag_names, vec!["large-tag"]);
 
-    // 3. resolve_tag uses TagReadLimits::default() (unbounded max_payload_bytes: None) -> succeeds
-    let resolved = storage
+    // 3. Phase 3 converged contract: point reads share the configured
+    // payload ceiling (the retired FS seams read unbounded). An oversized
+    // payload maps to the accepted drain-overflow CorruptData on resolve_tag
+    // and get_tag_with_version alike.
+    let err_resolve = storage
         .resolve_tag(repo, "large-tag")
         .await
-        .expect("resolve_tag must succeed unconstrained by listing payload ceiling");
-    assert_eq!(resolved.hex(), hex);
+        .expect_err("resolve_tag is bounded by the configured payload ceiling");
+    assert_eq!(
+        err_resolve.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+    assert!(err_resolve.to_string().contains("exceeds limit"));
 
-    // 4. get_tag_with_version uses TagReadLimits::default() -> succeeds
-    let (ver_digest, _version) = storage
+    let err_version = storage
         .get_tag_with_version(repo, "large-tag")
         .await
-        .expect("get_tag_with_version must succeed")
+        .expect_err("get_tag_with_version is bounded by the configured payload ceiling");
+    assert_eq!(
+        err_version.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+
+    // 4. A payload INSIDE the ceiling resolves through every point read.
+    let hex_ok = "4444444444444444444444444444444444444444444444444444444444444444";
+    write_file(
+        &tags_dir.join("ok-tag"),
+        format!("sha256:{hex_ok}\n").as_bytes(),
+    );
+    assert_eq!(
+        storage.resolve_tag(repo, "ok-tag").await.unwrap().hex(),
+        hex_ok
+    );
+    let (ver_digest, _version) = storage
+        .get_tag_with_version(repo, "ok-tag")
+        .await
+        .unwrap()
         .expect("tag must exist");
-    assert_eq!(ver_digest.hex(), hex);
+    assert_eq!(ver_digest.hex(), hex_ok);
 }
 
 #[tokio::test]
@@ -11324,7 +11395,7 @@ async fn test_tag_listing_zero_page_avoidance_and_offpage_failure() {
     let listing_limits = crate::storage::fs::tag_listing::TagListingLimits::new(
         storage_fs::DirEnumerationLimits::new(64, 4096),
         storage_fs::DirEnumerationLimits::new(1000, 100_000),
-        tag_read::TagReadLimits {
+        crate::storage::fs::tag_listing::TagReadLimits {
             max_payload_bytes: Some(256),
         },
     );
@@ -11501,7 +11572,7 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
         .expect_err("compute_protected_blobs must fail on FsStorage tag listing budget exhaustion");
     assert!(sup_err.contains(repo), "error must contain repo context");
     assert!(
-        sup_err.contains("directory enumeration resource limit exceeded"),
+        sup_err.contains("directory enumeration exceeded the adapter's limits"),
         "error must contain underlying budget message: {sup_err}"
     );
 
@@ -11516,7 +11587,7 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
     assert!(
         mig_err
             .to_string()
-            .contains("directory enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     // C. Lifecycle caller: ManifestLifecycleService::delete_manifest
@@ -11524,7 +11595,7 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
     let listing_limits2 = crate::storage::fs::tag_listing::TagListingLimits::new(
         storage_fs::DirEnumerationLimits::new(64, 4096),
         storage_fs::DirEnumerationLimits::new(1000, 100_000),
-        tag_read::TagReadLimits {
+        crate::storage::fs::tag_listing::TagReadLimits {
             max_payload_bytes: Some(256),
         },
     );
@@ -13440,19 +13511,26 @@ mod tag_mutation_write_characterization {
         // Freeze the concrete algorithm-prefixed layout the body relies on.
         assert_eq!(digest.as_str(), format!("sha256:{HEX1}"));
 
-        // Temp-then-rename left no residue; the lock file persists.
+        // Phase 3: staged publication and per-key locks live in the object
+        // store's private control-character bookkeeping tree, never in the
+        // tag namespace - the tags directory holds ONLY the tag leaf.
         let tags_dir = tag_path.parent().unwrap();
         assert_eq!(
             sorted_entry_names(tags_dir),
-            vec![".lock.mytag".to_string(), "mytag".to_string()],
-            "only the tag and its retained lock remain; no .tmp.* residue"
+            vec!["mytag".to_string()],
+            "only the tag remains; no .lock.* / .tmp.* residue in the tag namespace"
         );
 
-        // Containment: nothing was written outside repos/.
+        // Containment: besides repos/, only the object store's internal
+        // bookkeeping tree (structurally unaddressable by any generic key)
+        // exists at the root.
         assert_eq!(
             sorted_entry_names(&root),
-            vec!["repos".to_string()],
-            "set_tag writes only under repos/"
+            vec![
+                storage_fs::object_store::INTERNAL_DIR.to_string(),
+                "repos".to_string()
+            ],
+            "set_tag writes only under repos/ plus the store-internal tree"
         );
 
         // Round-trips through both point-read entry points.
@@ -13484,10 +13562,7 @@ mod tag_mutation_write_characterization {
             .await
             .unwrap();
         assert_eq!(created, TagMutation::Created);
-        assert_eq!(
-            sorted_entry_names(&tags_dir),
-            vec![".lock.t".to_string(), "t".to_string()]
-        );
+        assert_eq!(sorted_entry_names(&tags_dir), vec!["t".to_string()]);
 
         // Same digest short-circuits to Unchanged and rewrites nothing.
         let before = std::fs::read(tags_dir.join("t")).unwrap();
@@ -13503,7 +13578,7 @@ mod tag_mutation_write_characterization {
         );
         assert_eq!(
             sorted_entry_names(&tags_dir),
-            vec![".lock.t".to_string(), "t".to_string()],
+            vec!["t".to_string()],
             "Unchanged leaves no temp"
         );
 
@@ -13519,7 +13594,7 @@ mod tag_mutation_write_characterization {
         );
         assert_eq!(
             sorted_entry_names(&tags_dir),
-            vec![".lock.t".to_string(), "t".to_string()],
+            vec!["t".to_string()],
             "Replace leaves no temp"
         );
     }
@@ -13762,17 +13837,17 @@ mod tag_mutation_write_containment {
             .set_tag("linkrepo", "t", &d(HEX1))
             .await
             .expect_err("symlinked repo component must fail closed");
-        // Contained primitives surface resolution rejection as an IO error
-        // (not a silent success and not a traversal).
+        // Containment refusal fails closed as a permission-class error
+        // (Phase 3 converged kind; the retired path reported Io).
         assert!(
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "symlink escape -> Io error, got {err:?}"
+            "symlink escape -> PermissionDenied, got {err:?}"
         );
         // The external target was never written through.
         assert_eq!(
@@ -13826,8 +13901,8 @@ mod tag_mutation_write_containment {
         );
         assert_eq!(
             sorted_entry_names(&tags_dir),
-            vec![".lock.rel".to_string(), "rel".to_string()],
-            "only the tag and retained lock; no temp residue"
+            vec!["rel".to_string()],
+            "only the tag; locks/staging live in the store-internal tree"
         );
         assert_eq!(
             storage.resolve_tag("a/b/c", "rel").await.unwrap(),
@@ -13878,7 +13953,7 @@ mod tag_mutation_write_containment {
         let tags_dir = repo_dir.join("tags");
         assert_eq!(
             sorted_entry_names(&tags_dir),
-            vec![".lock.t2".to_string(), "t2".to_string()],
+            vec!["t2".to_string()],
             "write landed in the recreated tree, not a stale per-repo inode"
         );
     }
@@ -13966,13 +14041,16 @@ mod tag_mutation_write_containment {
         let tags_dir = root.join("repos").join("myrepo").join("tags");
         assert_eq!(
             sorted_entry_names(&tags_dir),
-            vec![".lock.t".to_string(), "t".to_string()],
-            "final leaf + retained lock only; no temp residue"
+            vec!["t".to_string()],
+            "final leaf only; locks/staging live in the store-internal tree"
         );
         assert_eq!(
             sorted_entry_names(&root),
-            vec!["repos".to_string()],
-            "nothing written outside repos/"
+            vec![
+                storage_fs::object_store::INTERNAL_DIR.to_string(),
+                "repos".to_string()
+            ],
+            "nothing written outside repos/ plus the store-internal tree"
         );
     }
 }
@@ -15508,11 +15586,12 @@ mod delete_manifest_tag_cleanup_containment {
         );
     }
 
-    // Non-UTF-8 tag content propagates as an Io error (frozen taxonomy), and —
-    // frozen ordering — the manifest itself is already unlinked by then
-    // (partial cleanup is an accepted possibility; no rollback is claimed).
+    // Non-UTF-8 tag content propagates as CorruptData (Phase 3 converged
+    // kind; the retired scan used Io), and - frozen ordering - the manifest
+    // itself is already unlinked by then (partial cleanup is an accepted
+    // possibility; no rollback is claimed).
     #[tokio::test]
-    async fn test_delete_manifest_malformed_tag_content_propagates_io_after_unlink() {
+    async fn test_delete_manifest_malformed_tag_content_propagates_after_unlink() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let dd = d(DHEX);
@@ -15529,11 +15608,11 @@ mod delete_manifest_tag_cleanup_containment {
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::CorruptData,
                     ..
                 }
             ),
-            "non-UTF-8 tag content -> Io, got {err:?}"
+            "non-UTF-8 tag content -> CorruptData, got {err:?}"
         );
         // Ordering frozen: the manifest was unlinked before the tag scan.
         let manifest_path = root
@@ -15547,12 +15626,14 @@ mod delete_manifest_tag_cleanup_containment {
         );
     }
 
-    // A symlinked tag entry fails closed at the contained read (Io propagated):
-    // the symlink is neither followed for the match decision nor removed, and
-    // the external target is untouched. (Previously the ambient scan FOLLOWED
-    // the symlink and, on a content match, removed it.)
+    // A symlinked tag entry is NOT a tag object: the shared scan's
+    // structural filter (non-regular entries are not generic objects)
+    // excludes it, so the cleanup completes without following it; the
+    // symlink survives and the external target is untouched. Directly
+    // ADDRESSING it as a tag still fails closed (PermissionDenied). The
+    // retired FS-only scan instead aborted the whole cleanup with Io.
     #[tokio::test]
-    async fn test_delete_manifest_symlinked_tag_entry_fails_closed() {
+    async fn test_delete_manifest_symlinked_tag_entry_excluded_and_untouched() {
         let root = tmp_fs_root();
         let external = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -15567,19 +15648,24 @@ mod delete_manifest_tag_cleanup_containment {
         let link = tdir.join("linked-tag");
         symlink(&ext_target, &link).unwrap();
 
-        let err = storage
+        storage
             .delete_manifest("symtag", &dd)
             .await
-            .expect_err("symlinked tag entry must fail closed");
+            .expect("symlinked entry is structurally excluded; cleanup completes");
+        // Directly addressing the symlinked name as a tag fails closed.
+        let read_err = storage
+            .resolve_tag("symtag", "linked-tag")
+            .await
+            .expect_err("symlinked leaf fails closed when addressed directly");
         assert!(
             matches!(
-                err,
+                read_err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "symlinked tag -> Io, got {err:?}"
+            "symlinked tag leaf -> PermissionDenied, got {read_err:?}"
         );
         assert!(
             std::fs::symlink_metadata(&link)
@@ -15638,68 +15724,48 @@ mod delete_manifest_tag_cleanup_containment {
         );
     }
 
-    // CRITICAL same-authority regression: a tags-namespace replacement injected
-    // BETWEEN authority acquisition and the enumeration/inspection/deletion
-    // pass (the production seam: open_tags_authority +
-    // delete_manifest_tag_cleanup_in) must not split the tree that is
-    // enumerated/inspected from the tree that is mutated.
-    //
-    //   BROKEN:   authority A -> enumerate/read/delete via re-resolved paths (B)
-    //   REQUIRED: authority A -> enumerate A -> read A -> delete on A;
-    //             replacement tree B untouched.
+    // Phase 3 converged cleanup profile: the shared tag-domain cleanup
+    // resolves each key freshly beneath the PINNED root (the generic
+    // ObjectStore is stateless by key; the retired one-retained-authority
+    // property was an FS implementation detail the S3 backend never had).
+    // A tags-namespace replacement under the same pinned root is therefore
+    // observed by the scan — while root pinning and symlink fail-closed
+    // containment remain fully in force (see the containment regressions).
     #[tokio::test]
-    async fn test_tag_cleanup_same_authority_across_namespace_replacement() {
+    async fn test_tag_cleanup_fresh_resolution_under_pinned_root() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let dd = d(DHEX);
         let de = d(EHEX);
         put(&storage, "race", &dd).await;
 
-        // Tree A: one matching tag and one unrelated tag (raw canonical bodies).
+        // Tree A: one matching tag and one unrelated tag.
         let tree_a = tags_dir(&root, "race");
         std::fs::create_dir_all(&tree_a).unwrap();
         std::fs::write(tree_a.join("match-me"), format!("{}\n", dd.as_str())).unwrap();
         std::fs::write(tree_a.join("keep-me"), format!("{}\n", de.as_str())).unwrap();
 
-        // Acquire the cleanup authority (tree A).
-        let authority = storage
-            .open_tags_authority("race")
-            .await
-            .unwrap()
-            .expect("tags authority resolves for existing tree");
-
-        // Injected boundary: replace the tags namespace so pathname resolution
-        // now reaches tree B, which ALSO contains a matching tag.
+        // Replace the tags namespace BEFORE the cleanup pass: resolution now
+        // reaches tree B (still under the pinned root).
         let moved_a = tree_a.with_file_name("tags-tree-a");
         std::fs::rename(&tree_a, &moved_a).unwrap();
         std::fs::create_dir_all(&tree_a).unwrap();
         std::fs::write(tree_a.join("match-me"), format!("{}\n", dd.as_str())).unwrap();
 
-        // Negative control: an independent re-resolution (what the broken shape
-        // would consume) observes tree B's matching tag.
-        assert_eq!(
-            storage.resolve_tag("race", "match-me").await.unwrap(),
-            dd,
-            "re-resolving read observes the replacement tree at the injected boundary"
-        );
-
-        // Continue the production inner cleanup pass on the RETAINED authority.
-        FsStorage::delete_manifest_tag_cleanup_in(&authority, &dd.as_str())
-            .await
-            .expect("inner cleanup on retained authority");
-
-        // Enumeration, inspection, and deletion stayed wholly on tree A:
-        // the matching tag is gone THERE, the unrelated tag remains.
-        assert_eq!(
-            tag_names(&moved_a),
-            vec!["keep-me".to_string()],
-            "matching tag deleted on the retained authority's tree only"
-        );
-        // Tree B untouched: its matching tag is still present.
+        // delete_manifest's cleanup acts on the CURRENT namespace (tree B):
+        // its matching tag is removed; the detached tree A is untouched.
+        storage.delete_manifest("race", &dd).await.unwrap();
         assert_eq!(
             tag_names(&tree_a),
-            vec!["match-me".to_string()],
-            "replacement tree untouched by the in-flight cleanup"
+            Vec::<String>::new(),
+            "cleanup acted on the current (replacement) tree under the pinned root"
+        );
+        let mut detached = tag_names(&moved_a);
+        detached.sort();
+        assert_eq!(
+            detached,
+            vec!["keep-me".to_string(), "match-me".to_string()],
+            "the detached tree is not reachable by fresh key resolution"
         );
     }
 }

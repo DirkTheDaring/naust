@@ -3708,7 +3708,8 @@ async fn test_manifest_read_service_tag_fixtures_cutover() {
         "malformed tag content must yield ManifestReadError::TagNotFound, got {err_malformed:?}"
     );
 
-    // 4. Symlink tag fixture returns ManifestReadError::Storage(StorageError::Internal { kind: Io, .. })
+    // 4. Symlink tag fixture fails closed as a permission-class containment
+    // refusal (Phase 3 converged kind; the retired FS seam reported Io).
     let symlink_tag_path = tags_dir.join("symlink-tag");
     std::os::unix::fs::symlink(tags_dir.join("valid-tag"), &symlink_tag_path).unwrap();
 
@@ -3719,9 +3720,11 @@ async fn test_manifest_read_service_tag_fixtures_cutover() {
         .unwrap_err();
     match err_symlink {
         ManifestReadError::Storage(StorageError::Internal { kind, .. }) => {
-            assert_eq!(kind, StorageErrorKind::Io);
+            assert_eq!(kind, StorageErrorKind::PermissionDenied);
         }
-        other => panic!("expected ManifestReadError::Storage(Io) for symlink tag, got {other:?}"),
+        other => panic!(
+            "expected ManifestReadError::Storage(PermissionDenied) for symlink tag, got {other:?}"
+        ),
     }
 }
 
@@ -4119,59 +4122,59 @@ async fn test_http_distinguish_valid_input_storage_error_and_tag_precondition_fa
     .unwrap();
     let tree_b_bytes_before = std::fs::read(new_tags_dir.join("latest")).unwrap();
 
-    // Send DELETE request:
-    // get_tag_with_version reads through pinned descriptor (fs_root_old) getting hex_c1 version,
-    // delete_tag_conditional reads fs_root getting hex_c2 version -> TagPreconditionFailed!
-    // Handler matches Err(_) => errors::internal_error() -> 500 INTERNAL_SERVER_ERROR with UNKNOWN!
-    let resp_del_precondition = client
+    // Send DELETE request. Since the O-04 write-containment cutover (and
+    // unchanged through the Phase 3 shared tag domain), tag reads AND tag
+    // mutations resolve through the SAME pinned root: get_tag_with_version
+    // observes tree A (hex_c1) and delete_tag_conditional deletes that same
+    // pinned leaf under a matching version token -> 202 ACCEPTED. The
+    // ambient replacement tree B is untouched.
+    //
+    // (This section previously asserted the PRE-O-04 divergence — reads
+    // pinned, mutations ambient -> TagPreconditionFailed -> 500 — and had
+    // been latently failing since the coherence cutover; verified failing
+    // identically at the accepted Phase 3 baseline f2196653/64d438c0.)
+    let resp_del_coherent = client
         .delete(format!("{base_url}/v2/{repo_pre}/manifests/latest"))
         .basic_auth("testuser", Some("testpass"))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        resp_del_precondition.status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-    );
-    let body_del_precondition = resp_del_precondition.text().await.unwrap();
-    assert!(
-        body_del_precondition.contains("\"code\":\"UNKNOWN\""),
-        "TagPreconditionFailed on DELETE must map to HTTP 500 UNKNOWN without modification, got: {body_del_precondition}"
+        resp_del_coherent.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "coherent pinned-root read+delete succeeds end-to-end"
     );
 
-    // Demonstrate deterministic TagPreconditionFailed execution path by inspecting cleanup and state outcomes:
-    // 1. Journal was deleted on PreconditionFailed cleanup
+    // 1. Journal was deleted on the successful completion path.
     assert!(
         storage
             .read_lifecycle_journal(repo_pre)
             .await
             .unwrap()
             .is_none(),
-        "journal must be deleted on TagPreconditionFailed cleanup"
+        "journal must be deleted after the completed tag deletion"
     );
-    // 2. Index was restored to ready health
+    // 2. Index restored to ready health.
     assert!(
         services.ref_index.check_health().is_ok(),
-        "ref_index must be marked ready on TagPreconditionFailed cleanup"
+        "ref_index must be marked ready after the completed tag deletion"
     );
-    // 3. Tree B tag was preserved intact on disk with unchanged bytes
+    // 3. The deletion landed on the PINNED tree A: its leaf is gone.
+    assert!(
+        !fs_root_old
+            .join("repos")
+            .join("valid")
+            .join("precondition-repo")
+            .join("tags")
+            .join("latest")
+            .exists(),
+        "the pinned old tree's tag leaf was deleted (read/write coherence)"
+    );
+    let _ = tree_a_bytes_before;
+    // 4. The ambient replacement tree B is untouched.
     assert_eq!(
         std::fs::read(new_tags_dir.join("latest")).unwrap(),
         tree_b_bytes_before,
-        "Tree B tag bytes must be preserved intact on disk"
-    );
-    // 4. Tree A tag was preserved intact on disk with unchanged bytes
-    assert_eq!(
-        std::fs::read(
-            fs_root_old
-                .join("repos")
-                .join("valid")
-                .join("precondition-repo")
-                .join("tags")
-                .join("latest")
-        )
-        .unwrap(),
-        tree_a_bytes_before,
-        "Tree A tag bytes must be preserved intact on disk"
+        "the replacement tree is never addressed by the pinned instance"
     );
 }

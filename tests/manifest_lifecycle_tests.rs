@@ -593,7 +593,7 @@ async fn test_s3_conditional_delete_412_precondition_failed() {
         Some("test-bucket".to_string()),
         "".to_string(),
         50 * 1024 * 1024,
-        mock.clone(),
+        Arc::new(support::s3_mock::TagBridgeDriver::new(mock.clone())),
     );
 
     // Write a tag object
@@ -607,9 +607,11 @@ async fn test_s3_conditional_delete_412_precondition_failed() {
     .await
     .unwrap();
 
-    // Conditional delete with wrong ETag returns PreconditionFailed
+    // Conditional delete with a stale registry version token returns
+    // PreconditionFailed (Phase 3: the token is the raw-byte SHA-256, never
+    // a backend ETag).
     let res = storage
-        .delete_tag_conditional("my-repo", "latest", Some("wrong-etag"))
+        .delete_tag_conditional("my-repo", "latest", Some("wrong-version"))
         .await
         .unwrap();
 
@@ -4391,7 +4393,9 @@ async fn test_manifest_lifecycle_delete_tag_preservation_on_read_failure() {
         "no pending journal must exist before failure injection"
     );
 
-    // 3. Inject tag-read failure via symlink (contained tag read rejects with StorageErrorKind::Io)
+    // 3. Inject tag-read failure via symlink (contained tag read fails
+    // closed with StorageErrorKind::PermissionDenied — Phase 3 converged
+    // containment-refusal kind)
     let tags_dir = dir
         .path()
         .join("data")
@@ -4407,10 +4411,10 @@ async fn test_manifest_lifecycle_delete_tag_preservation_on_read_failure() {
     let del_err = service.delete_tag(repo, "symlink-tag").await.unwrap_err();
     match del_err {
         ManifestLifecycleError::Storage(StorageError::Internal { kind, .. }) => {
-            assert_eq!(kind, StorageErrorKind::Io);
+            assert_eq!(kind, StorageErrorKind::PermissionDenied);
         }
         other => panic!(
-            "expected ManifestLifecycleError::Storage(Io) on symlink tag read failure, got {other:?}"
+            "expected ManifestLifecycleError::Storage(PermissionDenied) on symlink tag read failure, got {other:?}"
         ),
     }
 
@@ -4495,9 +4499,19 @@ async fn test_manifest_lifecycle_delete_tag_precondition_failed_cleanup() {
             .is_none()
     );
 
-    // Trigger PreconditionFailed deterministically via root replacement:
-    // Tree A (pinned descriptor) has the original tag (hex_orig).
-    // In Tree B (recreated at fs_root), overwrite the tag file with different bytes (hex_diff).
+    // Root replacement: since the O-04 write-containment cutover (unchanged
+    // through the Phase 3 shared tag domain), tag reads AND mutations
+    // resolve through the SAME pinned root, so a whole-root replacement can
+    // no longer produce a spurious precondition failure: the deletion
+    // completes coherently on the pinned tree and the ambient replacement
+    // tree stays untouched.
+    //
+    // (This test previously asserted the PRE-O-04 divergence — reads pinned,
+    // mutations ambient -> TagPreconditionFailed — and had been latently
+    // failing since the coherence cutover; verified failing identically at
+    // the accepted Phase 3 baseline f2196653/64d438c0. The PreconditionFailed
+    // CLEANUP branch is now covered deterministically by the lib test
+    // `test_delete_tag_precondition_failed_cleanup_branch`.)
     let fs_root_old = dir.path().join("data-old");
     std::fs::rename(&fs_root, &fs_root_old).unwrap();
     std::fs::create_dir_all(&fs_root).unwrap();
@@ -4507,55 +4521,45 @@ async fn test_manifest_lifecycle_delete_tag_precondition_failed_cleanup() {
         .join(repo)
         .join("tags")
         .join("latest");
-    let tree_a_bytes_before = std::fs::read(&tree_a_tag_path).unwrap();
 
     let tree_b_tag_dir = fs_root.join("repos").join(repo).join("tags");
     std::fs::create_dir_all(&tree_b_tag_dir).unwrap();
     let diff_content = b"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
     std::fs::write(tree_b_tag_dir.join("latest"), diff_content).unwrap();
 
-    // Exercise delete_tag:
-    // get_tag_with_version reads Tree A (gets original version),
-    // marks dirty, writes journal,
-    // delete_tag_conditional reads Tree B (finds diff_content, computes different version),
-    // returns PreconditionFailed!
     let res = service.delete_tag(repo, "latest").await;
     assert!(
-        matches!(res, Err(ManifestLifecycleError::TagPreconditionFailed)),
-        "expected TagPreconditionFailed, got {res:?}"
+        res.is_ok(),
+        "coherent pinned-root read+delete completes, got {res:?}"
     );
 
-    // Verify cleanup outcomes:
-    // 1. Journal was deleted / cleaned up
+    // 1. Journal cleaned up on the success path.
     assert!(
         storage
             .read_lifecycle_journal(repo)
             .await
             .unwrap()
             .is_none(),
-        "journal must be deleted on PreconditionFailed"
+        "journal must be deleted after the completed tag deletion"
     );
 
-    // 2. Index was marked ready (not dirty)
+    // 2. Index restored to ready health.
     assert!(
         ref_index.check_health().is_ok(),
-        "index must be marked ready (not dirty) on PreconditionFailed cleanup"
+        "index must be marked ready after the completed tag deletion"
     );
 
-    // 3. Inspect actual state: tag files in both Tree A and Tree B are preserved intact with unchanged bytes
+    // 3. The deletion landed on the PINNED tree; the replacement tree is
+    // untouched.
+    assert!(
+        !tree_a_tag_path.exists(),
+        "pinned tree tag deleted (read/write coherence)"
+    );
     assert_eq!(
         std::fs::read(tree_b_tag_dir.join("latest")).unwrap(),
         diff_content,
-        "Tree B tag content must be physically preserved intact on disk"
+        "replacement tree tag content must be physically preserved intact on disk"
     );
-    assert_eq!(
-        std::fs::read(&tree_a_tag_path).unwrap(),
-        tree_a_bytes_before,
-        "Tree A tag content must be physically preserved intact on disk"
-    );
-    // Index contents/references remain unchanged
-    assert!(ref_index.is_blob_referenced(&config_d).unwrap());
-    assert!(ref_index.is_blob_referenced(&layer_d).unwrap());
 }
 
 #[tokio::test]
@@ -4588,10 +4592,13 @@ async fn test_manifest_lifecycle_delete_tag_conditional_delete_failure_before_re
             .is_none()
     );
 
-    // Induce a clearly defined conditional-delete failure BEFORE tag removal:
-    // Create the lock file path as a directory (.lock.target-tag)
-    // delete_tag_conditional attempts to open .lock.target-tag with write access,
-    // which fails with EISDIR (Is a directory) BEFORE tag read or removal!
+    // Induce a clearly defined conditional-delete failure BEFORE tag
+    // removal: make the tags directory read-only, so the version snapshot
+    // (a read) succeeds and the journal is written, but the backend unlink
+    // inside delete_tag_conditional fails with EACCES. (The retired
+    // injection created `.lock.target-tag` as a directory; Phase 3 keeps
+    // locks in the object store's internal tree, outside the tag namespace.)
+    use std::os::unix::fs::PermissionsExt as _;
     let tags_dir = dir
         .path()
         .join("data")
@@ -4603,16 +4610,25 @@ async fn test_manifest_lifecycle_delete_tag_conditional_delete_failure_before_re
     assert!(ref_index.is_blob_referenced(&config_d).unwrap());
     assert!(ref_index.is_blob_referenced(&layer_d).unwrap());
 
-    let lock_dir_path = tags_dir.join(".lock.target-tag");
-    let _ = std::fs::remove_file(&lock_dir_path);
-    std::fs::create_dir(&lock_dir_path).unwrap();
+    let perms_before = std::fs::metadata(&tags_dir).unwrap().permissions();
+    std::fs::set_permissions(&tags_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let del_err = service.delete_tag(repo, "target-tag").await.unwrap_err();
+    let del_res = service.delete_tag(repo, "target-tag").await;
+    std::fs::set_permissions(&tags_dir, perms_before).unwrap();
+    let del_err = del_res.unwrap_err();
     match del_err {
         ManifestLifecycleError::Storage(StorageError::Internal { kind, .. }) => {
-            assert_eq!(kind, StorageErrorKind::Io);
+            assert!(
+                matches!(
+                    kind,
+                    StorageErrorKind::PermissionDenied | StorageErrorKind::Io
+                ),
+                "denied unlink surfaces as a classified internal error, got {kind:?}"
+            );
         }
-        other => panic!("expected Storage(Io) for lock failure before tag removal, got {other:?}"),
+        other => {
+            panic!("expected Storage error for denied unlink before tag removal, got {other:?}")
+        }
     }
 
     // Inspect actual state: DO NOT infer persistence solely from Err!
@@ -4675,8 +4691,16 @@ async fn test_manifest_lifecycle_root_replacement_sequencing() {
         .await
         .unwrap();
 
-    // Rename root_path to root_path_old (Tree A - pinned descriptor).
-    // Recreate fresh root_path (Tree B - ambient pathname resolution for mutations).
+    // Rename root_path to root_path_old (Tree A - the pinned descriptor).
+    // Recreate a fresh tree at root_path (Tree B - the ambient pathname).
+    //
+    // Coherent sequencing since the O-04 cutover (unchanged through the
+    // Phase 3 shared tag domain): reads AND mutations resolve through the
+    // SAME pinned root, so the state of the ambient replacement tree is
+    // irrelevant to the operation's outcome. (This test previously asserted
+    // the PRE-O-04 reads-pinned/mutations-ambient divergence and had been
+    // latently failing since the coherence cutover; verified failing
+    // identically at the accepted Phase 3 baseline f2196653/64d438c0.)
     let root_old = fixture.path().join("storage-root-old");
     std::fs::rename(&root_path, &root_old).unwrap();
     std::fs::create_dir_all(&root_path).unwrap();
@@ -4686,111 +4710,44 @@ async fn test_manifest_lifecycle_root_replacement_sequencing() {
         .join(repo)
         .join("tags")
         .join("latest");
-    let tree_a_tag_bytes = std::fs::read(&tree_a_tag_path).unwrap();
+    assert!(tree_a_tag_path.exists());
 
-    // =========================================================================
-    // Case 1: Replacement-tree tag is MISSING in Tree B
-    // =========================================================================
-    // get_tag_with_version reads Tree A (pinned descriptor), finding "latest".
-    // delete_tag_conditional resolves pathname in Tree B, getting NotFound.
-    let res_missing = service.delete_tag(repo, "latest").await;
-    assert!(
-        matches!(res_missing, Err(ManifestLifecycleError::TagNotFound)),
-        "missing tag in replacement tree must yield TagNotFound, got {res_missing:?}"
-    );
-    // Tree A tag remains preserved with unchanged bytes
-    assert_eq!(
-        std::fs::read(&tree_a_tag_path).unwrap(),
-        tree_a_tag_bytes,
-        "tag in Tree A (pinned reader) must remain preserved with unchanged bytes"
-    );
-    // Tree B tag remains absent
-    assert!(
-        !root_path
-            .join("repos")
-            .join(repo)
-            .join("tags")
-            .join("latest")
-            .exists(),
-        "tag in Tree B remains absent"
-    );
-
-    // =========================================================================
-    // Case 2: Replacement-tree tag has DIFFERENT BYTES in Tree B
-    // =========================================================================
+    // Seed a CONFLICTING tag in the replacement tree: it must play no role.
     let tree_b_tags = root_path.join("repos").join(repo).join("tags");
     std::fs::create_dir_all(&tree_b_tags).unwrap();
     let diff_tag_bytes =
         b"sha256:2222222222222222222222222222222222222222222222222222222222222222\n";
     std::fs::write(tree_b_tags.join("latest"), diff_tag_bytes).unwrap();
 
-    // get_tag_with_version reads Tree A (version from hex_orig),
-    // delete_tag_conditional reads Tree B (version from diff_tag_bytes),
-    // version mismatch -> TagPreconditionFailed!
-    let res_diff = service.delete_tag(repo, "latest").await;
+    // Case 1: the delete completes coherently on the pinned tree.
+    let res = service.delete_tag(repo, "latest").await;
     assert!(
-        matches!(res_diff, Err(ManifestLifecycleError::TagPreconditionFailed)),
-        "differing bytes in replacement tree must yield TagPreconditionFailed, got {res_diff:?}"
+        res.is_ok(),
+        "coherent pinned-root read+delete completes, got {res:?}"
     );
-    // Both trees preserve their tags with unchanged bytes
+    assert!(
+        !tree_a_tag_path.exists(),
+        "pinned tree tag deleted (read and mutation on ONE namespace)"
+    );
     assert_eq!(
         std::fs::read(tree_b_tags.join("latest")).unwrap(),
         diff_tag_bytes,
-        "Tree B tag must be preserved on precondition failure with unchanged bytes"
+        "replacement tree tag untouched: the pinned instance never resolves it"
+    );
+
+    // Case 2: a second delete observes the pinned tree's (now absent) state —
+    // TagNotFound — even though the ambient replacement tree still has the
+    // tag. Sequencing never mixes the two namespaces.
+    let res_second = service.delete_tag(repo, "latest").await;
+    assert!(
+        matches!(res_second, Err(ManifestLifecycleError::TagNotFound)),
+        "second delete reads the pinned namespace only, got {res_second:?}"
     );
     assert_eq!(
-        std::fs::read(&tree_a_tag_path).unwrap(),
-        tree_a_tag_bytes,
-        "Tree A tag must remain preserved with unchanged bytes"
+        std::fs::read(tree_b_tags.join("latest")).unwrap(),
+        diff_tag_bytes,
+        "replacement tree remains untouched after the second attempt"
     );
-
-    // =========================================================================
-    // Case 3: Replacement-tree tag has IDENTICAL BYTES in Tree B
-    // =========================================================================
-    std::fs::write(tree_b_tags.join("latest"), &tree_a_tag_bytes).unwrap();
-
-    // Also populate blobs in Tree B so delete_tag index maintenance succeeds
-    let tree_b_blobs = root_path.join("blobs");
-    let tree_a_blobs = root_old.join("blobs");
-    if tree_a_blobs.exists() {
-        copy_dir_recursive_helper(&tree_a_blobs, &tree_b_blobs);
-    }
-
-    // get_tag_with_version reads Tree A (version V_orig),
-    // delete_tag_conditional reads Tree B (same version V_orig),
-    // matching version succeeds!
-    // Tag in Tree B is physically deleted, while Tree A tag is preserved!
-    let res_identical = service.delete_tag(repo, "latest").await;
-    assert!(
-        res_identical.is_ok(),
-        "identical bytes in replacement tree allows conditional deletion to succeed, got {res_identical:?}"
-    );
-    // Document and assert the actual behavior:
-    // Deletion occurred in the replacement tree (Tree B)!
-    assert!(
-        !tree_b_tags.join("latest").exists(),
-        "tag in replacement tree (Tree B) is deleted because versions match"
-    );
-    // Pinned Tree A was NOT deleted (still exists in Tree A with unchanged bytes)!
-    assert_eq!(
-        std::fs::read(&tree_a_tag_path).unwrap(),
-        tree_a_tag_bytes,
-        "tag in pinned tree (Tree A) was not deleted and has unchanged bytes because mutation targeted pathname self.root"
-    );
-}
-
-fn copy_dir_recursive_helper(src: &std::path::Path, dst: &std::path::Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_recursive_helper(&path, &dest_path);
-        } else {
-            std::fs::copy(&path, &dest_path).unwrap();
-        }
-    }
 }
 
 // =========================================================================

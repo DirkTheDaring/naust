@@ -132,6 +132,22 @@ pub trait S3Driver: Send + Sync + 'static {
         key: &str,
         if_match: Option<String>,
     ) -> Result<super::ConditionalDeleteResult, StorageError>;
+
+    /// Phase 3 transitional wiring: the backend-neutral [`ObjectStore`]
+    /// handle for the migrated tag family, rooted at the given bucket and
+    /// configured key prefix. Defaulted so existing driver test doubles that
+    /// never serve tag traffic compile unchanged; the production
+    /// [`AwsS3Driver`] overrides it.
+    async fn tag_object_store(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
+        Err(StorageError::configuration(
+            "this S3 driver does not provide a tag object store",
+        ))
+    }
+
     async fn copy_object(
         &self,
         src_bucket: &str,
@@ -245,6 +261,33 @@ pub(crate) fn track_continuation_token(
 
 #[async_trait]
 impl S3Driver for AwsS3Driver {
+    /// Builds the shared S3 ObjectStore over this driver's lazily
+    /// constructed SDK client. The registry prefix is normalized exactly as
+    /// `S3Storage::key` normalizes it (slash-trimmed), so
+    /// `ObjectKey "repos/<repo>/tags/<tag>"` maps to byte-identical physical
+    /// bucket keys.
+    async fn tag_object_store(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
+        let client = self.client().await?;
+        let s3_client = storage_s3::AwsS3Client::new(client, bucket);
+        let trimmed = prefix.trim_matches('/');
+        let prefix_opt = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        let store =
+            storage_s3::S3ObjectStore::new(Arc::new(s3_client), prefix_opt).map_err(|e| {
+                StorageError::configuration(format!(
+                    "configured S3 prefix is not usable as a tag store root: {e}"
+                ))
+            })?;
+        Ok(Arc::new(store))
+    }
+
     async fn get_bucket_versioning_state(&self, bucket: &str) -> S3BucketVersioningState {
         let client = match self.client().await {
             Ok(c) => c,
@@ -725,6 +768,10 @@ pub struct S3Storage {
     pub session_config: S3SessionConfig,
     driver: Arc<dyn S3Driver>,
     referrer_locks: Arc<Vec<Mutex<()>>>,
+    /// Phase 3 tag-family cutover: lazily wired shared tag domain over the
+    /// driver's backend-neutral ObjectStore (lazy to preserve the historical
+    /// first-use surfacing of bucket/region configuration errors).
+    tag_domain: Arc<OnceCell<crate::storage::tag_domain::TagDomain>>,
 }
 
 impl std::fmt::Debug for S3Storage {
@@ -758,6 +805,7 @@ impl S3Storage {
             session_config: S3SessionConfig::default(),
             driver,
             referrer_locks: Arc::new(referrer_locks),
+            tag_domain: Arc::new(OnceCell::new()),
         }
     }
 
@@ -779,6 +827,7 @@ impl S3Storage {
             session_config: S3SessionConfig::default(),
             driver,
             referrer_locks: Arc::new(referrer_locks),
+            tag_domain: Arc::new(OnceCell::new()),
         }
     }
 
@@ -797,6 +846,31 @@ impl S3Storage {
         self.bucket
             .as_deref()
             .ok_or_else(|| StorageError::configuration("STORAGE_S3_BUCKET is required"))
+    }
+
+    /// Shared tag domain over the driver's backend-neutral ObjectStore,
+    /// wired on first use (missing bucket/region keep surfacing as the
+    /// historical per-request configuration errors). S3 has no repository
+    /// existence notion, so the probe always reports existence (absent
+    /// repositories list as empty — the historical S3 contract), and the
+    /// resource bounds are the shared defaults (S3 historically had none;
+    /// bounded truthful failure is the accepted campaign policy).
+    async fn tag_domain(&self) -> Result<&crate::storage::tag_domain::TagDomain, StorageError> {
+        self.tag_domain
+            .get_or_try_init(|| async {
+                let bucket = self.bucket()?;
+                let store = self.driver.tag_object_store(bucket, &self.prefix).await?;
+                Ok(crate::storage::tag_domain::TagDomain::new(
+                    store,
+                    crate::storage::tag_domain::TagDomainConfig {
+                        max_payload_bytes: crate::storage::tag_domain::DEFAULT_MAX_PAYLOAD_BYTES,
+                        max_listing_entries:
+                            crate::storage::tag_domain::DEFAULT_MAX_LISTING_ENTRIES,
+                    },
+                    Arc::new(crate::storage::tag_domain::AlwaysExistsRepoProbe),
+                ))
+            })
+            .await
     }
 
     fn key(&self, suffix: &str) -> String {
@@ -831,10 +905,6 @@ impl S3Storage {
 
     fn manifest_key(&self, name: &str, digest: &Digest) -> String {
         self.key(&format!("repos/{name}/manifests/{}", digest.hex()))
-    }
-
-    fn tag_key(&self, name: &str, tag: &str) -> String {
-        self.key(&format!("repos/{name}/tags/{tag}"))
     }
 
     fn repo_blob_key(&self, repo: &CanonicalRepoName, digest: &Digest) -> String {
@@ -1071,25 +1141,6 @@ impl S3Storage {
             .and_then(|v| v.as_str())
             .unwrap_or("application/vnd.oci.image.manifest.v1+json");
         Ok(media_type.to_string())
-    }
-
-    async fn get_tag_with_etag(
-        &self,
-        name: &str,
-        tag: &str,
-    ) -> Result<Option<(Digest, String)>, StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.tag_key(name, tag);
-        let res = self.driver.get_object(bucket, &key).await?;
-        match res {
-            None => Ok(None),
-            Some((bytes, etag)) => {
-                let s = std::str::from_utf8(&bytes)
-                    .map_err(|_| StorageError::corrupt_data("invalid tag pointer"))?;
-                let digest = Digest::parse(s.trim()).map_err(|_| StorageError::NotFound)?;
-                Ok(Some((digest, etag)))
-            }
-        }
     }
 
     async fn get_session_doc_with_etag(
@@ -1626,28 +1677,11 @@ impl Storage for S3Storage {
     }
 
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
-        let key = self.tag_key(name, tag);
-        let bytes = self.get_object_bytes(&key).await?;
-        let s = std::str::from_utf8(&bytes)
-            .map_err(|_| StorageError::corrupt_data("invalid tag pointer"))?;
-        Digest::parse(s.trim()).map_err(|_| StorageError::NotFound)
+        self.tag_domain().await?.resolve_tag(name, tag).await
     }
 
     async fn list_tags(&self, name: &str) -> Result<Vec<String>, StorageError> {
-        let bucket = self.bucket()?;
-        let prefix = self.tags_prefix(name);
-        let objects = self.driver.list_objects_v2(bucket, &prefix).await?;
-
-        let mut tags = Vec::new();
-        for obj in objects {
-            if let Some(rest) = obj.key.strip_prefix(&prefix)
-                && !rest.is_empty()
-            {
-                tags.push(rest.to_string());
-            }
-        }
-        tags.sort();
-        Ok(tags)
+        self.tag_domain().await?.list_tags(name).await
     }
 
     async fn head_manifest(
@@ -1714,118 +1748,22 @@ impl Storage for S3Storage {
         digest: &Digest,
         policy: super::TagMutationPolicy,
     ) -> Result<super::TagMutation, StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.tag_key(name, tag);
-        let body = format!("{}\n", digest.as_str());
-
-        match policy {
-            super::TagMutationPolicy::CreateOnly => {
-                let res = self
-                    .driver
-                    .put_object_conditional(
-                        bucket,
-                        &key,
-                        Bytes::from(body.into_bytes()),
-                        None,
-                        Some("*".to_string()),
-                    )
-                    .await;
-
-                match res {
-                    Ok(_) => Ok(super::TagMutation::Created),
-                    Err(StorageError::TagAlreadyExists) => {
-                        if let Ok(existing_d) = self.resolve_tag(name, tag).await
-                            && existing_d == *digest
-                        {
-                            return Ok(super::TagMutation::Unchanged);
-                        }
-                        Err(StorageError::TagAlreadyExists)
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            super::TagMutationPolicy::Replace => {
-                let max_retries = 5;
-                for attempt in 0..max_retries {
-                    let current = self.get_tag_with_etag(name, tag).await?;
-                    match current {
-                        None => {
-                            let res = self
-                                .driver
-                                .put_object_conditional(
-                                    bucket,
-                                    &key,
-                                    Bytes::from(body.clone().into_bytes()),
-                                    None,
-                                    Some("*".to_string()),
-                                )
-                                .await;
-                            match res {
-                                Ok(_) => return Ok(super::TagMutation::Created),
-                                Err(StorageError::TagAlreadyExists) => {
-                                    if attempt + 1 < max_retries {
-                                        tokio::time::sleep(std::time::Duration::from_millis(
-                                            10 * (1 << attempt),
-                                        ))
-                                        .await;
-                                        continue;
-                                    }
-                                    return Err(StorageError::conflict(
-                                        "tag mutation contention limit exceeded",
-                                    ));
-                                }
-                                Err(err) => return Err(err),
-                            }
-                        }
-                        Some((existing_d, etag)) => {
-                            if existing_d == *digest {
-                                return Ok(super::TagMutation::Unchanged);
-                            }
-
-                            let res = self
-                                .driver
-                                .put_object_conditional(
-                                    bucket,
-                                    &key,
-                                    Bytes::from(body.clone().into_bytes()),
-                                    Some(etag),
-                                    None,
-                                )
-                                .await;
-                            match res {
-                                Ok(_) => {
-                                    return Ok(super::TagMutation::Replaced {
-                                        previous: existing_d,
-                                    });
-                                }
-                                Err(StorageError::TagAlreadyExists) => {
-                                    if attempt + 1 < max_retries {
-                                        tokio::time::sleep(std::time::Duration::from_millis(
-                                            10 * (1 << attempt),
-                                        ))
-                                        .await;
-                                        continue;
-                                    }
-                                    return Err(StorageError::conflict(
-                                        "tag mutation contention limit exceeded",
-                                    ));
-                                }
-                                Err(err) => return Err(err),
-                            }
-                        }
-                    }
-                }
-                Err(StorageError::conflict(
-                    "tag mutation contention limit exceeded",
-                ))
-            }
-        }
+        // Phase 3: shared tag domain over the backend-neutral ObjectStore.
+        // CreateOnly rides on the service-atomic If-None-Match publication;
+        // the old read/CAS-retry loop (and its Conflict exhaustion error) is
+        // retired (see the Phase 3 tag mutation design).
+        self.tag_domain()
+            .await?
+            .mutate_tag(name, tag, digest, policy)
+            .await
     }
 
     async fn delete_tag(&self, name: &str, tag: &str) -> Result<(), StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.tag_key(name, tag);
-        self.driver.delete_object(bucket, &key).await
+        // Converged contract (Phase 3): absent -> NotFound, matching the
+        // trait's filesystem behavior. (The retired S3-specific path treated
+        // absence as idempotent success; production callers ignore the
+        // result.) Backend delete failures keep the accepted classification.
+        self.tag_domain().await?.delete_tag(name, tag).await
     }
 
     async fn list_manifest_digests_page(
@@ -1880,61 +1818,10 @@ impl Storage for S3Storage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
-        let bucket = self.bucket()?;
-        let prefix = self.tags_prefix(repo);
-        let tag_objects = self.driver.list_objects_v2(bucket, &prefix).await?;
-
-        let mut tags_with_digest: Vec<(String, Digest)> = Vec::new();
-        for obj in tag_objects {
-            let tag_name = match obj.key.strip_prefix(&prefix) {
-                Some(t) => t.to_string(),
-                None => continue,
-            };
-            // Structural non-tag entries (empty or nested keys beneath the tag
-            // prefix) are skipped — the analogue of the filesystem listing
-            // skipping subdirectories/non-regular entries.
-            if tag_name.is_empty() || tag_name.contains('/') {
-                continue;
-            }
-            if let Some((bytes, _etag)) = self.driver.get_object(bucket, &obj.key).await? {
-                // Fail-closed parity with the contained filesystem listing:
-                // invalid UTF-8 in a registry-owned tag payload is corrupt
-                // authoritative state and must not silently vanish from a
-                // listing that feeds reference/deletion proofs. (Empty or
-                // malformed digest TEXT is omitted on both backends — the
-                // documented shared contract; an object deleted between the
-                // listing and the read is skipped as genuinely absent.)
-                let s = std::str::from_utf8(&bytes).map_err(|err| {
-                    StorageError::corrupt_data(format!(
-                        "invalid UTF-8 in tag payload {tag_name}: {err}"
-                    ))
-                })?;
-                if let Ok(d) = Digest::parse(s.trim()) {
-                    tags_with_digest.push((tag_name, d));
-                }
-            }
-        }
-        tags_with_digest.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let start_idx = if let Some(token) = continuation_token {
-            match tags_with_digest.binary_search_by(|(t, _)| t.as_str().cmp(token)) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            }
-        } else {
-            0
-        };
-
-        let end_idx = (start_idx + page_limit).min(tags_with_digest.len());
-        let page_slice = &tags_with_digest[start_idx..end_idx];
-
-        let next_token = if end_idx < tags_with_digest.len() {
-            page_slice.last().map(|(t, _)| t.clone())
-        } else {
-            None
-        };
-
-        Ok((page_slice.to_vec(), next_token))
+        self.tag_domain()
+            .await?
+            .list_tags_page(repo, continuation_token, page_limit)
+            .await
     }
 
     async fn list_referrers_page(
@@ -1973,15 +1860,14 @@ impl Storage for S3Storage {
         repo: &str,
         tag: &str,
     ) -> Result<Option<(Digest, String)>, StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.tag_key(repo, tag);
-        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
-            let s = String::from_utf8_lossy(&bytes);
-            let digest = Digest::parse(s.trim())
-                .map_err(|e| StorageError::corrupt_data(format!("corrupt tag {tag}: {e}")))?;
-            return Ok(Some((digest, etag)));
-        }
-        Ok(None)
+        // Phase 3: the returned version token is the registry's raw-byte
+        // SHA-256 on every backend (the retired S3 path exposed the object
+        // ETag). Tokens are never client-supplied; journal snapshots from a
+        // pre-cutover run degrade to recovery's fresh-read sweep.
+        self.tag_domain()
+            .await?
+            .get_tag_with_version(repo, tag)
+            .await
     }
 
     async fn delete_tag_conditional(
@@ -1990,10 +1876,12 @@ impl Storage for S3Storage {
         tag: &str,
         expected_version: Option<&str>,
     ) -> Result<super::ConditionalDeleteResult, StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.tag_key(repo, tag);
-        self.driver
-            .delete_object_conditional(bucket, &key, expected_version.map(|s| s.to_string()))
+        // Registry version precondition composed over read_with_version +
+        // delete_if_version: the service-atomic If-Match delete replaces the
+        // retired GET-then-conditional-DELETE driver path.
+        self.tag_domain()
+            .await?
+            .delete_tag_conditional(repo, tag, expected_version)
             .await
     }
 
@@ -2506,23 +2394,15 @@ impl Storage for S3Storage {
 
         self.driver.delete_object(bucket, &key).await?;
 
+        // Shared backend-neutral tag-domain cleanup (Phase 3): same
+        // manifest-first ordering and best-effort per-tag deletion; the
+        // shared scan converges on the fail-closed contract (unreadable or
+        // non-UTF-8 tag payloads propagate instead of being skipped).
         let digest_str = digest.as_str();
-        let prefix = self.tags_prefix(name);
-        let tag_objects = self.driver.list_objects_v2(bucket, &prefix).await?;
-
-        for obj in tag_objects {
-            let bytes = match self.get_object_bytes(&obj.key).await {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let s = match std::str::from_utf8(&bytes) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if s.trim() == digest_str {
-                let _ = self.driver.delete_object(bucket, &obj.key).await;
-            }
-        }
+        self.tag_domain()
+            .await?
+            .delete_manifest_tag_cleanup(name, &digest_str)
+            .await?;
 
         if let Some(subject) = maybe_subject {
             let _ = self.remove_referrer(name, &subject, digest).await;

@@ -264,7 +264,7 @@ pub(crate) async fn repo_timestamps_impl(
     ops: &(impl RepoMetaInspector + ?Sized),
     repo: &str,
 ) -> Result<RepoTimestamps, StorageError> {
-    super::tag_read::validate_path_component(repo, "repository name")?;
+    crate::storage::tag_domain::validate_path_component(repo, "repository name")?;
 
     let repo_key_str = format!("repos/{repo}");
     let repo_key = ObjectKey::parse(&repo_key_str)

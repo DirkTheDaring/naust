@@ -614,3 +614,353 @@ pub fn create_mock_storage() -> (S3Storage, Arc<MockS3Driver>) {
     );
     (storage, driver)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 tag-family test bridge (integration-test analogue of the lib-test
+// bridge): exposes this mock's object map through the storage-s3 `S3Client`
+// seam so the REAL `S3ObjectStore` adapter serves migrated tag operations
+// against the same mock state the unmigrated families use.
+// ---------------------------------------------------------------------------
+
+struct MockDriverTagClient(Arc<MockS3Driver>);
+
+impl MockDriverTagClient {
+    fn fire(&self, method: &str, key: &str) -> Result<(), storage_s3::S3ApiError> {
+        if let Some(hook) = self.0.hook_before_op.lock().unwrap().as_ref()
+            && let Some(err) = hook(method, key)
+        {
+            let msg = err.message().unwrap_or("injected fault").to_string();
+            return Err(match err.internal_kind() {
+                Some(registry_rust::storage::StorageErrorKind::PermissionDenied) => {
+                    storage_s3::S3ApiError::new(Some(403), Some("AccessDenied"), msg)
+                }
+                _ => storage_s3::S3ApiError::new(Some(500), Some("InternalError"), msg),
+            });
+        }
+        Ok(())
+    }
+
+    fn next_etag(&self) -> String {
+        let n = self.0.etag_seq.fetch_add(1, Ordering::SeqCst);
+        format!("\"tagmock-{n}\"")
+    }
+}
+
+fn trim_etag(e: &str) -> &str {
+    e.trim_matches('"')
+}
+
+#[async_trait]
+impl storage_s3::S3Client for MockDriverTagClient {
+    async fn head_object(
+        &self,
+        key: &str,
+    ) -> Result<Option<storage_s3::client::ObjectStat>, storage_s3::S3ApiError> {
+        self.fire("head_object", key)?;
+        Ok(self
+            .0
+            .objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|(b, e)| storage_s3::client::ObjectStat {
+                size: b.len() as u64,
+                modified: None,
+                etag: e.clone(),
+            }))
+    }
+
+    async fn get_object(
+        &self,
+        key: &str,
+        max_len: u64,
+    ) -> Result<Option<storage_s3::client::GetResult>, storage_s3::S3ApiError> {
+        self.fire("get_object", key)?;
+        let objs = self.0.objects.lock().unwrap();
+        let Some((bytes, etag)) = objs.get(key) else {
+            return Ok(None);
+        };
+        if bytes.len() as u64 > max_len {
+            return Err(storage_s3::S3ApiError::new(
+                None,
+                Some(&storage_s3::client::too_large_sentinel(max_len)),
+                "object exceeds caller byte bound",
+            ));
+        }
+        Ok(Some(storage_s3::client::GetResult {
+            stat: storage_s3::client::ObjectStat {
+                size: bytes.len() as u64,
+                modified: None,
+                etag: etag.clone(),
+            },
+            bytes: bytes.clone(),
+        }))
+    }
+
+    async fn put_object(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        precondition: storage_s3::client::PutPrecondition,
+    ) -> Result<String, storage_s3::S3ApiError> {
+        self.fire("put_object", key)?;
+        let mut objs = self.0.objects.lock().unwrap();
+        match &precondition {
+            storage_s3::client::PutPrecondition::None => {}
+            storage_s3::client::PutPrecondition::IfNoneMatchAny => {
+                if objs.contains_key(key) {
+                    return Err(storage_s3::S3ApiError::new(
+                        Some(412),
+                        Some("PreconditionFailed"),
+                        "If-None-Match: * failed: object exists",
+                    ));
+                }
+            }
+            storage_s3::client::PutPrecondition::IfMatch(expected) => match objs.get(key) {
+                None => {
+                    return Err(storage_s3::S3ApiError::new(
+                        Some(404),
+                        Some("NoSuchKey"),
+                        "If-Match on absent object",
+                    ));
+                }
+                Some((_, cur)) if trim_etag(cur) != trim_etag(expected) => {
+                    return Err(storage_s3::S3ApiError::new(
+                        Some(412),
+                        Some("PreconditionFailed"),
+                        "If-Match failed: stale etag",
+                    ));
+                }
+                Some(_) => {}
+            },
+        }
+        let etag = self.next_etag();
+        objs.insert(key.to_string(), (bytes, etag.clone()));
+        Ok(etag)
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<(), storage_s3::S3ApiError> {
+        self.fire("delete_object", key)?;
+        self.0.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        key: &str,
+        etag: &str,
+    ) -> Result<storage_s3::client::RawConditionalDelete, storage_s3::S3ApiError> {
+        self.fire("delete_object_if_match", key)?;
+        let mut objs = self.0.objects.lock().unwrap();
+        match objs.get(key) {
+            None => Ok(storage_s3::client::RawConditionalDelete::NotFound),
+            Some((_, cur)) if trim_etag(cur) != trim_etag(etag) => {
+                Ok(storage_s3::client::RawConditionalDelete::PreconditionFailed)
+            }
+            Some(_) => {
+                objs.remove(key);
+                Ok(storage_s3::client::RawConditionalDelete::Deleted)
+            }
+        }
+    }
+
+    async fn list_direct_children(
+        &self,
+        dir_prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<storage_s3::client::RawListPage, storage_s3::S3ApiError> {
+        self.fire("list_objects_v2", dir_prefix)?;
+        let objs = self.0.objects.lock().unwrap();
+        let mut keys: Vec<&String> = objs
+            .keys()
+            .filter(|k| {
+                let Some(rest) = k.strip_prefix(dir_prefix) else {
+                    return false;
+                };
+                !rest.is_empty() && !rest.contains('/')
+            })
+            .collect();
+        keys.sort();
+        let cap = max_keys.clamp(1, 1000);
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for key in keys {
+            if let Some(sa) = start_after
+                && key.as_str() <= sa
+            {
+                continue;
+            }
+            if out.len() == cap {
+                truncated = true;
+                break;
+            }
+            let (bytes, etag) = &objs[key.as_str()];
+            out.push((
+                key.clone(),
+                storage_s3::client::ObjectStat {
+                    size: bytes.len() as u64,
+                    modified: None,
+                    etag: etag.clone(),
+                },
+            ));
+        }
+        Ok(storage_s3::client::RawListPage {
+            objects: out,
+            truncated,
+        })
+    }
+}
+
+/// Delegating [`S3Driver`] wrapper adding the Phase 3 `tag_object_store`
+/// seam over the shared mock state.
+pub struct TagBridgeDriver {
+    inner: Arc<MockS3Driver>,
+}
+
+impl TagBridgeDriver {
+    pub fn new(inner: Arc<MockS3Driver>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl S3Driver for TagBridgeDriver {
+    async fn get_bucket_versioning_state(&self, bucket: &str) -> S3BucketVersioningState {
+        self.inner.get_bucket_versioning_state(bucket).await
+    }
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, StorageError> {
+        self.inner.create_multipart_upload(bucket, key).await
+    }
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: Bytes,
+    ) -> Result<String, StorageError> {
+        self.inner
+            .upload_part(bucket, key, upload_id, part_number, body)
+            .await
+    }
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .complete_multipart_upload(bucket, key, upload_id, parts)
+            .await
+    }
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .abort_multipart_upload(bucket, key, upload_id)
+            .await
+    }
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<S3MultipartListResult, StorageError> {
+        self.inner
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker)
+            .await
+    }
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(Bytes, String)>, StorageError> {
+        self.inner.get_object(bucket, key).await
+    }
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, StorageError> {
+        self.inner.head_object(bucket, key).await
+    }
+    async fn put_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+    ) -> Result<String, StorageError> {
+        self.inner
+            .put_object_conditional(bucket, key, body, if_match, if_none_match)
+            .await
+    }
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(bucket, key).await
+    }
+    async fn delete_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<String>,
+    ) -> Result<ConditionalDeleteResult, StorageError> {
+        self.inner
+            .delete_object_conditional(bucket, key, if_match)
+            .await
+    }
+    async fn tag_object_store(
+        &self,
+        _bucket: &str,
+        prefix: &str,
+    ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
+        let client = Arc::new(MockDriverTagClient(self.inner.clone()));
+        let trimmed = prefix.trim_matches('/');
+        let prefix_opt = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        let store = storage_s3::S3ObjectStore::new(client, prefix_opt)
+            .map_err(|e| StorageError::configuration(e.to_string()))?;
+        Ok(Arc::new(store))
+    }
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .copy_object(src_bucket, src_key, dst_bucket, dst_key)
+            .await
+    }
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<S3ObjectSummary>, StorageError> {
+        self.inner.list_objects_v2(bucket, prefix).await
+    }
+    async fn list_objects_v2_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> Result<S3ObjectsPage, StorageError> {
+        self.inner
+            .list_objects_v2_page(bucket, prefix, continuation_token, max_keys)
+            .await
+    }
+    fn now_unix_secs(&self) -> u64 {
+        self.inner.now_unix_secs()
+    }
+}

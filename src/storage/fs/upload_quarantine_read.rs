@@ -246,7 +246,7 @@ pub(crate) async fn get_finalized_receipt_impl(
     ops: &(impl MembershipReadOps + ?Sized),
     session: &UploadSessionId,
 ) -> Result<Option<FinalizedReceipt>, StorageError> {
-    super::tag_read::validate_path_component(&session.uuid, "upload session id")?;
+    crate::storage::tag_domain::validate_path_component(&session.uuid, "upload session id")?;
     let key_str = format!("uploads/.finalized/{}.json", session.uuid);
     let key = parse_internal_key(&key_str)?;
 

@@ -612,9 +612,367 @@ pub fn create_mock_storage() -> (S3Storage, Arc<MockS3Driver>) {
         Some("test-bucket".to_string()),
         "".to_string(),
         100 * 1024 * 1024,
-        driver.clone(),
+        Arc::new(TagBridgeDriver::new(driver.clone())),
     );
     (storage, driver)
+}
+
+// ==========================================
+// Phase 3 tag-family test bridge
+// ==========================================
+
+/// Exposes the [`MockS3Driver`]'s object map and injected-fault hooks
+/// through the `storage-s3` [`storage_s3::S3Client`] seam so the REAL
+/// `S3ObjectStore` adapter serves the migrated tag family against the same
+/// mock state the unmigrated families use. Hook method names stay the
+/// legacy driver names ("get_object", "put_object", "delete_object",
+/// "list_objects_v2") so existing fault closures keep working.
+struct MockDriverTagClient(Arc<MockS3Driver>);
+
+fn hook_to_api_error(err: StorageError) -> storage_s3::S3ApiError {
+    let msg = err.message().unwrap_or("injected fault").to_string();
+    match err.internal_kind() {
+        Some(crate::storage::StorageErrorKind::PermissionDenied) => {
+            storage_s3::S3ApiError::new(Some(403), Some("AccessDenied"), msg)
+        }
+        _ => storage_s3::S3ApiError::new(Some(500), Some("InternalError"), msg),
+    }
+}
+
+impl MockDriverTagClient {
+    fn fire(&self, method: &str, key: &str) -> Result<(), storage_s3::S3ApiError> {
+        self.0
+            .check_before_hook(method, key)
+            .map_err(hook_to_api_error)
+    }
+
+    fn next_etag(&self) -> String {
+        let n = self.0.etag_seq.fetch_add(1, Ordering::SeqCst);
+        format!("\"tagmock-{n}\"")
+    }
+}
+
+fn trimmed(e: &str) -> &str {
+    e.trim_matches('"')
+}
+
+#[async_trait]
+impl storage_s3::S3Client for MockDriverTagClient {
+    async fn head_object(
+        &self,
+        key: &str,
+    ) -> Result<Option<storage_s3::client::ObjectStat>, storage_s3::S3ApiError> {
+        self.fire("head_object", key)?;
+        Ok(self
+            .0
+            .objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|(b, e)| storage_s3::client::ObjectStat {
+                size: b.len() as u64,
+                modified: None,
+                etag: e.clone(),
+            }))
+    }
+
+    async fn get_object(
+        &self,
+        key: &str,
+        max_len: u64,
+    ) -> Result<Option<storage_s3::client::GetResult>, storage_s3::S3ApiError> {
+        self.fire("get_object", key)?;
+        let objs = self.0.objects.lock().unwrap();
+        let Some((bytes, etag)) = objs.get(key) else {
+            return Ok(None);
+        };
+        if bytes.len() as u64 > max_len {
+            return Err(storage_s3::S3ApiError::new(
+                None,
+                Some(&storage_s3::client::too_large_sentinel(max_len)),
+                "object exceeds caller byte bound",
+            ));
+        }
+        Ok(Some(storage_s3::client::GetResult {
+            stat: storage_s3::client::ObjectStat {
+                size: bytes.len() as u64,
+                modified: None,
+                etag: etag.clone(),
+            },
+            bytes: bytes.clone(),
+        }))
+    }
+
+    async fn put_object(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        precondition: storage_s3::client::PutPrecondition,
+    ) -> Result<String, storage_s3::S3ApiError> {
+        self.fire("put_object", key)?;
+        // One lock across evaluate + apply: service-atomic conditionals.
+        let mut objs = self.0.objects.lock().unwrap();
+        match &precondition {
+            storage_s3::client::PutPrecondition::None => {}
+            storage_s3::client::PutPrecondition::IfNoneMatchAny => {
+                if objs.contains_key(key) {
+                    return Err(storage_s3::S3ApiError::new(
+                        Some(412),
+                        Some("PreconditionFailed"),
+                        "If-None-Match: * failed: object exists",
+                    ));
+                }
+            }
+            storage_s3::client::PutPrecondition::IfMatch(expected) => match objs.get(key) {
+                None => {
+                    return Err(storage_s3::S3ApiError::new(
+                        Some(404),
+                        Some("NoSuchKey"),
+                        "If-Match on absent object",
+                    ));
+                }
+                Some((_, cur)) if trimmed(cur) != trimmed(expected) => {
+                    return Err(storage_s3::S3ApiError::new(
+                        Some(412),
+                        Some("PreconditionFailed"),
+                        "If-Match failed: stale etag",
+                    ));
+                }
+                Some(_) => {}
+            },
+        }
+        let etag = self.next_etag();
+        objs.insert(key.to_string(), (bytes, etag.clone()));
+        Ok(etag)
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<(), storage_s3::S3ApiError> {
+        self.fire("delete_object", key)?;
+        // Native S3: deleting an absent key is 204 success.
+        self.0.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        key: &str,
+        etag: &str,
+    ) -> Result<storage_s3::client::RawConditionalDelete, storage_s3::S3ApiError> {
+        self.fire("delete_object_if_match", key)?;
+        let mut objs = self.0.objects.lock().unwrap();
+        match objs.get(key) {
+            None => Ok(storage_s3::client::RawConditionalDelete::NotFound),
+            Some((_, cur)) if trimmed(cur) != trimmed(etag) => {
+                Ok(storage_s3::client::RawConditionalDelete::PreconditionFailed)
+            }
+            Some(_) => {
+                objs.remove(key);
+                Ok(storage_s3::client::RawConditionalDelete::Deleted)
+            }
+        }
+    }
+
+    async fn list_direct_children(
+        &self,
+        dir_prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<storage_s3::client::RawListPage, storage_s3::S3ApiError> {
+        self.fire("list_objects_v2", dir_prefix)?;
+        let objs = self.0.objects.lock().unwrap();
+        let mut keys: Vec<&String> = objs
+            .keys()
+            .filter(|k| {
+                let Some(rest) = k.strip_prefix(dir_prefix) else {
+                    return false;
+                };
+                // Delimiter mode: nested keys are common prefixes, not rows.
+                !rest.is_empty() && !rest.contains('/')
+            })
+            .collect();
+        keys.sort();
+        let cap = max_keys.clamp(1, 1000);
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for key in keys {
+            if let Some(sa) = start_after
+                && key.as_str() <= sa
+            {
+                continue;
+            }
+            if out.len() == cap {
+                truncated = true;
+                break;
+            }
+            let (bytes, etag) = &objs[key.as_str()];
+            out.push((
+                key.clone(),
+                storage_s3::client::ObjectStat {
+                    size: bytes.len() as u64,
+                    modified: None,
+                    etag: etag.clone(),
+                },
+            ));
+        }
+        Ok(storage_s3::client::RawListPage {
+            objects: out,
+            truncated,
+        })
+    }
+}
+
+/// Delegating [`S3Driver`] wrapper adding the Phase 3 `tag_object_store`
+/// seam over the shared mock state; every unmigrated-family method forwards
+/// to the inner [`MockS3Driver`] unchanged.
+pub struct TagBridgeDriver {
+    inner: Arc<MockS3Driver>,
+}
+
+impl TagBridgeDriver {
+    pub fn new(inner: Arc<MockS3Driver>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl S3Driver for TagBridgeDriver {
+    async fn get_bucket_versioning_state(&self, bucket: &str) -> S3BucketVersioningState {
+        self.inner.get_bucket_versioning_state(bucket).await
+    }
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, StorageError> {
+        self.inner.create_multipart_upload(bucket, key).await
+    }
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: Bytes,
+    ) -> Result<String, StorageError> {
+        self.inner
+            .upload_part(bucket, key, upload_id, part_number, body)
+            .await
+    }
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .complete_multipart_upload(bucket, key, upload_id, parts)
+            .await
+    }
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .abort_multipart_upload(bucket, key, upload_id)
+            .await
+    }
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+    ) -> Result<S3MultipartListResult, StorageError> {
+        self.inner
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker)
+            .await
+    }
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(Bytes, String)>, StorageError> {
+        self.inner.get_object(bucket, key).await
+    }
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, StorageError> {
+        self.inner.head_object(bucket, key).await
+    }
+    async fn put_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+    ) -> Result<String, StorageError> {
+        self.inner
+            .put_object_conditional(bucket, key, body, if_match, if_none_match)
+            .await
+    }
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(bucket, key).await
+    }
+    async fn delete_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<String>,
+    ) -> Result<crate::storage::ConditionalDeleteResult, StorageError> {
+        self.inner
+            .delete_object_conditional(bucket, key, if_match)
+            .await
+    }
+    async fn tag_object_store(
+        &self,
+        _bucket: &str,
+        prefix: &str,
+    ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
+        let client = Arc::new(MockDriverTagClient(self.inner.clone()));
+        let trimmed_prefix = prefix.trim_matches('/');
+        let prefix_opt = if trimmed_prefix.is_empty() {
+            None
+        } else {
+            Some(trimmed_prefix)
+        };
+        let store = storage_s3::S3ObjectStore::new(client, prefix_opt)
+            .map_err(|e| StorageError::configuration(e.to_string()))?;
+        Ok(Arc::new(store))
+    }
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .copy_object(src_bucket, src_key, dst_bucket, dst_key)
+            .await
+    }
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<S3ObjectSummary>, StorageError> {
+        self.inner.list_objects_v2(bucket, prefix).await
+    }
+    async fn list_objects_v2_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> Result<S3ObjectsPage, StorageError> {
+        self.inner
+            .list_objects_v2_page(bucket, prefix, continuation_token, max_keys)
+            .await
+    }
+    fn now_unix_secs(&self) -> u64 {
+        self.inner.now_unix_secs()
+    }
 }
 
 // ==========================================
@@ -3634,94 +3992,105 @@ async fn test_delete_blob_conditional_missing_version_is_conflict() {
 }
 
 #[tokio::test]
-async fn test_s3_mutate_tag_preserves_conflict_backend_and_permission_denied() {
+async fn test_s3_mutate_tag_shared_semantics_and_error_propagation() {
     let digest =
         Digest::parse("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
             .unwrap();
-    let tag_key = "repos/test-repo/tags/v1.0.0";
-
-    // 1. Absent tag + repeated 412 contention on creation -> Conflict (baseline line 1626)
-    let driver1 = Arc::new(MockS3Driver::new(1000));
-    let storage1 = S3Storage::new_with_driver(
-        Some("test-bucket".to_string()),
-        "".to_string(),
-        100_000_000,
-        driver1.clone(),
-    );
-    driver1.inject_412_on_key(tag_key);
-    let res_create_conflict = storage1
-        .mutate_tag(
-            "test-repo",
-            "v1.0.0",
-            &digest,
-            crate::storage::TagMutationPolicy::Replace,
-        )
-        .await;
-    assert!(res_create_conflict.is_err());
-    let err_create = res_create_conflict.unwrap_err();
-    assert_eq!(
-        err_create.internal_kind(),
-        Some(crate::storage::StorageErrorKind::Conflict)
-    );
-    assert_eq!(
-        err_create.message(),
-        Some("tag mutation contention limit exceeded")
-    );
-    assert_eq!(
-        err_create.to_string(),
-        "internal error: tag mutation contention limit exceeded"
-    );
-
-    // 2. Existing tag + repeated 412 contention on update -> Conflict (baseline line 1662)
-    let driver2 = Arc::new(MockS3Driver::new(1000));
-    let storage2 = S3Storage::new_with_driver(
-        Some("test-bucket".to_string()),
-        "".to_string(),
-        100_000_000,
-        driver2.clone(),
-    );
-    let old_digest =
+    let other =
         Digest::parse("sha256:1111111111111111111111111111111111111111111111111111111111111111")
             .unwrap();
-    driver2.objects.lock().unwrap().insert(
-        tag_key.to_string(),
-        (
-            bytes::Bytes::from(old_digest.as_str().to_string().into_bytes()),
-            "etag-v1-old".to_string(),
-        ),
-    );
-    driver2.inject_412_on_key(tag_key);
-    let res_update_conflict = storage2
+    let tag_key = "repos/test-repo/tags/v1.0.0";
+
+    // 1. CreateOnly on an absent tag -> Created (service-atomic
+    //    If-None-Match publication); repeated CreateOnly with the SAME
+    //    digest -> Unchanged; different digest -> TagAlreadyExists.
+    let (storage, driver) = create_mock_storage();
+    let created = storage
         .mutate_tag(
             "test-repo",
             "v1.0.0",
             &digest,
+            crate::storage::TagMutationPolicy::CreateOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created, crate::storage::TagMutation::Created);
+    assert_eq!(
+        driver.objects.lock().unwrap().get(tag_key).unwrap().0,
+        Bytes::from(format!("{}\n", digest.as_str())),
+        "exact historical bytes: digest + newline"
+    );
+    let unchanged = storage
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &digest,
+            crate::storage::TagMutationPolicy::CreateOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged, crate::storage::TagMutation::Unchanged);
+    let conflict = storage
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &other,
+            crate::storage::TagMutationPolicy::CreateOnly,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, StorageError::TagAlreadyExists));
+
+    // 2. Replace on an existing tag -> Replaced { previous }; same digest
+    //    short-circuits to Unchanged WITHOUT rewriting (etag stable).
+    let replaced = storage
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &other,
             crate::storage::TagMutationPolicy::Replace,
         )
-        .await;
-    assert!(res_update_conflict.is_err());
-    let err_update = res_update_conflict.unwrap_err();
+        .await
+        .unwrap();
     assert_eq!(
-        err_update.internal_kind(),
-        Some(crate::storage::StorageErrorKind::Conflict)
+        replaced,
+        crate::storage::TagMutation::Replaced {
+            previous: digest.clone()
+        }
     );
+    let etag_before = driver
+        .objects
+        .lock()
+        .unwrap()
+        .get(tag_key)
+        .unwrap()
+        .1
+        .clone();
+    let unchanged2 = storage
+        .mutate_tag(
+            "test-repo",
+            "v1.0.0",
+            &other,
+            crate::storage::TagMutationPolicy::Replace,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged2, crate::storage::TagMutation::Unchanged);
+    let etag_after = driver
+        .objects
+        .lock()
+        .unwrap()
+        .get(tag_key)
+        .unwrap()
+        .1
+        .clone();
     assert_eq!(
-        err_update.message(),
-        Some("tag mutation contention limit exceeded")
-    );
-    assert_eq!(
-        err_update.to_string(),
-        "internal error: tag mutation contention limit exceeded"
+        etag_before, etag_after,
+        "same-digest short-circuit performs no write"
     );
 
-    // 3. Underlying backend transport/service failure -> Backend
-    let driver3 = Arc::new(MockS3Driver::new(1000));
-    let storage3 = S3Storage::new_with_driver(
-        Some("test-bucket".to_string()),
-        "".to_string(),
-        100_000_000,
-        driver3.clone(),
-    );
+    // 3. Underlying backend transport/service failure -> Backend.
+    let (storage3, driver3) = create_mock_storage();
     driver3.set_hook_before(|method, key| {
         if method == "put_object" && key == "repos/test-repo/tags/v1.0.0" {
             Some(StorageError::backend("s3 service 503 slow down"))
@@ -3729,34 +4098,26 @@ async fn test_s3_mutate_tag_preserves_conflict_backend_and_permission_denied() {
             None
         }
     });
-    let res_backend = storage3
+    let err_backend = storage3
         .mutate_tag(
             "test-repo",
             "v1.0.0",
             &digest,
             crate::storage::TagMutationPolicy::Replace,
         )
-        .await;
-    assert!(res_backend.is_err());
-    let err_backend = res_backend.unwrap_err();
+        .await
+        .unwrap_err();
     assert_eq!(
         err_backend.internal_kind(),
         Some(crate::storage::StorageErrorKind::Backend)
     );
-    assert_eq!(err_backend.message(), Some("s3 service 503 slow down"));
-    assert_eq!(
-        err_backend.to_string(),
-        "internal error: s3 service 503 slow down"
+    assert!(
+        err_backend.to_string().contains("s3 service 503 slow down"),
+        "underlying diagnostic preserved: {err_backend}"
     );
 
-    // 4. Underlying permission failure -> PermissionDenied
-    let driver4 = Arc::new(MockS3Driver::new(1000));
-    let storage4 = S3Storage::new_with_driver(
-        Some("test-bucket".to_string()),
-        "".to_string(),
-        100_000_000,
-        driver4.clone(),
-    );
+    // 4. Underlying permission failure -> PermissionDenied.
+    let (storage4, driver4) = create_mock_storage();
     driver4.set_hook_before(|method, key| {
         if method == "put_object" && key == "repos/test-repo/tags/v1.0.0" {
             Some(StorageError::permission_denied("s3:PutObject forbidden"))
@@ -3764,36 +4125,49 @@ async fn test_s3_mutate_tag_preserves_conflict_backend_and_permission_denied() {
             None
         }
     });
-    let res_perm = storage4
+    let err_perm = storage4
         .mutate_tag(
             "test-repo",
             "v1.0.0",
             &digest,
             crate::storage::TagMutationPolicy::Replace,
         )
-        .await;
-    assert!(res_perm.is_err());
-    let err_perm = res_perm.unwrap_err();
+        .await
+        .unwrap_err();
     assert_eq!(
         err_perm.internal_kind(),
         Some(crate::storage::StorageErrorKind::PermissionDenied)
     );
-    assert_eq!(err_perm.message(), Some("s3:PutObject forbidden"));
-    assert_eq!(
-        err_perm.to_string(),
-        "internal error: s3:PutObject forbidden"
-    );
+    assert!(err_perm.to_string().contains("s3:PutObject forbidden"));
 }
 
 #[tokio::test]
 async fn test_s3_get_tag_with_version_corrupt_digest_is_corrupt_data() {
-    let driver = Arc::new(MockS3Driver::new(1000));
-    let storage = S3Storage::new_with_driver(
-        Some("test-bucket".to_string()),
-        "".to_string(),
-        100_000_000,
-        driver.clone(),
+    let (storage, driver) = create_mock_storage();
+
+    // Phase 3: the version token is the registry raw-byte SHA-256, never the
+    // backend ETag.
+    let hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let payload = format!("sha256:{hex}\n");
+    driver.objects.lock().unwrap().insert(
+        "repos/test-repo/tags/good-tag".to_string(),
+        (
+            bytes::Bytes::from(payload.clone()),
+            "\"etag-opaque\"".to_string(),
+        ),
     );
+    let (d, version) = storage
+        .get_tag_with_version("test-repo", "good-tag")
+        .await
+        .unwrap()
+        .expect("tag exists");
+    assert_eq!(d.hex(), hex);
+    {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(payload.as_bytes());
+        assert_eq!(version, hex::encode(hasher.finalize()));
+    }
 
     let tag_key = "repos/test-repo/tags/corrupt-tag";
     driver.objects.lock().unwrap().insert(
@@ -4917,14 +5291,12 @@ async fn test_s3_delete_manifest_propagates_object_delete_failure() {
     );
 }
 
-// `delete_tag` parity: a failed DeleteObject surfaces (as on the filesystem
-// backend); deleting an ABSENT tag remains S3-native idempotent success —
-// a documented intentional difference from the filesystem's NotFound, visible
-// only on the unconditional trait method (production tag deletion flows
-// through `delete_tag_conditional`, which reports NotFound identically on
-// both backends).
+// `delete_tag` parity (Phase 3 converged): a failed DeleteObject surfaces;
+// deleting an ABSENT tag is Err(NotFound) on BOTH backends (the retired
+// S3-specific path returned idempotent success; production callers are
+// best-effort journal recovery that ignores the result).
 #[tokio::test]
-async fn test_s3_delete_tag_propagates_failure_and_absent_is_idempotent_ok() {
+async fn test_s3_delete_tag_propagates_failure_and_absent_is_not_found() {
     let (storage, driver) = create_mock_storage();
     let tag_key = "repos/parity-repo/tags/v1".to_string();
     driver.objects.lock().unwrap().insert(
@@ -4966,11 +5338,12 @@ async fn test_s3_delete_tag_propagates_failure_and_absent_is_idempotent_ok() {
         .expect("tag deletion succeeds without the fault");
     assert!(!driver.objects.lock().unwrap().contains_key(&tag_key));
 
-    // Absent tag: idempotent success (S3-native DeleteObject semantics).
-    storage
+    // Absent tag: Err(NotFound) — the converged cross-backend contract.
+    let err_absent = storage
         .delete_tag("parity-repo", "v1")
         .await
-        .expect("deleting an absent tag is idempotent success on S3");
+        .expect_err("deleting an absent tag reports NotFound on both backends");
+    assert!(matches!(err_absent, StorageError::NotFound));
 }
 
 // ==========================================

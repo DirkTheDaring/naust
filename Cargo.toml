@@ -45,6 +45,7 @@ uuid = { version = "1", features = ["v4"] }
 acmecert-core = { path = "../acmecert/crates/acmecert-core" }
 storage-core = { path = "../storage-layer-rust/crates/storage-core" }
 storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
+storage-s3 = { path = "../storage-layer-rust/crates/storage-s3" }
 
 [features]
 default = ["storage-fs"]
@@ -59,3 +60,6 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # edition-2024 resolver, dev-dependency features are not unified into normal builds, so
 # production `FsStorage` never contains the seam.
 storage-fs = { path = "../storage-layer-rust/crates/storage-fs", features = ["fault-injection"] }
+# The deterministic in-memory S3 client mock drives the real S3ObjectStore adapter in
+# registry tag tests without an S3 endpoint. Dev-only; never unified into normal builds.
+storage-s3 = { path = "../storage-layer-rust/crates/storage-s3", features = ["mock-client"] }
