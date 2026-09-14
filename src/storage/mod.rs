@@ -266,8 +266,16 @@ pub enum GcDeleteResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GcQuarantineResult {
-    Quarantined { size: u64 },
+    Quarantined {
+        size: u64,
+    },
     Skipped,
+    /// The current object no longer matches the version the GC candidate was
+    /// based on (stale candidate). The live object is left untouched — the
+    /// quarantine analogue of [`GcDeleteResult::PreconditionFailed`].
+    PreconditionFailed {
+        current_version: Option<BlobObjectVersion>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

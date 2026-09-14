@@ -1270,3 +1270,27 @@ pub async fn write_live_blob(fs_root: &std::path::Path, digest: &Digest, bytes: 
         .await
         .expect("write blob");
 }
+
+/// The GC candidate version token of the current live CAS leaf, derived by the
+/// same rules as production candidate listing: `"{mtime_whole_seconds}:{size}"`
+/// (absent/pre-epoch mtime maps to 0). `quarantine_blob` validates against this
+/// token before moving anything.
+#[allow(dead_code)]
+pub fn live_blob_candidate_version(
+    fs_root: &std::path::Path,
+    digest: &Digest,
+) -> registry_rust::storage::BlobObjectVersion {
+    let path = fs_root
+        .join("blobs")
+        .join("sha256")
+        .join(digest.prefix2())
+        .join(digest.hex());
+    let meta = std::fs::metadata(&path).expect("live blob metadata");
+    let secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    registry_rust::storage::BlobObjectVersion(format!("{secs}:{}", meta.len()))
+}

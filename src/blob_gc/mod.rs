@@ -299,6 +299,12 @@ pub async fn blob_gc_quarantine_with_authority(
                     stats.quarantined_bytes = stats.quarantined_bytes.saturating_add(size);
                 }
                 Ok(storage::GcQuarantineResult::Skipped) => {}
+                Ok(storage::GcQuarantineResult::PreconditionFailed { .. }) => {
+                    tracing::warn!(
+                        "blob {} version changed since candidate inspection, preserving object",
+                        candidate.digest
+                    );
+                }
                 Err(source) => {
                     return Err(BlobGcError::QuarantineStorage {
                         digest: candidate.digest,

@@ -15766,6 +15766,34 @@ mod gc_quarantine_containment {
         BlobObjectVersion("fs:0:0:dummy".to_string())
     }
 
+    /// The current live CAS leaf's candidate token, derived by the shared
+    /// production rules (`listing::candidate_version`) — what a GC listing
+    /// pass would have produced for this leaf, and what `quarantine_blob`
+    /// validates against.
+    fn live_candidate_version(root: &Path, digest: &Digest) -> BlobObjectVersion {
+        let meta = std::fs::metadata(cas_path(root, digest)).expect("live blob metadata");
+        listing::candidate_version(meta.modified().ok(), meta.len())
+    }
+
+    /// Deterministically pin a file's mtime (whole seconds) so version tokens
+    /// can be forced equal or distinct without sleeps.
+    fn set_mtime_secs(path: &Path, secs: i64) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat({path:?}) failed");
+    }
+
     // Full protocol round trip with exact artifacts: quarantine moves the CAS
     // leaf into the quarantine shard byte-identically, writes the `<secs>\n`
     // timestamp (mode 0o600, no temp residue), the contained read seam
@@ -15782,7 +15810,7 @@ mod gc_quarantine_containment {
         plant_cas_blob(&root, &digest, &body);
 
         let res = storage
-            .quarantine_blob(&permit, &digest, &dummy_version())
+            .quarantine_blob(&permit, &digest, &live_candidate_version(&root, &digest))
             .await
             .expect("quarantine_blob");
         assert_eq!(
@@ -15849,7 +15877,7 @@ mod gc_quarantine_containment {
         plant_cas_blob(&root, &digest, &body);
 
         storage
-            .quarantine_blob(&permit, &digest, &dummy_version())
+            .quarantine_blob(&permit, &digest, &live_candidate_version(&root, &digest))
             .await
             .unwrap();
         assert!(ts_path(&root, &digest).exists());
@@ -15936,7 +15964,7 @@ mod gc_quarantine_containment {
         let digest = d(QHEX);
         plant_cas_blob(&root, &digest, b"original");
         storage
-            .quarantine_blob(&permit, &digest, &dummy_version())
+            .quarantine_blob(&permit, &digest, &live_candidate_version(&root, &digest))
             .await
             .unwrap();
         let stale_version = storage
@@ -15992,7 +16020,7 @@ mod gc_quarantine_containment {
         let digest = d(QHEX);
         plant_cas_blob(&root, &digest, b"raced");
         storage
-            .quarantine_blob(&permit, &digest, &dummy_version())
+            .quarantine_blob(&permit, &digest, &live_candidate_version(&root, &digest))
             .await
             .unwrap();
         let version = storage
@@ -16132,7 +16160,7 @@ mod gc_quarantine_containment {
         let digest = d(QHEX);
         plant_cas_blob(&root, &digest, b"tree-a-content");
         storage
-            .quarantine_blob(&permit, &digest, &dummy_version())
+            .quarantine_blob(&permit, &digest, &live_candidate_version(&root, &digest))
             .await
             .unwrap();
         let version_a = storage
@@ -16187,6 +16215,499 @@ mod gc_quarantine_containment {
             std::fs::read(shard_path.join(digest.hex())).unwrap(),
             b"tree-b-content",
             "replacement tree untouched by the in-flight deletion"
+        );
+    }
+
+    // ---- GC-QUARANTINE-VERSION: the quarantine conditional-version guard ----
+    //
+    // Established token contract (two stages, deliberately distinct):
+    //   * quarantine guards against the CANDIDATE token produced by CAS
+    //     listing — "{mtime_whole_seconds}:{size}" (shared derivation:
+    //     `listing::candidate_version`; S3 parity: the S3 listing fallback
+    //     token is the same shape when no ETag exists);
+    //   * final conditional deletion guards against the QUARANTINED-object
+    //     token — "fs:{len}:{mtime_nanos}:{sha256}" via
+    //     `quarantined_blob_version` / `compute_blob_version_from_file`.
+
+    // T1: a token obtained through the production candidate inspection path
+    // (list_cas_blobs_page) is accepted and the quarantine proceeds with the
+    // established artifacts.
+    #[tokio::test]
+    async fn test_quarantine_matching_version_from_production_listing_succeeds() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        let body = b"guarded-quarantine-payload".to_vec();
+        plant_cas_blob(&root, &digest, &body);
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_100);
+
+        // Production inspection path: the same candidate the GC sweep consumes.
+        let page = storage
+            .list_cas_blobs_page(None, 16)
+            .await
+            .expect("list_cas_blobs_page");
+        let candidate = page
+            .items
+            .iter()
+            .find(|c| c.digest == digest)
+            .expect("planted blob listed as a candidate");
+        assert_eq!(
+            candidate.version,
+            BlobObjectVersion(format!("1700000100:{}", body.len())),
+            "listing token binds (mtime_secs, size)"
+        );
+
+        let res = storage
+            .quarantine_blob(&permit, &digest, &candidate.version)
+            .await
+            .expect("quarantine with the matching candidate token");
+        assert_eq!(
+            res,
+            GcQuarantineResult::Quarantined {
+                size: body.len() as u64
+            }
+        );
+        assert!(!cas_path(&root, &digest).exists(), "live leaf moved away");
+        assert_eq!(
+            std::fs::read(q_path(&root, &digest)).unwrap(),
+            body,
+            "quarantined contents unchanged"
+        );
+        assert!(
+            ts_path(&root, &digest).exists(),
+            "success timestamp written"
+        );
+    }
+
+    // T2: a stale candidate token is rejected as PreconditionFailed carrying
+    // the current token, with ZERO side effects — the current live blob and
+    // contents remain, no quarantine destination is created, and no success
+    // timestamp is published.
+    #[tokio::test]
+    async fn test_quarantine_stale_version_rejected_without_side_effects() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"first-generation");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_000);
+        let v1 = live_candidate_version(&root, &digest);
+
+        // The blob is replaced after candidate inspection (re-publication).
+        let replacement = b"second-generation-content";
+        std::fs::remove_file(cas_path(&root, &digest)).unwrap();
+        plant_cas_blob(&root, &digest, replacement);
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_777);
+
+        let res = storage
+            .quarantine_blob(&permit, &digest, &v1)
+            .await
+            .expect("stale token classifies, not errors");
+        assert_eq!(
+            res,
+            GcQuarantineResult::PreconditionFailed {
+                current_version: Some(BlobObjectVersion(format!(
+                    "1700000777:{}",
+                    replacement.len()
+                )))
+            },
+            "mismatch reports the recomputed current token"
+        );
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            replacement,
+            "current live blob and contents preserved"
+        );
+        assert!(
+            !root.join("quarantine").join("blobs").exists(),
+            "no quarantine destination created on the mismatch path"
+        );
+        assert!(
+            !ts_path(&root, &digest).exists(),
+            "no success timestamp side effect"
+        );
+    }
+
+    // T3: stage-token pipeline. The quarantine stage accepts exactly the
+    // listing candidate token — NOT the delete-stage token (the established
+    // contract keeps the two stages distinct) — and the quarantined object
+    // then flows through `quarantined_blob_version` into the unchanged
+    // conditional final deletion.
+    #[tokio::test]
+    async fn test_quarantine_and_delete_stage_tokens_end_to_end() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        let body = b"stage-token-pipeline".to_vec();
+        plant_cas_blob(&root, &digest, &body);
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_200);
+
+        // The delete-stage token shape is NOT valid at the quarantine stage.
+        let delete_style = compute_fs_blob_version(&cas_path(&root, &digest))
+            .await
+            .expect("reference token helper");
+        let res = storage
+            .quarantine_blob(&permit, &digest, &delete_style)
+            .await
+            .unwrap();
+        assert!(
+            matches!(res, GcQuarantineResult::PreconditionFailed { .. }),
+            "delete-stage token rejected at the quarantine stage, got {res:?}"
+        );
+        assert!(
+            cas_path(&root, &digest).exists(),
+            "live blob untouched by the rejected attempt"
+        );
+
+        // The quarantine stage accepts the listing candidate token.
+        let cand = live_candidate_version(&root, &digest);
+        assert_eq!(
+            storage
+                .quarantine_blob(&permit, &digest, &cand)
+                .await
+                .unwrap(),
+            GcQuarantineResult::Quarantined {
+                size: body.len() as u64
+            }
+        );
+
+        // The delete stage accepts the quarantined-object token (unchanged
+        // reference implementation).
+        let qv = storage
+            .quarantined_blob_version(&digest)
+            .await
+            .unwrap()
+            .expect("quarantined version");
+        assert_eq!(
+            storage
+                .delete_blob_conditional(&permit, &digest, Some(&qv))
+                .await
+                .unwrap(),
+            GcDeleteResult::Deleted
+        );
+        assert!(!q_path(&root, &digest).exists());
+        assert!(!ts_path(&root, &digest).exists());
+    }
+
+    // T4: replacement changing either token component — mtime second (same
+    // length) or size (same mtime second) — makes the stale token fail.
+    #[tokio::test]
+    async fn test_quarantine_content_replacement_changes_token_and_is_rejected() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"aaaa-content");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_000);
+        let v1 = live_candidate_version(&root, &digest);
+
+        // Same length, different mtime second: rejected via the mtime component.
+        std::fs::remove_file(cas_path(&root, &digest)).unwrap();
+        plant_cas_blob(&root, &digest, b"bbbb-content");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_001);
+        let res = storage
+            .quarantine_blob(&permit, &digest, &v1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(res, GcQuarantineResult::PreconditionFailed { .. }),
+            "same-length different-mtime replacement rejected, got {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            b"bbbb-content"
+        );
+
+        // Different length, same mtime second: rejected via the size component.
+        std::fs::remove_file(cas_path(&root, &digest)).unwrap();
+        plant_cas_blob(&root, &digest, b"tiny");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_000);
+        let res = storage
+            .quarantine_blob(&permit, &digest, &v1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(res, GcQuarantineResult::PreconditionFailed { .. }),
+            "different-length same-mtime replacement rejected, got {res:?}"
+        );
+        assert_eq!(std::fs::read(cas_path(&root, &digest)).unwrap(), b"tiny");
+        assert!(!root.join("quarantine").join("blobs").exists());
+        assert!(!ts_path(&root, &digest).exists());
+    }
+
+    // T5: the established candidate token binds (mtime_secs, size) — it
+    // intentionally identifies neither content bytes nor inode identity
+    // (S3 listing parity). A replacement reproducing both components carries
+    // the SAME logical version and is accepted; this pins the token strength
+    // honestly rather than inventing a stronger contract.
+    #[tokio::test]
+    async fn test_quarantine_same_token_replacement_accepted_per_contract() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"original-bytes!!");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_300);
+        let v1 = live_candidate_version(&root, &digest);
+
+        // New inode, different bytes, SAME length and mtime second.
+        std::fs::remove_file(cas_path(&root, &digest)).unwrap();
+        plant_cas_blob(&root, &digest, b"different-bytes!");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_300);
+        assert_eq!(
+            live_candidate_version(&root, &digest),
+            v1,
+            "replacement reproduces the logical token"
+        );
+
+        let res = storage
+            .quarantine_blob(&permit, &digest, &v1)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            GcQuarantineResult::Quarantined { size: 16 },
+            "same logical token accepted per the established contract"
+        );
+        assert_eq!(
+            std::fs::read(q_path(&root, &digest)).unwrap(),
+            b"different-bytes!"
+        );
+    }
+
+    // T6: a validation failure (leaf unreadable) propagates as an error
+    // BEFORE any mutation: no rename, no quarantine destination, no
+    // timestamp publication.
+    #[tokio::test]
+    async fn test_quarantine_validation_failure_propagates_without_mutation() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"unreadable-leaf");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_400);
+        let v1 = live_candidate_version(&root, &digest);
+
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let leaf = cas_path(&root, &digest);
+            let _guard = PermGuard(&leaf);
+            std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let err = storage
+                .quarantine_blob(&permit, &digest, &v1)
+                .await
+                .expect_err("unreadable leaf must fail validation");
+            assert!(
+                matches!(err, StorageError::Internal { .. }),
+                "validation failure propagates as an internal storage error, got {err:?}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            b"unreadable-leaf",
+            "live blob untouched by the failed validation"
+        );
+        assert!(
+            !root.join("quarantine").join("blobs").exists(),
+            "no quarantine destination created"
+        );
+        assert!(!ts_path(&root, &digest).exists(), "no timestamp published");
+    }
+
+    // T7: containment across ambient root replacement — the validation AND
+    // the action both act through the authorities pinned at construction;
+    // a replacement tree at the original ambient pathname is untouched.
+    #[tokio::test]
+    async fn test_quarantine_root_replacement_acts_only_on_pinned_tree() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"pinned-tree-blob");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_500);
+        let v1 = live_candidate_version(&root, &digest);
+
+        // Pin the storage's contained authorities (first use memoizes the
+        // pinned roots) with a read-only operation before the swap.
+        let _ = storage.list_cas_blobs_page(None, 1).await.unwrap();
+
+        // Replace the ambient root: tree A keeps living under a new pathname,
+        // an unrelated tree B takes over the original pathname.
+        let moved_a = root.with_file_name(format!(
+            "{}-tree-a",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::rename(&root, &moved_a).unwrap();
+        plant_cas_blob(&root, &digest, b"ambient-replacement-blob");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_500);
+
+        let res = storage
+            .quarantine_blob(&permit, &digest, &v1)
+            .await
+            .expect("quarantine through the pinned authorities");
+        assert_eq!(
+            res,
+            GcQuarantineResult::Quarantined {
+                size: b"pinned-tree-blob".len() as u64
+            }
+        );
+
+        // Tree A (the pinned tree, now at the moved pathname): leaf moved into
+        // ITS quarantine namespace.
+        assert!(
+            !cas_path(&moved_a, &digest).exists(),
+            "pinned tree's live leaf moved"
+        );
+        assert_eq!(
+            std::fs::read(q_path(&moved_a, &digest)).unwrap(),
+            b"pinned-tree-blob",
+            "pinned tree's blob quarantined byte-identically"
+        );
+        assert!(
+            ts_path(&moved_a, &digest).exists(),
+            "timestamp written in the pinned tree"
+        );
+
+        // Tree B (ambient replacement): completely untouched.
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            b"ambient-replacement-blob",
+            "replacement tree's blob untouched"
+        );
+        assert!(
+            !root.join("quarantine").exists(),
+            "no quarantine namespace created in the replacement tree"
+        );
+
+        std::fs::remove_dir_all(&moved_a).ok();
+    }
+
+    // T8: a symlinked live CAS leaf fails closed at the contained open used
+    // for validation — the external target is neither read into a decision
+    // nor renamed, and nothing is quarantined.
+    #[tokio::test]
+    async fn test_quarantine_symlinked_leaf_fails_closed() {
+        let root = tmp_fs_root();
+        let external = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+
+        let ext_target = external.join("outside_blob");
+        std::fs::write(&ext_target, b"external-bytes").unwrap();
+        let leaf = cas_path(&root, &digest);
+        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        symlink(&ext_target, &leaf).unwrap();
+
+        let err = storage
+            .quarantine_blob(&permit, &digest, &dummy_version())
+            .await
+            .expect_err("symlinked live leaf must fail closed");
+        assert!(
+            matches!(
+                err,
+                StorageError::Internal {
+                    kind: crate::storage::StorageErrorKind::Io,
+                    ..
+                }
+            ),
+            "symlink -> Io error, got {err:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&leaf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink left in place (not renamed)"
+        );
+        assert_eq!(
+            std::fs::read(&ext_target).unwrap(),
+            b"external-bytes",
+            "external target untouched"
+        );
+        assert!(
+            !root.join("quarantine").join("blobs").exists(),
+            "nothing quarantined"
+        );
+    }
+
+    // CRITICAL validation/action race regression: a leaf replacement injected
+    // at the test seam BETWEEN the conditional-version validation and the
+    // quarantine rename — the window that the deployment writer lock plus the
+    // consistency coordinator exclude for every protocol-compliant writer —
+    // must not leave the replacement quarantined under the stale token. The
+    // implementation is deliberately NOT an atomic compare-and-rename: it
+    // detects the swap by post-rename object-identity (dev/ino) verification
+    // through the GC-exclusive quarantine authority and deterministically
+    // restores the replacement to the live CAS leaf, reporting
+    // PreconditionFailed.
+    #[tokio::test]
+    async fn test_quarantine_boundary_replacement_not_captured_under_stale_token() {
+        let root = tmp_fs_root();
+        let storage = FsStorage::new(root.clone(), 1024 * 1024);
+        let authority = authority_for(&root).await;
+        let permit = authority.gc_mutation_permit();
+        let digest = d(QHEX);
+        plant_cas_blob(&root, &digest, b"validated-generation");
+        set_mtime_secs(&cas_path(&root, &digest), 1_700_000_000);
+        let v1 = live_candidate_version(&root, &digest);
+
+        let replacement = b"replacement-generation-longer";
+        let hook_root = root.clone();
+        let hook_digest = digest.clone();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_hook = fired.clone();
+        storage.set_quarantine_boundary_hook(Arc::new(move |hex| {
+            assert_eq!(hex, hook_digest.hex());
+            let leaf = cas_path(&hook_root, &hook_digest);
+            std::fs::remove_file(&leaf).unwrap();
+            std::fs::write(&leaf, replacement).unwrap();
+            set_mtime_secs(&leaf, 1_700_000_555);
+            fired_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let res = storage
+            .quarantine_blob(&permit, &digest, &v1)
+            .await
+            .expect("swap detection classifies, not errors");
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "boundary hook fired inside the validate->rename window"
+        );
+        assert_eq!(
+            res,
+            GcQuarantineResult::PreconditionFailed {
+                current_version: Some(BlobObjectVersion(format!(
+                    "1700000555:{}",
+                    replacement.len()
+                )))
+            },
+            "swap detected and reported with the replacement's token"
+        );
+        assert_eq!(
+            std::fs::read(cas_path(&root, &digest)).unwrap(),
+            replacement,
+            "replacement restored to the live CAS leaf"
+        );
+        assert!(
+            !q_path(&root, &digest).exists(),
+            "the replacement is NOT left quarantined under the stale token"
+        );
+        assert!(
+            !ts_path(&root, &digest).exists(),
+            "no success timestamp side effect"
         );
     }
 }
@@ -16681,8 +17202,21 @@ mod durability_barriers {
             .join(digest.hex());
         std::fs::create_dir_all(cas_path.parent().unwrap()).unwrap();
         std::fs::write(&cas_path, b"restore-barrier-payload").unwrap();
+        // Current candidate token ("{mtime_secs}:{size}"), which quarantine
+        // now validates before moving anything.
+        let meta = std::fs::metadata(&cas_path).unwrap();
+        let secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let q = storage
-            .quarantine_blob(&permit, &digest, &BlobObjectVersion("fs:0:0:d".into()))
+            .quarantine_blob(
+                &permit,
+                &digest,
+                &BlobObjectVersion(format!("{secs}:{}", meta.len())),
+            )
             .await
             .unwrap();
         assert!(matches!(q, GcQuarantineResult::Quarantined { .. }));

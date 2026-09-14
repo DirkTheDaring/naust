@@ -12,7 +12,7 @@ use registry_rust::storage::fs::FsStorage;
 use registry_rust::storage::mutation_authority::RuntimeMutationAuthority;
 use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
 use registry_rust::storage::repo_membership::RepositoryBlobMembershipStorage;
-use registry_rust::storage::{self, GcDeleteResult, GcQuarantineResult, GcStorage, Storage};
+use registry_rust::storage::{GcDeleteResult, GcQuarantineResult, GcStorage, Storage};
 use sha2::Digest as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -525,12 +525,13 @@ async fn test_fs_quarantined_object_version_mismatch_returns_precondition_failed
     let digest = Digest::parse(&format!("sha256:{hex}")).expect("digest");
     write_live_blob(&fs_root, &digest, blob_a).await;
 
-    // Quarantine original blob
+    // Quarantine original blob (with the current live candidate token, which
+    // quarantine now validates before moving anything)
     let q_res = storage
         .quarantine_blob(
             &permit,
             &digest,
-            &storage::BlobObjectVersion("init".to_string()),
+            &support::gc_coordination::live_blob_candidate_version(&fs_root, &digest),
         )
         .await
         .unwrap();
@@ -1883,11 +1884,7 @@ async fn test_integration_fs_deletion_requires_both_gc_proof_types() {
     write_live_blob(&fs_root, &digest, &blob_bytes).await;
 
     let permit = authority.gc_mutation_permit();
-    let version = storage
-        .quarantined_blob_version(&digest)
-        .await
-        .unwrap()
-        .unwrap_or(storage::BlobObjectVersion("v1".to_string()));
+    let version = live_blob_candidate_version(&fs_root, &digest);
     let q_res = storage
         .quarantine_blob(&permit, &digest, &version)
         .await

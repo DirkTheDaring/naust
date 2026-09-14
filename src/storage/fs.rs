@@ -469,6 +469,15 @@ pub struct FsStorage {
     /// snapshot.
     #[cfg(test)]
     reaper_receipt_boundary_hook: ReaperBoundaryHookSlot,
+    /// Test-only synchronization seam invoked inside `quarantine_blob` at the
+    /// boundary between the conditional-version validation of the live CAS
+    /// leaf and the quarantine rename, with the candidate digest hex. Lets a
+    /// regression interpose a leaf replacement in exactly the window the
+    /// in-deployment protocol (deployment writer lock + consistency
+    /// coordinator) excludes, and prove the replacement cannot end up
+    /// quarantined under the stale token.
+    #[cfg(test)]
+    quarantine_boundary_hook: ReaperBoundaryHookSlot,
 }
 
 /// See [`FsStorage::reaper_boundary_hook`]. The callback runs on the reaper's
@@ -673,6 +682,8 @@ impl FsStorage {
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
             reaper_receipt_boundary_hook: ReaperBoundaryHookSlot::default(),
+            #[cfg(test)]
+            quarantine_boundary_hook: ReaperBoundaryHookSlot::default(),
         })
     }
 
@@ -1401,6 +1412,13 @@ impl FsStorage {
     #[cfg(test)]
     fn set_reaper_receipt_boundary_hook(&self, hook: ReaperBoundaryHook) {
         *self.reaper_receipt_boundary_hook.0.lock().unwrap() = Some(hook);
+    }
+
+    /// Install the test-only quarantine validation/action boundary hook
+    /// (see `quarantine_boundary_hook`).
+    #[cfg(test)]
+    fn set_quarantine_boundary_hook(&self, hook: ReaperBoundaryHook) {
+        *self.quarantine_boundary_hook.0.lock().unwrap() = Some(hook);
     }
 
     async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
@@ -4567,6 +4585,34 @@ fn compute_blob_version_from_file(
     Ok(BlobObjectVersion(format!("fs:{len}:{mtime}:{hash}")))
 }
 
+/// Validation snapshot of an opened blob leaf taken by `fstat` on the
+/// descriptor itself: the GC CANDIDATE version token recomputed by the same
+/// shared rules that produced the candidate (`listing::candidate_version`,
+/// `"{mtime_secs}:{size}"` — this stage's token, distinct from the
+/// quarantined-object token above) plus the object identity (`dev`/`ino`)
+/// used to verify after the quarantine rename that the moved leaf is exactly
+/// the validated object.
+struct LeafVersionSnapshot {
+    version: BlobObjectVersion,
+    size: u64,
+    dev: u64,
+    ino: u64,
+}
+
+/// See [`LeafVersionSnapshot`]. Blocking I/O — call from `spawn_blocking`.
+fn snapshot_leaf_candidate_version(
+    file: &std::fs::File,
+) -> Result<LeafVersionSnapshot, StorageError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file.metadata().map_err(map_fs_io_err)?;
+    Ok(LeafVersionSnapshot {
+        version: listing::candidate_version(meta.modified().ok(), meta.len()),
+        size: meta.len(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
 #[async_trait]
 impl GcStorage for FsStorage {
     async fn list_cas_blobs_page(
@@ -4587,7 +4633,7 @@ impl GcStorage for FsStorage {
         &self,
         permit: &crate::storage::mutation_authority::GcMutationPermit<'_>,
         digest: &Digest,
-        _version: &BlobObjectVersion,
+        version: &BlobObjectVersion,
     ) -> Result<GcQuarantineResult, StorageError> {
         if !permit.is_valid() {
             return Err(StorageError::permission_denied(
@@ -4601,35 +4647,98 @@ impl GcStorage for FsStorage {
             return Ok(GcQuarantineResult::Skipped);
         };
         let leaf = Self::blob_leaf(digest)?;
-        let size = match src.inspect(&leaf).await {
-            Ok(Some(identity)) => identity.size,
-            Ok(None) => return Ok(GcQuarantineResult::Skipped),
+
+        // Already-quarantined check first (non-creating resolution), keeping
+        // the prior Skipped precedence while leaving the version-mismatch path
+        // below completely free of side effects (no quarantine shard creation).
+        if let Some(dest) = self.quarantine_blobs_shard(digest, false).await? {
+            match dest.inspect(&leaf).await {
+                Ok(Some(_)) => return Ok(GcQuarantineResult::Skipped),
+                Ok(None) => {}
+                Err(err) => return Err(map_fs_mutate_err(err)),
+            }
+        }
+
+        // Conditional-version validation on the leaf OPENED through the
+        // retained CAS authority: fstat the descriptor and recompute the
+        // candidate token by the same shared rules that produced the caller's
+        // candidate. A mismatch (stale candidate) mutates nothing. Validation
+        // failures propagate before any rename or timestamp publication.
+        let handle = match src.open_leaf_read(&leaf).await {
+            Ok(h) => h,
+            Err(FsMutateError::NotFound) => return Ok(GcQuarantineResult::Skipped),
             Err(err) => return Err(map_fs_mutate_err(err)),
         };
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let file = handle.into_file();
+            snapshot_leaf_candidate_version(&file)
+        })
+        .await
+        .map_err(map_blocking_join_error)??;
+        if &snapshot.version != version {
+            return Ok(GcQuarantineResult::PreconditionFailed {
+                current_version: Some(snapshot.version),
+            });
+        }
 
-        // Contained quarantine destination shard (created if missing, as the
-        // prior create_dir_all did).
+        // Test-only seam: the window between validation and rename that the
+        // in-deployment protocol excludes (all reachability mutations require
+        // the exclusive deployment writer lock and run under the consistency
+        // coordinator whose guard the GC caller holds across this call).
+        #[cfg(test)]
+        if let Some(hook) = self.quarantine_boundary_hook.0.lock().unwrap().clone() {
+            hook(&digest.hex());
+        }
+
+        // Contained quarantine destination shard, created only on the action
+        // path (as the prior create_dir_all did).
         let dest = self
             .quarantine_blobs_shard(digest, true)
             .await?
             .expect("ensure-mode shard resolution always yields an authority");
-        match dest.inspect(&leaf).await {
-            Ok(Some(_)) => return Ok(GcQuarantineResult::Skipped),
-            Ok(None) => {}
+
+        // Contained cross-authority rename (renameat between the two pinned
+        // shard fds; no ambient path reconstruction). `rename_leaf` acts by
+        // leaf name, NOT by validated inode — this is deliberately NOT an
+        // atomic compare-and-rename.
+        match src.rename_leaf(&leaf, &dest, &leaf).await {
+            Ok(()) => {}
+            Err(FsMutateError::NotFound) => return Ok(GcQuarantineResult::Skipped),
             Err(err) => return Err(map_fs_mutate_err(err)),
         }
 
-        // Contained cross-authority rename (renameat between the two pinned
-        // shard fds; no ambient path reconstruction).
-        match src.rename_leaf(&leaf, &dest, &leaf).await {
-            Ok(()) => {
-                let now = SystemTime::now();
-                self.write_quarantine_timestamp(digest, now).await?;
-                Ok(GcQuarantineResult::Quarantined { size })
-            }
-            Err(FsMutateError::NotFound) => Ok(GcQuarantineResult::Skipped),
-            Err(err) => Err(map_fs_mutate_err(err)),
+        // Post-rename identity verification: the moved leaf now lives in the
+        // quarantine namespace, whose only writer is the (exclusively
+        // permitted) GC itself, so fstat-ing it here observes exactly the
+        // object the rename moved. If its identity differs from the validated
+        // snapshot, a replacement slipped into the validate->rename window
+        // (possible only outside the in-deployment protocol); restore it to
+        // the CAS leaf and refuse — a token-mismatched object never remains
+        // quarantined, and no success timestamp is published.
+        let moved = dest
+            .open_leaf_read(&leaf)
+            .await
+            .map_err(map_fs_mutate_err)?;
+        let moved_snapshot = tokio::task::spawn_blocking(move || {
+            let file = moved.into_file();
+            snapshot_leaf_candidate_version(&file)
+        })
+        .await
+        .map_err(map_blocking_join_error)??;
+        if (moved_snapshot.dev, moved_snapshot.ino) != (snapshot.dev, snapshot.ino) {
+            dest.rename_leaf(&leaf, &src, &leaf)
+                .await
+                .map_err(map_fs_mutate_err)?;
+            return Ok(GcQuarantineResult::PreconditionFailed {
+                current_version: Some(moved_snapshot.version),
+            });
         }
+
+        let now = SystemTime::now();
+        self.write_quarantine_timestamp(digest, now).await?;
+        Ok(GcQuarantineResult::Quarantined {
+            size: snapshot.size,
+        })
     }
 
     async fn restore_quarantined_blob(

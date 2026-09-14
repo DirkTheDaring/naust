@@ -280,11 +280,7 @@ pub(crate) fn translate_inspect_error(err: ReadError) -> StorageError {
 pub(crate) fn convert_candidate(digest: Digest, inspected: &FsFileMetadata) -> GcBlobCandidate {
     let last_modified = inspected.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let size = inspected.size();
-    let version_seconds = last_modified
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let version = BlobObjectVersion(format!("{version_seconds}:{size}"));
+    let version = candidate_version(inspected.modified(), size);
 
     GcBlobCandidate {
         digest,
@@ -292,6 +288,21 @@ pub(crate) fn convert_candidate(digest: Digest, inspected: &FsFileMetadata) -> G
         last_modified,
         version,
     }
+}
+
+/// Single source of the filesystem GC candidate version token:
+/// `"{mtime_whole_seconds}:{size}"`, with an absent or pre-epoch modification
+/// time mapping to `0` seconds. Shared by candidate conversion (above) and by
+/// `FsStorage::quarantine_blob`'s conditional-version validation so the token
+/// the quarantine guard compares is derived by exactly the rules that produced
+/// the candidate it guards.
+pub(crate) fn candidate_version(modified: Option<SystemTime>, size: u64) -> BlobObjectVersion {
+    let version_seconds = modified
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    BlobObjectVersion(format!("{version_seconds}:{size}"))
 }
 
 /// Registry-owned resource limits for CAS listing enumeration.
