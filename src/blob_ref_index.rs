@@ -5,7 +5,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 1;
+// Schema v2: root reachability is derived from per-repository provenance.
+//
+// INVARIANT (root accounting): `repo_roots` holds one record per
+// (repository, digest) describing that repository's LIVE contribution to root
+// reachability: whether the repository stores a manifest with that digest
+// (`manifest` flag) and how many of the repository's tags currently target it
+// (`tag_refs`). A contribution is live iff `manifest || tag_refs > 0`.
+// `root_counts[digest]` is the derived aggregation: the number of repositories
+// with a live contribution for that digest (key absent when zero). Repository-
+// scoped reconciliation (sync/rebuild) replaces exactly that repository's
+// contribution and can never erase another repository's accounting; incremental
+// lifecycle hooks (manifest publish/delete, tag create/retarget/delete) adjust
+// the same per-repository records so that incremental accounting is equivalent
+// to a clean rebuild of the same authoritative state.
+const SCHEMA_VERSION: u32 = 2;
 
 const META_SCHEMA_VERSION: &[u8] = b"schema_version";
 const META_STATE: &[u8] = b"state";
@@ -37,6 +51,8 @@ pub struct BlobRefIndex {
     meta: sled::Tree,
     tag_to_root: sled::Tree,
     root_counts: sled::Tree,
+    /// Per-repository root provenance: `repo \0 digest` -> (manifest flag, tag_refs).
+    repo_roots: sled::Tree,
     rev_edges: sled::Tree,
     pins: sled::Tree,
     repo_memberships: sled::Tree,
@@ -104,6 +120,7 @@ impl BlobRefIndex {
         let meta = db.open_tree("meta")?;
         let tag_to_root = db.open_tree("tag_to_root")?;
         let root_counts = db.open_tree("root_counts")?;
+        let repo_roots = db.open_tree("repo_roots")?;
         let rev_edges = db.open_tree("rev_edges")?;
         let pins = db.open_tree("pins")?;
         let repo_memberships = db.open_tree("repo_memberships")?;
@@ -113,6 +130,7 @@ impl BlobRefIndex {
             meta,
             tag_to_root,
             root_counts,
+            repo_roots,
             rev_edges,
             pins,
             repo_memberships,
@@ -432,22 +450,12 @@ impl BlobRefIndex {
                 self.ingest_root(storage, repo, new_root).await?;
                 Ok(())
             }
-            crate::storage::TagMutation::Created => {
+            crate::storage::TagMutation::Created | crate::storage::TagMutation::Replaced { .. } => {
+                // Accounting reconciles against the mapping the index itself
+                // previously stored (not the caller-reported previous digest),
+                // keeping per-repository tag_refs self-consistent.
                 self.ingest_root(storage, repo, new_root).await?;
-                let key = tag_key(repo, tag);
-                let new_val = new_root.as_str().as_bytes().to_vec();
-                self.tag_to_root.insert(&key, new_val)?;
-                self.inc_root_count(new_root.as_str().as_bytes())?;
-                self.db.flush()?;
-                Ok(())
-            }
-            crate::storage::TagMutation::Replaced { previous } => {
-                self.ingest_root(storage, repo, new_root).await?;
-                let key = tag_key(repo, tag);
-                let new_val = new_root.as_str().as_bytes().to_vec();
-                self.tag_to_root.insert(&key, new_val)?;
-                self.dec_root_count(previous.as_str().as_bytes())?;
-                self.inc_root_count(new_root.as_str().as_bytes())?;
+                self.set_tag_mapping_accounted(repo, tag, &new_root.as_str())?;
                 self.db.flush()?;
                 Ok(())
             }
@@ -465,26 +473,11 @@ impl BlobRefIndex {
         // Ensure the manifest graph is present.
         self.ingest_root(storage, repo, new_root).await?;
 
-        // Update tag mapping + root refcounts.
-        let key = tag_key(repo, tag);
-        let new_val = new_root.as_str().as_bytes().to_vec();
-
-        // If caller provided old_root, use it. Otherwise, derive from existing tag_to_root.
-        let prev = match old_root {
-            Some(r) => Some(r),
-            None => self
-                .tag_to_root
-                .get(&key)?
-                .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
-                .and_then(|s| Digest::parse(&s).ok()),
-        };
-
-        self.tag_to_root.insert(&key, new_val)?;
-
-        if let Some(p) = prev {
-            self.dec_root_count(p.as_str().as_bytes())?;
-        }
-        self.inc_root_count(new_root.as_str().as_bytes())?;
+        // Accounting reconciles against the mapping the index itself previously
+        // stored; `old_root` remains accepted for API compatibility but the
+        // stored mapping is authoritative for per-repository tag_refs.
+        let _ = old_root;
+        self.set_tag_mapping_accounted(repo, tag, &new_root.as_str())?;
 
         self.db.flush()?;
         Ok(())
@@ -498,32 +491,78 @@ impl BlobRefIndex {
         // Phase 1: Read-only storage discovery (all-or-nothing; zero index mutations on error)
         let staged = Self::discover_repo_manifests_and_tags(storage, repo).await?;
 
-        // Phase 2: Index application (performs sled operations, no backend I/O)
-        // 1. Remove all existing tags for this repo from the index.
+        // Phase 2: Index application (performs sled operations, no backend I/O).
+        // Reconcile THIS repository's contribution against the staged discovery:
+        // repository-scoped replacement that is idempotent for unchanged storage
+        // state and can never erase another repository's accounting. Multi-tree
+        // application remains non-transactional (as elsewhere in this index) and
+        // is protected by the caller-side dirty/rebuild mechanism.
+        // 1. Build the repository's NEW contribution map from staged state.
+        let mut new_contribs: HashMap<String, (bool, u32)> = HashMap::new();
+        for digest in &staged.roots {
+            new_contribs
+                .entry(digest.as_str().to_string())
+                .or_insert((false, 0))
+                .0 = true;
+        }
+        for (_tag_k, digest_bytes) in &staged.tags {
+            if let Ok(s) = std::str::from_utf8(digest_bytes) {
+                let entry = new_contribs.entry(s.to_string()).or_insert((false, 0));
+                entry.1 = entry.1.saturating_add(1);
+            }
+        }
+
+        // 2. Load the repository's OLD contribution map.
         let prefix = tag_prefix(repo);
+        let mut old_contribs: HashMap<String, (bool, u32)> = HashMap::new();
+        for item in self.repo_roots.scan_prefix(&prefix) {
+            let (k, v) = item?;
+            let digest_str = std::str::from_utf8(&k[prefix.len()..])
+                .map_err(|_| RefIndexError::Corrupt("invalid repo_roots key".to_string()))?
+                .to_string();
+            old_contribs.insert(digest_str, decode_contribution(Some(&v)));
+        }
+
+        // 3. Apply the per-digest delta, adjusting derived global reachability
+        // only on liveness transitions of THIS repository's contribution.
+        let mut all_digests: HashSet<String> = old_contribs.keys().cloned().collect();
+        all_digests.extend(new_contribs.keys().cloned());
+        for digest_str in all_digests {
+            let old = old_contribs.get(&digest_str).copied().unwrap_or((false, 0));
+            let new = new_contribs.get(&digest_str).copied().unwrap_or((false, 0));
+            let old_live = old.0 || old.1 > 0;
+            let new_live = new.0 || new.1 > 0;
+            let key = repo_root_key(repo, &digest_str);
+            if new_live {
+                self.repo_roots
+                    .insert(&key, encode_contribution(new.0, new.1))?;
+            } else {
+                self.repo_roots.remove(&key)?;
+            }
+            if !old_live && new_live {
+                self.inc_root_count(digest_str.as_bytes())?;
+            } else if old_live && !new_live {
+                self.dec_root_count(digest_str.as_bytes())?;
+            }
+        }
+
+        // 4. Replace this repository's tags.
         let existing_tags: Vec<Vec<u8>> = self
             .tag_to_root
-            .scan_prefix(prefix)
+            .scan_prefix(&prefix)
             .filter_map(|r| r.ok())
             .map(|(k, _v)| k.to_vec())
             .collect();
         for k in existing_tags {
             let _ = self.tag_to_root.remove(k);
         }
-
-        // 2. Increment root counts and apply DAG edges for discovered manifests.
-        // Root occurrence order and multiplicity are preserved; count inflation on repeated
-        // successful syncs remains unresolved in this narrow slice and is explicitly documented.
-        for digest in staged.roots {
-            self.inc_root_count(digest.as_str().as_bytes())?;
-        }
-        for (child, parent) in staged.edges {
-            self.add_parent(&child, &parent)?;
-        }
-
-        // 3. Insert discovered tags into tag_to_root
         for (tag_k, digest_bytes) in staged.tags {
             self.tag_to_root.insert(tag_k, digest_bytes.as_slice())?;
+        }
+
+        // 5. Apply DAG edges for discovered manifests.
+        for (child, parent) in staged.edges {
+            self.add_parent(&child, &parent)?;
         }
 
         self.db.flush()?;
@@ -670,25 +709,35 @@ impl BlobRefIndex {
         digest: &Digest,
         tag: Option<&str>,
     ) -> Result<(), RefIndexError> {
-        self.inc_root_count(digest.as_str().as_bytes())?;
+        // Idempotent per-repository manifest contribution (re-publishing an
+        // already-indexed manifest does not inflate accounting).
+        self.contribution_set_manifest(repo, &digest.as_str(), true)?;
         self.ingest_root(storage, repo, digest).await?;
         if let Some(t) = tag {
-            self.tag_to_root
-                .insert(tag_key(repo, t), digest.as_str().as_bytes())?;
+            self.set_tag_mapping_accounted(repo, t, &digest.as_str())?;
         }
         self.db.flush()?;
         Ok(())
     }
 
     pub fn on_tag_deleted(&self, repo: &str, tag: &str) -> Result<(), RefIndexError> {
-        self.tag_to_root.remove(tag_key(repo, tag))?;
+        // Removing the mapping releases this repository's tag contribution to
+        // the previously targeted digest.
+        if let Some(prev) = self.tag_to_root.remove(tag_key(repo, tag))? {
+            if let Ok(prev_str) = std::str::from_utf8(&prev) {
+                let prev_str = prev_str.to_string();
+                self.contribution_adjust_tag_refs(repo, &prev_str, -1)?;
+            }
+        }
         self.db.flush()?;
         Ok(())
     }
 
     pub fn on_manifest_deleted(&self, repo: &str, digest: &Digest) -> Result<(), RefIndexError> {
+        // Clear exactly THIS repository's contribution (manifest presence plus
+        // the tag references removed below); other repositories' live
+        // contributions to the same content-addressed digest are untouched.
         let digest_str = digest.as_str();
-        self.root_counts.remove(digest_str.as_bytes())?;
         let prefix = tag_prefix(repo);
         let digest_bytes = digest_str.as_bytes();
         let tags_to_remove: Vec<Vec<u8>> = self
@@ -701,6 +750,7 @@ impl BlobRefIndex {
         for k in tags_to_remove {
             let _ = self.tag_to_root.remove(k);
         }
+        self.contribution_clear(repo, &digest_str)?;
         self.db.flush()?;
         Ok(())
     }
@@ -716,6 +766,7 @@ impl BlobRefIndex {
 
         self.tag_to_root.clear()?;
         self.root_counts.clear()?;
+        self.repo_roots.clear()?;
         self.rev_edges.clear()?;
         self.repo_memberships.clear()?;
 
@@ -788,8 +839,12 @@ impl BlobRefIndex {
                 let cur = self.tag_to_root.get(&key)?;
                 let needs_update = cur.as_ref().map(|v| v.as_ref()) != Some(new_val.as_slice());
                 if needs_update {
+                    // Deliberately conservative (documented above): add the new
+                    // target's tag contribution without decrementing the old
+                    // target, so concurrent writes can only over-retain. The
+                    // next repository sync/rebuild reconciles exactly.
                     self.tag_to_root.insert(&key, new_val)?;
-                    self.inc_root_count(root.as_str().as_bytes())?;
+                    self.contribution_adjust_tag_refs(repo.as_str(), &root.as_str(), 1)?;
                     stats.tags_updated += 1;
                 }
             }
@@ -875,6 +930,113 @@ impl BlobRefIndex {
         Ok(())
     }
 
+    /// Applies a pure transformation to this repository's contribution record
+    /// for `digest_str` and adjusts the derived global `root_counts` entry only
+    /// on liveness transitions of THIS repository's contribution. The record is
+    /// removed when it becomes dead (`!manifest && tag_refs == 0`).
+    fn contribution_apply(
+        &self,
+        repo: &str,
+        digest_str: &str,
+        f: impl Fn(bool, u32) -> (bool, u32),
+    ) -> Result<(), RefIndexError> {
+        let key = repo_root_key(repo, digest_str);
+        let prev = self.repo_roots.fetch_and_update(&key, |old| {
+            let (m, t) = decode_contribution(old);
+            let (nm, nt) = f(m, t);
+            if !nm && nt == 0 {
+                None
+            } else {
+                Some(encode_contribution(nm, nt))
+            }
+        })?;
+        let (old_m, old_t) = decode_contribution(prev.as_deref());
+        let (new_m, new_t) = f(old_m, old_t);
+        let old_live = old_m || old_t > 0;
+        let new_live = new_m || new_t > 0;
+        if !old_live && new_live {
+            self.inc_root_count(digest_str.as_bytes())?;
+        } else if old_live && !new_live {
+            self.dec_root_count(digest_str.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Sets/clears the manifest-presence bit of this repository's contribution.
+    fn contribution_set_manifest(
+        &self,
+        repo: &str,
+        digest_str: &str,
+        present: bool,
+    ) -> Result<(), RefIndexError> {
+        self.contribution_apply(repo, digest_str, move |_m, t| (present, t))
+    }
+
+    /// Adjusts the tag-reference count of this repository's contribution
+    /// (saturating at zero).
+    fn contribution_adjust_tag_refs(
+        &self,
+        repo: &str,
+        digest_str: &str,
+        delta: i64,
+    ) -> Result<(), RefIndexError> {
+        self.contribution_apply(repo, digest_str, move |m, t| {
+            let next = (i64::from(t)).saturating_add(delta).max(0) as u32;
+            (m, next)
+        })
+    }
+
+    /// Removes this repository's ENTIRE contribution for `digest_str`
+    /// (manifest presence and tag references).
+    fn contribution_clear(&self, repo: &str, digest_str: &str) -> Result<(), RefIndexError> {
+        self.contribution_apply(repo, digest_str, |_m, _t| (false, 0))
+    }
+
+    /// Inserts/replaces a tag mapping and reconciles per-repository tag
+    /// contributions against the mapping the index PREVIOUSLY stored:
+    /// retargets release the old target and add the new one; same-target
+    /// writes change nothing; fresh mappings add the new target.
+    fn set_tag_mapping_accounted(
+        &self,
+        repo: &str,
+        tag: &str,
+        new_root_str: &str,
+    ) -> Result<(), RefIndexError> {
+        let key = tag_key(repo, tag);
+        let prev = self.tag_to_root.insert(&key, new_root_str.as_bytes())?;
+        match prev {
+            Some(prev_v) if prev_v.as_ref() == new_root_str.as_bytes() => Ok(()),
+            Some(prev_v) => {
+                if let Ok(prev_str) = std::str::from_utf8(&prev_v) {
+                    let prev_str = prev_str.to_string();
+                    self.contribution_adjust_tag_refs(repo, &prev_str, -1)?;
+                }
+                self.contribution_adjust_tag_refs(repo, new_root_str, 1)
+            }
+            None => self.contribution_adjust_tag_refs(repo, new_root_str, 1),
+        }
+    }
+
+    /// Test seam: derived global reachability count for a digest.
+    #[cfg(test)]
+    pub(crate) fn debug_root_count(&self, digest: &Digest) -> Option<u64> {
+        self.root_counts
+            .get(digest.as_str().as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| decode_u64(&v))
+    }
+
+    /// Test seam: this repository's contribution record for a digest.
+    #[cfg(test)]
+    pub(crate) fn debug_contribution(&self, repo: &str, digest: &Digest) -> Option<(bool, u32)> {
+        self.repo_roots
+            .get(repo_root_key(repo, &digest.as_str()))
+            .ok()
+            .flatten()
+            .map(|v| decode_contribution(Some(&v)))
+    }
+
     fn inc_root_count(&self, root: &[u8]) -> Result<(), RefIndexError> {
         self.root_counts.update_and_fetch(root, |old| {
             let cur = old.and_then(|v| decode_u64(v)).unwrap_or(0);
@@ -913,6 +1075,37 @@ fn tag_prefix(repo: &str) -> Vec<u8> {
     p.extend_from_slice(repo.as_bytes());
     p.push(0);
     p
+}
+
+/// Per-repository provenance key: `repo \0 digest` (same framing as tag keys;
+/// digest strings never contain NUL).
+fn repo_root_key(repo: &str, digest_str: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(repo.len() + 1 + digest_str.len());
+    k.extend_from_slice(repo.as_bytes());
+    k.push(0);
+    k.extend_from_slice(digest_str.as_bytes());
+    k
+}
+
+/// Contribution record: `[manifest u8][tag_refs u32 BE]`. Tolerant decode:
+/// malformed records (never written by this schema) read as empty and are
+/// overwritten on the next apply (the index is rebuildable by design).
+fn encode_contribution(manifest: bool, tag_refs: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(5);
+    v.push(u8::from(manifest));
+    v.extend_from_slice(&tag_refs.to_be_bytes());
+    v
+}
+
+fn decode_contribution(v: Option<&[u8]>) -> (bool, u32) {
+    match v {
+        Some(b) if b.len() == 5 => {
+            let mut t = [0u8; 4];
+            t.copy_from_slice(&b[1..5]);
+            (b[0] != 0, u32::from_be_bytes(t))
+        }
+        _ => (false, 0),
+    }
 }
 
 fn encode_u64(v: u64) -> Vec<u8> {
@@ -2360,7 +2553,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_repo_repeated_success_count_behavior_documented() {
+    async fn test_sync_repo_repeated_success_is_idempotent() {
+        // T1: repeated successful sync of unchanged storage state must not
+        // inflate accounting (previously this test documented counts 1/2/3;
+        // schema v2 per-repository provenance makes sync idempotent).
         let path = temp_index_path();
         let idx = BlobRefIndex::open(path.clone()).expect("open");
         let mock = Arc::new(MockStorage::new());
@@ -2368,46 +2564,35 @@ mod tests {
 
         let repo = "org/repo";
         let r1 = d('1');
+        mock.set_tag_sync(repo, "t1", &r1);
         mock.put_manifest_bytes(repo, &r1, image_manifest(&d('2'), &d('3')));
 
-        // Run 1: count becomes 1
+        for run in 1..=3 {
+            idx.sync_repo_manifests_and_tags(&storage, repo)
+                .await
+                .unwrap_or_else(|e| panic!("run {run}: {e}"));
+            assert_eq!(
+                idx.debug_root_count(&r1),
+                Some(1),
+                "run {run}: exactly one contributing repository"
+            );
+            assert_eq!(
+                idx.debug_contribution(repo, &r1),
+                Some((true, 1)),
+                "run {run}: manifest presence + one tag reference"
+            );
+        }
+        // Full logical accounting is byte-stable across repeated syncs.
         idx.sync_repo_manifests_and_tags(&storage, repo)
             .await
-            .expect("run 1");
-        let count1 = decode_u64(
-            &idx.root_counts
-                .get(r1.as_str().as_bytes())
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(count1, 1);
-
-        // Run 2: existing behavior increments count to 2
+            .expect("run 4");
+        let roots_a = snapshot_tree(&idx.root_counts);
+        let contribs_a = snapshot_tree(&idx.repo_roots);
         idx.sync_repo_manifests_and_tags(&storage, repo)
             .await
-            .expect("run 2");
-        let count2 = decode_u64(
-            &idx.root_counts
-                .get(r1.as_str().as_bytes())
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(count2, 2);
-
-        // Run 3: count increments to 3
-        idx.sync_repo_manifests_and_tags(&storage, repo)
-            .await
-            .expect("run 3");
-        let count3 = decode_u64(
-            &idx.root_counts
-                .get(r1.as_str().as_bytes())
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(count3, 3);
+            .expect("run 5");
+        assert_eq!(snapshot_tree(&idx.root_counts), roots_a);
+        assert_eq!(snapshot_tree(&idx.repo_roots), contribs_a);
 
         let _ = std::fs::remove_dir_all(path);
     }
@@ -2667,5 +2852,379 @@ mod tests {
         idx.check_health().expect("check_health must succeed");
 
         let _ = std::fs::remove_dir_all(index_dir);
+    }
+
+    // T2: cross-repository manifest survival through the PRODUCTION hooks —
+    // deleting repository A's manifest must not erase repository B's live
+    // contribution for the same content-addressed digest (previously
+    // on_manifest_deleted removed the entire global key).
+    #[tokio::test]
+    async fn test_cross_repo_manifest_delete_preserves_other_repo_contribution() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let shared = d('7');
+        let blob = d('8');
+        mock.put_manifest_bytes("repo/a", &shared, image_manifest(&d('9'), &blob));
+        mock.put_manifest_bytes("repo/b", &shared, image_manifest(&d('9'), &blob));
+
+        idx.on_manifest_published(&storage, "repo/a", &shared, Some("va"))
+            .await
+            .expect("publish a");
+        idx.on_manifest_published(&storage, "repo/b", &shared, None)
+            .await
+            .expect("publish b");
+        // Bootstrap the meta state so is_blob_referenced's health check passes.
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .unwrap();
+        idx.mark_ready().unwrap();
+
+        assert_eq!(
+            idx.debug_root_count(&shared),
+            Some(2),
+            "two contributing repos"
+        );
+        assert!(idx.is_blob_referenced(&blob).expect("referenced via both"));
+
+        // Re-publishing must be idempotent (no inflation).
+        idx.on_manifest_published(&storage, "repo/a", &shared, Some("va"))
+            .await
+            .expect("republish a");
+        assert_eq!(
+            idx.debug_root_count(&shared),
+            Some(2),
+            "re-publish does not inflate"
+        );
+
+        // Delete A's manifest: B's contribution survives.
+        idx.on_manifest_deleted("repo/a", &shared)
+            .expect("delete a");
+        assert_eq!(
+            idx.debug_root_count(&shared),
+            Some(1),
+            "B still contributes"
+        );
+        assert_eq!(idx.debug_contribution("repo/a", &shared), None, "A cleared");
+        assert!(
+            idx.is_blob_referenced(&blob).expect("still referenced"),
+            "digest remains reachable through repository B"
+        );
+
+        // Delete B's manifest: no contribution remains.
+        idx.on_manifest_deleted("repo/b", &shared)
+            .expect("delete b");
+        assert_eq!(idx.debug_root_count(&shared), None, "no contributors left");
+        assert!(
+            !idx.is_blob_referenced(&blob).expect("unreferenced"),
+            "digest unreachable once every contribution is gone"
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T3: per-repository reconciliation removes the stale contribution when the
+    // repository's authoritative state changes, without touching another
+    // repository's independent contribution to the removed digest.
+    #[tokio::test]
+    async fn test_sync_reconciliation_replaces_stale_contribution() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let root_a = d('a');
+        let root_b = d('b');
+
+        // Other repo independently contributes root_a.
+        mock.put_manifest_bytes("other", &root_a, image_manifest(&d('c'), &d('d')));
+        idx.sync_repo_manifests_and_tags(&storage, "other")
+            .await
+            .expect("sync other");
+
+        // R contributes root_a initially.
+        mock.put_manifest_bytes("r", &root_a, image_manifest(&d('c'), &d('d')));
+        idx.sync_repo_manifests_and_tags(&storage, "r")
+            .await
+            .expect("sync r (a)");
+        assert_eq!(idx.debug_root_count(&root_a), Some(2));
+
+        // Authoritative state changes: R now contributes root_b instead.
+        mock.remove_manifest("r", &root_a);
+        mock.put_manifest_bytes("r", &root_b, image_manifest(&d('e'), &d('f')));
+        idx.sync_repo_manifests_and_tags(&storage, "r")
+            .await
+            .expect("sync r (b)");
+
+        assert_eq!(
+            idx.debug_contribution("r", &root_a),
+            None,
+            "stale contribution removed"
+        );
+        assert_eq!(idx.debug_contribution("r", &root_b), Some((true, 0)));
+        assert_eq!(
+            idx.debug_root_count(&root_a),
+            Some(1),
+            "other repo's independent contribution intact"
+        );
+        assert_eq!(idx.debug_root_count(&root_b), Some(1));
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T4: tag create / retarget / delete keep contributions balanced and
+    // equivalent to rebuild semantics, including shared digests across repos.
+    #[tokio::test]
+    async fn test_tag_mutation_contribution_balance() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let m1 = d('1');
+        let m2 = d('2');
+        mock.put_manifest_bytes("r", &m1, image_manifest(&d('3'), &d('4')));
+        mock.put_manifest_bytes("r", &m2, image_manifest(&d('5'), &d('6')));
+        // Another repo also tags m1: its contribution must be unaffected.
+        mock.put_manifest_bytes("s", &m1, image_manifest(&d('3'), &d('4')));
+        idx.on_tag_set(&storage, "s", "keep", &m1, None)
+            .await
+            .expect("s tag");
+        assert_eq!(idx.debug_contribution("s", &m1), Some((false, 1)));
+
+        // Create.
+        idx.on_tag_set(&storage, "r", "t", &m1, None)
+            .await
+            .expect("create");
+        assert_eq!(idx.debug_contribution("r", &m1), Some((false, 1)));
+        assert_eq!(idx.debug_root_count(&m1), Some(2));
+
+        // Same-target re-set: no change.
+        idx.on_tag_set(&storage, "r", "t", &m1, None)
+            .await
+            .expect("re-set");
+        assert_eq!(idx.debug_contribution("r", &m1), Some((false, 1)));
+        assert_eq!(idx.debug_root_count(&m1), Some(2));
+
+        // Retarget t: m1 -> m2 (via the TagMutation hook).
+        idx.on_tag_mutation(
+            &storage,
+            "r",
+            "t",
+            &m2,
+            &crate::storage::TagMutation::Replaced {
+                previous: m1.clone(),
+            },
+        )
+        .await
+        .expect("retarget");
+        assert_eq!(
+            idx.debug_contribution("r", &m1),
+            None,
+            "old target released"
+        );
+        assert_eq!(idx.debug_contribution("r", &m2), Some((false, 1)));
+        assert_eq!(
+            idx.debug_root_count(&m1),
+            Some(1),
+            "repo s still contributes m1"
+        );
+        assert_eq!(idx.debug_root_count(&m2), Some(1));
+
+        // Delete.
+        idx.on_tag_deleted("r", "t").expect("delete tag");
+        assert_eq!(idx.debug_contribution("r", &m2), None);
+        assert_eq!(idx.debug_root_count(&m2), None);
+        assert_eq!(
+            idx.debug_root_count(&m1),
+            Some(1),
+            "repo s untouched throughout"
+        );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T6: schema bump — a v1 index is recognized as requiring rebuild by the
+    // existing mechanism, the rebuild produces correct v2 accounting, and a
+    // reopen uses the new schema normally.
+    #[tokio::test]
+    async fn test_schema_bump_forces_rebuild_and_reopen_is_healthy() {
+        let path = temp_index_path();
+        {
+            let idx = BlobRefIndex::open(path.clone()).expect("open");
+            // Simulate an old (v1) on-disk index: old schema marker + a stale
+            // inflated global count with no provenance.
+            idx.meta.insert(META_SCHEMA_VERSION, encode_u32(1)).unwrap();
+            idx.meta.insert(META_STATE, META_STATE_READY).unwrap();
+            idx.root_counts
+                .insert(d('1').as_str().as_bytes(), encode_u64(3))
+                .unwrap();
+            idx.flush().unwrap();
+        }
+
+        let idx = BlobRefIndex::open(path.clone()).expect("reopen");
+        let err = idx.check_health().expect_err("v1 schema must be rejected");
+        assert!(matches!(err, RefIndexError::Corrupt(_)));
+
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        let m1 = d('1');
+        mock.set_tag_sync("r", "t", &m1);
+        mock.put_manifest_bytes("r", &m1, image_manifest(&d('2'), &d('3')));
+
+        idx.ensure_healthy_or_rebuild(&storage, true, false)
+            .await
+            .expect("auto-rebuild on schema mismatch");
+        idx.check_health().expect("healthy after rebuild");
+        assert_eq!(
+            idx.debug_root_count(&m1),
+            Some(1),
+            "stale inflated count replaced"
+        );
+        assert_eq!(idx.debug_contribution("r", &m1), Some((true, 1)));
+
+        // Reopen normally under the new schema.
+        drop(idx);
+        let idx2 = BlobRefIndex::open(path.clone()).expect("reopen v2");
+        idx2.check_health().expect("v2 index healthy on reopen");
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T7: rebuild equivalence — incremental lifecycle events over two repos
+    // (shared digest, distinct digest, tag retarget + deletion) produce the
+    // same logical accounting as a clean rebuild of the same state.
+    #[tokio::test]
+    async fn test_incremental_accounting_matches_clean_rebuild() {
+        let inc_path = temp_index_path();
+        let reb_path = temp_index_path();
+        let inc = BlobRefIndex::open(inc_path.clone()).expect("open inc");
+        let reb = BlobRefIndex::open(reb_path.clone()).expect("open reb");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let shared = d('1');
+        let only_a = d('2');
+        let retired = d('3');
+
+        // Authoritative end state built alongside incremental events.
+        mock.put_manifest_bytes("a", &shared, image_manifest(&d('4'), &d('5')));
+        mock.put_manifest_bytes("b", &shared, image_manifest(&d('4'), &d('5')));
+        mock.put_manifest_bytes("a", &only_a, image_manifest(&d('6'), &d('7')));
+        mock.put_manifest_bytes("a", &retired, image_manifest(&d('8'), &d('9')));
+
+        inc.on_manifest_published(&storage, "a", &shared, Some("s"))
+            .await
+            .unwrap();
+        inc.on_manifest_published(&storage, "b", &shared, None)
+            .await
+            .unwrap();
+        inc.on_manifest_published(&storage, "a", &only_a, None)
+            .await
+            .unwrap();
+        inc.on_manifest_published(&storage, "a", &retired, Some("old"))
+            .await
+            .unwrap();
+        mock.set_tag_sync("a", "s", &shared);
+        mock.set_tag_sync("a", "old", &retired);
+
+        // Retarget "old" from `retired` to `only_a`, then delete `retired`.
+        inc.on_tag_mutation(
+            &storage,
+            "a",
+            "old",
+            &only_a,
+            &crate::storage::TagMutation::Replaced {
+                previous: retired.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        mock.set_tag_sync("a", "old", &only_a);
+        inc.on_manifest_deleted("a", &retired).unwrap();
+        mock.remove_manifest("a", &retired);
+        mock.remove_tag("a", "nonexistent"); // no-op; keep mock coherent
+
+        // Clean rebuild of the same authoritative end state.
+        reb.rebuild(&storage).await.expect("rebuild");
+
+        for digest in [&shared, &only_a, &retired] {
+            assert_eq!(
+                inc.debug_root_count(digest),
+                reb.debug_root_count(digest),
+                "global accounting must match rebuild for {digest:?}"
+            );
+            for repo in ["a", "b"] {
+                assert_eq!(
+                    inc.debug_contribution(repo, digest),
+                    reb.debug_contribution(repo, digest),
+                    "contribution must match rebuild for {repo}/{digest:?}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(inc_path);
+        let _ = std::fs::remove_dir_all(reb_path);
+    }
+
+    // T7b: repeated rebuild converges (byte-stable accounting trees).
+    #[tokio::test]
+    async fn test_repeated_rebuild_converges() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+        mock.set_tag_sync("r", "t", &d('1'));
+        mock.put_manifest_bytes("r", &d('1'), image_manifest(&d('2'), &d('3')));
+
+        idx.rebuild(&storage).await.expect("rebuild 1");
+        let roots = snapshot_tree(&idx.root_counts);
+        let contribs = snapshot_tree(&idx.repo_roots);
+        idx.rebuild(&storage).await.expect("rebuild 2");
+        assert_eq!(snapshot_tree(&idx.root_counts), roots);
+        assert_eq!(snapshot_tree(&idx.repo_roots), contribs);
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // T8: ordinary single-repository behavior is unweakened — publish makes
+    // blobs referenced, delete makes them unreferenced.
+    #[tokio::test]
+    async fn test_single_repo_reference_lifecycle_regression() {
+        let path = temp_index_path();
+        let idx = BlobRefIndex::open(path.clone()).expect("open");
+        let mock = Arc::new(MockStorage::new());
+        let storage = mock.clone();
+
+        let m = d('1');
+        let blob = d('4');
+        mock.put_manifest_bytes("solo", &m, image_manifest(&d('3'), &blob));
+        idx.meta
+            .insert(META_SCHEMA_VERSION, encode_u32(SCHEMA_VERSION))
+            .unwrap();
+        idx.mark_ready().unwrap();
+
+        idx.on_manifest_published(&storage, "solo", &m, Some("v1"))
+            .await
+            .expect("publish");
+        assert!(idx.is_blob_referenced(&blob).expect("referenced"));
+        assert_eq!(idx.debug_contribution("solo", &m), Some((true, 1)));
+
+        idx.on_tag_deleted("solo", "v1").expect("tag delete");
+        assert!(
+            idx.is_blob_referenced(&blob).expect("still referenced"),
+            "stored manifest keeps the digest live after tag deletion"
+        );
+        assert_eq!(idx.debug_contribution("solo", &m), Some((true, 0)));
+
+        idx.on_manifest_deleted("solo", &m)
+            .expect("manifest delete");
+        assert!(!idx.is_blob_referenced(&blob).expect("unreferenced"));
+        assert_eq!(idx.debug_contribution("solo", &m), None);
+        assert_eq!(idx.debug_root_count(&m), None);
+
+        let _ = std::fs::remove_dir_all(path);
     }
 }
