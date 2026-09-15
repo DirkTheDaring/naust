@@ -265,14 +265,6 @@ struct UploadAuthorities {
     blobs: OnceCell<ContainedDir>,
     /// `<root>/repo-memberships`, pinned once and shared.
     memberships: OnceCell<ContainedDir>,
-    /// `<root>/repos`, pinned once and shared. This is the fixed top-level
-    /// repository namespace root; per-`<repository>` authorities are **not**
-    /// cached — each tag mutation re-resolves `repos/<repo>/tags` freshly
-    /// beneath this pinned dir (see the tag-mutation contained-integration
-    /// design, Decision A). Caching stops at this never-deleted top level so a
-    /// deleted/recreated repository inode is always observed on the next
-    /// operation, keeping tag reads and writes coherent.
-    repos: OnceCell<ContainedDir>,
     /// `<root>/quarantine`, pinned once and shared (GC quarantine payloads and
     /// timestamp metadata).
     quarantine: OnceCell<ContainedDir>,
@@ -293,7 +285,6 @@ impl UploadAuthorities {
             finalized: OnceCell::new(),
             blobs: OnceCell::new(),
             memberships: OnceCell::new(),
-            repos: OnceCell::new(),
             quarantine: OnceCell::new(),
         })
     }
@@ -342,19 +333,6 @@ impl UploadAuthorities {
                     root.ensure_subdir(&FileName::new("repo-memberships")?)
                         .await
                 }
-            })
-            .await
-            .map(ContainedDir::clone)
-    }
-
-    /// The shared `<root>/repos` authority (fixed top-level repository namespace
-    /// root). Pinned exactly once; per-repository `tags` authorities are resolved
-    /// freshly beneath it per operation and never cached.
-    async fn repos(&self) -> Result<ContainedDir, FsMutateError> {
-        self.repos
-            .get_or_try_init(|| {
-                let root = self.root.clone();
-                async move { root.ensure_subdir(&FileName::new("repos")?).await }
             })
             .await
             .map(ContainedDir::clone)
@@ -465,6 +443,11 @@ pub struct FsStorage {
     /// enumeration operations and `meta/` readiness/checkpoint state remain
     /// on the retained seams (see `membership_read`).
     membership_domain: crate::storage::membership_domain::MembershipDomain,
+    /// Phase 7 lifecycle-journal cutover: the shared backend-neutral journal
+    /// implementation over its own `FsObjectStore` pinned to the same
+    /// storage root (identity key mapping — every journal stays at
+    /// `repos/<repo>/meta/lifecycle_journal.json`).
+    journal_domain: crate::storage::journal_domain::JournalDomain,
     /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
     /// at the boundary between a candidate's confirmed expiry decision and its
     /// destructive action, with the candidate uuid. Lets a regression prove that no
@@ -727,6 +710,15 @@ impl FsStorage {
             std::sync::Arc::new(membership_store),
         );
 
+        // Phase 7 lifecycle-journal cutover: a fifth pinned object store over
+        // the SAME root (identity key mapping). Journals never enumerate, so
+        // no enumeration budget is configured; reads preserve the historical
+        // unbounded contract inside the domain.
+        let journal_store = storage_fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::io(format!("open journal object store root: {e}")))?;
+        let journal_domain =
+            crate::storage::journal_domain::JournalDomain::new(std::sync::Arc::new(journal_store));
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
@@ -745,6 +737,7 @@ impl FsStorage {
             manifest_domain,
             referrer_domain,
             membership_domain,
+            journal_domain,
             #[cfg(test)]
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
@@ -996,38 +989,6 @@ impl FsStorage {
             .join(digest.algorithm())
             .join(digest.prefix2())
             .join(digest.hex())
-    }
-
-    /// Contained authority for `repos/<repo>/meta` (the lifecycle-journal
-    /// namespace), beneath the pinned `repos` root. `create = false` opens
-    /// without creating (`Ok(None)` on absence, preserving absent-state
-    /// contracts); `create = true` ensures the chain (newly created directory
-    /// entries are persisted by the primitive). The repository grammar is the
-    /// upstream-validated `CanonicalRepoName`, matching the contained journal
-    /// reader's key construction.
-    async fn journal_meta_authority(
-        &self,
-        canonical: &CanonicalRepoName,
-        create: bool,
-    ) -> Result<Option<ContainedDir>, StorageError> {
-        let mut dir = self
-            .upload_authorities
-            .repos()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for segment in canonical.as_str().split('/').chain(std::iter::once("meta")) {
-            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
-            dir = if create {
-                dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?
-            } else {
-                match dir.open_subdir(&name).await {
-                    Ok(d) => d,
-                    Err(FsMutateError::NotFound) => return Ok(None),
-                    Err(err) => return Err(map_fs_mutate_err(err)),
-                }
-            };
-        }
-        Ok(Some(dir))
     }
 
     #[cfg(test)]
@@ -1333,52 +1294,27 @@ impl Storage for FsStorage {
     }
 
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
-        journal_read::read_lifecycle_journal_impl(self.reader.as_ref(), repo).await
+        self.journal_domain.read_lifecycle_journal(repo).await
     }
 
     async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
-        // The lifecycle journal is authoritative recovery state: GC's pre-delete
-        // revalidation treats its presence as protection for in-flight manifest
-        // lifecycle operations. Write it contained (beneath the pinned `repos`
-        // authority, same `repos/<repo>/meta/lifecycle_journal.json` key the
-        // contained reader resolves) and durably (temp fsync + rename + parent
-        // dir fsync, all propagated) - the prior ambient temp+rename never
-        // fsynced the file content at all, so a crash could publish an
-        // unpersisted journal.
-        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let meta = self
-            .journal_meta_authority(&canonical, true)
-            .await?
-            .expect("ensure-mode resolution always yields an authority");
-        let leaf = FileName::new("lifecycle_journal.json").map_err(map_fs_mutate_err)?;
-        meta.write_leaf_atomic(&leaf, data.to_vec(), true)
+        // Phase 7: the shared domain performs the frozen unconditional
+        // durable publication (payload fsync + atomic rename + directory
+        // fsync, all propagated) at the identical contained key. The journal
+        // remains authoritative recovery state; serialization stays with the
+        // caller's repository lease + coordinator, as before.
+        self.journal_domain
+            .write_lifecycle_journal(repo, data)
             .await
-            .map_err(map_fs_mutate_err)?;
-        Ok(())
     }
 
     async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
-        // Contained, non-creating; absent components preserve the Ok contract.
-        // Directory-entry persistence of the removal stays best-effort, exactly
-        // as the prior ambient fsync (journal resurrection after a crash only
-        // makes GC more conservative).
-        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let Some(meta) = self.journal_meta_authority(&canonical, false).await? else {
-            return Ok(());
-        };
-        let leaf = FileName::new("lifecycle_journal.json").map_err(map_fs_mutate_err)?;
-        match meta.unlink(&leaf, false).await {
-            Ok(()) => {
-                let _ = meta.sync().await;
-                Ok(())
-            }
-            Err(FsMutateError::NotFound) => Ok(()),
-            Err(err) => Err(map_fs_mutate_err(err)),
-        }
+        // Phase 7: idempotent removal through the shared domain (absent →
+        // success; failures propagate truthfully; P1-shape deletion
+        // durability — journal resurrection after a crash only makes GC more
+        // conservative).
+        self.journal_domain.delete_lifecycle_journal(repo).await
     }
-
     async fn acquire_repo_lease(
         &self,
         repo: &str,
@@ -4315,9 +4251,6 @@ pub(crate) mod timestamps_emptiness;
 
 #[path = "fs/membership_read.rs"]
 pub(crate) mod membership_read;
-
-#[path = "fs/journal_read.rs"]
-pub(crate) mod journal_read;
 
 #[path = "fs/upload_quarantine_read.rs"]
 pub(crate) mod upload_quarantine_read;

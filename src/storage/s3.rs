@@ -907,6 +907,15 @@ impl S3Storage {
         ))
     }
 
+    /// Shared lifecycle-journal domain over the migrated-family ObjectStore
+    /// (Phase 7).
+    async fn journal_domain(
+        &self,
+    ) -> Result<crate::storage::journal_domain::JournalDomain, StorageError> {
+        let store = self.migrated_object_store().await?;
+        Ok(crate::storage::journal_domain::JournalDomain::new(store))
+    }
+
     fn key(&self, suffix: &str) -> String {
         let p = self.prefix.trim_matches('/');
         if p.is_empty() {
@@ -1832,43 +1841,30 @@ impl Storage for S3Storage {
     }
 
     async fn read_lifecycle_journal(&self, repo: &str) -> Result<Option<Bytes>, StorageError> {
-        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let bucket = self.bucket()?;
-        let key = self.key(&format!(
-            "repos/{}/meta/lifecycle_journal.json",
-            canonical.as_str()
-        ));
-        match self.driver.get_object(bucket, &key).await? {
-            Some((bytes, _etag)) => Ok(Some(bytes)),
-            None => Ok(None),
-        }
+        self.journal_domain()
+            .await?
+            .read_lifecycle_journal(repo)
+            .await
     }
 
     async fn write_lifecycle_journal(&self, repo: &str, data: Bytes) -> Result<(), StorageError> {
-        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let bucket = self.bucket()?;
-        let key = self.key(&format!(
-            "repos/{}/meta/lifecycle_journal.json",
-            canonical.as_str()
-        ));
-        self.driver
-            .put_object_conditional(bucket, &key, data, None, None)
-            .await?;
-        Ok(())
+        // Phase 7: the shared domain performs the frozen unconditional
+        // durable publication at the identical prefixed key.
+        self.journal_domain()
+            .await?
+            .write_lifecycle_journal(repo, data)
+            .await
     }
 
     async fn delete_lifecycle_journal(&self, repo: &str) -> Result<(), StorageError> {
-        let canonical = crate::registry::canonical_name::CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let bucket = self.bucket()?;
-        let key = self.key(&format!(
-            "repos/{}/meta/lifecycle_journal.json",
-            canonical.as_str()
-        ));
-        let _ = self.driver.delete_object(bucket, &key).await;
-        Ok(())
+        // Phase 7: idempotent removal through the shared domain. The retired
+        // body discarded EVERY delete error (`let _ =`) while all production
+        // callers `?`-propagate; failures now surface truthfully, matching
+        // the filesystem contract (semantic-matrix row R).
+        self.journal_domain()
+            .await?
+            .delete_lifecycle_journal(repo)
+            .await
     }
 
     async fn acquire_repo_lease(

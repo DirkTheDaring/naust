@@ -17406,6 +17406,9 @@ mod durability_barriers {
         std::fs::create_dir_all(&repo_dir).unwrap();
         symlink(&external, repo_dir.join("meta")).unwrap();
 
+        // Phase 7: the pinned adapter reports its containment refusal as
+        // PermissionDenied (the retired contained seam said Io — both are
+        // production-inert Internal kinds; accepted C2 convergence).
         let err = storage
             .write_lifecycle_journal("symjournal", Bytes::from_static(b"x"))
             .await
@@ -17414,11 +17417,11 @@ mod durability_barriers {
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "write -> Io, got {err:?}"
+            "write -> PermissionDenied, got {err:?}"
         );
         let err = storage
             .delete_lifecycle_journal("symjournal")
@@ -17428,11 +17431,11 @@ mod durability_barriers {
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "delete -> Io, got {err:?}"
+            "delete -> PermissionDenied, got {err:?}"
         );
         assert_eq!(
             std::fs::read(&ext_journal).unwrap(),
