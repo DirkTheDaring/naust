@@ -16,6 +16,7 @@ pub mod fs;
 pub(crate) mod manifest_domain;
 pub mod mutation_authority;
 pub mod ports;
+pub(crate) mod referrer_domain;
 pub mod repo_membership;
 pub mod s3;
 pub(crate) mod store_common;

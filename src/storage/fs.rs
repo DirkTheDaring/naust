@@ -181,7 +181,6 @@ pub(crate) fn fs_repo_dir(
 }
 
 const HASH_SHARDS: usize = 64;
-const REFERRER_SHARDS: usize = 64;
 
 fn shard_index(key: &str, num_shards: usize) -> usize {
     let mut hasher = std::hash::DefaultHasher::new();
@@ -430,7 +429,6 @@ pub struct FsStorage {
     root: PathBuf,
     max_upload_bytes: u64,
     upload_hashes: Vec<Mutex<std::collections::HashMap<String, SerializableSha256>>>,
-    referrer_locks: Vec<Mutex<()>>,
     repo_locks: std::sync::Mutex<std::collections::HashMap<String, std::fs::File>>,
     reader: std::sync::Arc<storage_fs::FsMetadataReader>,
     read_adapter: std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>>,
@@ -452,6 +450,13 @@ pub struct FsStorage {
     /// `repos/<repo>/manifests/<hex>`), budgeted with the configured
     /// manifest listing limits.
     manifest_domain: crate::storage::manifest_domain::ManifestDomain,
+    /// Phase 5 referrer-family cutover: the shared backend-neutral
+    /// referrer-domain implementation over its own `FsObjectStore` pinned to
+    /// the same storage root (identity key mapping — every referrer index
+    /// stays at `repos/<repo>/referrers/<subject.hex()>.json`). The domain
+    /// owns the historical in-process same-subject shard locks and the
+    /// replacement-safe conditional read-modify-write protocol.
+    referrer_domain: crate::storage::referrer_domain::ReferrerDomain,
     /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
     /// at the boundary between a candidate's confirmed expiry decision and its
     /// destructive action, with the candidate uuid. Lets a regression prove that no
@@ -692,19 +697,26 @@ impl FsStorage {
             },
         );
 
+        // Phase 5 referrer-family cutover: a third pinned object store over
+        // the SAME root (identity key mapping — every referrer index stays
+        // at `repos/<repo>/referrers/<hex>.json`). Referrers never enumerate
+        // a namespace, so no enumeration budget is configured; index reads
+        // preserve the historical unbounded contract inside the domain.
+        let referrer_store = storage_fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::io(format!("open referrer object store root: {e}")))?;
+        let referrer_domain = crate::storage::referrer_domain::ReferrerDomain::new(
+            std::sync::Arc::new(referrer_store),
+            std::sync::Arc::new(crate::storage::referrer_domain::ReferrerLockShards::new()),
+        );
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
-        }
-        let mut referrer_locks = Vec::with_capacity(REFERRER_SHARDS);
-        for _ in 0..REFERRER_SHARDS {
-            referrer_locks.push(Mutex::new(()));
         }
         Ok(Self {
             root,
             max_upload_bytes,
             upload_hashes,
-            referrer_locks,
             repo_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             reader,
             read_adapter,
@@ -713,6 +725,7 @@ impl FsStorage {
             gc_ref_limits,
             tag_domain,
             manifest_domain,
+            referrer_domain,
             #[cfg(test)]
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
@@ -804,12 +817,6 @@ impl FsStorage {
     ) -> &Mutex<std::collections::HashMap<String, SerializableSha256>> {
         let idx = shard_index(uuid, HASH_SHARDS);
         &self.upload_hashes[idx]
-    }
-
-    fn referrer_lock_shard(&self, name: &str, subject: &Digest) -> &Mutex<()> {
-        let key = format!("{name}:{}", subject.hex());
-        let idx = shard_index(&key, REFERRER_SHARDS);
-        &self.referrer_locks[idx]
     }
 
     async fn load_upload_hash_state_from_disk(
@@ -1002,115 +1009,6 @@ impl FsStorage {
             };
         }
         Ok(Some(dir))
-    }
-
-    /// Resolves the contained authority for `repos/<repo>/referrers`, creating
-    /// missing directories beneath the pinned `repos` root.
-    ///
-    /// Reuses the referrers READ grammar (`referrers_read::referrers_key`:
-    /// `tag_domain::validate_path_component` + `ObjectKey` composition) so a
-    /// mutation is accepted iff the matching contained read accepts the same
-    /// repository name. The composed key is discarded; only its validation side
-    /// effect is required here. Resolution is fresh per operation — no
-    /// per-repository authority caching — so repository deletion/recreation is
-    /// observed and read/write namespace resolution stays coherent.
-    async fn referrers_authority(
-        &self,
-        repo: &str,
-        subject: &Digest,
-    ) -> Result<ContainedDir, StorageError> {
-        referrers_read::referrers_key(repo, subject)?;
-        let mut dir = self
-            .upload_authorities
-            .repos()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for segment in repo.split('/') {
-            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
-            dir = dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?;
-        }
-        let referrers = FileName::new("referrers").map_err(map_fs_mutate_err)?;
-        dir.ensure_subdir(&referrers)
-            .await
-            .map_err(map_fs_mutate_err)
-    }
-
-    /// Reads and parses the referrers index leaf through an ALREADY-RESOLVED
-    /// contained authority, so a mutation's inspection and action share one
-    /// resolution (no independent path re-resolution between them).
-    ///
-    /// Preserves the mutation-read contract of the contained reader seam:
-    /// missing leaf → empty vector; corrupt JSON / invalid UTF-8 → legacy Io
-    /// taxonomy via the shared `referrers_read::parse_referrers_bytes`;
-    /// physical descriptor order preserved; no normalization or deduplication.
-    /// Symlinked or non-regular leaves fail closed at the contained primitive.
-    async fn read_referrers_from_authority(
-        referrers: &ContainedDir,
-        leaf: &FileName,
-    ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
-        match referrers.read_leaf(leaf, u64::MAX).await {
-            Ok(bytes) => referrers_read::parse_referrers_bytes(&bytes),
-            Err(FsMutateError::NotFound) => Ok(Vec::new()),
-            Err(err) => Err(map_fs_mutate_err(err)),
-        }
-    }
-
-    /// Inner `add_referrer` sequence, run under the caller-held shard lock:
-    /// inspect, modify, and write all through the ONE retained `referrers`
-    /// authority. This seam is also exercised directly by the same-authority
-    /// replacement regressions.
-    async fn add_referrer_locked(
-        &self,
-        referrers: &ContainedDir,
-        leaf: &FileName,
-        descriptor: ReferrerDescriptor,
-    ) -> Result<(), StorageError> {
-        let mut existing = Self::read_referrers_from_authority(referrers, leaf).await?;
-        if !existing.iter().any(|d| d.digest == descriptor.digest) {
-            existing.push(descriptor);
-        }
-
-        // A duplicate add still rewrites the (unchanged) array, as before.
-        let bytes = serde_json::to_vec(&existing)
-            .map_err(|err| StorageError::serialization(err.to_string()))?;
-        referrers
-            .write_leaf_atomic(leaf, bytes, true)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        Ok(())
-    }
-
-    /// Inner `remove_referrer` sequence, run under the caller-held shard lock:
-    /// inspect, decide (no-change / rewrite / empty unlink), and act all
-    /// through the ONE retained `referrers` authority.
-    async fn remove_referrer_locked(
-        &self,
-        referrers: &ContainedDir,
-        leaf: &FileName,
-        referrer: &Digest,
-    ) -> Result<(), StorageError> {
-        let mut existing = Self::read_referrers_from_authority(referrers, leaf).await?;
-        let orig_len = existing.len();
-        let referrer_str = referrer.as_str();
-        existing.retain(|d| d.digest != referrer_str);
-        if existing.len() == orig_len {
-            return Ok(());
-        }
-
-        if existing.is_empty() {
-            // Best-effort removal of the now-empty index (result ignored, as
-            // before) plus best-effort directory-entry durability.
-            let _ = referrers.unlink(leaf, true).await;
-            let _ = referrers.sync().await;
-        } else {
-            let bytes = serde_json::to_vec(&existing)
-                .map_err(|err| StorageError::serialization(err.to_string()))?;
-            referrers
-                .write_leaf_atomic(leaf, bytes, true)
-                .await
-                .map_err(map_fs_mutate_err)?;
-        }
-        Ok(())
     }
 
     /// Resolves the contained authority for the membership record directory
@@ -1495,28 +1393,9 @@ impl Storage for FsStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError> {
-        let mut refs = self.list_referrers(repo, subject).await.unwrap_or_default();
-        refs.sort_by(|a, b| a.digest.cmp(&b.digest));
-
-        let start_idx = if let Some(token) = continuation_token {
-            match refs.binary_search_by(|r| r.digest.as_str().cmp(token)) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            }
-        } else {
-            0
-        };
-
-        let end_idx = (start_idx + page_limit).min(refs.len());
-        let page_slice = &refs[start_idx..end_idx];
-
-        let next_token = if end_idx < refs.len() {
-            page_slice.last().map(|r| r.digest.clone())
-        } else {
-            None
-        };
-
-        Ok((page_slice.to_vec(), next_token))
+        self.referrer_domain
+            .list_referrers_page(repo, subject, continuation_token, page_limit)
+            .await
     }
 
     async fn get_tag_with_version(
@@ -1981,13 +1860,7 @@ impl Storage for FsStorage {
         name: &str,
         subject: &Digest,
     ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
-        referrers_read::read_referrers_contained(
-            self.reader.as_ref(),
-            name,
-            subject,
-            &referrers_read::ReferrersReadLimits::default(),
-        )
-        .await
+        self.referrer_domain.list_referrers(name, subject).await
     }
 
     async fn add_referrer(
@@ -1996,19 +1869,15 @@ impl Storage for FsStorage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
-        // Retained in-process shard lock (same identity/scope as before) held
-        // across the full read/modify/write sequence. ONE contained
-        // `repos/<repo>/referrers` authority is resolved (validate-then-ensure
-        // beneath the pinned `repos` root) and retained across inspection AND
-        // write, so a repository/referrers namespace replacement mid-operation
-        // cannot split the tree that is inspected from the tree that is
-        // mutated. Ordinary reads still resolve independently through the
-        // contained reader seam; no snapshot isolation or cross-process
-        // serialization is claimed.
-        let _lock = self.referrer_lock_shard(name, subject).lock().await;
-        let referrers = self.referrers_authority(name, subject).await?;
-        let leaf = FileName::new(format!("{}.json", subject.hex())).map_err(map_fs_mutate_err)?;
-        self.add_referrer_locked(&referrers, &leaf, descriptor)
+        // Phase 5: the shared domain keeps the historical in-process shard
+        // lock (same identity/scope as before) and composes the mutation as
+        // replacement-safe conditional read-modify-write over the pinned
+        // object store — a namespace replacement racing the mutation
+        // survives (the stale generation cannot overwrite it), where the
+        // retired retained-authority sequence only kept inspection and
+        // action on one resolution.
+        self.referrer_domain
+            .add_referrer(name, subject, descriptor)
             .await
     }
 
@@ -2018,21 +1887,19 @@ impl Storage for FsStorage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
-        // Same retained shard lock and single retained contained authority as
-        // `add_referrer`; read, decision, rewrite, and empty-index unlink all
-        // act on that one resolution.
-        let _lock = self.referrer_lock_shard(name, subject).lock().await;
-        let referrers = self.referrers_authority(name, subject).await?;
-        let leaf = FileName::new(format!("{}.json", subject.hex())).map_err(map_fs_mutate_err)?;
-        self.remove_referrer_locked(&referrers, &leaf, referrer)
+        // Same shared shard lock and conditional read-modify-write as
+        // `add_referrer`; the empty-index removal is version-conditional
+        // with the historical best-effort error treatment.
+        self.referrer_domain
+            .remove_referrer(name, subject, referrer)
             .await
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
-        // Phase 4: frozen ordering — shared payload steps (pre-read ->
-        // subject extraction -> payload delete) and the accepted Phase 3
+        // Frozen ordering — shared payload steps (pre-read -> subject
+        // extraction -> payload delete) and the accepted Phase 3
         // replacement-safe tag cleanup run in the shared manifest domain;
-        // the existing unmigrated-family referrer cleanup stays the final
+        // the shared referrer-domain cleanup (Phase 5) stays the final
         // best-effort step. Not a transaction; partial cleanup after the
         // payload delete remains possible, exactly as before.
         let maybe_subject = self
@@ -4570,9 +4437,6 @@ pub(crate) use manifest_refs as manifest_refs_seam;
 
 #[path = "fs/tag_listing.rs"]
 pub(crate) mod tag_listing;
-
-#[path = "fs/referrers_read.rs"]
-pub(crate) mod referrers_read;
 
 #[path = "fs/catalog_discovery.rs"]
 pub(crate) mod catalog_discovery;

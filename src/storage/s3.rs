@@ -23,15 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncRead;
-use tokio::sync::{Mutex, OnceCell};
-
-const REFERRER_SHARDS: usize = 64;
-
-fn shard_index(key: &str, num_shards: usize) -> usize {
-    let mut hasher = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(key, &mut hasher);
-    std::hash::Hasher::finish(&hasher) as usize % num_shards
-}
+use tokio::sync::OnceCell;
 
 #[derive(Debug, Clone)]
 pub struct S3ObjectSummary {
@@ -768,7 +760,12 @@ pub struct S3Storage {
     max_upload_bytes: u64,
     pub session_config: S3SessionConfig,
     driver: Arc<dyn S3Driver>,
-    referrer_locks: Arc<Vec<Mutex<()>>>,
+    /// Phase 5 referrer-family cutover: the historical in-process
+    /// same-subject mutation serialization, now owned by the shared
+    /// backend-neutral referrer domain. Shared via `Arc` across clones so
+    /// every clone serializes against one shard set, exactly as the retired
+    /// `Arc<Vec<Mutex<()>>>` did.
+    referrer_locks: Arc<crate::storage::referrer_domain::ReferrerLockShards>,
     /// Migrated-family cutovers (Phase 3 tags, Phase 4 manifests): the
     /// lazily wired backend-neutral ObjectStore shared by both domains
     /// (lazy to preserve the historical first-use surfacing of
@@ -796,17 +793,13 @@ impl S3Storage {
         max_upload_bytes: u64,
     ) -> Self {
         let driver = Arc::new(AwsS3Driver::new(endpoint, region));
-        let mut referrer_locks = Vec::with_capacity(REFERRER_SHARDS);
-        for _ in 0..REFERRER_SHARDS {
-            referrer_locks.push(Mutex::new(()));
-        }
         Self {
             bucket,
             prefix,
             max_upload_bytes,
             session_config: S3SessionConfig::default(),
             driver,
-            referrer_locks: Arc::new(referrer_locks),
+            referrer_locks: Arc::new(crate::storage::referrer_domain::ReferrerLockShards::new()),
             object_store: Arc::new(OnceCell::new()),
         }
     }
@@ -818,17 +811,13 @@ impl S3Storage {
         max_upload_bytes: u64,
         driver: Arc<dyn S3Driver>,
     ) -> Self {
-        let mut referrer_locks = Vec::with_capacity(REFERRER_SHARDS);
-        for _ in 0..REFERRER_SHARDS {
-            referrer_locks.push(Mutex::new(()));
-        }
         Self {
             bucket,
             prefix,
             max_upload_bytes,
             session_config: S3SessionConfig::default(),
             driver,
-            referrer_locks: Arc::new(referrer_locks),
+            referrer_locks: Arc::new(crate::storage::referrer_domain::ReferrerLockShards::new()),
             object_store: Arc::new(OnceCell::new()),
         }
     }
@@ -836,12 +825,6 @@ impl S3Storage {
     pub fn with_session_config(mut self, session_config: S3SessionConfig) -> Self {
         self.session_config = session_config;
         self
-    }
-
-    fn referrer_lock_shard(&self, name: &str, subject: &Digest) -> &Mutex<()> {
-        let key = format!("{name}:{}", subject.hex());
-        let idx = shard_index(&key, REFERRER_SHARDS);
-        &self.referrer_locks[idx]
     }
 
     fn bucket(&self) -> Result<&str, StorageError> {
@@ -897,6 +880,20 @@ impl S3Storage {
         ))
     }
 
+    /// Shared referrer domain over the migrated-family ObjectStore (Phase 5).
+    /// The lock shards live on `self` (shared across clones) so per-call
+    /// domain construction preserves the historical instance-wide in-process
+    /// same-subject serialization.
+    async fn referrer_domain(
+        &self,
+    ) -> Result<crate::storage::referrer_domain::ReferrerDomain, StorageError> {
+        let store = self.migrated_object_store().await?;
+        Ok(crate::storage::referrer_domain::ReferrerDomain::new(
+            store,
+            Arc::clone(&self.referrer_locks),
+        ))
+    }
+
     fn key(&self, suffix: &str) -> String {
         let p = self.prefix.trim_matches('/');
         if p.is_empty() {
@@ -937,10 +934,6 @@ impl S3Storage {
 
     fn all_memberships_prefix(&self) -> String {
         self.key(crate::storage::repo_membership::canonical_all_memberships_prefix())
-    }
-
-    fn referrers_key(&self, name: &str, subject: &Digest) -> String {
-        self.key(&format!("repos/{name}/referrers/{}.json", subject.hex()))
     }
 
     fn tags_prefix(&self, name: &str) -> String {
@@ -1141,15 +1134,6 @@ impl S3Storage {
             Ok((base.to_string(), upload_id))
         } else {
             Ok((token.to_string(), String::new()))
-        }
-    }
-
-    async fn get_object_bytes(&self, key: &str) -> Result<Bytes, StorageError> {
-        let bucket = self.bucket()?;
-        let res = self.driver.get_object(bucket, key).await?;
-        match res {
-            Some((bytes, _)) => Ok(bytes),
-            None => Err(StorageError::NotFound),
         }
     }
 
@@ -1793,28 +1777,10 @@ impl Storage for S3Storage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<ReferrerDescriptor>, Option<String>), StorageError> {
-        let mut refs = self.list_referrers(repo, subject).await.unwrap_or_default();
-        refs.sort_by(|a, b| a.digest.cmp(&b.digest));
-
-        let start_idx = if let Some(token) = continuation_token {
-            match refs.binary_search_by(|r| r.digest.as_str().cmp(token)) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            }
-        } else {
-            0
-        };
-
-        let end_idx = (start_idx + page_limit).min(refs.len());
-        let page_slice = &refs[start_idx..end_idx];
-
-        let next_token = if end_idx < refs.len() {
-            page_slice.last().map(|r| r.digest.clone())
-        } else {
-            None
-        };
-
-        Ok((page_slice.to_vec(), next_token))
+        self.referrer_domain()
+            .await?
+            .list_referrers_page(repo, subject, continuation_token, page_limit)
+            .await
     }
 
     async fn get_tag_with_version(
@@ -2280,14 +2246,10 @@ impl Storage for S3Storage {
         name: &str,
         subject: &Digest,
     ) -> Result<Vec<ReferrerDescriptor>, StorageError> {
-        let key = self.referrers_key(name, subject);
-        let bytes = match self.get_object_bytes(&key).await {
-            Ok(b) => b,
-            Err(StorageError::NotFound) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        serde_json::from_slice::<Vec<ReferrerDescriptor>>(&bytes)
-            .map_err(|err| StorageError::corrupt_data(err.to_string()))
+        self.referrer_domain()
+            .await?
+            .list_referrers(name, subject)
+            .await
     }
 
     async fn add_referrer(
@@ -2296,21 +2258,15 @@ impl Storage for S3Storage {
         subject: &Digest,
         descriptor: ReferrerDescriptor,
     ) -> Result<(), StorageError> {
-        let _lock = self.referrer_lock_shard(name, subject).lock().await;
-        let bucket = self.bucket()?;
-        let key = self.referrers_key(name, subject);
-
-        let mut existing = self.list_referrers(name, subject).await?;
-        if !existing.iter().any(|d| d.digest == descriptor.digest) {
-            existing.push(descriptor);
-        }
-        let body = serde_json::to_vec(&existing)
-            .map_err(|err| StorageError::serialization(err.to_string()))?;
-
-        self.driver
-            .put_object_conditional(bucket, &key, Bytes::from(body), None, None)
-            .await?;
-        Ok(())
+        // Phase 5: the shared domain keeps the historical in-process shard
+        // lock (same identity/scope, shared across clones via `self`) and
+        // replaces the retired GET + unconditional PUT with replacement-safe
+        // conditional read-modify-write — an external writer racing the
+        // mutation can no longer be silently overwritten.
+        self.referrer_domain()
+            .await?
+            .add_referrer(name, subject, descriptor)
+            .await
     }
 
     async fn remove_referrer(
@@ -2319,28 +2275,13 @@ impl Storage for S3Storage {
         subject: &Digest,
         referrer: &Digest,
     ) -> Result<(), StorageError> {
-        let _lock = self.referrer_lock_shard(name, subject).lock().await;
-        let bucket = self.bucket()?;
-        let key = self.referrers_key(name, subject);
-
-        let mut existing = self.list_referrers(name, subject).await?;
-        let orig_len = existing.len();
-        let referrer_str = referrer.as_str();
-        existing.retain(|d| d.digest != referrer_str);
-        if existing.len() == orig_len {
-            return Ok(());
-        }
-
-        if existing.is_empty() {
-            let _ = self.driver.delete_object(bucket, &key).await;
-        } else {
-            let body = serde_json::to_vec(&existing)
-                .map_err(|err| StorageError::serialization(err.to_string()))?;
-            self.driver
-                .put_object_conditional(bucket, &key, Bytes::from(body), None, None)
-                .await?;
-        }
-        Ok(())
+        // Same shared shard lock and conditional read-modify-write as
+        // `add_referrer`; the empty-index removal is version-conditional
+        // with the historical best-effort error treatment.
+        self.referrer_domain()
+            .await?
+            .remove_referrer(name, subject, referrer)
+            .await
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {

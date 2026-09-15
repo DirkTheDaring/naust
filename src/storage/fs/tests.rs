@@ -12283,8 +12283,13 @@ mod referrers_read_characterization {
             .await
             .unwrap_err();
         match direct_err {
-            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-            other => panic!("expected Io on symlink rejection, got {other:?}"),
+            // Phase 5: the pinned adapter reports its containment refusal as
+            // PermissionDenied (the retired contained seam said Io — both are
+            // production-inert Internal kinds; accepted C2 convergence).
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, StorageErrorKind::PermissionDenied)
+            }
+            other => panic!("expected PermissionDenied on symlink rejection, got {other:?}"),
         }
 
         // Paged read continues to suppress the rejection into empty success.
@@ -12334,8 +12339,13 @@ mod referrers_read_characterization {
             .await
             .unwrap_err();
         match direct_err {
-            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-            other => panic!("expected Io on symlink escape rejection, got {other:?}"),
+            // Phase 5: the pinned adapter reports its containment refusal as
+            // PermissionDenied (the retired contained seam said Io — both are
+            // production-inert Internal kinds; accepted C2 convergence).
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, StorageErrorKind::PermissionDenied)
+            }
+            other => panic!("expected PermissionDenied on symlink escape rejection, got {other:?}"),
         }
 
         let paged = storage
@@ -12380,8 +12390,15 @@ mod referrers_read_characterization {
             .await
             .unwrap_err();
         match direct_err {
-            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-            other => panic!("expected Io on directory symlink rejection, got {other:?}"),
+            // Phase 5: the pinned adapter reports its containment refusal as
+            // PermissionDenied (the retired contained seam said Io — both are
+            // production-inert Internal kinds; accepted C2 convergence).
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, StorageErrorKind::PermissionDenied)
+            }
+            other => {
+                panic!("expected PermissionDenied on directory symlink rejection, got {other:?}")
+            }
         }
 
         let paged = storage
@@ -12454,17 +12471,17 @@ mod referrers_read_characterization {
             .join(format!("{}.json", subject.hex()));
         std::fs::create_dir_all(&dir_path).unwrap();
 
-        // Direct read returns StorageErrorKind::Io (EISDIR on Unix)
-        let direct_err = storage
-            .list_referrers("testrepo", &subject)
-            .await
-            .unwrap_err();
-        match direct_err {
-            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-            other => panic!("expected StorageErrorKind::Io for directory read, got {other:?}"),
-        }
+        // Phase 5: a non-regular object at the index leaf is STRUCTURAL
+        // ABSENCE under the shared adapter contract (the accepted
+        // tag/manifest convergence row) — the retired contained seam
+        // reported Internal{Io} (EISDIR). Reads observe an empty index; the
+        // unreadable garbage is never parsed or served.
+        assert_eq!(
+            storage.list_referrers("testrepo", &subject).await.unwrap(),
+            vec![],
+            "directory leaf reads as structurally absent"
+        );
 
-        // Paged read suppresses directory read error into empty success
         let paged_res = storage
             .list_referrers_page("testrepo", &subject, None, 10)
             .await
@@ -12784,7 +12801,7 @@ mod referrers_read_characterization {
     }
 
     #[tokio::test]
-    async fn test_pagination_large_limit_start_idx_gt_zero_complete_method_panic() {
+    async fn test_pagination_large_limit_start_idx_gt_zero_saturates() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let subject = Digest::parse(
@@ -12808,31 +12825,23 @@ mod referrers_read_characterization {
             &root,
             "testrepo",
             &subject,
-            &serde_json::to_vec(&vec![desc_a.clone(), desc_b]).unwrap(),
+            &serde_json::to_vec(&vec![desc_a.clone(), desc_b.clone()]).unwrap(),
         );
 
         // Continuation token matches desc_a at index 0 -> start_idx = 1.
-        // Complete method evaluates: (start_idx + page_limit).min(refs.len())
-        // In the tested debug build profile (overflow-checks = true):
-        // 1 + usize::MAX panics with attempt to add with overflow.
-        // In release profile without overflow checks:
-        // 1 + usize::MAX wraps to 0, then slicing &refs[1..0] panics on slice index ordering.
+        // The retired body computed (start_idx + page_limit) unchecked and
+        // PANICKED on usize::MAX in debug builds (wrapped + slice-panicked in
+        // release). The shared domain saturates: the full remainder is
+        // returned with a terminal page — no panic, no truncated lie.
+        // (No production caller exists; accepted convergence row.)
         let token = desc_a.digest.clone();
-        let handle = tokio::spawn(async move {
-            storage
-                .list_referrers_page("testrepo", &subject, Some(&token), usize::MAX)
-                .await
-        });
-        let join_res = handle.await;
-        assert!(
-            join_res.is_err(),
-            "complete method must fail with panic on large page_limit with start_idx > 0"
-        );
-        let join_err = join_res.unwrap_err();
-        assert!(
-            join_err.is_panic(),
-            "join error must be caused by panic in list_referrers_page"
-        );
+        let (page, next) = storage
+            .list_referrers_page("testrepo", &subject, Some(&token), usize::MAX)
+            .await
+            .expect("saturating pagination completes");
+        assert_eq!(page.len(), 1, "remainder after the token");
+        assert_eq!(page[0].digest, desc_b.digest);
+        assert!(next.is_none(), "terminal page");
     }
 
     // ------------------------------------------------------------------------
@@ -13023,8 +13032,14 @@ mod referrers_contained_mutation_compat {
             .await
             .expect_err("contained pre-read must reject the symlinked referrers file");
         match err {
-            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-            other => panic!("expected Io on symlink rejection in add_referrer, got {other:?}"),
+            // Phase 5: adapter containment refusal is PermissionDenied (was Io;
+            // both production-inert Internal kinds; accepted C2 convergence).
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, StorageErrorKind::PermissionDenied)
+            }
+            other => panic!(
+                "expected PermissionDenied on symlink rejection in add_referrer, got {other:?}"
+            ),
         }
 
         // Fail-closed: neither the symlink nor its target was replaced or rewritten.
@@ -13098,8 +13113,14 @@ mod referrers_contained_mutation_compat {
             .await
             .expect_err("contained pre-read must reject the symlinked referrers file");
         match err {
-            StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-            other => panic!("expected Io on symlink rejection in remove_referrer, got {other:?}"),
+            // Phase 5: adapter containment refusal is PermissionDenied (was Io;
+            // both production-inert Internal kinds; accepted C2 convergence).
+            StorageError::Internal { kind, .. } => {
+                assert_eq!(kind, StorageErrorKind::PermissionDenied)
+            }
+            other => panic!(
+                "expected PermissionDenied on symlink rejection in remove_referrer, got {other:?}"
+            ),
         }
 
         // Fail-closed: no unlink and no writeback happened.
@@ -13248,10 +13269,12 @@ mod referrers_contained_mutation_compat {
             .await
             .expect_err("symlinked referrers file must fail closed on the public route");
         match err {
+            // Phase 5: the containment refusal surfaces as PermissionDenied
+            // (was Io; both map to HTTP 500 — accepted C2 convergence).
             ReferrersQueryError::Storage(StorageError::Internal { kind, .. }) => {
-                assert_eq!(kind, StorageErrorKind::Io);
+                assert_eq!(kind, StorageErrorKind::PermissionDenied);
             }
-            other => panic!("expected Storage(Internal(Io)), got: {other:?}"),
+            other => panic!("expected Storage(Internal(PermissionDenied)), got: {other:?}"),
         }
     }
 }
@@ -14614,18 +14637,17 @@ mod referrer_write_containment {
             "no rewrite happened (same inode)"
         );
 
-        // Absent repository: Ok, and the contained resolution leaves an empty
-        // referrers directory (D-B).
+        // Absent repository: Ok, and NOTHING is created. (The retired
+        // authority resolution pre-created repos/<repo>/referrers/ even for
+        // no-ops — a mechanics side effect with no production observer; the
+        // shared domain performs no write at all. Accepted C1 row.)
         storage
             .remove_referrer("neverseen", &s, &missing)
             .await
             .expect("absent repository removal is Ok");
-        let dir = referrers_dir(&root, "neverseen");
-        assert!(dir.is_dir(), "contained resolution ensured the directory");
-        assert_eq!(
-            sorted_entry_names(&dir),
-            Vec::<String>::new(),
-            "no index leaf was created"
+        assert!(
+            !root.join("repos").join("neverseen").exists(),
+            "no directories created by the no-op removal"
         );
     }
 
@@ -14683,15 +14705,17 @@ mod referrer_write_containment {
             .add_referrer("linkrepo", &subject(), desc('a', 1))
             .await
             .expect_err("symlinked repo component must fail closed");
+        // Phase 5: adapter containment refusal is PermissionDenied (was Io;
+        // accepted C2 convergence).
         assert!(
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "symlink escape -> Io error, got {err:?}"
+            "symlink escape -> PermissionDenied error, got {err:?}"
         );
         assert_eq!(
             sorted_entry_names(&external),
@@ -14847,20 +14871,19 @@ mod referrer_write_containment {
     // mutation inspection must not split the tree that is inspected from the
     // tree that is mutated.
     //
-    // The injection point is the production seam itself: `add_referrer` is
-    // lock + `referrers_authority` + `add_referrer_locked`, and this test runs
-    // the replacement between those last two steps, then executes the exact
-    // production inner sequence on the retained authority.
+    // Namespace-replacement coherence at the PUBLIC referrer boundary
+    // (Phase 5 successor of the retired retained-authority seam regressions).
     //
-    // Distinguishes the shapes:
-    //   BROKEN:   authority A -> independent path re-resolution reads B -> write A
-    //             (index on A would become [B, C], losing descriptor A)
-    //   REQUIRED: authority A -> read A -> write A
-    //             (index on A becomes exactly [A, C]; tree B untouched)
+    // The retired implementation kept an in-flight mutation wholly on the
+    // authority resolved BEFORE a repository-namespace replacement (tree A).
+    // The shared domain ties inspection and action together with a version
+    // precondition instead: the mutation acts wholly on the generation it
+    // read — the CURRENT namespace (tree B) — and can never split "read tree
+    // X, write tree Y" or clobber a replacement it did not observe. Both
+    // shapes are coherent; the new one additionally cannot resurrect an
+    // abandoned tree (accepted C2 row of the Phase 5 semantic matrix).
     #[tokio::test]
-    async fn test_add_referrer_same_authority_across_namespace_replacement() {
-        use storage_fs::FileName;
-
+    async fn test_add_referrer_namespace_replacement_coherence() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let s = subject();
@@ -14871,13 +14894,8 @@ mod referrer_write_containment {
         // Tree A holds descriptor A.
         storage.add_referrer("race", &s, da.clone()).await.unwrap();
 
-        // Step 1 of the production sequence: acquire the mutation authority
-        // (resolves tree A).
-        let authority = storage.referrers_authority("race", &s).await.unwrap();
-        let leaf = FileName::new(format!("{}.json", s.hex())).unwrap();
-
-        // Injected boundary: replace the repository namespace so PATHNAME
-        // resolution now reaches tree B, whose index holds descriptor B.
+        // Replace the repository namespace: pathname resolution now reaches
+        // tree B, whose index holds descriptor B.
         let repo_dir = root.join("repos").join("race");
         let moved_a = root.join("repos").join("race-tree-a");
         std::fs::rename(&repo_dir, &moved_a).unwrap();
@@ -14890,48 +14908,31 @@ mod referrer_write_containment {
         )
         .unwrap();
 
-        // Negative control: at this boundary an INDEPENDENT path re-resolution
-        // (the read the broken two-resolution shape would consume) observes
-        // tree B — so a mutation reading that way would base its decision on
-        // [B] and write [B, C] onto tree A.
-        assert_eq!(
-            storage.list_referrers("race", &s).await.unwrap(),
-            vec![db.clone()],
-            "re-resolving read observes the replacement tree at the injected boundary"
-        );
+        // The mutation acts WHOLLY on the current namespace (tree B): its
+        // read and its conditional write name the same generation.
+        storage.add_referrer("race", &s, dc.clone()).await.unwrap();
 
-        // Step 2: continue the production inner sequence on the RETAINED
-        // authority (tree A).
-        storage
-            .add_referrer_locked(&authority, &leaf, dc.clone())
-            .await
-            .expect("locked add on retained authority");
-
-        // Inspection AND action stayed wholly on tree A: [A, C].
-        assert_eq!(
-            std::fs::read(moved_a.join("referrers").join(&index_name)).unwrap(),
-            serde_json::to_vec(&vec![da, dc]).unwrap(),
-            "read/modify/write remained on the retained authority's tree \
-             (a two-resolution implementation would have produced [B, C])"
-        );
-        // Tree B was not inspected into the result and not written.
         assert_eq!(
             std::fs::read(tree_b_referrers.join(&index_name)).unwrap(),
-            serde_json::to_vec(&vec![db]).unwrap(),
-            "replacement tree untouched by the in-flight mutation"
+            serde_json::to_vec(&vec![db.clone(), dc]).unwrap(),
+            "inspection and action both landed on the current tree — no split"
+        );
+        // The abandoned tree is untouched: exactly [A].
+        assert_eq!(
+            std::fs::read(moved_a.join("referrers").join(&index_name)).unwrap(),
+            serde_json::to_vec(&vec![da]).unwrap(),
+            "abandoned tree untouched by the mutation"
         );
     }
 
-    // CRITICAL same-authority regression (remove): same injected boundary as
-    // the add case. Removing the only descriptor of tree A must observe tree A
-    // through the retained authority (index becomes empty -> leaf unlinked ON
-    // TREE A). A two-resolution implementation would read tree B, find the
-    // digest absent, take the no-change short-circuit, and leave tree A's
-    // index in place.
+    // Removal under the same replacement: the domain observes the CURRENT
+    // tree (B), in which the target descriptor is absent — the no-change
+    // short-circuit applies to B, and neither tree is mutated. (The retired
+    // shape unlinked the abandoned tree A's leaf instead; both outcomes are
+    // coherent, and the descriptor's index entry lives only on the abandoned
+    // tree either way.)
     #[tokio::test]
-    async fn test_remove_referrer_same_authority_across_namespace_replacement() {
-        use storage_fs::FileName;
-
+    async fn test_remove_referrer_namespace_replacement_coherence() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let s = subject();
@@ -14939,16 +14940,10 @@ mod referrer_write_containment {
         let db = desc('b', 200);
         let da_digest = Digest::parse(&da.digest).unwrap();
 
-        // Tree A holds only descriptor A.
         storage
             .add_referrer("race-rm", &s, da.clone())
             .await
             .unwrap();
-
-        // Acquire the mutation authority (tree A), then inject the namespace
-        // replacement before inspection.
-        let authority = storage.referrers_authority("race-rm", &s).await.unwrap();
-        let leaf = FileName::new(format!("{}.json", s.hex())).unwrap();
 
         let repo_dir = root.join("repos").join("race-rm");
         let moved_a = root.join("repos").join("race-rm-tree-a");
@@ -14962,34 +14957,24 @@ mod referrer_write_containment {
         )
         .unwrap();
 
-        // Negative control: an independent re-resolution observes tree B, in
-        // which descriptor A is absent — the broken shape would therefore take
-        // the no-change short-circuit and leave tree A's index in place.
-        assert_eq!(
-            storage.list_referrers("race-rm", &s).await.unwrap(),
-            vec![db.clone()],
-            "re-resolving read observes the replacement tree at the injected boundary"
-        );
-
-        // Continue the production inner sequence on the RETAINED authority.
         storage
-            .remove_referrer_locked(&authority, &leaf, &da_digest)
+            .remove_referrer("race-rm", &s, &da_digest)
             .await
-            .expect("locked remove on retained authority");
+            .unwrap();
 
-        // Inspection saw tree A ([A]) and the empty-index unlink acted on tree
-        // A: its leaf is gone. A two-resolution implementation would have read
-        // tree B ([B]), hit the no-change short-circuit, and left this leaf
-        // in place.
-        assert!(
-            !moved_a.join("referrers").join(&index_name).exists(),
-            "empty-index unlink acted on the retained authority's tree"
-        );
-        // Tree B untouched: still exactly [B].
+        // Tree B (current): descriptor A absent -> no-change short-circuit,
+        // exactly [B] and the leaf still present.
         assert_eq!(
             std::fs::read(tree_b_referrers.join(&index_name)).unwrap(),
             serde_json::to_vec(&vec![db]).unwrap(),
-            "replacement tree untouched by the in-flight removal"
+            "current tree untouched by the no-change removal"
+        );
+        // The abandoned tree keeps its index: the removal never reached
+        // across namespaces.
+        assert_eq!(
+            std::fs::read(moved_a.join("referrers").join(&index_name)).unwrap(),
+            serde_json::to_vec(&vec![da]).unwrap(),
+            "abandoned tree untouched by the removal"
         );
     }
 }
