@@ -210,10 +210,12 @@ impl BlobDeleteService {
 
     /// Safely handles a repository-scoped blob deletion request:
     /// 1. Acquires mutation guard from coordinator.
-    /// 2. Ensures ref-index is healthy / rebuilt if dirty.
-    /// 3. Verifies membership in the requested repository (returns NotFound if absent).
-    /// 4. Verifies whether any manifest in the requested repository still references the blob (returns InUse if so).
-    /// 5. Unlinks only the requested repository's membership record through the ledger under guard.
+    /// 2. Verifies membership in the requested repository (returns NotFound if absent).
+    /// 3. Verifies whether any manifest in the requested repository still references the blob (returns InUse if so).
+    /// 4. Unlinks only the requested repository's membership record through the ledger under guard
+    ///    (the ledger's index gate fails CLOSED on an unhealthy index — deletion never
+    ///    triggers a rebuild itself; recovery runs via the documented auto-heal paths:
+    ///    blob finalization, manifest/tag mutations, GC preflight, scheduled GC, startup).
     pub async fn delete_repo_blob(
         &self,
         repo: &str,

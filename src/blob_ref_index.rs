@@ -65,6 +65,17 @@ pub struct BlobRefIndex {
     /// (the setter is `cfg(test)`), so production always uses
     /// [`DiscoveryLimits::PRODUCTION`].
     test_discovery_limits: Arc<std::sync::Mutex<Option<DiscoveryLimits>>>,
+    /// In-process rebuild serialization (shared across clones). `rebuild`
+    /// destructively clears the live trees before repopulating, so two
+    /// interleaved rebuilds could publish READY while one of them is still
+    /// mid-scan — violating the pinned invariant that READY is only ever
+    /// written by a rebuild that completed its own full scan ("never
+    /// silently ready"). Cross-process exclusion is already provided by
+    /// sled's directory lock plus the server's root lock; this gate closes
+    /// the in-process request-path race (blob finalize / lifecycle recovery
+    /// / GC preflight can all trigger `ensure_healthy_or_rebuild`
+    /// concurrently).
+    rebuild_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -274,6 +285,7 @@ impl BlobRefIndex {
             fail_mark_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_mark_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             test_discovery_limits: Arc::new(std::sync::Mutex::new(None)),
+            rebuild_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -529,8 +541,24 @@ impl BlobRefIndex {
         match self.check_health() {
             Ok(()) => Ok(()),
             Err(RefIndexError::Corrupt(reason)) if auto_rebuild_on_corruption => {
-                tracing::warn!(reason, "ref-index: corruption detected; rebuilding");
-                self.rebuild(storage).await
+                // Serialize with any in-flight rebuild and COALESCE waiters:
+                // a rebuild that completed while this caller waited on the
+                // gate already healed the index, so re-check before
+                // rebuilding again (N concurrent healers perform one
+                // rebuild, not N serial destructive rebuilds).
+                let _gate = self.rebuild_gate.lock().await;
+                match self.check_health() {
+                    Ok(()) => Ok(()),
+                    Err(RefIndexError::Corrupt(reason2)) => {
+                        let _ = reason;
+                        tracing::warn!(
+                            reason = reason2,
+                            "ref-index: corruption detected; rebuilding"
+                        );
+                        self.rebuild_locked(storage).await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
@@ -928,6 +956,17 @@ impl BlobRefIndex {
     }
 
     pub async fn rebuild(
+        &self,
+        storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
+    ) -> Result<(), RefIndexError> {
+        let _gate = self.rebuild_gate.lock().await;
+        self.rebuild_locked(storage).await
+    }
+
+    /// Rebuild body, callers hold `rebuild_gate` (rebuilds are destructive:
+    /// the live trees are cleared before repopulation, so rebuilds must
+    /// never interleave in-process).
+    async fn rebuild_locked(
         &self,
         storage: &(impl crate::storage::BlobRefIndexStoragePort + ?Sized),
     ) -> Result<(), RefIndexError> {
@@ -2841,6 +2880,231 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(path_a);
         let _ = std::fs::remove_dir_all(path_b);
+    }
+
+    /// Discovery port that fails repository listing deterministically
+    /// (drives a genuine failed rebuild -> durable BUILDING).
+    struct FailingDiscoveryPort;
+    #[async_trait]
+    impl crate::storage::RepositoryCatalogReader for FailingDiscoveryPort {
+        async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+            Err(StorageError::backend("injected discovery failure"))
+        }
+        async fn repo_timestamps(
+            &self,
+            _n: &str,
+        ) -> Result<crate::storage::RepoTimestamps, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+    }
+    #[async_trait]
+    impl crate::storage::TagReader for FailingDiscoveryPort {
+        async fn resolve_tag(&self, _n: &str, _t: &str) -> Result<Digest, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn list_tags(&self, _n: &str) -> Result<Vec<String>, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn list_tags_page(
+            &self,
+            _r: &str,
+            _c: Option<&str>,
+            _p: usize,
+        ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn get_tag_with_version(
+            &self,
+            _r: &str,
+            _t: &str,
+        ) -> Result<Option<(Digest, String)>, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+    }
+    #[async_trait]
+    impl crate::storage::ManifestReader for FailingDiscoveryPort {
+        async fn head_manifest(
+            &self,
+            _n: &str,
+            _d: &Digest,
+        ) -> Result<crate::storage::ManifestMeta, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn get_manifest(
+            &self,
+            _n: &str,
+            _d: &Digest,
+        ) -> Result<(crate::storage::ManifestMeta, Bytes), StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn list_manifest_digests_page(
+            &self,
+            _r: &str,
+            _c: Option<&str>,
+            _p: usize,
+        ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+    }
+    impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for FailingDiscoveryPort {}
+
+    /// Discovery port whose FIRST repository listing signals `started` and
+    /// then blocks until `release` — a deterministic mid-rebuild hold point.
+    /// Subsequent listings return an empty catalog immediately. Counts every
+    /// listing call.
+    struct GatedStorage {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+    impl GatedStorage {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                started: Arc::new(tokio::sync::Semaphore::new(0)),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+    }
+    #[async_trait]
+    impl crate::storage::RepositoryCatalogReader for GatedStorage {
+        async fn list_repositories(&self) -> Result<Vec<String>, StorageError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.started.add_permits(1);
+                let _p = self.release.acquire().await.expect("release semaphore");
+            }
+            Ok(Vec::new())
+        }
+        async fn repo_timestamps(
+            &self,
+            _n: &str,
+        ) -> Result<crate::storage::RepoTimestamps, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+    }
+    #[async_trait]
+    impl crate::storage::TagReader for GatedStorage {
+        async fn resolve_tag(&self, _n: &str, _t: &str) -> Result<Digest, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn list_tags(&self, _n: &str) -> Result<Vec<String>, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn list_tags_page(
+            &self,
+            _r: &str,
+            _c: Option<&str>,
+            _p: usize,
+        ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn get_tag_with_version(
+            &self,
+            _r: &str,
+            _t: &str,
+        ) -> Result<Option<(Digest, String)>, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+    }
+    #[async_trait]
+    impl crate::storage::ManifestReader for GatedStorage {
+        async fn head_manifest(
+            &self,
+            _n: &str,
+            _d: &Digest,
+        ) -> Result<crate::storage::ManifestMeta, StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn get_manifest(
+            &self,
+            _n: &str,
+            _d: &Digest,
+        ) -> Result<(crate::storage::ManifestMeta, Bytes), StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+        async fn list_manifest_digests_page(
+            &self,
+            _r: &str,
+            _c: Option<&str>,
+            _p: usize,
+        ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
+            Err(StorageError::backend("unused"))
+        }
+    }
+    impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for GatedStorage {}
+
+    /// Rebuild serialization + waiter coalescing (Recovery Step 1): rebuilds
+    /// are destructive (trees cleared before repopulation), so two healers
+    /// must never interleave, and a healer that waited out another's
+    /// completed rebuild must NOT run a second destructive rebuild. On the
+    /// pre-repair base the two `ensure_healthy_or_rebuild` calls rebuilt
+    /// CONCURRENTLY (two listing calls; READY publishable mid-scan of the
+    /// slower rebuild — "silently ready" while incomplete).
+    #[tokio::test]
+    async fn test_concurrent_ensure_serializes_and_coalesces_rebuilds() {
+        let path = temp_index_path();
+        let idx = Arc::new(BlobRefIndex::open(path.clone()).expect("open"));
+
+        // Wedge: a genuinely failed rebuild leaves durable BUILDING.
+        idx.rebuild(&FailingDiscoveryPort)
+            .await
+            .expect_err("injected discovery failure");
+        assert!(idx.check_health().is_err(), "BUILDING after failed rebuild");
+
+        let gated = Arc::new(GatedStorage::new());
+
+        // Healer A enters the rebuild and blocks mid-scan (deterministic
+        // hold inside its first listing call).
+        let idx_a = Arc::clone(&idx);
+        let gated_a = Arc::clone(&gated);
+        let a = tokio::spawn(async move {
+            idx_a
+                .ensure_healthy_or_rebuild(gated_a.as_ref(), true, false)
+                .await
+        });
+        let _s = gated.started.acquire().await.expect("A reached the hold");
+
+        // Healer B arrives while A holds the rebuild gate.
+        let idx_b = Arc::clone(&idx);
+        let gated_b = Arc::clone(&gated);
+        let b_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b_done_flag = Arc::clone(&b_done);
+        let b = tokio::spawn(async move {
+            let r = idx_b
+                .ensure_healthy_or_rebuild(gated_b.as_ref(), true, false)
+                .await;
+            b_done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            r
+        });
+
+        // B must not complete while A is mid-rebuild (bounded cooperative
+        // yields; the gate guarantees this — the assertion documents it).
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !b_done.load(std::sync::atomic::Ordering::SeqCst),
+            "a second healer must not complete while a rebuild is mid-scan"
+        );
+
+        // Release A; both healers finish; B coalesces (no second rebuild).
+        gated.release.add_permits(1);
+        a.await.unwrap().expect("healer A rebuild succeeds");
+        b.await
+            .unwrap()
+            .expect("healer B coalesces onto A's result");
+
+        assert_eq!(
+            gated.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly ONE rebuild ran: the waiter re-checked health under the \
+             gate and never issued a second destructive rebuild"
+        );
+        idx.check_health()
+            .expect("healthy after coalesced recovery");
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[tokio::test]

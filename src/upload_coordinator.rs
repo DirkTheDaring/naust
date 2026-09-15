@@ -606,7 +606,21 @@ impl BlobUploadCoordinator {
             )
             .await?;
 
-        // STEP 2: Durably pin the verified digest in BlobRefIndex to protect against concurrent online GC
+        // STEP 2: Ensure the reverse index is healthy BEFORE the pin gate.
+        // The pin acquisition fails closed on an unhealthy index, so the
+        // documented BUILDING/dirty recovery (auto-rebuild) must run first —
+        // with the historical order (pin gate, then heal) a failed rebuild
+        // left blob finalization permanently refusing with "ref-index
+        // unhealthy before acquiring GC pin" while the self-heal four lines
+        // below it was unreachable (the BUILDING-wedge repair; the heal call
+        // itself is unchanged).
+        if let Some(ref idx) = self.ref_index {
+            idx.ensure_healthy_or_rebuild(&self.storage, true, false)
+                .await
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
+        }
+
+        // STEP 3: Durably pin the verified digest in BlobRefIndex to protect against concurrent online GC
         let mut pin_guard = if let Some(ref idx) = self.ref_index {
             Some(
                 PinLeaseGuard::acquire_and_start(
@@ -621,16 +635,13 @@ impl BlobUploadCoordinator {
             None
         };
 
-        // STEP 3: Durably mark reverse index dirty before storage mutation
+        // STEP 4: Durably mark reverse index dirty before storage mutation
         if let Some(ref idx) = self.ref_index {
-            idx.ensure_healthy_or_rebuild(&self.storage, true, false)
-                .await
-                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
             idx.mark_dirty()
                 .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
         }
 
-        // STEP 4: Commit finalize in storage backend under the consistency coordinator
+        // STEP 5: Commit finalize in storage backend under the consistency coordinator
         let _guard = self.consistency.acquire_mutation().await;
         let outcome = if let Some(ref mut guard) = pin_guard {
             tokio::select! {
@@ -648,7 +659,7 @@ impl BlobUploadCoordinator {
             self.storage.commit_finalize(&prepared).await?
         };
 
-        // STEP 5: Update reverse index, flush, and mark ready
+        // STEP 6: Update reverse index, flush, and mark ready
         if let Some(ref idx) = self.ref_index {
             idx.record_membership(expected_digest, repo)
                 .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
@@ -659,7 +670,7 @@ impl BlobUploadCoordinator {
         }
         drop(_guard);
 
-        // STEP 6: Stop renewal and release pin
+        // STEP 7: Stop renewal and release pin
         if let Some(ref mut guard) = pin_guard {
             guard.stop().await;
             let _ = guard.release_pin();
@@ -779,8 +790,18 @@ impl BlobUploadCoordinator {
             return Ok(CrossMountResult::Fallback(start));
         };
 
-        // 2. Durably pin the verified digest in BlobRefIndex
+        // 2. Ensure the reverse index is healthy BEFORE the pin gate (the
+        // same BUILDING-wedge repair as monolithic finalization: the
+        // documented auto-rebuild recovery must precede the fail-closed pin
+        // health gate).
         let op_id = uuid::Uuid::new_v4().to_string();
+        if let Some(ref idx) = self.ref_index {
+            idx.ensure_healthy_or_rebuild(&self.storage, true, false)
+                .await
+                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
+        }
+
+        // 3. Durably pin the verified digest in BlobRefIndex
         let mut pin_guard = if let Some(ref idx) = self.ref_index {
             Some(
                 PinLeaseGuard::acquire_and_start(
@@ -795,22 +816,19 @@ impl BlobUploadCoordinator {
             None
         };
 
-        // 3. Verify underlying CAS blob existence
+        // 4. Verify underlying CAS blob existence
         let meta = match self.storage.head_blob(digest).await {
             Ok(m) => m,
             Err(e) => return Err(CoordinatorError::from(e)),
         };
 
-        // 4. Durably mark reverse index dirty before storage mutation
+        // 5. Durably mark reverse index dirty before storage mutation
         if let Some(ref idx) = self.ref_index {
-            idx.ensure_healthy_or_rebuild(&self.storage, true, false)
-                .await
-                .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
             idx.mark_dirty()
                 .map_err(|e| CoordinatorError::Storage(map_ref_index_error(e)))?;
         }
 
-        // 5. Durably create target repository membership under the consistency coordinator
+        // 6. Durably create target repository membership under the consistency coordinator
         let target_record =
             crate::storage::repo_membership::RepoBlobMembershipRecord::new_cross_mount(
                 canonical_target,
@@ -1103,6 +1121,204 @@ mod tests {
                 .unwrap(),
             "Blob must remain protected by operation pin during crash/recovery window"
         );
+    }
+
+    /// Discovery port whose repository listing fails deterministically —
+    /// drives a GENUINE failed rebuild (durable BUILDING meta state) without
+    /// touching the real storage backend.
+    struct FailingDiscoveryPort;
+
+    #[async_trait::async_trait]
+    impl crate::storage::RepositoryCatalogReader for FailingDiscoveryPort {
+        async fn list_repositories(&self) -> Result<Vec<String>, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend(
+                "injected discovery failure",
+            ))
+        }
+        async fn repo_timestamps(
+            &self,
+            _name: &str,
+        ) -> Result<crate::storage::RepoTimestamps, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::TagReader for FailingDiscoveryPort {
+        async fn resolve_tag(
+            &self,
+            _n: &str,
+            _t: &str,
+        ) -> Result<Digest, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+        async fn list_tags(&self, _n: &str) -> Result<Vec<String>, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+        async fn list_tags_page(
+            &self,
+            _r: &str,
+            _c: Option<&str>,
+            _p: usize,
+        ) -> Result<(Vec<(String, Digest)>, Option<String>), crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+        async fn get_tag_with_version(
+            &self,
+            _r: &str,
+            _t: &str,
+        ) -> Result<Option<(Digest, String)>, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::ManifestReader for FailingDiscoveryPort {
+        async fn head_manifest(
+            &self,
+            _n: &str,
+            _d: &Digest,
+        ) -> Result<crate::storage::ManifestMeta, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+        async fn get_manifest(
+            &self,
+            _n: &str,
+            _d: &Digest,
+        ) -> Result<(crate::storage::ManifestMeta, bytes::Bytes), crate::storage::StorageError>
+        {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+        async fn list_manifest_digests_page(
+            &self,
+            _r: &str,
+            _c: Option<&str>,
+            _p: usize,
+        ) -> Result<(Vec<Digest>, Option<String>), crate::storage::StorageError> {
+            Err(crate::storage::StorageError::backend("unused"))
+        }
+    }
+
+    impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for FailingDiscoveryPort {}
+
+    /// BUILDING-wedge regression (Recovery Step 1): a FAILED rebuild leaves
+    /// the index durably at BUILDING (the intended fail-closed state); blob
+    /// finalization must then reach the DOCUMENTED auto-rebuild recovery
+    /// instead of refusing at the pin health gate. On the pre-repair base
+    /// this sequence failed every attempt with "ref-index unhealthy before
+    /// acquiring GC pin" because the pin gate preceded the (unreachable)
+    /// self-heal.
+    #[tokio::test]
+    async fn test_monolithic_finalize_recovers_from_building_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let fs_root = temp_dir.path().join("fs_root");
+        let ref_path = temp_dir.path().join("ref_index");
+        std::fs::create_dir_all(&ref_path).unwrap();
+
+        let storage: Arc<dyn BlobUploadCoordinatorStoragePort> =
+            Arc::new(crate::storage::fs::FsStorage::new(fs_root, 104857600));
+        let ref_index = Arc::new(BlobRefIndex::open(ref_path).unwrap());
+        ref_index
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
+            .await
+            .unwrap();
+        ref_index.check_health().expect("healthy before the wedge");
+
+        // A genuinely FAILED rebuild leaves durable BUILDING (fail-closed).
+        ref_index
+            .rebuild(&FailingDiscoveryPort)
+            .await
+            .expect_err("injected discovery failure must fail the rebuild");
+        assert!(
+            ref_index.check_health().is_err(),
+            "failed rebuild leaves the index unhealthy (BUILDING)"
+        );
+
+        let config = BlobUploadCoordinatorConfig {
+            signing_key: b"test-building-recovery".to_vec(),
+            max_upload_bytes: 104857600,
+            abort_on_digest_mismatch: false,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+        };
+        let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
+
+        let repo = "recovery/repo";
+        let data = b"payload after failed rebuild";
+        let digest = Digest::parse(&format!("sha256:{}", hex_sha256(data))).unwrap();
+        let stream = Box::pin(futures_util::stream::once(async move {
+            Ok(bytes::Bytes::from_static(data))
+        }));
+
+        let fin = coordinator
+            .monolithic_upload(repo, &digest, Some(stream))
+            .await
+            .expect("finalization heals the BUILDING index via the documented auto-rebuild");
+        match fin {
+            MonolithicUploadResult::Created(res) => assert_eq!(res.digest, digest),
+            other => panic!("expected created outcome, got {other:?}"),
+        }
+        ref_index
+            .check_health()
+            .expect("index healthy after the self-healed finalization");
+    }
+
+    /// The same wedge repair on the cross-mount path: a BUILDING index must
+    /// heal via the documented recovery before the pin gate.
+    #[tokio::test]
+    async fn test_cross_mount_recovers_from_building_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let fs_root = temp_dir.path().join("fs_root");
+        let ref_path = temp_dir.path().join("ref_index");
+        std::fs::create_dir_all(&ref_path).unwrap();
+
+        let storage: Arc<dyn BlobUploadCoordinatorStoragePort> =
+            Arc::new(crate::storage::fs::FsStorage::new(fs_root, 104857600));
+        let ref_index = Arc::new(BlobRefIndex::open(ref_path).unwrap());
+        ref_index
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
+            .await
+            .unwrap();
+
+        let config = BlobUploadCoordinatorConfig {
+            signing_key: b"test-building-recovery-xm".to_vec(),
+            max_upload_bytes: 104857600,
+            abort_on_digest_mismatch: false,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+        };
+        let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
+
+        // Publish the source blob while the index is healthy.
+        let source_repo = "xm/source";
+        let data = b"cross-mount payload";
+        let digest = Digest::parse(&format!("sha256:{}", hex_sha256(data))).unwrap();
+        let stream = Box::pin(futures_util::stream::once(async move {
+            Ok(bytes::Bytes::from_static(data))
+        }));
+        coordinator
+            .monolithic_upload(source_repo, &digest, Some(stream))
+            .await
+            .unwrap();
+
+        // Wedge the index with a genuinely failed rebuild.
+        ref_index
+            .rebuild(&FailingDiscoveryPort)
+            .await
+            .expect_err("injected discovery failure must fail the rebuild");
+        assert!(ref_index.check_health().is_err());
+
+        let res = coordinator
+            .cross_mount_blob("xm/target", Some(source_repo), &digest)
+            .await
+            .expect("cross-mount heals the BUILDING index via the documented auto-rebuild");
+        match res {
+            CrossMountResult::Mounted(fin) => assert_eq!(fin.digest, digest),
+            other => panic!("expected mounted outcome, got {other:?}"),
+        }
+        ref_index.check_health().expect("healthy after cross-mount");
     }
 
     #[tokio::test]
@@ -1431,8 +1647,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Mark index dirty so health check / pin acquisition will fail
+        // Make the index UNRECOVERABLY unhealthy: mark it dirty AND plant a
+        // poison manifest so the documented auto-rebuild recovery fails
+        // deterministically. (Recovery Step 1 note: a merely-dirty index no
+        // longer blocks finalization — the documented auto-heal now runs
+        // BEFORE the pin gate and repairs it, which is the corrected
+        // contract. The property under test — no commit without pin
+        // protection — therefore requires a failure the heal cannot fix.)
         ref_index.mark_dirty().unwrap();
+        let poison = _tmp
+            .path()
+            .join("fs_root")
+            .join("repos")
+            .join("poisoned")
+            .join("manifests")
+            .join("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        std::fs::create_dir_all(poison.parent().unwrap()).unwrap();
+        std::fs::write(&poison, b"not json at all").unwrap();
 
         let res = coordinator
             .finalize_upload(
@@ -1445,10 +1676,13 @@ mod tests {
             )
             .await;
 
-        // Finalize must fail
+        // Finalize must fail (the heal attempt fails on the poison object;
+        // the pin is never acquired and the commit never runs)
         assert!(res.is_err());
         // CAS blob must NOT have been created in storage
         assert!(storage.head_blob(&digest).await.is_err());
+        // The index remains fail-closed (never silently ready)
+        assert!(ref_index.check_health().is_err());
     }
 
     // Property 2: successful commit stops and joins renewal before releasing the pin
