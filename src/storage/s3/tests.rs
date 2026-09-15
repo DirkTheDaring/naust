@@ -29,6 +29,10 @@ pub struct MockS3Driver {
     pub versioning_state: StdMutex<S3BucketVersioningState>,
     pub hook_before_op: StdMutex<Option<MockHookFn>>,
     pub hook_after_op: StdMutex<Option<MockHookFn>>,
+    /// Optional per-key modification times (unix seconds) surfaced through
+    /// the bridge's listing `ObjectStat.modified` (Phase 8 repo-timestamp
+    /// tests); keys without an entry list with `modified: None`.
+    pub object_mtimes: StdMutex<HashMap<String, u64>>,
 }
 
 impl MockS3Driver {
@@ -43,6 +47,7 @@ impl MockS3Driver {
             versioning_state: StdMutex::new(S3BucketVersioningState::Unversioned),
             hook_before_op: StdMutex::new(None),
             hook_after_op: StdMutex::new(None),
+            object_mtimes: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -805,11 +810,18 @@ impl storage_s3::S3Client for MockDriverTagClient {
                 break;
             }
             let (bytes, etag) = &objs[key.as_str()];
+            let modified = self
+                .0
+                .object_mtimes
+                .lock()
+                .unwrap()
+                .get(key.as_str())
+                .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(*secs));
             out.push((
                 key.clone(),
                 storage_s3::client::ObjectStat {
                     size: bytes.len() as u64,
-                    modified: None,
+                    modified,
                     etag: etag.clone(),
                 },
             ));

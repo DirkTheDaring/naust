@@ -20,6 +20,7 @@ pub mod mutation_authority;
 pub mod ports;
 pub(crate) mod referrer_domain;
 pub mod repo_membership;
+pub(crate) mod repo_timestamp_domain;
 pub mod s3;
 pub(crate) mod store_common;
 pub(crate) mod tag_domain;

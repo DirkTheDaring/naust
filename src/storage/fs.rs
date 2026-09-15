@@ -448,6 +448,10 @@ pub struct FsStorage {
     /// storage root (identity key mapping — every journal stays at
     /// `repos/<repo>/meta/lifecycle_journal.json`).
     journal_domain: crate::storage::journal_domain::JournalDomain,
+    /// Phase 8 repository-timestamp cutover: the shared backend-neutral
+    /// timestamp derivation over its own `FsObjectStore` pinned to the same
+    /// storage root, with the real contained repository-existence probe.
+    repo_timestamp_domain: crate::storage::repo_timestamp_domain::RepoTimestampDomain,
     /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
     /// at the boundary between a candidate's confirmed expiry decision and its
     /// destructive action, with the candidate uuid. Lets a regression prove that no
@@ -719,6 +723,27 @@ impl FsStorage {
         let journal_domain =
             crate::storage::journal_domain::JournalDomain::new(std::sync::Arc::new(journal_store));
 
+        // Phase 8 repository-timestamp cutover: a sixth pinned object store
+        // over the SAME root with UNBOUNDED per-directory enumeration (the
+        // frozen "no approved limit covers these operations" baseline), and
+        // the real contained repository-existence probe (the accepted
+        // Phase 3 pattern — repository existence remains a backend notion).
+        let timestamp_store = storage_fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::io(format!("open timestamp object store root: {e}")))?
+            .with_enumeration_limits(storage_fs::DirEnumerationLimits::new(
+                usize::MAX,
+                usize::MAX,
+            ));
+        let repo_timestamp_domain = crate::storage::repo_timestamp_domain::RepoTimestampDomain::new(
+            std::sync::Arc::new(timestamp_store),
+            crate::storage::repo_timestamp_domain::RepoExistencePolicy::Probe(std::sync::Arc::new(
+                tag_listing::FsTagRepoProbe::new(
+                    std::sync::Arc::clone(&reader),
+                    tag_listing_limits.repo_probe_limits,
+                ),
+            )),
+        );
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
@@ -738,6 +763,7 @@ impl FsStorage {
             referrer_domain,
             membership_domain,
             journal_domain,
+            repo_timestamp_domain,
             #[cfg(test)]
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
@@ -1134,7 +1160,12 @@ impl Storage for FsStorage {
     }
 
     async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
-        timestamps_emptiness::repo_timestamps_impl(self.reader.as_ref(), name).await
+        // Phase 8: the shared derivation over the pinned object store's
+        // direct-child listing metadata (regular objects only, dotfiles
+        // included, unbounded — the frozen contract); the contained
+        // repository-existence probe preserves the frozen absent-repository
+        // NotFound rule.
+        self.repo_timestamp_domain.repo_timestamps(name).await
     }
 
     async fn is_storage_empty(&self) -> Result<bool, StorageError> {

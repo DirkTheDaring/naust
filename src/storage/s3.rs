@@ -916,6 +916,21 @@ impl S3Storage {
         Ok(crate::storage::journal_domain::JournalDomain::new(store))
     }
 
+    /// Shared repository-timestamp domain over the migrated-family
+    /// ObjectStore (Phase 8). S3 has no repository-existence notion: zero
+    /// rows in both namespaces IS absence (the frozen S3 rule).
+    async fn repo_timestamp_domain(
+        &self,
+    ) -> Result<crate::storage::repo_timestamp_domain::RepoTimestampDomain, StorageError> {
+        let store = self.migrated_object_store().await?;
+        Ok(
+            crate::storage::repo_timestamp_domain::RepoTimestampDomain::new(
+                store,
+                crate::storage::repo_timestamp_domain::RepoExistencePolicy::EmptyIsAbsent,
+            ),
+        )
+    }
+
     fn key(&self, suffix: &str) -> String {
         let p = self.prefix.trim_matches('/');
         if p.is_empty() {
@@ -961,10 +976,6 @@ impl S3Storage {
 
     fn all_memberships_prefix(&self) -> String {
         self.key(crate::storage::repo_membership::canonical_all_memberships_prefix())
-    }
-
-    fn tags_prefix(&self, name: &str) -> String {
-        self.key(&format!("repos/{name}/tags/"))
     }
 
     fn upload_key(&self, base_uuid: &str) -> String {
@@ -1598,33 +1609,13 @@ impl Storage for S3Storage {
     }
 
     async fn repo_timestamps(&self, name: &str) -> Result<RepoTimestamps, StorageError> {
-        let bucket = self.bucket()?;
-        let tags_prefix = self.tags_prefix(name);
-        let manifests_prefix = self.key(&format!("repos/{name}/manifests/"));
-
-        let tag_objects = self.driver.list_objects_v2(bucket, &tags_prefix).await?;
-        let manifest_objects = self
-            .driver
-            .list_objects_v2(bucket, &manifests_prefix)
-            .await?;
-
-        if tag_objects.is_empty() && manifest_objects.is_empty() {
-            return Err(StorageError::NotFound);
-        }
-
-        let last_tag_update = tag_objects
-            .into_iter()
-            .map(|o| UNIX_EPOCH + Duration::from_secs(o.last_modified_unix_secs))
-            .max();
-        let last_manifest_update = manifest_objects
-            .into_iter()
-            .map(|o| UNIX_EPOCH + Duration::from_secs(o.last_modified_unix_secs))
-            .max();
-
-        Ok(RepoTimestamps {
-            last_tag_update,
-            last_manifest_update,
-        })
+        // Phase 8: the shared derivation over the migrated object store's
+        // direct-child listing metadata; zero rows in both namespaces is
+        // absence (the frozen S3 rule — no repository-existence notion).
+        self.repo_timestamp_domain()
+            .await?
+            .repo_timestamps(name)
+            .await
     }
 
     async fn is_storage_empty(&self) -> Result<bool, StorageError> {
