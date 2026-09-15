@@ -1005,12 +1005,13 @@ async fn fs_internal_namespace_unaddressable() {
 async fn fs_durable_publication_fault_propagates() {
     use storage_fs::mutate::fault::{self, FaultPoint};
 
+    let _fault_guard = crate::storage::store_common::FAULT_TEST_LOCK.lock().await;
     let b = fs_backend();
 
     // Rename fault: the staged publication of this unique leaf fails.
     fault::arm(FaultPoint::RenameLeaf, Some("zzregfaulttag"), 1, libc::EIO);
     let err = b
-        .set_tag("fault-repo", "zzregfaulttag", &d(HEX1))
+        .set_tag("zztagfaultrepo", "zzregfaulttag", &d(HEX1))
         .await
         .expect_err("failed staged rename must propagate");
     assert!(
@@ -1018,14 +1019,14 @@ async fn fs_durable_publication_fault_propagates() {
         "classified internal error: {err:?}"
     );
     assert!(
-        b.read_raw("fault-repo", "zzregfaulttag").is_none(),
+        b.read_raw("zztagfaultrepo", "zzregfaulttag").is_none(),
         "no partial tag published"
     );
 
     // Directory-sync fault: Durable publication reports the barrier failure.
-    fault::arm(FaultPoint::DirSync, Some("fault-repo"), 1, libc::EIO);
+    fault::arm(FaultPoint::DirSync, Some("zztagfaultrepo"), 1, libc::EIO);
     let err = b
-        .set_tag("fault-repo", "zzregfaultsync", &d(HEX1))
+        .set_tag("zztagfaultrepo", "zzregfaultsync", &d(HEX1))
         .await
         .expect_err("failed durable barrier must propagate");
     assert!(
@@ -1035,7 +1036,7 @@ async fn fs_durable_publication_fault_propagates() {
     fault::reset();
 
     // Negative control: with faults cleared the same write succeeds.
-    b.set_tag("fault-repo", "zzregfaulttag", &d(HEX1))
+    b.set_tag("zztagfaultrepo", "zzregfaulttag", &d(HEX1))
         .await
         .expect("write succeeds after faults cleared");
 }

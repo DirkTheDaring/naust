@@ -4288,7 +4288,7 @@ async fn test_manifest_listing_lifecycle_error_propagation_on_promoted_listing_f
             assert!(
                 storage_err
                     .to_string()
-                    .contains("enumeration resource limit exceeded"),
+                    .contains("directory enumeration exceeded the adapter's limits"),
                 "expected budget exhaustion error, got: {storage_err:?}"
             );
         }

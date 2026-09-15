@@ -133,18 +133,18 @@ pub trait S3Driver: Send + Sync + 'static {
         if_match: Option<String>,
     ) -> Result<super::ConditionalDeleteResult, StorageError>;
 
-    /// Phase 3 transitional wiring: the backend-neutral [`ObjectStore`]
-    /// handle for the migrated tag family, rooted at the given bucket and
-    /// configured key prefix. Defaulted so existing driver test doubles that
-    /// never serve tag traffic compile unchanged; the production
-    /// [`AwsS3Driver`] overrides it.
-    async fn tag_object_store(
+    /// Transitional wiring: the backend-neutral [`ObjectStore`] handle for
+    /// the MIGRATED families (Phase 3 tags, Phase 4 manifests), rooted at
+    /// the given bucket and configured key prefix. Defaulted so existing
+    /// driver test doubles that never serve migrated-family traffic compile
+    /// unchanged; the production [`AwsS3Driver`] overrides it.
+    async fn object_store(
         &self,
         _bucket: &str,
         _prefix: &str,
     ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
         Err(StorageError::configuration(
-            "this S3 driver does not provide a tag object store",
+            "this S3 driver does not provide an object store",
         ))
     }
 
@@ -264,9 +264,10 @@ impl S3Driver for AwsS3Driver {
     /// Builds the shared S3 ObjectStore over this driver's lazily
     /// constructed SDK client. The registry prefix is normalized exactly as
     /// `S3Storage::key` normalizes it (slash-trimmed), so
-    /// `ObjectKey "repos/<repo>/tags/<tag>"` maps to byte-identical physical
-    /// bucket keys.
-    async fn tag_object_store(
+    /// migrated-family ObjectKeys (`repos/<repo>/tags/<tag>`,
+    /// `repos/<repo>/manifests/<hex>`) map to byte-identical physical bucket
+    /// keys.
+    async fn object_store(
         &self,
         bucket: &str,
         prefix: &str,
@@ -768,10 +769,11 @@ pub struct S3Storage {
     pub session_config: S3SessionConfig,
     driver: Arc<dyn S3Driver>,
     referrer_locks: Arc<Vec<Mutex<()>>>,
-    /// Phase 3 tag-family cutover: lazily wired shared tag domain over the
-    /// driver's backend-neutral ObjectStore (lazy to preserve the historical
-    /// first-use surfacing of bucket/region configuration errors).
-    tag_domain: Arc<OnceCell<crate::storage::tag_domain::TagDomain>>,
+    /// Migrated-family cutovers (Phase 3 tags, Phase 4 manifests): the
+    /// lazily wired backend-neutral ObjectStore shared by both domains
+    /// (lazy to preserve the historical first-use surfacing of
+    /// bucket/region configuration errors).
+    object_store: Arc<OnceCell<Arc<dyn storage_core::object_store::ObjectStore>>>,
 }
 
 impl std::fmt::Debug for S3Storage {
@@ -805,7 +807,7 @@ impl S3Storage {
             session_config: S3SessionConfig::default(),
             driver,
             referrer_locks: Arc::new(referrer_locks),
-            tag_domain: Arc::new(OnceCell::new()),
+            object_store: Arc::new(OnceCell::new()),
         }
     }
 
@@ -827,7 +829,7 @@ impl S3Storage {
             session_config: S3SessionConfig::default(),
             driver,
             referrer_locks: Arc::new(referrer_locks),
-            tag_domain: Arc::new(OnceCell::new()),
+            object_store: Arc::new(OnceCell::new()),
         }
     }
 
@@ -848,29 +850,51 @@ impl S3Storage {
             .ok_or_else(|| StorageError::configuration("STORAGE_S3_BUCKET is required"))
     }
 
-    /// Shared tag domain over the driver's backend-neutral ObjectStore,
+    /// The backend-neutral ObjectStore shared by the migrated families,
     /// wired on first use (missing bucket/region keep surfacing as the
-    /// historical per-request configuration errors). S3 has no repository
-    /// existence notion, so the probe always reports existence (absent
-    /// repositories list as empty — the historical S3 contract), and the
-    /// resource bounds are the shared defaults (S3 historically had none;
-    /// bounded truthful failure is the accepted campaign policy).
-    async fn tag_domain(&self) -> Result<&crate::storage::tag_domain::TagDomain, StorageError> {
-        self.tag_domain
+    /// historical per-request configuration errors).
+    async fn migrated_object_store(
+        &self,
+    ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
+        self.object_store
             .get_or_try_init(|| async {
                 let bucket = self.bucket()?;
-                let store = self.driver.tag_object_store(bucket, &self.prefix).await?;
-                Ok(crate::storage::tag_domain::TagDomain::new(
-                    store,
-                    crate::storage::tag_domain::TagDomainConfig {
-                        max_payload_bytes: crate::storage::tag_domain::DEFAULT_MAX_PAYLOAD_BYTES,
-                        max_listing_entries:
-                            crate::storage::tag_domain::DEFAULT_MAX_LISTING_ENTRIES,
-                    },
-                    Arc::new(crate::storage::tag_domain::AlwaysExistsRepoProbe),
-                ))
+                self.driver.object_store(bucket, &self.prefix).await
             })
             .await
+            .cloned()
+    }
+
+    /// Shared tag domain over the migrated-family ObjectStore. S3 has no
+    /// repository existence notion, so the probe always reports existence
+    /// (absent repositories list as empty — the historical S3 contract),
+    /// and the resource bounds are the shared defaults (S3 historically had
+    /// none; bounded truthful failure is the accepted campaign policy).
+    async fn tag_domain(&self) -> Result<crate::storage::tag_domain::TagDomain, StorageError> {
+        let store = self.migrated_object_store().await?;
+        Ok(crate::storage::tag_domain::TagDomain::new(
+            store,
+            crate::storage::tag_domain::TagDomainConfig {
+                max_payload_bytes: crate::storage::tag_domain::DEFAULT_MAX_PAYLOAD_BYTES,
+                max_listing_entries: crate::storage::tag_domain::DEFAULT_MAX_LISTING_ENTRIES,
+            },
+            Arc::new(crate::storage::tag_domain::AlwaysExistsRepoProbe),
+        ))
+    }
+
+    /// Shared manifest domain over the migrated-family ObjectStore (Phase 4).
+    /// The listing bound is the shared default (mirroring the accepted FS
+    /// configured default; the retired S3 listing drained unboundedly).
+    async fn manifest_domain(
+        &self,
+    ) -> Result<crate::storage::manifest_domain::ManifestDomain, StorageError> {
+        let store = self.migrated_object_store().await?;
+        Ok(crate::storage::manifest_domain::ManifestDomain::new(
+            store,
+            crate::storage::manifest_domain::ManifestDomainConfig {
+                max_listing_entries: crate::storage::manifest_domain::DEFAULT_MAX_LISTING_ENTRIES,
+            },
+        ))
     }
 
     fn key(&self, suffix: &str) -> String {
@@ -901,10 +925,6 @@ impl S3Storage {
             digest.prefix2(),
             digest.hex()
         ))
-    }
-
-    fn manifest_key(&self, name: &str, digest: &Digest) -> String {
-        self.key(&format!("repos/{name}/manifests/{}", digest.hex()))
     }
 
     fn repo_blob_key(&self, repo: &CanonicalRepoName, digest: &Digest) -> String {
@@ -1131,16 +1151,6 @@ impl S3Storage {
             Some((bytes, _)) => Ok(bytes),
             None => Err(StorageError::NotFound),
         }
-    }
-
-    async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|err| StorageError::corrupt_data(err.to_string()))?;
-        let media_type = value
-            .get("mediaType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("application/vnd.oci.image.manifest.v1+json");
-        Ok(media_type.to_string())
     }
 
     async fn get_session_doc_with_etag(
@@ -1689,13 +1699,10 @@ impl Storage for S3Storage {
         name: &str,
         digest: &Digest,
     ) -> Result<ManifestMeta, StorageError> {
-        let key = self.manifest_key(name, digest);
-        let bytes = self.get_object_bytes(&key).await?;
-        let media_type = self.detect_manifest_media_type(&bytes).await?;
-        Ok(ManifestMeta {
-            size: bytes.len() as u64,
-            media_type,
-        })
+        self.manifest_domain()
+            .await?
+            .head_manifest(name, digest)
+            .await
     }
 
     async fn get_manifest(
@@ -1703,16 +1710,10 @@ impl Storage for S3Storage {
         name: &str,
         digest: &Digest,
     ) -> Result<(ManifestMeta, Bytes), StorageError> {
-        let key = self.manifest_key(name, digest);
-        let bytes = self.get_object_bytes(&key).await?;
-        let media_type = self.detect_manifest_media_type(&bytes).await?;
-        Ok((
-            ManifestMeta {
-                size: bytes.len() as u64,
-                media_type,
-            },
-            bytes,
-        ))
+        self.manifest_domain()
+            .await?
+            .get_manifest(name, digest)
+            .await
     }
 
     async fn put_manifest(
@@ -1721,18 +1722,13 @@ impl Storage for S3Storage {
         digest: &Digest,
         bytes: Bytes,
     ) -> Result<ManifestMeta, StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.manifest_key(name, digest);
-        let media_type = self.detect_manifest_media_type(&bytes).await?;
-
-        self.driver
-            .put_object_conditional(bucket, &key, bytes.clone(), None, None)
-            .await?;
-
-        Ok(ManifestMeta {
-            size: bytes.len() as u64,
-            media_type,
-        })
+        // Phase 4: shared manifest domain over the migrated-family
+        // ObjectStore — media type validated before the write; unconditional
+        // durable publication (one acknowledged PUT).
+        self.manifest_domain()
+            .await?
+            .put_manifest(name, digest, bytes)
+            .await
     }
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
@@ -1772,44 +1768,10 @@ impl Storage for S3Storage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
-        let bucket = self.bucket()?;
-        let prefix = self.key(&format!("repos/{repo}/manifests/"));
-        let objects = self.driver.list_objects_v2(bucket, &prefix).await?;
-
-        let mut all_digests: Vec<Digest> = Vec::new();
-        for obj in objects {
-            let rel = match obj.key.strip_prefix(&prefix) {
-                Some(r) => r,
-                None => continue,
-            };
-            let hex = rel.trim_end_matches(".json");
-            if let Ok(d) = Digest::parse(&format!("sha256:{hex}")) {
-                all_digests.push(d);
-            } else if let Ok(d) = Digest::parse(hex) {
-                all_digests.push(d);
-            }
-        }
-        all_digests.sort_by(|a, b| a.hex().cmp(b.hex()));
-
-        let start_idx = if let Some(token) = continuation_token {
-            match all_digests.binary_search_by(|d| d.as_str().as_str().cmp(token)) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            }
-        } else {
-            0
-        };
-
-        let end_idx = (start_idx + page_limit).min(all_digests.len());
-        let page_slice = &all_digests[start_idx..end_idx];
-
-        let next_token = if end_idx < all_digests.len() {
-            page_slice.last().map(|d| d.as_str().to_string())
-        } else {
-            None
-        };
-
-        Ok((page_slice.to_vec(), next_token))
+        self.manifest_domain()
+            .await?
+            .list_manifest_digests_page(repo, continuation_token, page_limit)
+            .await
     }
 
     async fn list_tags_page(
@@ -2382,32 +2344,20 @@ impl Storage for S3Storage {
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.manifest_key(name, digest);
-
-        let bytes = self.get_object_bytes(&key).await?;
-        let maybe_subject = crate::manifest_refs::extract_subject_digest(&bytes).map_err(|e| {
-            StorageError::corrupt_data(format!(
-                "cannot delete manifest with malformed structure: {e}"
-            ))
-        })?;
-
-        self.driver.delete_object(bucket, &key).await?;
-
-        // Shared backend-neutral tag-domain cleanup (Phase 3): same
-        // manifest-first ordering and best-effort per-tag deletion; the
-        // shared scan converges on the fail-closed contract (unreadable or
-        // non-UTF-8 tag payloads propagate instead of being skipped).
-        let digest_str = digest.as_str();
-        self.tag_domain()
+        // Phase 4: frozen ordering — shared payload steps (pre-read ->
+        // subject extraction -> payload delete) and the accepted Phase 3
+        // replacement-safe tag cleanup run in the shared manifest domain;
+        // the existing unmigrated-family referrer cleanup stays the final
+        // best-effort step. Not a transaction; partial cleanup after the
+        // payload delete remains possible, exactly as before.
+        let maybe_subject = self
+            .manifest_domain()
             .await?
-            .delete_manifest_tag_cleanup(name, &digest_str)
+            .delete_manifest(&self.tag_domain().await?, name, digest)
             .await?;
-
         if let Some(subject) = maybe_subject {
             let _ = self.remove_referrer(name, &subject, digest).await;
         }
-
         Ok(())
     }
 }

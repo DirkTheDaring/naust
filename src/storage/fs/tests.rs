@@ -3868,7 +3868,8 @@ async fn test_detect_manifest_media_type_malformed_json_is_corrupt_data() {
     let expected_err = serde_json::from_slice::<serde_json::Value>(malformed_bytes).unwrap_err();
     let expected_message = expected_err.to_string();
 
-    let res = storage.detect_manifest_media_type(malformed_bytes).await;
+    let _ = &storage;
+    let res = crate::storage::manifest_domain::detect_manifest_media_type(malformed_bytes);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(
@@ -6358,7 +6359,12 @@ async fn test_manifest_read_missing_paths_return_not_found() {
 }
 
 #[tokio::test]
-async fn test_manifest_read_nondirectory_components_return_io() {
+async fn test_manifest_read_nondirectory_components_structural_absence() {
+    // Phase 4 converged (accepted Phase 1 adapter contract): a regular file
+    // occupying an intermediate component, or a directory sitting where the
+    // manifest leaf should be, is NOT a manifest object — structural
+    // absence (NotFound), not an Io error. Symlinks still fail closed (see
+    // the containment tests).
     let fixture = tempfile::tempdir().expect("create test fixture");
     let root = fixture.path().join("storage-root");
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -6367,72 +6373,48 @@ async fn test_manifest_read_nondirectory_components_return_io() {
         Digest::parse("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
             .expect("valid digest");
 
-    // Case 1: Repository component is a regular file instead of a directory
+    // Case 1: repository component is a regular file instead of a directory.
     let repos_dir = root.join("repos");
     std::fs::create_dir_all(&repos_dir).expect("create repos dir");
-    let repo_file = repos_dir.join("file_repo");
-    write_file(&repo_file, b"not a dir");
+    write_file(&repos_dir.join("file_repo"), b"not a dir");
+    assert!(matches!(
+        storage.head_manifest("file_repo", &digest).await,
+        Err(StorageError::NotFound)
+    ));
+    assert!(matches!(
+        storage.get_manifest("file_repo", &digest).await,
+        Err(StorageError::NotFound)
+    ));
 
-    let err_repo_file_head = storage
-        .head_manifest("file_repo", &digest)
-        .await
-        .unwrap_err();
-    match err_repo_file_head {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => panic!("expected StorageErrorKind::Io for ENOTDIR on repo, got: {other:?}"),
-    }
-    let err_repo_file_get = storage
-        .get_manifest("file_repo", &digest)
-        .await
-        .unwrap_err();
-    match err_repo_file_get {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => panic!("expected StorageErrorKind::Io for ENOTDIR on repo, got: {other:?}"),
-    }
-
-    // Case 2: manifests component is a regular file instead of a directory
+    // Case 2: manifests component is a regular file instead of a directory.
     let repo2_dir = repos_dir.join("repo_with_file_manifests");
     std::fs::create_dir_all(&repo2_dir).expect("create repo2 dir");
-    let manifests_file = repo2_dir.join("manifests");
-    write_file(&manifests_file, b"not a dir");
+    write_file(&repo2_dir.join("manifests"), b"not a dir");
+    assert!(matches!(
+        storage
+            .head_manifest("repo_with_file_manifests", &digest)
+            .await,
+        Err(StorageError::NotFound)
+    ));
+    assert!(matches!(
+        storage
+            .get_manifest("repo_with_file_manifests", &digest)
+            .await,
+        Err(StorageError::NotFound)
+    ));
 
-    let err_manifests_file_head = storage
-        .head_manifest("repo_with_file_manifests", &digest)
-        .await
-        .unwrap_err();
-    match err_manifests_file_head {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => {
-            panic!("expected StorageErrorKind::Io for ENOTDIR on manifests dir, got: {other:?}")
-        }
-    }
-    let err_manifests_file_get = storage
-        .get_manifest("repo_with_file_manifests", &digest)
-        .await
-        .unwrap_err();
-    match err_manifests_file_get {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => {
-            panic!("expected StorageErrorKind::Io for ENOTDIR on manifests dir, got: {other:?}")
-        }
-    }
-
-    // Case 3: Target manifest path is a directory instead of a regular file
+    // Case 3: target manifest path is a directory instead of a regular file.
     let repo3_manifests = repos_dir.join("repo3").join("manifests");
-    std::fs::create_dir_all(&repo3_manifests).expect("create repo3 manifests dir");
-    let target_as_dir = repo3_manifests.join(digest.hex());
-    std::fs::create_dir_all(&target_as_dir).expect("create dir at manifest path");
-
-    let err_target_dir_head = storage.head_manifest("repo3", &digest).await.unwrap_err();
-    match err_target_dir_head {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => panic!("expected StorageErrorKind::Io for directory-as-manifest, got: {other:?}"),
-    }
-    let err_target_dir_get = storage.get_manifest("repo3", &digest).await.unwrap_err();
-    match err_target_dir_get {
-        StorageError::Internal { kind, .. } => assert_eq!(kind, StorageErrorKind::Io),
-        other => panic!("expected StorageErrorKind::Io for directory-as-manifest, got: {other:?}"),
-    }
+    std::fs::create_dir_all(repo3_manifests.join(digest.hex()))
+        .expect("create dir at manifest path");
+    assert!(matches!(
+        storage.head_manifest("repo3", &digest).await,
+        Err(StorageError::NotFound)
+    ));
+    assert!(matches!(
+        storage.get_manifest("repo3", &digest).await,
+        Err(StorageError::NotFound)
+    ));
 }
 
 #[tokio::test]
@@ -6688,28 +6670,32 @@ async fn test_manifest_read_containment_symlink_traversal() {
     let symlink_file = manifests_dir.join(&hex);
     symlink(&outside_file, &symlink_file).expect("create symlink to outside file");
 
-    // Contained behavior: openat2 resolution rejection fails closed with StorageErrorKind::Io
+    // Contained behavior: openat2 resolution rejection fails closed with StorageErrorKind::PermissionDenied
     let head_sym_outside = storage.head_manifest(repo, &digest).await;
     match head_sym_outside {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "External symlink must be rejected with StorageErrorKind::Io"
+                StorageErrorKind::PermissionDenied,
+                "External symlink must be rejected with the converged PermissionDenied kind"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for external symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for external symlink, got {other:?}"
+        ),
     }
     let get_sym_outside = storage.get_manifest(repo, &digest).await;
     match get_sym_outside {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "External symlink must be rejected with StorageErrorKind::Io"
+                StorageErrorKind::PermissionDenied,
+                "External symlink must be rejected with the converged PermissionDenied kind"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for external symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for external symlink, got {other:?}"
+        ),
     }
 
     // Scenario 2: Manifest file is a symlink pointing inside storage root
@@ -6723,22 +6709,26 @@ async fn test_manifest_read_containment_symlink_traversal() {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "Internal symlink must be rejected with StorageErrorKind::Io"
+                StorageErrorKind::PermissionDenied,
+                "Internal symlink must be rejected with the converged PermissionDenied kind"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for internal symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for internal symlink, got {other:?}"
+        ),
     }
     let get_sym_inside = storage.get_manifest(repo, &digest).await;
     match get_sym_inside {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "Internal symlink must be rejected with StorageErrorKind::Io"
+                StorageErrorKind::PermissionDenied,
+                "Internal symlink must be rejected with the converged PermissionDenied kind"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for internal symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for internal symlink, got {other:?}"
+        ),
     }
 
     // Scenario 3: Intermediate manifests directory is a symlink to an outside directory
@@ -6757,22 +6747,26 @@ async fn test_manifest_read_containment_symlink_traversal() {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "Ancestor directory symlink must be rejected with StorageErrorKind::Io"
+                StorageErrorKind::PermissionDenied,
+                "Ancestor directory symlink must be rejected with the converged PermissionDenied kind"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for ancestor symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for ancestor symlink, got {other:?}"
+        ),
     }
     let get_dir_sym = storage.get_manifest("repo_sym_dir", &digest).await;
     match get_dir_sym {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "Ancestor directory symlink must be rejected with StorageErrorKind::Io"
+                StorageErrorKind::PermissionDenied,
+                "Ancestor directory symlink must be rejected with the converged PermissionDenied kind"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for ancestor symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for ancestor symlink, got {other:?}"
+        ),
     }
 
     // Scenario 4: Dangling symlink fails closed with Io (openat2 resolution rejection overrides NotFound)
@@ -6785,22 +6779,26 @@ async fn test_manifest_read_containment_symlink_traversal() {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "Dangling symlink must produce StorageErrorKind::Io (ResolutionRejected overrides NotFound)"
+                StorageErrorKind::PermissionDenied,
+                "Dangling symlink must produce StorageErrorKind::PermissionDenied (ResolutionRejected overrides NotFound)"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for dangling symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for dangling symlink, got {other:?}"
+        ),
     }
     let get_dangling = storage.get_manifest(repo, &digest).await;
     match get_dangling {
         Err(StorageError::Internal { kind, .. }) => {
             assert_eq!(
                 kind,
-                StorageErrorKind::Io,
-                "Dangling symlink must produce StorageErrorKind::Io (ResolutionRejected overrides NotFound)"
+                StorageErrorKind::PermissionDenied,
+                "Dangling symlink must produce StorageErrorKind::PermissionDenied (ResolutionRejected overrides NotFound)"
             );
         }
-        other => panic!("expected StorageErrorKind::Io for dangling symlink, got {other:?}"),
+        other => panic!(
+            "expected StorageErrorKind::PermissionDenied for dangling symlink, got {other:?}"
+        ),
     }
 
     // Genuine missing paths (without a rejected symlink) remain NotFound:
@@ -7464,7 +7462,11 @@ async fn test_manifest_listing_symlinked_manifests_and_ancestors() {
 
     let res1 = storage.list_manifest_digests_page(repo1, None, 10).await;
     let err1 = res1.expect_err("symlinked manifests dir must fail closed");
-    assert_eq!(err1.internal_kind(), Some(StorageErrorKind::Io));
+    assert_eq!(
+        err1.internal_kind(),
+        Some(StorageErrorKind::PermissionDenied),
+        "containment refusal (Phase 4 converged kind)"
+    );
 
     // Case 2: Ancestor repo directory is a symlink to outside directory
     let outside_repo2 = outside.join("ext_repo2");
@@ -7481,7 +7483,11 @@ async fn test_manifest_listing_symlinked_manifests_and_ancestors() {
         .list_manifest_digests_page("sym_ancestor_repo", None, 10)
         .await;
     let err2 = res2.expect_err("symlinked ancestor dir must fail closed");
-    assert_eq!(err2.internal_kind(), Some(StorageErrorKind::Io));
+    assert_eq!(
+        err2.internal_kind(),
+        Some(StorageErrorKind::PermissionDenied),
+        "containment refusal (Phase 4 converged kind)"
+    );
 }
 
 #[tokio::test]
@@ -7530,24 +7536,32 @@ async fn test_manifest_listing_component_wrong_type_suppressed() {
     let repos_dir = root.join("repos");
     std::fs::create_dir_all(&repos_dir).expect("create repos dir");
 
-    // Case 1: manifests component is a regular file instead of a directory
+    // Phase 4 converged (accepted Phase 1 adapter contract): a regular file
+    // occupying an intermediate component means NOTHING can exist beneath it
+    // — structural absence, an empty terminal page (the retired FS listing
+    // errored CorruptData; on S3 such shadowing is impossible: prefix
+    // listings are independent of any same-named object). The FS-native GC
+    // discovery path already treated a file named "manifests" as
+    // contributing nothing, so no reachable object loses protection.
+
+    // Case 1: manifests component is a regular file instead of a directory.
     let repo1_dir = repos_dir.join("file_manifests_repo");
     std::fs::create_dir_all(&repo1_dir).expect("create repo1 dir");
     write_file(&repo1_dir.join("manifests"), b"regular file, not a dir");
 
-    let res1 = storage
+    let (p1, t1) = storage
         .list_manifest_digests_page("file_manifests_repo", None, 10)
-        .await;
-    let err1 = res1.expect_err("ENOTDIR on manifests component must fail closed");
-    assert_eq!(err1.internal_kind(), Some(StorageErrorKind::CorruptData));
+        .await
+        .expect("structural absence lists empty");
+    assert!(p1.is_empty() && t1.is_none());
 
-    // Case 2: repo component itself is a regular file instead of a directory
+    // Case 2: repo component itself is a regular file instead of a directory.
     write_file(&repos_dir.join("file_repo"), b"regular file, not a dir");
-    let res2 = storage
+    let (p2, t2) = storage
         .list_manifest_digests_page("file_repo", None, 10)
-        .await;
-    let err2 = res2.expect_err("repo as file must fail closed with ENOTDIR");
-    assert_eq!(err2.internal_kind(), Some(StorageErrorKind::CorruptData));
+        .await
+        .expect("structural absence lists empty");
+    assert!(p2.is_empty() && t2.is_none());
 }
 
 #[tokio::test]
@@ -7729,34 +7743,45 @@ async fn test_manifest_listing_constructor_validation() {
             .contains("manifest_listing_max_name_bytes must be at least 128")
     );
 
-    // 3. Valid limits succeed
+    // 3. Valid limits succeed and are wired into the manifest listing
+    // budget (Phase 4: the configured limits bound the manifest object
+    // store's enumeration; exceeding max_entries fails truthfully).
     let storage_custom = FsStorage::try_new_with_limits(
         root.clone(),
         1024 * 1024,
-        storage_fs::DirEnumerationLimits::new(500, 50_000),
+        storage_fs::DirEnumerationLimits::new(2, 50_000),
     )
     .expect("valid limits succeed");
-    assert_eq!(storage_custom.manifest_listing_limits().max_entries(), 500);
-    assert_eq!(
-        storage_custom
-            .manifest_listing_limits()
-            .max_total_name_bytes(),
-        50_000
-    );
+    let hexes = [
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    ];
+    let mdir = root.join("repos").join("limitrepo").join("manifests");
+    std::fs::create_dir_all(&mdir).unwrap();
+    for h in &hexes[..2] {
+        std::fs::write(mdir.join(h), br#"{"schemaVersion":2}"#).unwrap();
+    }
+    let (page, _) = storage_custom
+        .list_manifest_digests_page("limitrepo", None, 10)
+        .await
+        .expect("2 entries within max_entries=2 succeeds");
+    assert_eq!(page.len(), 2);
+    std::fs::write(mdir.join(hexes[2]), br#"{"schemaVersion":2}"#).unwrap();
+    let err = storage_custom
+        .list_manifest_digests_page("limitrepo", None, 10)
+        .await
+        .expect_err("3 entries over max_entries=2 fails truthfully");
+    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
 
-    // 4. Default constructor supplies approved defaults
+    // 4. Default constructor succeeds with the approved defaults wired.
     let storage_default =
         FsStorage::try_new(root.clone(), 1024 * 1024).expect("default constructor succeeds");
-    assert_eq!(
-        storage_default.manifest_listing_limits().max_entries(),
-        10_000
-    );
-    assert_eq!(
-        storage_default
-            .manifest_listing_limits()
-            .max_total_name_bytes(),
-        1_500_000
-    );
+    let (dpage, _) = storage_default
+        .list_manifest_digests_page("limitrepo", None, 10)
+        .await
+        .expect("defaults (10_000 entries) accommodate the fixture");
+    assert_eq!(dpage.len(), 3);
 }
 
 #[tokio::test]
@@ -7799,7 +7824,7 @@ async fn test_manifest_listing_exact_entry_boundary() {
     assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
     assert!(
         err.to_string()
-            .contains("enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 }
 
@@ -7841,7 +7866,7 @@ async fn test_manifest_listing_exact_name_byte_boundary_including_128_byte_sha51
     assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
     assert!(
         err.to_string()
-            .contains("enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 }
 
@@ -7918,7 +7943,7 @@ async fn test_manifest_listing_shared_reader_and_startup_offload() {
     assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
     assert!(
         err.to_string()
-            .contains("enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     // 4. Demonstrate configured limits govern listing through filesystem proxy-cache wiring:
@@ -7952,7 +7977,7 @@ async fn test_manifest_listing_shared_reader_and_startup_offload() {
     assert!(
         proxy_err
             .to_string()
-            .contains("enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 }
 
@@ -10571,7 +10596,7 @@ async fn test_tag_listing_ignores_configured_manifest_enumeration_limits() {
     assert!(
         err_manifests
             .to_string()
-            .contains("enumeration resource limit exceeded")
+            .contains("directory enumeration exceeded the adapter's limits")
     );
 
     // 2. Characterize tag-listing behavior under the same configured limits:
@@ -14190,11 +14215,11 @@ mod manifest_write_containment {
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "symlink escape -> Io error, got {err:?}"
+            "symlink escape fails closed as PermissionDenied (Phase 4 converged kind), got {err:?}"
         );
         assert_eq!(
             sorted_entry_names(&external),
@@ -14336,11 +14361,11 @@ mod manifest_write_containment {
             matches!(
                 err,
                 StorageError::Internal {
-                    kind: crate::storage::StorageErrorKind::Io,
+                    kind: crate::storage::StorageErrorKind::PermissionDenied,
                     ..
                 }
             ),
-            "symlink leaf -> Io error, got {err:?}"
+            "symlink leaf fails closed as PermissionDenied (Phase 4 converged kind), got {err:?}"
         );
 
         // Fail closed: the symlink remains and the external target is untouched.

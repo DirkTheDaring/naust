@@ -437,7 +437,6 @@ pub struct FsStorage {
     /// Pinned contained directory authorities shared by every upload-lifecycle
     /// operation (Option A). Captured once at construction; see `UploadAuthorities`.
     upload_authorities: std::sync::Arc<UploadAuthorities>,
-    manifest_listing_limits: storage_fs::DirEnumerationLimits,
     gc_discovery_limits: repo_discovery::DiscoveryLimits,
     gc_ref_limits: manifest_refs::ManifestReferenceLimits,
     /// Phase 3 tag-family cutover: the shared backend-neutral tag-domain
@@ -447,6 +446,12 @@ pub struct FsStorage {
     /// old physical layout). Unmigrated families continue on the retained
     /// contained authorities above.
     tag_domain: crate::storage::tag_domain::TagDomain,
+    /// Phase 4 manifest-family cutover: the shared backend-neutral
+    /// manifest-domain implementation over its own `FsObjectStore` pinned to
+    /// the same storage root (identity key mapping — every manifest stays at
+    /// `repos/<repo>/manifests/<hex>`), budgeted with the configured
+    /// manifest listing limits.
+    manifest_domain: crate::storage::manifest_domain::ManifestDomain,
     /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
     /// at the boundary between a candidate's confirmed expiry decision and its
     /// destructive action, with the candidate uuid. Lets a regression prove that no
@@ -673,6 +678,20 @@ impl FsStorage {
             )),
         );
 
+        // Phase 4 manifest-family cutover: a second pinned object store over
+        // the SAME root, budgeted with the configured manifest listing
+        // limits (each migrated family keeps its own configured enumeration
+        // budget).
+        let manifest_store = storage_fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::io(format!("open manifest object store root: {e}")))?
+            .with_enumeration_limits(manifest_listing_limits);
+        let manifest_domain = crate::storage::manifest_domain::ManifestDomain::new(
+            std::sync::Arc::new(manifest_store),
+            crate::storage::manifest_domain::ManifestDomainConfig {
+                max_listing_entries: manifest_listing_limits.max_entries(),
+            },
+        );
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
@@ -690,10 +709,10 @@ impl FsStorage {
             reader,
             read_adapter,
             upload_authorities,
-            manifest_listing_limits,
             gc_discovery_limits,
             gc_ref_limits,
             tag_domain,
+            manifest_domain,
             #[cfg(test)]
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
@@ -761,32 +780,6 @@ impl FsStorage {
     #[cfg(test)]
     pub(crate) fn reader(&self) -> &std::sync::Arc<storage_fs::FsMetadataReader> {
         &self.reader
-    }
-
-    /// Returns configured directory enumeration limits for manifest listing.
-    #[cfg(test)]
-    pub(crate) fn manifest_listing_limits(&self) -> storage_fs::DirEnumerationLimits {
-        self.manifest_listing_limits
-    }
-
-    /// Internal test helper to list manifest digests with explicitly injected limits.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) async fn list_manifest_digests_page_with_limits(
-        &self,
-        repo: &str,
-        continuation_token: Option<&str>,
-        page_limit: usize,
-        limits: storage_fs::DirEnumerationLimits,
-    ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
-        manifest_listing::list_manifest_digests_page_impl(
-            self.reader.as_ref(),
-            repo,
-            continuation_token,
-            page_limit,
-            limits,
-        )
-        .await
     }
 
     /// Internal test helper to list CAS blobs with explicitly injected listing budgets.
@@ -1009,47 +1002,6 @@ impl FsStorage {
             };
         }
         Ok(Some(dir))
-    }
-
-    /// Resolve a fresh contained authority for `repos/<repo>/manifests`, beneath
-    /// the stable pinned `repos` authority — the manifest-namespace analogue of
-    /// [`Self::tags_authority`]. The repository is re-resolved on every call (no
-    /// per-repository authority is cached), so a repository directory removed and
-    /// recreated at the same pathname is observed as its new inode on the next
-    /// operation, keeping manifest writes coherent with the already-contained
-    /// manifest reads and preventing stale-inode writes into a detached tree.
-    ///
-    /// Validation reuses the manifest read seam's own grammar
-    /// ([`manifest::manifest_key`]) rather than the tag validator: the read path
-    /// accepts colon-bearing segments such as `C:/repo`, so validating writes with
-    /// the same function keeps manifest reads and writes on one grammar and one
-    /// error taxonomy ([`StorageError::InvalidRepoName`]). Every directory
-    /// component is traversed through contained `ensure_subdir` primitives; the
-    /// resulting authority never reconstructs an ambient path.
-    async fn manifests_authority(
-        &self,
-        repo: &str,
-        digest: &Digest,
-    ) -> Result<ContainedDir, StorageError> {
-        // Reuse the manifest read grammar (rejects `..`/`.`/empty segments,
-        // control characters, backslashes, leading/trailing slashes; accepts
-        // nested and colon-bearing segments) so a write is accepted iff the
-        // matching read is. The composed key is discarded; only its validation
-        // side effect is required here.
-        manifest::manifest_key(repo, digest)?;
-        let mut dir = self
-            .upload_authorities
-            .repos()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for segment in repo.split('/') {
-            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
-            dir = dir.ensure_subdir(&name).await.map_err(map_fs_mutate_err)?;
-        }
-        let manifests = FileName::new("manifests").map_err(map_fs_mutate_err)?;
-        dir.ensure_subdir(&manifests)
-            .await
-            .map_err(map_fs_mutate_err)
     }
 
     /// Resolves the contained authority for `repos/<repo>/referrers`, creating
@@ -1323,10 +1275,6 @@ impl FsStorage {
         *self.quarantine_boundary_hook.0.lock().unwrap() = Some(hook);
     }
 
-    async fn detect_manifest_media_type(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        manifest::detect_manifest_media_type(bytes)
-    }
-
     async fn list_repo_names(&self) -> Result<Vec<String>, StorageError> {
         catalog_discovery::discover_catalog_repositories_impl(
             self.reader.as_ref(),
@@ -1468,7 +1416,7 @@ impl Storage for FsStorage {
         name: &str,
         digest: &Digest,
     ) -> Result<ManifestMeta, StorageError> {
-        manifest::head_manifest_impl(self.reader.as_ref(), name, digest).await
+        self.manifest_domain.head_manifest(name, digest).await
     }
 
     async fn get_manifest(
@@ -1476,7 +1424,7 @@ impl Storage for FsStorage {
         name: &str,
         digest: &Digest,
     ) -> Result<(ManifestMeta, bytes::Bytes), StorageError> {
-        manifest::get_manifest_impl(self.reader.as_ref(), name, digest).await
+        self.manifest_domain.get_manifest(name, digest).await
     }
 
     async fn put_manifest(
@@ -1485,23 +1433,9 @@ impl Storage for FsStorage {
         digest: &Digest,
         bytes: Bytes,
     ) -> Result<ManifestMeta, StorageError> {
-        // Contained authority for `repos/<repo>/manifests` (fresh per op, no
-        // per-repo cache), resolved beneath the pinned `repos` root — matching the
-        // already-contained manifest reads and replacing the prior ambient
-        // `self.root.join(...)` reconstruction. Resolving the authority also ensures
-        // the `manifests` directory, mirroring the previous `ensure_dir`, so the
-        // create/detect/write ordering is preserved.
-        let manifests = self.manifests_authority(name, digest).await?;
-
-        let media_type = self.detect_manifest_media_type(&bytes).await?;
-        let size = bytes.len() as u64;
-        let leaf = FileName::new(digest.hex()).map_err(map_fs_mutate_err)?;
-        manifests
-            .write_leaf_atomic(&leaf, bytes.to_vec(), true)
-            .await
-            .map_err(map_fs_mutate_err)?;
-
-        Ok(ManifestMeta { size, media_type })
+        // Phase 4: shared manifest domain over the pinned FS object store —
+        // media type validated before the write; durable atomic publication.
+        self.manifest_domain.put_manifest(name, digest, bytes).await
     }
 
     async fn set_tag(&self, name: &str, tag: &str, digest: &Digest) -> Result<(), StorageError> {
@@ -1538,14 +1472,9 @@ impl Storage for FsStorage {
         continuation_token: Option<&str>,
         page_limit: usize,
     ) -> Result<(Vec<Digest>, Option<String>), StorageError> {
-        manifest_listing::list_manifest_digests_page_impl(
-            self.reader.as_ref(),
-            repo,
-            continuation_token,
-            page_limit,
-            self.manifest_listing_limits,
-        )
-        .await
+        self.manifest_domain
+            .list_manifest_digests_page(repo, continuation_token, page_limit)
+            .await
     }
 
     async fn list_tags_page(
@@ -2100,58 +2029,19 @@ impl Storage for FsStorage {
     }
 
     async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
-        // Contained authority for `repos/<repo>/manifests`; replaces the prior
-        // ambient read+remove of the reconstructed manifest path. Both the subject
-        // pre-read and the unlink resolve through this single pinned authority (no
-        // ambient reconstruction; a symlinked or root-replaced manifest leaf fails
-        // closed). The tag cleanup below runs on one retained contained tags
-        // authority and the referrer cleanup is contained via the contained
-        // `remove_referrer` seam — every namespace this operation touches is
-        // contained. Ordering (manifest unlink -> tag scan -> referrer cleanup),
-        // error propagation/suppression, and the possibility of partial cleanup
-        // after the manifest unlink are unchanged; this is not a transaction.
-        let manifests = self.manifests_authority(name, digest).await?;
-        let leaf = FileName::new(digest.hex()).map_err(map_fs_mutate_err)?;
-
-        // Pre-read manifest bytes to extract subject if present for referrers cleanup.
-        let bytes = match manifests.read_leaf(&leaf, u64::MAX).await {
-            Ok(b) => b,
-            Err(FsMutateError::NotFound) => return Err(StorageError::NotFound),
-            Err(err) => return Err(map_fs_mutate_err(err)),
-        };
-
-        let maybe_subject = crate::manifest_refs::extract_subject_digest(&bytes).map_err(|e| {
-            StorageError::corrupt_data(format!(
-                "cannot delete manifest with malformed structure: {e}"
-            ))
-        })?;
-
-        match manifests.unlink(&leaf, false).await {
-            Ok(()) => {}
-            Err(FsMutateError::NotFound) => return Err(StorageError::NotFound),
-            Err(err) => return Err(map_fs_mutate_err(err)),
-        }
-        // Best-effort durability of the directory-entry removal (result ignored, as
-        // with the contained `delete_tag`); no success/error-path change.
-        let _ = manifests.sync().await;
-
-        // Remove any tags pointing to this digest — enumeration, inspection, and
-        // deletion all through ONE retained contained tags authority, resolved
-        // non-creating (an absent tags directory preserves the empty-scan
-        // contract with zero directory creation).
-        // Shared backend-neutral tag-domain cleanup (Phase 3): same frozen
-        // lock-free scan contract, over the generic object store. An absent
-        // tags namespace is an empty scan with zero directory creation.
-        let digest_str = digest.as_str();
-        self.tag_domain
-            .delete_manifest_tag_cleanup(name, &digest_str)
+        // Phase 4: frozen ordering — shared payload steps (pre-read ->
+        // subject extraction -> payload delete) and the accepted Phase 3
+        // replacement-safe tag cleanup run in the shared manifest domain;
+        // the existing unmigrated-family referrer cleanup stays the final
+        // best-effort step. Not a transaction; partial cleanup after the
+        // payload delete remains possible, exactly as before.
+        let maybe_subject = self
+            .manifest_domain
+            .delete_manifest(&self.tag_domain, name, digest)
             .await?;
-
-        // Clean up from referrers list if this manifest referenced a subject.
         if let Some(subject) = maybe_subject {
             let _ = self.remove_referrer(name, &subject, digest).await;
         }
-
         Ok(())
     }
 }
@@ -4664,9 +4554,6 @@ mod payload_seam;
 
 #[path = "fs/listing.rs"]
 pub(crate) mod listing;
-
-#[path = "fs/manifest.rs"]
-pub(crate) mod manifest;
 
 #[path = "fs/manifest_listing.rs"]
 pub(crate) mod manifest_listing;

@@ -915,7 +915,7 @@ impl S3Driver for TagBridgeDriver {
             .delete_object_conditional(bucket, key, if_match)
             .await
     }
-    async fn tag_object_store(
+    async fn object_store(
         &self,
         _bucket: &str,
         prefix: &str,

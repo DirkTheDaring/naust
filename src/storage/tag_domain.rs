@@ -256,7 +256,19 @@ fn translate_store_error(err: StoreError, what: &str) -> StorageError {
         StoreError::InvalidInput { message } => {
             StorageError::internal_invariant(format!("{what}: {message}"))
         }
-        StoreError::Backend { message, .. } => StorageError::backend(format!("{what}: {message}")),
+        StoreError::Backend { .. } => {
+            // RESTORED (Phase 4 reconciliation of an unnoticed Phase 3 row):
+            // the filesystem backend historically classified ENOSPC as
+            // InsufficientStorage (HTTP 507); detect it structurally from
+            // the preserved io::Error source chain.
+            if crate::storage::store_common::store_error_is_storage_full(&err) {
+                return StorageError::InsufficientStorage;
+            }
+            let StoreError::Backend { message, .. } = err else {
+                unreachable!()
+            };
+            StorageError::backend(format!("{what}: {message}"))
+        }
     }
 }
 

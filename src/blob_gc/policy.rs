@@ -889,8 +889,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{err:?}").contains("MaxEntries(1)"),
-            "contained reader must enforce configured directory budget limit = 1"
+            format!("{err:?}").contains("directory enumeration exceeded the adapter's limits"),
+            "contained reader must enforce configured directory budget limit = 1, got {err:?}"
         );
 
         // Contained GC discovery uses independent GC limits (not public listing limits), discovering all 5 manifests

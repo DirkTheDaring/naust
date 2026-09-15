@@ -13,10 +13,12 @@ use tokio::io::AsyncRead;
 
 pub(crate) mod facade;
 pub mod fs;
+pub(crate) mod manifest_domain;
 pub mod mutation_authority;
 pub mod ports;
 pub mod repo_membership;
 pub mod s3;
+pub(crate) mod store_common;
 pub(crate) mod tag_domain;
 pub mod upload_session;
 

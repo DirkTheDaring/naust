@@ -2990,7 +2990,7 @@ mod tests {
                 assert!(
                     storage_err
                         .to_string()
-                        .contains("enumeration resource limit exceeded"),
+                        .contains("directory enumeration exceeded the adapter's limits"),
                     "expected budget exhaustion error, got: {storage_err:?}"
                 );
             }

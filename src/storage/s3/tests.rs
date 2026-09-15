@@ -925,7 +925,7 @@ impl S3Driver for TagBridgeDriver {
             .delete_object_conditional(bucket, key, if_match)
             .await
     }
-    async fn tag_object_store(
+    async fn object_store(
         &self,
         _bucket: &str,
         prefix: &str,
@@ -3939,7 +3939,8 @@ async fn test_detect_manifest_media_type_malformed_json_is_corrupt_data() {
     let expected_err = serde_json::from_slice::<serde_json::Value>(malformed_bytes).unwrap_err();
     let expected_message = expected_err.to_string();
 
-    let res = storage.detect_manifest_media_type(malformed_bytes).await;
+    let _ = &storage;
+    let res = crate::storage::manifest_domain::detect_manifest_media_type(malformed_bytes);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(
