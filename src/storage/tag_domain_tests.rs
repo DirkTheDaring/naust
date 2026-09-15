@@ -35,6 +35,11 @@ fn d(hex: &str) -> Digest {
     Digest::parse(&format!("sha256:{hex}")).unwrap()
 }
 
+/// The `test_hooks` seams are process-global: tests that install a hook
+/// serialize on this lock so a concurrent test cannot overwrite another's
+/// interposition (same pattern as the storage-fs fault-table lock).
+static HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
@@ -592,6 +597,7 @@ async fn shared_conditional_delete() {
 /// semantics — identically on both backends.
 #[tokio::test]
 async fn shared_conditional_delete_replacement_race() {
+    let _hook_guard = HOOK_LOCK.lock().await;
     for b in both() {
         let n = b.name();
         let repo = match b {
@@ -1170,4 +1176,236 @@ async fn s3_vanished_listing_candidate_omitted() {
         "vanished candidate omitted, page otherwise intact"
     );
     assert!(next.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 semantic reconciliation: cleanup replacement timelines (§15) and
+// Replace race outcomes (§11)
+// ---------------------------------------------------------------------------
+
+const MANIFEST_JSON: &[u8] =
+    br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+
+/// Timeline: cleanup observes tag t -> X (matching the deleted digest); a
+/// replacement B -> Y lands between inspection and the conditional delete.
+/// B must survive — observing A never authorizes deleting an unobserved B.
+#[tokio::test]
+async fn shared_cleanup_replacement_pointing_elsewhere_survives() {
+    let _hook_guard = HOOK_LOCK.lock().await;
+    for b in both() {
+        let n = b.name();
+        let repo = match b {
+            Backend::Fs { .. } => "clnrace-fs",
+            Backend::S3 { .. } => "clnrace-s3",
+        };
+        let x = d(HEX1);
+        b.put_manifest(repo, &x, bytes::Bytes::from_static(MANIFEST_JSON))
+            .await;
+        b.set_tag(repo, "t", &x).await.unwrap();
+
+        let replacement = format!("sha256:{HEX2}\n");
+        {
+            let repl = replacement.clone();
+            let hook_repo = repo.to_string();
+            match &b {
+                Backend::Fs { root, .. } => {
+                    let path = root.join("repos").join(repo).join("tags").join("t");
+                    super::test_hooks::set_cleanup_boundary(move |r, t| {
+                        if r == hook_repo && t == "t" {
+                            std::fs::write(&path, repl.as_bytes()).unwrap();
+                        }
+                    });
+                }
+                Backend::S3 { driver, .. } => {
+                    let driver = driver.clone();
+                    let key = format!("repos/{repo}/tags/t");
+                    super::test_hooks::set_cleanup_boundary(move |r, t| {
+                        if r == hook_repo && t == "t" {
+                            driver.objects.lock().unwrap().insert(
+                                key.clone(),
+                                (
+                                    bytes::Bytes::from(repl.clone().into_bytes()),
+                                    "\"replacement\"".to_string(),
+                                ),
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
+        b.delete_manifest(repo, &x)
+            .await
+            .expect("cleanup is best-effort; a lost race is not an error");
+        super::test_hooks::clear_cleanup_boundary();
+
+        assert_eq!(
+            b.read_raw(repo, "t").unwrap(),
+            replacement.clone().into_bytes(),
+            "[{n}] replacement B -> Y survives the cleanup window"
+        );
+    }
+}
+
+/// Timeline: the replacement B ALSO points at the deleted digest X. Accepted
+/// result: B survives THIS best-effort pass (its generation was never
+/// observed); the lifecycle layer's snapshot/proof passes own re-matching.
+#[tokio::test]
+async fn shared_cleanup_replacement_same_target_survives_this_pass() {
+    let _hook_guard = HOOK_LOCK.lock().await;
+    for b in both() {
+        let n = b.name();
+        let repo = match b {
+            Backend::Fs { .. } => "clnsame-fs",
+            Backend::S3 { .. } => "clnsame-s3",
+        };
+        let x = d(HEX1);
+        b.put_manifest(repo, &x, bytes::Bytes::from_static(MANIFEST_JSON))
+            .await;
+        b.set_tag(repo, "t", &x).await.unwrap();
+
+        // Replacement with the SAME canonical bytes: a NEW backend generation.
+        let same = format!("sha256:{HEX1}\n");
+        {
+            let repl = same.clone();
+            let hook_repo = repo.to_string();
+            match &b {
+                Backend::Fs { root, .. } => {
+                    let path = root.join("repos").join(repo).join("tags").join("t");
+                    super::test_hooks::set_cleanup_boundary(move |r, t| {
+                        if r == hook_repo && t == "t" {
+                            // Recreate the leaf so even identical bytes are a
+                            // distinct generation (fresh inode/mtime).
+                            std::fs::remove_file(&path).unwrap();
+                            std::fs::write(&path, repl.as_bytes()).unwrap();
+                        }
+                    });
+                }
+                Backend::S3 { driver, .. } => {
+                    let driver = driver.clone();
+                    let key = format!("repos/{repo}/tags/t");
+                    super::test_hooks::set_cleanup_boundary(move |r, t| {
+                        if r == hook_repo && t == "t" {
+                            driver.objects.lock().unwrap().insert(
+                                key.clone(),
+                                (
+                                    bytes::Bytes::from(repl.clone().into_bytes()),
+                                    "\"replacement-gen\"".to_string(),
+                                ),
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
+        b.delete_manifest(repo, &x).await.unwrap();
+        super::test_hooks::clear_cleanup_boundary();
+
+        assert_eq!(
+            b.read_raw(repo, "t").unwrap(),
+            same.clone().into_bytes(),
+            "[{n}] an unobserved same-target replacement generation survives this pass"
+        );
+    }
+}
+
+/// Timeline: the matching candidate vanishes between inspection and delete —
+/// the conditional delete reports absence and the pass tolerates it.
+#[tokio::test]
+async fn shared_cleanup_candidate_vanishes_in_window() {
+    let _hook_guard = HOOK_LOCK.lock().await;
+    for b in both() {
+        let n = b.name();
+        let repo = match b {
+            Backend::Fs { .. } => "clnvan-fs",
+            Backend::S3 { .. } => "clnvan-s3",
+        };
+        let x = d(HEX1);
+        b.put_manifest(repo, &x, bytes::Bytes::from_static(MANIFEST_JSON))
+            .await;
+        b.set_tag(repo, "t", &x).await.unwrap();
+        {
+            let hook_repo = repo.to_string();
+            match &b {
+                Backend::Fs { root, .. } => {
+                    let path = root.join("repos").join(repo).join("tags").join("t");
+                    super::test_hooks::set_cleanup_boundary(move |r, t| {
+                        if r == hook_repo && t == "t" {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    });
+                }
+                Backend::S3 { driver, .. } => {
+                    let driver = driver.clone();
+                    let key = format!("repos/{repo}/tags/t");
+                    super::test_hooks::set_cleanup_boundary(move |r, t| {
+                        if r == hook_repo && t == "t" {
+                            driver.objects.lock().unwrap().remove(&key);
+                        }
+                    });
+                }
+            }
+        }
+        b.delete_manifest(repo, &x)
+            .await
+            .expect("[cleanup] vanish in the window is tolerated");
+        super::test_hooks::clear_cleanup_boundary();
+        assert!(b.read_raw(repo, "t").is_none(), "[{n}]");
+    }
+}
+
+/// §11 Replace race: concurrent Replace(B) / Replace(C) over existing A.
+/// Final state is exactly one racer's canonical bytes; every outcome is
+/// Replaced with a `previous` naming one of the involved digests (never an
+/// invented value, never Created/Unchanged); attribution beyond that is
+/// best-effort (no supported caller consumes it — see the reconciliation
+/// call-graph evidence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_replace_race_outcomes() {
+    let hex_a = HEX1;
+    let hex_b = HEX2;
+    let hex_c = "3333333333333333333333333333333333333333333333333333333333333333";
+    for b in [Arc::new(fs_backend()), Arc::new(s3_backend())] {
+        let n = b.name();
+        b.set_tag("rprace", "t", &d(hex_a)).await.unwrap();
+
+        let b1 = b.clone();
+        let h1 = tokio::spawn(async move {
+            b1.mutate_tag("rprace", "t", &d(HEX2), TagMutationPolicy::Replace)
+                .await
+        });
+        let b2 = b.clone();
+        let h2 = tokio::spawn(async move {
+            let hex_c = "3333333333333333333333333333333333333333333333333333333333333333";
+            b2.mutate_tag("rprace", "t", &d(hex_c), TagMutationPolicy::Replace)
+                .await
+        });
+        let (r1, r2) = tokio::join!(h1, h2);
+        let outcomes = [(r1.unwrap().unwrap(), hex_b), (r2.unwrap().unwrap(), hex_c)];
+
+        let final_bytes = b.read_raw("rprace", "t").unwrap();
+        let final_s = String::from_utf8(final_bytes).unwrap();
+        let final_digest = Digest::parse(final_s.trim()).unwrap();
+        assert!(
+            final_digest == d(hex_b) || final_digest == d(hex_c),
+            "[{n}] final state is one racer's digest, canonical bytes intact"
+        );
+
+        for (outcome, own_hex) in outcomes {
+            match outcome {
+                TagMutation::Replaced { previous } => {
+                    assert!(
+                        [hex_a, hex_b, hex_c]
+                            .iter()
+                            .any(|h| previous == d(h) && previous != d(own_hex)),
+                        "[{n}] previous names another involved digest, got {previous:?}"
+                    );
+                }
+                other => panic!(
+                    "[{n}] Replace over an existing valid tag reports Replaced, got {other:?}"
+                ),
+            }
+        }
+    }
 }

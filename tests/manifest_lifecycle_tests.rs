@@ -6138,3 +6138,353 @@ async fn test_outer_caller_aborts_mutation_on_pending_recovery_tag_listing_failu
         other => panic!("expected Storage(Internal(Backend)), got {other:?}"),
     }
 }
+
+// =========================================================================
+// Phase 3 semantic reconciliation: legacy persisted S3 ETag version tokens
+// =========================================================================
+//
+// Pre-Phase-3 S3 deployments persisted the object ETag as
+// TagSnapshot.observed_version inside lifecycle journals. Phase 3's shared
+// tag domain issues raw-byte SHA-256 registry tokens, so a legacy journal's
+// token can never match after upgrade. These tests seed exact
+// historical-style persisted state and drive the PRODUCTION recovery entry
+// point (recover_and_ensure_index_healthy) over the REAL S3ObjectStore
+// adapter (mock client) and the real filesystem storage, proving:
+//   - a stale/legacy token can only no-op (never deletes a replacement);
+//   - the TagsSnapshotted fresh-read sweep converges without any token;
+//   - the journal is deleted and repeated restarts are no-ops (no wedging).
+
+mod legacy_s3_token_recovery {
+    use super::*;
+    use support::s3_mock::TagBridgeDriver;
+
+    const XHEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const YHEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn s3_storage_with_tag_bridge() -> (Arc<S3Storage>, Arc<MockS3Driver>) {
+        let driver = Arc::new(MockS3Driver::new(1000));
+        let storage = Arc::new(S3Storage::new_with_driver(
+            Some("test-bucket".to_string()),
+            "".to_string(),
+            50 * 1024 * 1024,
+            Arc::new(TagBridgeDriver::new(driver.clone())),
+        ));
+        (storage, driver)
+    }
+
+    fn d(hex: &str) -> Digest {
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    fn legacy_journal(
+        repo: &str,
+        target: &Digest,
+        tag: &str,
+        legacy_token: &str,
+    ) -> LifecycleJournalRecord {
+        LifecycleJournalRecord {
+            op_id: "legacy-op".to_string(),
+            repo: CanonicalRepoName::parse(repo).unwrap(),
+            op_kind: LifecycleOpKind::DeleteManifest,
+            target_digest: target.clone(),
+            target_reference: None,
+            phase: LifecyclePhase::TagsSnapshotted,
+            owner_id: "legacy-owner".to_string(),
+            lease_expiry_unix_secs: 9999999999,
+            started_unix_secs: 100,
+            updated_unix_secs: 100,
+            relevant_tags: vec![TagSnapshot {
+                tag: tag.to_string(),
+                // EXACT historical S3 form: quote-trimmed object ETag.
+                observed_version: legacy_token.to_string(),
+                target_digest: target.clone(),
+                deleted: false,
+            }],
+            subject_digest: None,
+            artifact_type: None,
+            annotations: None,
+            media_type: None,
+            manifest_size: None,
+        }
+    }
+
+    async fn seed_s3(driver: &MockS3Driver, repo: &str, target: &Digest) {
+        // Old-layout physical seeding: manifest object + nothing else.
+        driver.objects.lock().unwrap().insert(
+            format!("repos/{repo}/manifests/{}", target.hex()),
+            (
+                Bytes::from_static(
+                    br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#,
+                ),
+                "\"m1\"".to_string(),
+            ),
+        );
+    }
+
+    fn service_over(storage: Arc<S3Storage>) -> ManifestLifecycleService {
+        ManifestLifecycleService::new(
+            storage,
+            None,
+            registry_rust::consistency::ConsistencyCoordinator::new(),
+        )
+    }
+
+    /// Unchanged tag: the legacy-token conditional delete no-ops
+    /// (PreconditionFailed, discarded), and the token-free TagsSnapshotted
+    /// sweep deletes the tag that still points at the deleted digest.
+    /// Recovery converges: tag gone, manifest gone, journal gone.
+    #[tokio::test]
+    async fn legacy_token_unchanged_tag_converges_via_fresh_sweep() {
+        let repo = "legacy/unchanged";
+        let (storage, driver) = s3_storage_with_tag_bridge();
+        let x = d(XHEX);
+        seed_s3(&driver, repo, &x).await;
+        // Old-layout tag object pointing at X.
+        driver.objects.lock().unwrap().insert(
+            format!("repos/{repo}/tags/latest"),
+            (
+                Bytes::from(format!("sha256:{XHEX}\n")),
+                "\"legacy-etag-7\"".to_string(),
+            ),
+        );
+        let journal = legacy_journal(repo, &x, "latest", "legacy-etag-7");
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        let service = service_over(storage.clone());
+        service
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+
+        assert!(
+            !driver
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!("repos/{repo}/tags/latest")),
+            "tag pointing at the deleted digest is removed by the token-free sweep"
+        );
+        assert!(
+            !driver
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!("repos/{repo}/manifests/{}", x.hex())),
+            "manifest deletion completed"
+        );
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "journal deleted: recovery converged"
+        );
+    }
+
+    /// Replaced tag: the legacy token refers to generation A; the current
+    /// tag points at a DIFFERENT digest B. The stale token must not delete
+    /// the replacement, the sweep must not match it, and recovery must still
+    /// converge (journal deleted).
+    #[tokio::test]
+    async fn legacy_token_replaced_tag_replacement_survives() {
+        let repo = "legacy/replaced";
+        let (storage, driver) = s3_storage_with_tag_bridge();
+        let x = d(XHEX);
+        seed_s3(&driver, repo, &x).await;
+        let replacement = format!("sha256:{YHEX}\n");
+        driver.objects.lock().unwrap().insert(
+            format!("repos/{repo}/tags/latest"),
+            (Bytes::from(replacement.clone()), "\"new-gen\"".to_string()),
+        );
+        let journal = legacy_journal(repo, &x, "latest", "legacy-etag-of-A");
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        let service = service_over(storage.clone());
+        service
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver
+                .objects
+                .lock()
+                .unwrap()
+                .get(&format!("repos/{repo}/tags/latest"))
+                .map(|(b, _)| b.to_vec()),
+            Some(replacement.into_bytes()),
+            "replacement tag B survives the legacy token AND the sweep"
+        );
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "journal deleted despite the no-op: recovery converged"
+        );
+    }
+
+    /// Deleted tag: legacy token persisted but the tag is already absent.
+    /// Recovery converges (conditional delete reports absence, discarded;
+    /// sweep finds nothing; journal deleted).
+    #[tokio::test]
+    async fn legacy_token_absent_tag_converges() {
+        let repo = "legacy/absent";
+        let (storage, driver) = s3_storage_with_tag_bridge();
+        let x = d(XHEX);
+        seed_s3(&driver, repo, &x).await;
+        let journal = legacy_journal(repo, &x, "latest", "legacy-etag-9");
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+            .await
+            .unwrap();
+
+        let service = service_over(storage.clone());
+        service
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "journal deleted: absent-tag recovery converged"
+        );
+    }
+
+    /// Repeated restart: after one converged recovery the journal is gone, a
+    /// second production recovery pass is a no-op, and re-seeding the SAME
+    /// legacy journal converges again — legacy state cannot create a
+    /// permanent non-convergent loop.
+    #[tokio::test]
+    async fn legacy_token_repeated_restart_no_wedge() {
+        let repo = "legacy/restart";
+        let (storage, driver) = s3_storage_with_tag_bridge();
+        let x = d(XHEX);
+        seed_s3(&driver, repo, &x).await;
+        driver.objects.lock().unwrap().insert(
+            format!("repos/{repo}/tags/latest"),
+            (
+                Bytes::from(format!("sha256:{XHEX}\n")),
+                "\"legacy-etag-1\"".to_string(),
+            ),
+        );
+        let journal = legacy_journal(repo, &x, "latest", "legacy-etag-1");
+        let journal_bytes = serde_json::to_vec(&journal).unwrap();
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(journal_bytes.clone()))
+            .await
+            .unwrap();
+
+        // Restart 1: converges.
+        let service = service_over(storage.clone());
+        service
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Restart 2: no journal, recovery is a no-op.
+        let service2 = service_over(storage.clone());
+        service2
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+
+        // Adversarial: the same legacy journal resurfaces (e.g. restored
+        // backup). Tag and manifest are already gone; recovery converges
+        // again instead of wedging.
+        storage
+            .write_lifecycle_journal(repo, Bytes::from(journal_bytes))
+            .await
+            .unwrap();
+        let service3 = service_over(storage.clone());
+        service3
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "resurfaced legacy journal converges again - no permanent loop"
+        );
+    }
+
+    /// FS analogue with a format-alien token (the FS legacy token format was
+    /// already the raw-byte SHA-256; this pins that ANY unrecognizable
+    /// persisted token degrades to the same safe no-op + fresh-sweep path).
+    #[tokio::test]
+    async fn legacy_token_fs_bogus_token_converges_and_replacement_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = "legacy-fs";
+        let x = d(XHEX);
+
+        // Old-layout physical seeding.
+        let repo_dir = dir.path().join("data").join("repos").join(repo);
+        std::fs::create_dir_all(repo_dir.join("manifests")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("tags")).unwrap();
+        std::fs::write(
+            repo_dir.join("manifests").join(x.hex()),
+            br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#,
+        )
+        .unwrap();
+        // Tag REPLACED after the journal snapshot: points at Y, not X.
+        std::fs::write(
+            repo_dir.join("tags").join("latest"),
+            format!("sha256:{YHEX}\n"),
+        )
+        .unwrap();
+
+        {
+            // Pre-restart process: persist the legacy journal, then drop the
+            // service and index (releases the sled lock).
+            let (storage, _ref_index, _service) = setup_test_service(&dir).await;
+            let journal = legacy_journal(repo, &x, "latest", "not-a-sha256-token");
+            storage
+                .write_lifecycle_journal(repo, Bytes::from(serde_json::to_vec(&journal).unwrap()))
+                .await
+                .unwrap();
+        }
+
+        // Restart simulation: fresh service over the same durable state.
+        let (storage, _ref_index, service) = setup_test_service(&dir).await;
+        service
+            .recover_and_ensure_index_healthy(repo)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(repo_dir.join("tags").join("latest")).unwrap(),
+            format!("sha256:{YHEX}\n").into_bytes(),
+            "replacement tag survives the bogus persisted token and the sweep"
+        );
+        assert!(
+            storage
+                .read_lifecycle_journal(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "journal deleted: recovery converged"
+        );
+    }
+}

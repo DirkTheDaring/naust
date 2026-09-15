@@ -484,6 +484,28 @@ pub(crate) mod test_hooks {
             hook(repo, tag);
         }
     }
+
+    static CLEANUP_BOUNDARY: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Interposition seam between the cleanup scan's matching inspection and
+    /// its version-conditional best-effort delete, with `(repo, tag)`.
+    pub(crate) fn set_cleanup_boundary<F>(f: F)
+    where
+        F: Fn(&str, &str) + Send + Sync + 'static,
+    {
+        *CLEANUP_BOUNDARY.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    pub(crate) fn clear_cleanup_boundary() {
+        *CLEANUP_BOUNDARY.lock().unwrap() = None;
+    }
+
+    pub(crate) fn fire_cleanup_boundary(repo: &str, tag: &str) {
+        let hook = CLEANUP_BOUNDARY.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(repo, tag);
+        }
+    }
 }
 
 /// Conditional tag deletion — the registry version precondition composed
@@ -724,7 +746,17 @@ pub(crate) async fn delete_manifest_tag_cleanup(
     let leaves = collect_tag_leaves(store, cfg, repo).await?;
     for name in leaves {
         let key = tag_key(repo, &name)?;
-        let read = match store.read(&key, cfg.max_payload_bytes).await {
+        // Version-conditional inspect->delete coherence (Phase 3 semantic
+        // reconciliation): the bytes and the backend-private version come
+        // from ONE observed generation, and the best-effort delete is
+        // conditional on that exact generation. Observing tag A can
+        // therefore never authorize deleting an unobserved replacement B —
+        // a replacement landing after inspection survives (the backend
+        // reports PreconditionFailed, which this best-effort pass ignores
+        // exactly like the historical ignored unlink result). The retired
+        // FS scan approximated this with one retained directory authority;
+        // the retired S3 scan had no protection at all.
+        let read = match store.read_with_version(&key, cfg.max_payload_bytes).await {
             Ok(Some(r)) => r,
             Ok(None) => continue,
             Err(e) => return Err(translate_store_error(e, "tag cleanup read")),
@@ -738,7 +770,9 @@ pub(crate) async fn delete_manifest_tag_cleanup(
             }
         };
         if content.trim() == digest_str {
-            let _ = store.delete(&key).await;
+            #[cfg(test)]
+            test_hooks::fire_cleanup_boundary(repo, &name);
+            let _ = store.delete_if_version(&key, &read.version).await;
         }
     }
     Ok(())
