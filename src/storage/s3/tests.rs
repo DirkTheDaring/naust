@@ -3536,19 +3536,28 @@ async fn test_s3_membership_candidate_transition_racing_activation_fails_safe_on
     );
     storage.link_repo_blob(&rec).await.unwrap();
 
-    // Inject hook to simulate concurrent modification (etag change) during set_candidate
+    // Phase 6: simulate a REAL concurrent modification — the hook replaces
+    // the record with a new generation between the domain's versioned read
+    // and its conditional replace, so the precondition genuinely fails.
     let canonical_racing =
         crate::registry::canonical_name::CanonicalRepoName::parse("racing-repo").unwrap();
     let key = storage.repo_blob_key(&canonical_racing, &digest);
     let key_clone = key.clone();
+    let driver_for_hook = driver.clone();
+    let racing_bytes = {
+        let mut racing = rec.clone();
+        racing.created_at_unix_secs = 1;
+        bytes::Bytes::from(serde_json::to_vec(&racing).unwrap())
+    };
+    let racing_for_check = racing_bytes.clone();
     driver.set_hook_before(move |method, k| {
         if method == "put_object" && k == key_clone {
-            Some(StorageError::conflict(
-                "412 PreconditionFailed: ETag mismatch",
-            ))
-        } else {
-            None
+            driver_for_hook.objects.lock().unwrap().insert(
+                k.to_string(),
+                (racing_bytes.clone(), "\"racing-generation\"".to_string()),
+            );
         }
+        None
     });
 
     let res = storage
@@ -3557,7 +3566,18 @@ async fn test_s3_membership_candidate_transition_racing_activation_fails_safe_on
     assert_eq!(
         res.unwrap(),
         false,
-        "412 ETag mismatch on candidate transition must fail-safe returning Ok(false)"
+        "lost precondition on candidate transition must fail-safe returning Ok(false)"
+    );
+    driver.clear_hooks();
+    assert_eq!(
+        driver
+            .objects
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|(b, _)| b.clone()),
+        Some(racing_for_check),
+        "the racing generation survives byte-identically"
     );
 }
 
@@ -4252,7 +4272,7 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         Some("test-bucket".to_string()),
         "".to_string(),
         100_000_000,
-        driver1.clone(),
+        Arc::new(TagBridgeDriver::new(driver1.clone())),
     );
     let malformed_bytes = b"{{{ malformed membership json";
     driver1.objects.lock().unwrap().insert(
@@ -4271,8 +4291,9 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         crate::storage::repo_membership::RepoBlobMembershipRecord,
     >(malformed_bytes)
     .unwrap_err();
-    let expected_get_msg =
-        format!("corrupt membership record in s3 key {key}: {expected_parse_err}");
+    // Phase 6: the shared domain's point-read message carries the record
+    // key without the retired backend-specific "s3 key" wording.
+    let expected_get_msg = format!("corrupt membership record in {key}: {expected_parse_err}");
     assert_eq!(
         err_get.internal_kind(),
         Some(crate::storage::StorageErrorKind::CorruptData)
@@ -4289,7 +4310,7 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         Some("test-bucket".to_string()),
         "".to_string(),
         100_000_000,
-        driver2.clone(),
+        Arc::new(TagBridgeDriver::new(driver2.clone())),
     );
     let record = crate::storage::repo_membership::RepoBlobMembershipRecord::new_upload(
         canonical.clone(),
@@ -4318,10 +4339,13 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         err_backend.internal_kind(),
         Some(crate::storage::StorageErrorKind::Backend)
     );
-    assert_eq!(err_backend.message(), Some("s3 service 500 error"));
-    assert_eq!(
-        err_backend.to_string(),
-        "internal error: s3 service 500 error"
+    // Phase 6: the injected cause survives inside the shared translation's
+    // "membership write: ..." wrapper (the retired path surfaced it bare).
+    assert!(
+        err_backend.message().is_some_and(
+            |m| m.starts_with("membership write: ") && m.contains("s3 service 500 error")
+        ),
+        "cause preserved: {err_backend:?}"
     );
 
     // 3. Underlying permission failure during candidate mutation -> PermissionDenied
@@ -4330,7 +4354,7 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         Some("test-bucket".to_string()),
         "".to_string(),
         100_000_000,
-        driver3.clone(),
+        Arc::new(TagBridgeDriver::new(driver3.clone())),
     );
     driver3.objects.lock().unwrap().insert(
         key.clone(),
@@ -4358,10 +4382,11 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         err_perm.internal_kind(),
         Some(crate::storage::StorageErrorKind::PermissionDenied)
     );
-    assert_eq!(err_perm.message(), Some("s3:PutObject access denied"));
-    assert_eq!(
-        err_perm.to_string(),
-        "internal error: s3:PutObject access denied"
+    assert!(
+        err_perm.message().is_some_and(
+            |m| m.starts_with("membership write: ") && m.contains("s3:PutObject access denied")
+        ),
+        "cause preserved: {err_perm:?}"
     );
 
     // 4. Concurrently deleted membership record during pagination is skipped gracefully
@@ -4417,7 +4442,7 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         Some("test-bucket".to_string()),
         "".to_string(),
         100_000_000,
-        driver5.clone(),
+        Arc::new(TagBridgeDriver::new(driver5.clone())),
     );
     driver5.objects.lock().unwrap().insert(
         key.clone(),
@@ -4426,13 +4451,24 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
             "etag-mem-5".to_string(),
         ),
     );
+    // Phase 6: a REAL replacement between the versioned read and the
+    // conditional write (the retired test injected an opaque conflict error).
     let hook_key5 = key.clone();
+    let driver5_for_hook = driver5.clone();
+    let replaced5 = {
+        let mut r = record.clone();
+        r.created_at_unix_secs = 5;
+        bytes::Bytes::from(serde_json::to_vec(&r).unwrap())
+    };
     driver5.set_hook_before(move |method, k| {
         if method == "put_object" && k == hook_key5 {
-            Some(StorageError::conflict("opaque-membership-conflict"))
-        } else {
-            None
+            driver5_for_hook
+                .objects
+                .lock()
+                .unwrap()
+                .insert(k.to_string(), (replaced5.clone(), "\"gen-5b\"".to_string()));
         }
+        None
     });
     let res_set_conf = storage5
         .set_membership_candidate("test-repo", &digest, 200)
@@ -4445,7 +4481,7 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         Some("test-bucket".to_string()),
         "".to_string(),
         100_000_000,
-        driver6.clone(),
+        Arc::new(TagBridgeDriver::new(driver6.clone())),
     );
     let mut candidate_record = record.clone();
     candidate_record.mark_candidate(200);
@@ -4457,12 +4493,21 @@ async fn test_s3_membership_candidate_preserves_backend_and_permission_denied() 
         ),
     );
     let hook_key6 = key.clone();
+    let driver6_for_hook = driver6.clone();
+    let replaced6 = {
+        let mut r = candidate_record.clone();
+        r.created_at_unix_secs = 6;
+        bytes::Bytes::from(serde_json::to_vec(&r).unwrap())
+    };
     driver6.set_hook_before(move |method, k| {
         if method == "put_object" && k == hook_key6 {
-            Some(StorageError::conflict("opaque-membership-conflict"))
-        } else {
-            None
+            driver6_for_hook
+                .objects
+                .lock()
+                .unwrap()
+                .insert(k.to_string(), (replaced6.clone(), "\"gen-6b\"".to_string()));
         }
+        None
     });
     let res_clear_conf = storage6
         .clear_membership_candidate("test-repo", &digest)
@@ -5574,7 +5619,7 @@ async fn test_s3_unlink_repo_blob_failure_propagates_and_replacement_not_deleted
     // 1. Deletion failure propagates as Err (never a false `true`).
     let failing_key = record_key.clone();
     driver.set_hook_before(move |method, key| {
-        if method == "delete_object" && key == failing_key {
+        if method == "delete_object_if_match" && key == failing_key {
             Some(StorageError::backend("injected membership delete failure"))
         } else {
             None
@@ -5607,7 +5652,7 @@ async fn test_s3_unlink_repo_blob_failure_propagates_and_replacement_not_deleted
     let race_key = record_key.clone();
     let race_driver = driver.clone();
     driver.set_hook_before(move |method, key| {
-        if method == "delete_object" && key == race_key {
+        if method == "delete_object_if_match" && key == race_key {
             race_driver.objects.lock().unwrap().insert(
                 race_key.clone(),
                 (

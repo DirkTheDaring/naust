@@ -2379,8 +2379,11 @@ fn membership_digest(seed: u8) -> Digest {
     Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap()
 }
 
-/// Primary write failure: an ENOSPC on the temp-file write inside `write_leaf_atomic`
-/// surfaces as an error (no silent success) and leaves no destination behind.
+/// Publication failure surfaces: an ENOSPC on the publish rename (the
+/// destination-anchored step of the adapter's staged write; the temp-file
+/// staging now happens under the adapter's PRIVATE tmp tree with unique
+/// names and is pinned by the dependency's own suite) surfaces as
+/// `InsufficientStorage` and leaves no destination behind.
 #[tokio::test]
 async fn test_fs_atomic_primary_write_failure_surfaces_and_leaves_no_destination() {
     use crate::storage::repo_membership::{
@@ -2395,15 +2398,18 @@ async fn test_fs_atomic_primary_write_failure_surfaces_and_leaves_no_destination
     let digest = membership_digest(0x11);
     let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
 
-    arm(FaultPoint::AtomicWrite, Some(digest.hex()), 1, libc::ENOSPC);
+    arm(FaultPoint::RenameLeaf, Some(digest.hex()), 1, libc::ENOSPC);
     let err = storage
         .link_repo_blob(&record)
         .await
-        .expect_err("a primary write failure must surface, not silently succeed");
-    let _ = err;
+        .expect_err("a publication failure must surface, not silently succeed");
+    assert!(
+        matches!(err, StorageError::InsufficientStorage),
+        "ENOSPC keeps the InsufficientStorage classification, got {err:?}"
+    );
     assert!(
         !membership_record_path(&root, "repo", &digest).exists(),
-        "a failed primary write must not publish a destination record"
+        "a failed publication must not publish a destination record"
     );
 
     storage_fs::mutate::fault::reset();
@@ -2435,7 +2441,7 @@ async fn test_fs_atomic_rename_failure_preserves_prior_destination() {
     let mut mutated = original.clone();
     mutated.state = MembershipState::Candidate;
     mutated.unreferenced_since_unix_secs = Some(now_unix_secs());
-    arm(FaultPoint::AtomicRename, Some(digest.hex()), 1, libc::EIO);
+    arm(FaultPoint::RenameLeaf, Some(digest.hex()), 1, libc::EIO);
     storage
         .link_repo_blob(&mutated)
         .await
@@ -2461,9 +2467,13 @@ async fn test_fs_atomic_rename_failure_preserves_prior_destination() {
     storage_fs::mutate::fault::reset();
 }
 
-/// Secondary cleanup failure: when the publish rename fails AND the temp cleanup then
-/// also fails, the operation surfaces an error (the `CleanupFailed` combination is not
-/// swallowed) while the prior destination is still preserved.
+/// A failed publication leaves the OBJECT directory free of any staging
+/// residue and the prior destination intact. (The retired direct-staging
+/// shape could leave `.tmp.` residue in the record directory when its
+/// cleanup also failed — the `CleanupFailed` surfacing pin. The adapter
+/// stages under its PRIVATE tmp tree with unique names, so object
+/// directories structurally never contain staging entries; staging-cleanup
+/// mechanics are pinned by the dependency's own suite.)
 #[tokio::test]
 async fn test_fs_atomic_secondary_cleanup_failure_surfaces() {
     use crate::storage::repo_membership::{
@@ -2482,16 +2492,25 @@ async fn test_fs_atomic_secondary_cleanup_failure_surfaces() {
     storage.link_repo_blob(&original).await.unwrap();
     let original_bytes = std::fs::read(&path).unwrap();
 
-    // Rename fails, then the cleanup unlink of the temp also fails.
-    arm(FaultPoint::AtomicRename, Some(digest.hex()), 1, libc::EIO);
-    arm(FaultPoint::AtomicCleanup, Some(digest.hex()), 1, libc::EIO);
+    arm(FaultPoint::RenameLeaf, Some(digest.hex()), 1, libc::EIO);
     storage
         .link_repo_blob(&original)
         .await
-        .expect_err("a rename failure whose cleanup also fails must surface an error");
+        .expect_err("a failed publication must surface an error");
 
-    // The prior destination is still intact.
+    // The prior destination is intact and the record directory holds no
+    // staging residue of any kind.
     assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    let algo_dir = path.parent().unwrap();
+    let leftovers: Vec<_> = std::fs::read_dir(algo_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != &format!("{}.json", digest.hex()))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the object directory must never contain staging residue: {leftovers:?}"
+    );
 
     storage_fs::mutate::fault::reset();
 }
@@ -2512,8 +2531,8 @@ async fn test_fs_atomic_write_failure_retry_heals() {
     let digest = membership_digest(0x44);
     let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
 
-    // First attempt fails on the primary write (count 1).
-    arm(FaultPoint::AtomicWrite, Some(digest.hex()), 1, libc::ENOSPC);
+    // First attempt fails on the publication step (count 1).
+    arm(FaultPoint::RenameLeaf, Some(digest.hex()), 1, libc::ENOSPC);
     storage
         .link_repo_blob(&record)
         .await
@@ -14995,7 +15014,6 @@ mod membership_mutation_containment {
         encode_canonical_repo_key,
     };
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-    use storage_fs::FileName;
 
     fn d1() -> Digest {
         Digest::parse("sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1")
@@ -15263,15 +15281,18 @@ mod membership_mutation_containment {
             ("unlink", storage.unlink_repo_blob("symrepo", &digest).await),
         ] {
             let err = res.expect_err("symlinked key component must fail closed");
+            // Phase 6: the pinned adapter reports its containment refusal as
+            // PermissionDenied (the retired contained seam said Io — both are
+            // production-inert Internal kinds; accepted C2 convergence).
             assert!(
                 matches!(
                     err,
                     StorageError::Internal {
-                        kind: crate::storage::StorageErrorKind::Io,
+                        kind: crate::storage::StorageErrorKind::PermissionDenied,
                         ..
                     }
                 ),
-                "{op}: symlink escape -> Io error, got {err:?}"
+                "{op}: symlink escape -> PermissionDenied error, got {err:?}"
             );
         }
         assert_eq!(
@@ -15326,31 +15347,26 @@ mod membership_mutation_containment {
         );
     }
 
-    // CRITICAL same-authority regression (set): a membership-namespace
-    // replacement injected BETWEEN authority acquisition and inspection at the
-    // production seam (parse + membership_record_authority +
-    // set_membership_candidate_in) must not split the tree that is inspected
-    // from the tree that is mutated.
+    // Namespace-replacement coherence at the PUBLIC membership boundary
+    // (Phase 6 successor of the retired retained-authority seam regressions).
     //
-    //   BROKEN:   authority A -> independent re-resolution reads B -> write A
-    //   REQUIRED: authority A -> read A -> write A (tree B untouched)
+    // The retired implementation kept an in-flight transition wholly on the
+    // authority resolved BEFORE a membership-namespace replacement (tree A).
+    // The shared domain ties inspection and action together with a version
+    // precondition instead: the transition acts wholly on the generation it
+    // read — the CURRENT namespace (tree B) — and can never split "read tree
+    // X, write tree Y" or overwrite a generation it did not observe. Both
+    // shapes are coherent; the new one additionally cannot resurrect an
+    // abandoned tree (accepted C2 row of the Phase 6 semantic matrix).
     #[tokio::test]
-    async fn test_set_candidate_same_authority_across_namespace_replacement() {
+    async fn test_set_candidate_namespace_replacement_coherence() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let digest = d1();
         let rec_a = link(&storage, "race", &digest).await;
 
-        // Acquire the mutation authority (tree A).
-        let authority = storage
-            .membership_record_authority(&canonical("race"), &digest)
-            .await
-            .unwrap()
-            .expect("authority resolves for existing record");
-        let leaf = FileName::new(format!("{}.json", digest.hex())).unwrap();
-
-        // Injected boundary: replace the repository's membership namespace so
-        // pathname resolution now reaches tree B (distinguishable record).
+        // Replace the repository's membership namespace: pathname resolution
+        // now reaches tree B (distinguishable Active record).
         let key_dir = root
             .join("repo-memberships")
             .join("by-repo")
@@ -15368,50 +15384,38 @@ mod membership_mutation_containment {
         )
         .unwrap();
 
-        // Negative control: an independent re-resolution (the read a
-        // two-resolution shape would consume) observes tree B.
-        let re_read = storage
-            .get_repo_blob_membership("race", &digest)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            re_read.created_at_unix_secs, 42,
-            "re-resolving read observes the replacement tree at the injected boundary"
-        );
-
-        // Continue the production inner transition on the RETAINED authority.
+        // The transition acts WHOLLY on the current namespace (tree B): its
+        // read and its conditional write name the same generation.
         assert!(
-            FsStorage::set_membership_candidate_in(&authority, &leaf, 777)
+            storage
+                .set_membership_candidate("race", &digest, 777)
                 .await
-                .expect("inner set on retained authority"),
-            "transition applies against the retained tree"
+                .unwrap(),
+            "transition applies against the current tree"
         );
-
-        // Inspection AND rewrite stayed wholly on tree A.
-        let mut expect_a = rec_a.clone();
-        expect_a.state = MembershipState::Candidate;
-        expect_a.unreferenced_since_unix_secs = Some(777);
-        assert_eq!(
-            std::fs::read(moved_a.join("sha256").join(&leaf_name)).unwrap(),
-            serde_json::to_vec(&expect_a).unwrap(),
-            "read/modify/write remained on the retained authority's tree"
-        );
-        // Tree B untouched (still Active, created_at 42).
+        let mut expect_b = rec_b.clone();
+        expect_b.state = MembershipState::Candidate;
+        expect_b.unreferenced_since_unix_secs = Some(777);
         assert_eq!(
             std::fs::read(tree_b_algo.join(&leaf_name)).unwrap(),
-            serde_json::to_vec(&rec_b).unwrap(),
-            "replacement tree untouched by the in-flight transition"
+            serde_json::to_vec(&expect_b).unwrap(),
+            "inspection and action both landed on the current tree — no split"
+        );
+        // The abandoned tree is untouched: still the original Active record.
+        assert_eq!(
+            std::fs::read(moved_a.join("sha256").join(&leaf_name)).unwrap(),
+            serde_json::to_vec(&rec_a).unwrap(),
+            "abandoned tree untouched by the transition"
         );
     }
 
-    // CRITICAL same-authority regression (clear): tree A holds a Candidate
-    // record; tree B (post-replacement) holds an Active/no-since record. A
-    // two-resolution implementation would read tree B, take the already-active
-    // no-change short-circuit (Ok(false)), and leave tree A's candidate in
-    // place. The retained authority must read tree A and rewrite it to Active.
+    // Clear under the same replacement: the domain observes the CURRENT tree
+    // (B), whose Active/no-since record takes the no-change short-circuit —
+    // neither tree is mutated. (The retired retained-authority shape cleared
+    // the abandoned tree A's candidate instead; both outcomes are coherent,
+    // and the candidate state lives only on the abandoned tree either way.)
     #[tokio::test]
-    async fn test_clear_candidate_same_authority_across_namespace_replacement() {
+    async fn test_clear_candidate_namespace_replacement_coherence() {
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let digest = d1();
@@ -15420,14 +15424,9 @@ mod membership_mutation_containment {
             .set_membership_candidate("race-clr", &digest, 55)
             .await
             .unwrap();
-
-        let authority = storage
-            .membership_record_authority(&canonical("race-clr"), &digest)
-            .await
-            .unwrap()
-            .expect("authority resolves for existing record");
-        let leaf_name = format!("{}.json", digest.hex());
-        let leaf = FileName::new(leaf_name.clone()).unwrap();
+        let mut cand_a = rec_a.clone();
+        cand_a.state = MembershipState::Candidate;
+        cand_a.unreferenced_since_unix_secs = Some(55);
 
         // Replace with tree B: Active record, no since (the no-change state).
         let key_dir = root
@@ -15440,43 +15439,32 @@ mod membership_mutation_containment {
         rec_b.created_at_unix_secs = 42;
         let tree_b_algo = key_dir.join("sha256");
         std::fs::create_dir_all(&tree_b_algo).unwrap();
+        let leaf_name = format!("{}.json", digest.hex());
         std::fs::write(
             tree_b_algo.join(&leaf_name),
             serde_json::to_vec(&rec_b).unwrap(),
         )
         .unwrap();
 
-        // Negative control: independent re-resolution observes tree B's
-        // Active/no-since record — the state that would short-circuit.
-        let re_read = storage
-            .get_repo_blob_membership("race-clr", &digest)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(re_read.state, MembershipState::Active);
-        assert_eq!(re_read.unreferenced_since_unix_secs, None);
-
-        // The retained authority reads tree A's CANDIDATE record and rewrites it.
+        // The current tree's record is already Active/no-since: no-change.
         assert!(
-            FsStorage::clear_membership_candidate_in(&authority, &leaf)
+            !storage
+                .clear_membership_candidate("race-clr", &digest)
                 .await
-                .expect("inner clear on retained authority"),
-            "clear applies against the retained tree (a tree-B read would have \
-             short-circuited with false)"
-        );
-
-        let mut expect_a = rec_a.clone();
-        expect_a.state = MembershipState::Active;
-        expect_a.unreferenced_since_unix_secs = None;
-        assert_eq!(
-            std::fs::read(moved_a.join("sha256").join(&leaf_name)).unwrap(),
-            serde_json::to_vec(&expect_a).unwrap(),
-            "candidate cleared on the retained authority's tree"
+                .unwrap(),
+            "current tree short-circuits; the removal never reaches across \
+             namespaces"
         );
         assert_eq!(
             std::fs::read(tree_b_algo.join(&leaf_name)).unwrap(),
             serde_json::to_vec(&rec_b).unwrap(),
-            "replacement tree untouched by the in-flight transition"
+            "current tree untouched by the no-change clear"
+        );
+        // The abandoned tree keeps its candidate record.
+        assert_eq!(
+            std::fs::read(moved_a.join("sha256").join(&leaf_name)).unwrap(),
+            serde_json::to_vec(&cand_a).unwrap(),
+            "abandoned tree untouched by the clear"
         );
     }
 }

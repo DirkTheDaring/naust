@@ -14,6 +14,7 @@ use tokio::io::AsyncRead;
 pub(crate) mod facade;
 pub mod fs;
 pub(crate) mod manifest_domain;
+pub(crate) mod membership_domain;
 pub mod mutation_authority;
 pub mod ports;
 pub(crate) mod referrer_domain;

@@ -2,7 +2,7 @@ use super::upload_session::*;
 use super::{
     BlobMeta, BlobObjectVersion, ConditionalDeleteResult, GcBlobCandidate, GcBlobPage, GcCursor,
     GcDeleteResult, GcQuarantineResult, GcStorage, GcStorageStrategy, ManifestMeta,
-    ReferrerDescriptor, RepoTimestamps, Storage, StorageError, StorageErrorKind, UploadMeta,
+    ReferrerDescriptor, RepoTimestamps, Storage, StorageError, UploadMeta,
 };
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
@@ -894,6 +894,19 @@ impl S3Storage {
         ))
     }
 
+    /// Shared membership domain over the migrated-family ObjectStore
+    /// (Phase 6, point operations only; the enumeration operations and the
+    /// `meta/` readiness/checkpoint state remain on the retained raw-driver
+    /// seams).
+    async fn membership_domain(
+        &self,
+    ) -> Result<crate::storage::membership_domain::MembershipDomain, StorageError> {
+        let store = self.migrated_object_store().await?;
+        Ok(crate::storage::membership_domain::MembershipDomain::new(
+            store,
+        ))
+    }
+
     fn key(&self, suffix: &str) -> String {
         let p = self.prefix.trim_matches('/');
         if p.is_empty() {
@@ -924,6 +937,11 @@ impl S3Storage {
         ))
     }
 
+    /// Physical membership-record key composition, retained for TEST
+    /// seeding only (production point operations moved to the shared
+    /// membership domain in Phase 6; the deferred listing seams enumerate by
+    /// prefix and GET listed keys verbatim).
+    #[cfg(test)]
     fn repo_blob_key(&self, repo: &CanonicalRepoName, digest: &Digest) -> String {
         self.key(&crate::storage::repo_membership::canonical_repo_membership_relpath(repo, digest))
     }
@@ -3350,38 +3368,19 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         digest: &Digest,
     ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
     {
-        let bucket = self.bucket()?;
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let key = self.repo_blob_key(&canonical, digest);
-        if let Some((bytes, _etag)) = self.driver.get_object(bucket, &key).await? {
-            let record = serde_json::from_slice::<
-                crate::storage::repo_membership::RepoBlobMembershipRecord,
-            >(&bytes)
-            .map_err(|e| {
-                StorageError::corrupt_data(format!(
-                    "corrupt membership record in s3 key {key}: {e}"
-                ))
-            })?;
-            return Ok(Some(record));
-        }
-
-        Ok(None)
+        self.membership_domain()
+            .await?
+            .get_repo_blob_membership(repo, digest)
+            .await
     }
 
     async fn link_repo_blob(
         &self,
         record: &crate::storage::repo_membership::RepoBlobMembershipRecord,
     ) -> Result<(), StorageError> {
-        let bucket = self.bucket()?;
-        let key = self.repo_blob_key(&record.repo, &record.digest);
-        let bytes = serde_json::to_vec(record)
-            .map_err(|e| StorageError::serialization(format!("serialize membership error: {e}")))?;
-
-        self.driver
-            .put_object_conditional(bucket, &key, Bytes::from(bytes), None, None)
-            .await?;
-        Ok(())
+        // Phase 6: the shared domain performs the frozen unconditional
+        // durable publication at the identical physical key.
+        self.membership_domain().await?.link_repo_blob(record).await
     }
 
     async fn set_membership_candidate(
@@ -3390,48 +3389,14 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         digest: &Digest,
         since_unix_secs: u64,
     ) -> Result<bool, StorageError> {
-        let bucket = self.bucket()?;
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let key = self.repo_blob_key(&canonical, digest);
-        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
-            let mut record = serde_json::from_slice::<
-                crate::storage::repo_membership::RepoBlobMembershipRecord,
-            >(&bytes)
-            .map_err(|e| {
-                StorageError::corrupt_data(format!("corrupt membership record in s3: {e}"))
-            })?;
-
-            if record.state != crate::storage::repo_membership::MembershipState::Candidate
-                || record.unreferenced_since_unix_secs != Some(since_unix_secs)
-            {
-                record.mark_candidate(since_unix_secs);
-                let new_bytes = serde_json::to_vec(&record).map_err(|e| {
-                    StorageError::serialization(format!("serialize membership error: {e}"))
-                })?;
-
-                match self
-                    .driver
-                    .put_object_conditional(bucket, &key, Bytes::from(new_bytes), Some(etag), None)
-                    .await
-                {
-                    Ok(_) => Ok(true),
-                    Err(StorageError::TagAlreadyExists) => Ok(false),
-                    Err(StorageError::Internal {
-                        kind: StorageErrorKind::Conflict,
-                        ..
-                    }) => {
-                        // Stale ETag: concurrent modification occurred, return false safely
-                        Ok(false)
-                    }
-                    Err(e) => Err(e),
-                }
-            } else {
-                Ok(false)
-            }
-        } else {
-            Ok(false)
-        }
+        // Phase 6: the shared conditional transition preserves the pinned
+        // precondition-loss -> Ok(false) contract (the retired ETag-guarded
+        // read-modify-write), now version-conditional through the shared
+        // ObjectStore.
+        self.membership_domain()
+            .await?
+            .set_membership_candidate(repo, digest, since_unix_secs)
+            .await
     }
 
     async fn clear_membership_candidate(
@@ -3439,83 +3404,21 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
         repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
-        let bucket = self.bucket()?;
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let key = self.repo_blob_key(&canonical, digest);
-        if let Some((bytes, etag)) = self.driver.get_object(bucket, &key).await? {
-            let mut record = serde_json::from_slice::<
-                crate::storage::repo_membership::RepoBlobMembershipRecord,
-            >(&bytes)
-            .map_err(|e| {
-                StorageError::corrupt_data(format!("corrupt membership record in s3: {e}"))
-            })?;
-
-            if record.state != crate::storage::repo_membership::MembershipState::Active
-                || record.unreferenced_since_unix_secs.is_some()
-            {
-                record.mark_active();
-                let new_bytes = serde_json::to_vec(&record).map_err(|e| {
-                    StorageError::serialization(format!("serialize membership error: {e}"))
-                })?;
-
-                match self
-                    .driver
-                    .put_object_conditional(bucket, &key, Bytes::from(new_bytes), Some(etag), None)
-                    .await
-                {
-                    Ok(_) => Ok(true),
-                    Err(StorageError::TagAlreadyExists) => Ok(false),
-                    Err(StorageError::Internal {
-                        kind: StorageErrorKind::Conflict,
-                        ..
-                    }) => {
-                        // Stale ETag: concurrent modification occurred, return false safely
-                        Ok(false)
-                    }
-                    Err(e) => Err(e),
-                }
-            } else {
-                Ok(false)
-            }
-        } else {
-            Ok(false)
-        }
+        self.membership_domain()
+            .await?
+            .clear_membership_candidate(repo, digest)
+            .await
     }
 
     async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
-        let bucket = self.bucket()?;
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let key = self.repo_blob_key(&canonical, digest);
-
-        // Filesystem-parity contract: Ok(true) only when an EXISTING membership
-        // record was removed; Ok(false) when absent; deletion failures
-        // propagate (the ledger gates reverse-index removal on `true`). The
-        // removal is conditional on the observed ETag, so a record replaced
-        // between the read and the delete can never be deleted under this
-        // observation. Within the supported coordination model (every
-        // membership mutation serialized by the consistency coordinator under
-        // the exclusive deployment writer lock) the precondition cannot fail;
-        // outside it the operation fails closed instead of deleting a
-        // replacement object.
-        let Some((_bytes, etag)) = self.driver.get_object(bucket, &key).await? else {
-            return Ok(false);
-        };
-        match self
-            .driver
-            .delete_object_conditional(bucket, &key, Some(etag))
+        // Phase 6: the parity-closure existence contract through the shared
+        // domain — observation with a generation, then a conditional delete
+        // of that observed generation. Ok(true) only when an existing record
+        // was removed; a replacement racing the removal survives (Conflict).
+        self.membership_domain()
             .await?
-        {
-            super::ConditionalDeleteResult::Deleted => Ok(true),
-            super::ConditionalDeleteResult::NotFound => Ok(false),
-            super::ConditionalDeleteResult::PreconditionFailed { current_version } => {
-                Err(StorageError::conflict(format!(
-                    "membership record {key} changed concurrently during unlink \
-                     (current version {current_version:?})"
-                )))
-            }
-        }
+            .unlink_repo_blob(repo, digest)
+            .await
     }
 
     async fn list_repo_blob_memberships_page(

@@ -882,7 +882,7 @@ mod tests {
     use super::*;
     use crate::storage::Storage;
     use crate::storage::ports::BlobUploadCoordinatorStoragePort;
-    use crate::storage::s3::tests::MockS3Driver;
+    use crate::storage::s3::tests::{MockS3Driver, TagBridgeDriver};
     use crate::storage::upload_session::UploadSessionStorage;
     use sha2::Digest as _;
     use tempfile::TempDir;
@@ -909,11 +909,14 @@ mod tests {
     #[tokio::test]
     async fn test_coordinator_s3_monolithic_upload() {
         let driver = Arc::new(MockS3Driver::new(1000));
+        // Phase 6: the finalize path writes membership through the shared
+        // domain over the migrated object store, so the mock driver is
+        // wrapped in the bridge that provides the object-store seam.
         let storage = Arc::new(crate::storage::s3::S3Storage::new_with_driver(
             Some("test-bucket".to_string()),
             "".to_string(),
             104857600,
-            driver.clone(),
+            Arc::new(TagBridgeDriver::new(driver.clone())),
         ));
         let config = BlobUploadCoordinatorConfig {
             signing_key: b"test-key".to_vec(),

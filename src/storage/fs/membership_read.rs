@@ -127,7 +127,7 @@ use crate::registry::digest::Digest;
 use crate::storage::StorageError;
 use crate::storage::repo_membership::{
     MigrationCheckpointRecord, RepoBlobMembershipRecord, canonical_all_memberships_prefix,
-    canonical_repo_membership_relpath, decode_canonical_repo_key, encode_canonical_repo_key,
+    decode_canonical_repo_key, encode_canonical_repo_key,
 };
 
 const READY_MARKER_KEY: &str = "meta/membership_ready.json";
@@ -219,26 +219,6 @@ async fn load_selected_record(
     };
     let bytes = drain_payload(payload, &format!("membership in {key_str}")).await?;
     parse_membership_record(&bytes, key_str)
-}
-
-/// Contained point read of one repository-blob membership record.
-pub(crate) async fn get_repo_blob_membership_impl(
-    ops: &(impl MembershipReadOps + ?Sized),
-    repo: &str,
-    digest: &Digest,
-) -> Result<Option<RepoBlobMembershipRecord>, StorageError> {
-    let canonical =
-        CanonicalRepoName::parse(repo).map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-    let key_str = canonical_repo_membership_relpath(&canonical, digest);
-    let key = parse_internal_key(&key_str)?;
-
-    let payload = match ops.open_payload(&key).await {
-        Ok(p) => p,
-        Err(ReadError::NotFound { .. }) => return Ok(None),
-        Err(other) => return Err(super::read_adapter::translate_payload_read_error(other)),
-    };
-    let bytes = drain_payload(payload, &format!("membership in {key_str}")).await?;
-    Ok(Some(parse_membership_record(&bytes, &key_str)?))
 }
 
 /// Requires a UTF-8 directory-entry name; the ambient implementation
@@ -775,61 +755,10 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // Point reads
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_fake_get_membership_roundtrip_missing_corrupt_and_rejection() {
-        let d = digest_n(1);
-        let rel = canonical_repo_membership_relpath(&canonical("myrepo"), &d);
-        let k = key(&rel);
-
-        // Valid round-trip.
-        let fake = RecordingFakeOps::new();
-        fake.script_payload(k.clone(), Ok(payload_of(record_bytes("myrepo", &d))));
-        let rec = get_repo_blob_membership_impl(&fake, "myrepo", &d)
-            .await
-            .unwrap()
-            .expect("record present");
-        assert_eq!(rec.repo.as_str(), "myrepo");
-        assert_eq!(rec.digest, d);
-
-        // Genuinely missing -> None.
-        let fake = RecordingFakeOps::new();
-        fake.script_payload(k.clone(), Err(ReadError::not_found(k.clone())));
-        assert!(
-            get_repo_blob_membership_impl(&fake, "myrepo", &d)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        // Malformed JSON -> CorruptData (preserved taxonomy).
-        let fake = RecordingFakeOps::new();
-        fake.script_payload(k.clone(), Ok(payload_of(b"not-json".to_vec())));
-        let err = get_repo_blob_membership_impl(&fake, "myrepo", &d)
-            .await
-            .unwrap_err();
-        assert_eq!(err.internal_kind(), Some(StorageErrorKind::CorruptData));
-
-        // Containment rejection -> propagates as Io, never None.
-        for code in [libc::ELOOP, libc::EXDEV] {
-            let fake = RecordingFakeOps::new();
-            fake.script_payload(k.clone(), Err(rejection(code)));
-            let err = get_repo_blob_membership_impl(&fake, "myrepo", &d)
-                .await
-                .unwrap_err();
-            assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
-        }
-
-        // Invalid repository grammar preserved.
-        let fake = RecordingFakeOps::new();
-        let err = get_repo_blob_membership_impl(&fake, "Bad_Repo!", &d)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StorageError::InvalidRepoName(_)));
-    }
+    // (The point-read seam moved to the shared membership domain in Phase 6;
+    // its taxonomy — absent -> None, corrupt -> CorruptData with the record
+    // key, grammar -> InvalidRepoName, adapter containment refusal fails
+    // closed — is pinned by the cross-backend membership_domain suite.)
 
     // ========================================================================
     // Per-repo page listing
@@ -1642,12 +1571,18 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
 
-            // Point reads must error, never report absence.
+            // Point reads must error, never report absence. (Phase 6: the
+            // point read routes through the shared domain over the pinned
+            // adapter, which reports its containment refusal as
+            // PermissionDenied — the retired seam said Io; accepted C2.)
             let err = storage
                 .get_repo_blob_membership("alpha", &d)
                 .await
                 .unwrap_err();
-            assert_eq!(err.internal_kind(), Some(StorageErrorKind::Io));
+            assert_eq!(
+                err.internal_kind(),
+                Some(StorageErrorKind::PermissionDenied)
+            );
 
             // Actual safety-relevant caller: the storage-only membership
             // ledger propagates instead of answering "no memberships".

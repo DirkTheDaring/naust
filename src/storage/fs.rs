@@ -457,6 +457,14 @@ pub struct FsStorage {
     /// owns the historical in-process same-subject shard locks and the
     /// replacement-safe conditional read-modify-write protocol.
     referrer_domain: crate::storage::referrer_domain::ReferrerDomain,
+    /// Phase 6 membership-family cutover (point operations): the shared
+    /// backend-neutral membership-domain implementation over its own
+    /// `FsObjectStore` pinned to the same storage root (identity key
+    /// mapping — every record stays at
+    /// `repo-memberships/by-repo/<b64>/<algo>/<hex>.json`). The multi-level
+    /// enumeration operations and `meta/` readiness/checkpoint state remain
+    /// on the retained seams (see `membership_read`).
+    membership_domain: crate::storage::membership_domain::MembershipDomain,
     /// Test-only synchronization seam invoked inside the reaper's held-lock closure,
     /// at the boundary between a candidate's confirmed expiry decision and its
     /// destructive action, with the candidate uuid. Lets a regression prove that no
@@ -709,6 +717,16 @@ impl FsStorage {
             std::sync::Arc::new(crate::storage::referrer_domain::ReferrerLockShards::new()),
         );
 
+        // Phase 6 membership-family cutover (point operations): a fourth
+        // pinned object store over the SAME root (identity key mapping). No
+        // enumeration budget — the migrated point operations never list; the
+        // deferred enumeration seams keep their own bounds.
+        let membership_store = storage_fs::FsObjectStore::open(&root)
+            .map_err(|e| StorageError::io(format!("open membership object store root: {e}")))?;
+        let membership_domain = crate::storage::membership_domain::MembershipDomain::new(
+            std::sync::Arc::new(membership_store),
+        );
+
         let mut upload_hashes = Vec::with_capacity(HASH_SHARDS);
         for _ in 0..HASH_SHARDS {
             upload_hashes.push(Mutex::new(std::collections::HashMap::new()));
@@ -726,6 +744,7 @@ impl FsStorage {
             tag_domain,
             manifest_domain,
             referrer_domain,
+            membership_domain,
             #[cfg(test)]
             reaper_boundary_hook: ReaperBoundaryHookSlot::default(),
             #[cfg(test)]
@@ -1009,113 +1028,6 @@ impl FsStorage {
             };
         }
         Ok(Some(dir))
-    }
-
-    /// Resolves the contained authority for the membership record directory
-    /// `repo-memberships/by-repo/<key>/<algo>` beneath the pinned memberships
-    /// root WITHOUT creating missing components: returns `Ok(None)` when any
-    /// component is absent, preserving the exact absent-record contract of the
-    /// candidate/unlink mutations (`Ok(false)`) with zero directory-creation
-    /// side effects.
-    ///
-    /// Repository grammar is the upstream-validated [`CanonicalRepoName`]
-    /// (parsed by the callers); the encoded key is a single base64url
-    /// component. This is the same layout `link_repo_blob` writes and the
-    /// contained membership reads resolve. Resolution is fresh per operation.
-    async fn membership_record_authority(
-        &self,
-        canonical: &CanonicalRepoName,
-        digest: &Digest,
-    ) -> Result<Option<ContainedDir>, StorageError> {
-        let mut dir = self
-            .upload_authorities
-            .memberships()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        let key = crate::storage::repo_membership::encode_canonical_repo_key(canonical);
-        for segment in ["by-repo", key.as_str(), digest.algorithm()] {
-            let name = FileName::new(segment).map_err(map_fs_mutate_err)?;
-            dir = match dir.open_subdir(&name).await {
-                Ok(d) => d,
-                Err(FsMutateError::NotFound) => return Ok(None),
-                Err(err) => return Err(map_fs_mutate_err(err)),
-            };
-        }
-        Ok(Some(dir))
-    }
-
-    /// Reads and parses the membership record leaf through an ALREADY-RESOLVED
-    /// contained authority. Missing leaf → `Ok(None)`; corrupt JSON keeps the
-    /// frozen `corrupt membership record: ...` `CorruptData` taxonomy.
-    async fn read_membership_record_from_authority(
-        dir: &ContainedDir,
-        leaf: &FileName,
-    ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
-    {
-        let bytes = match dir.read_leaf(leaf, u64::MAX).await {
-            Ok(b) => b,
-            Err(FsMutateError::NotFound) => return Ok(None),
-            Err(err) => return Err(map_fs_mutate_err(err)),
-        };
-        let record = serde_json::from_slice::<
-            crate::storage::repo_membership::RepoBlobMembershipRecord,
-        >(&bytes)
-        .map_err(|e| StorageError::corrupt_data(format!("corrupt membership record: {e}")))?;
-        Ok(Some(record))
-    }
-
-    /// Inner `set_membership_candidate` transition: inspect, decide, and
-    /// rewrite all through the ONE retained membership authority (there is no
-    /// lock on candidate transitions — unchanged). This seam is also exercised
-    /// directly by the same-authority replacement regression.
-    async fn set_membership_candidate_in(
-        dir: &ContainedDir,
-        leaf: &FileName,
-        since_unix_secs: u64,
-    ) -> Result<bool, StorageError> {
-        let Some(mut record) = Self::read_membership_record_from_authority(dir, leaf).await? else {
-            return Ok(false);
-        };
-        if record.state == crate::storage::repo_membership::MembershipState::Candidate {
-            return Ok(false);
-        }
-        record.state = crate::storage::repo_membership::MembershipState::Candidate;
-        record.unreferenced_since_unix_secs = Some(since_unix_secs);
-        let updated_bytes = serde_json::to_vec(&record)
-            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
-        dir.write_leaf_atomic(leaf, updated_bytes, true)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        Ok(true)
-    }
-
-    /// Inner `clear_membership_candidate` transition: same retained-authority
-    /// inspect/decide/rewrite shape as the set transition.
-    async fn clear_membership_candidate_in(
-        dir: &ContainedDir,
-        leaf: &FileName,
-    ) -> Result<bool, StorageError> {
-        let Some(mut record) = Self::read_membership_record_from_authority(dir, leaf).await? else {
-            return Ok(false);
-        };
-        if record.state == crate::storage::repo_membership::MembershipState::Active
-            && record.unreferenced_since_unix_secs.is_none()
-        {
-            return Ok(false);
-        }
-        record.state = crate::storage::repo_membership::MembershipState::Active;
-        record.unreferenced_since_unix_secs = None;
-        let updated_bytes = serde_json::to_vec(&record)
-            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
-        dir.write_leaf_atomic(leaf, updated_bytes, true)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        Ok(true)
-    }
-
-    /// Leaf name for a membership record: `<hex>.json`.
-    fn membership_leaf_name(digest: &Digest) -> Result<FileName, StorageError> {
-        FileName::new(format!("{}.json", digest.hex())).map_err(map_fs_mutate_err)
     }
 
     #[cfg(test)]
@@ -3669,46 +3581,21 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         digest: &Digest,
     ) -> Result<Option<crate::storage::repo_membership::RepoBlobMembershipRecord>, StorageError>
     {
-        membership_read::get_repo_blob_membership_impl(self.reader.as_ref(), repo, digest).await
+        self.membership_domain
+            .get_repo_blob_membership(repo, digest)
+            .await
     }
 
     async fn link_repo_blob(
         &self,
         record: &crate::storage::repo_membership::RepoBlobMembershipRecord,
     ) -> Result<(), StorageError> {
-        // Route the durable membership write through the pinned memberships authority,
-        // mirroring `canonical_repo_membership_relpath`
-        // (`repo-memberships/by-repo/{key}/{algo}/{hex}.json`). The candidate
-        // transitions and `unlink_repo_blob` resolve the same layout through the
-        // non-creating `membership_record_authority`; reads resolve independently
-        // through the contained reader seam.
-        let memberships = self
-            .upload_authorities
-            .memberships()
-            .await
-            .map_err(map_fs_mutate_err)?;
-        let key = crate::storage::repo_membership::encode_canonical_repo_key(&record.repo);
-        let by_repo = memberships
-            .ensure_subdir(&FileName::new("by-repo").map_err(map_fs_mutate_err)?)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        let repo_dir = by_repo
-            .ensure_subdir(&FileName::new(key).map_err(map_fs_mutate_err)?)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        let algo_dir = repo_dir
-            .ensure_subdir(&FileName::new(record.digest.algorithm()).map_err(map_fs_mutate_err)?)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        let leaf =
-            FileName::new(format!("{}.json", record.digest.hex())).map_err(map_fs_mutate_err)?;
-        let bytes = serde_json::to_vec(record)
-            .map_err(|e| StorageError::serialization(format!("serialize membership: {e}")))?;
-        algo_dir
-            .write_leaf_atomic(&leaf, bytes, true)
-            .await
-            .map_err(map_fs_mutate_err)?;
-        Ok(())
+        // Phase 6: the shared domain performs the frozen unconditional
+        // durable publication at the identical physical layout
+        // (`repo-memberships/by-repo/{key}/{algo}/{hex}.json`). The
+        // upload-family BLOCKING commit writer (`write_membership_sync`)
+        // keeps persisting the same layout inside the commit transaction.
+        self.membership_domain.link_repo_blob(record).await
     }
 
     async fn set_membership_candidate(
@@ -3717,18 +3604,15 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         digest: &Digest,
         since_unix_secs: u64,
     ) -> Result<bool, StorageError> {
-        // ONE contained membership authority (resolved non-creating beneath the
-        // pinned memberships root) retained across the inspect/rewrite
-        // transition; absent components preserve the Ok(false) contract with
-        // zero directory creation. No lock exists on candidate transitions —
-        // unchanged; no cross-process serialization is claimed.
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let Some(dir) = self.membership_record_authority(&canonical, digest).await? else {
-            return Ok(false);
-        };
-        let leaf = Self::membership_leaf_name(digest)?;
-        Self::set_membership_candidate_in(&dir, &leaf, since_unix_secs).await
+        // Phase 6: replacement-safe conditional transition in the shared
+        // domain (read_with_version -> replace_if_version); a stale
+        // observation can never overwrite a newer generation (the retired
+        // retained-authority rewrite was unconditional). No lock exists on
+        // candidate transitions — unchanged; no cross-process serialization
+        // is claimed.
+        self.membership_domain
+            .set_membership_candidate(repo, digest, since_unix_secs)
+            .await
     }
 
     async fn clear_membership_candidate(
@@ -3736,35 +3620,20 @@ impl RepositoryBlobMembershipStorage for FsStorage {
         repo: &str,
         digest: &Digest,
     ) -> Result<bool, StorageError> {
-        // Same retained single-authority shape as `set_membership_candidate`.
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let Some(dir) = self.membership_record_authority(&canonical, digest).await? else {
-            return Ok(false);
-        };
-        let leaf = Self::membership_leaf_name(digest)?;
-        Self::clear_membership_candidate_in(&dir, &leaf).await
+        // Same shared conditional transition shape as
+        // `set_membership_candidate`.
+        self.membership_domain
+            .clear_membership_candidate(repo, digest)
+            .await
     }
 
     async fn unlink_repo_blob(&self, repo: &str, digest: &Digest) -> Result<bool, StorageError> {
-        // Single contained unlink through the non-creating membership
-        // authority; absent components or leaf preserve the Ok(false) contract.
-        let canonical = CanonicalRepoName::parse(repo)
-            .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        let Some(dir) = self.membership_record_authority(&canonical, digest).await? else {
-            return Ok(false);
-        };
-        let leaf = Self::membership_leaf_name(digest)?;
-        match dir.unlink(&leaf, false).await {
-            Ok(()) => {
-                // Best-effort directory-entry durability (result ignored), as
-                // with the other contained deletes; no observable change.
-                let _ = dir.sync().await;
-                Ok(true)
-            }
-            Err(FsMutateError::NotFound) => Ok(false),
-            Err(err) => Err(map_fs_mutate_err(err)),
-        }
+        // Phase 6: the parity-closure existence contract through the shared
+        // domain — observation with a generation, then a conditional delete
+        // of that observed generation. `true` only when an existing record
+        // was actually removed; a replacement racing the removal survives
+        // (Conflict, fail closed). P1 Option A deletion durability.
+        self.membership_domain.unlink_repo_blob(repo, digest).await
     }
 
     async fn list_repo_blob_memberships_page(
