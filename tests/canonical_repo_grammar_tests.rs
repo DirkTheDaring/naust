@@ -147,6 +147,44 @@ async fn wait_for_server(config_path: &Path, port: u16) {
     panic!("server failed to start on port {port}:\n{err_contents}");
 }
 
+/// Sorted recursive listing of the request-facing storage trees (`uploads`,
+/// `repos`, `blobs`) as paths relative to `fs_root`.
+///
+/// Captured once after server startup and again after rejected requests:
+/// legitimate startup scaffolding (e.g. the pinned `uploads/.finalized`
+/// receipts authority the server creates before serving) is part of the
+/// baseline, so ANY entry created by a rejected request — an upload session,
+/// a repo directory, a CAS object — shows up as a delta and fails the
+/// comparison.
+fn request_storage_snapshot(fs_root: &Path) -> Vec<String> {
+    let mut entries = Vec::new();
+    for tree in ["uploads", "repos", "blobs"] {
+        let root = fs_root.join(tree);
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => panic!("snapshot read_dir {}: {e}", dir.display()),
+            };
+            for ent in rd {
+                let ent = ent.expect("snapshot dir entry");
+                let path = ent.path();
+                entries.push(format!(
+                    "{}/{}",
+                    tree,
+                    path.strip_prefix(&root).unwrap().display()
+                ));
+                if ent.file_type().expect("snapshot file_type").is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
 // ================================================================================================
 // 1. ALL VALID SEPARATOR FORMS
 // ================================================================================================
@@ -1059,6 +1097,10 @@ async fn test_16_encoded_http_path_attacks() {
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{port}");
 
+    // Legitimate startup state (includes the pinned uploads/.finalized
+    // authority); every rejected request below must leave it untouched.
+    let storage_baseline = request_storage_snapshot(&fs_root);
+
     let reqwest_attack_paths = vec![
         "/v2/team%2fimage/blobs/uploads/",
         "/v2/team%2Fimage/blobs/uploads/",
@@ -1110,11 +1152,13 @@ async fn test_16_encoded_http_path_attacks() {
         assert!(resp_str.contains("NAME_INVALID"));
     }
 
-    // Verify zero storage mutations
-    let uploads_entries = std::fs::read_dir(fs_root.join("uploads")).unwrap().count();
+    // Verify zero request-induced storage mutation: the storage trees are
+    // byte-for-byte the startup baseline (no upload session, repo, or CAS
+    // entry was created by any rejected attack request).
     assert_eq!(
-        uploads_entries, 0,
-        "No upload sessions created on attack paths"
+        request_storage_snapshot(&fs_root),
+        storage_baseline,
+        "No storage mutation may result from rejected attack paths"
     );
 }
 
@@ -1182,6 +1226,10 @@ async fn test_18_zero_storage_mutation_on_invalid_input() {
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{port}");
 
+    // Legitimate startup state (includes the pinned uploads/.finalized
+    // authority); the rejected request below must leave it untouched.
+    let storage_baseline = request_storage_snapshot(&fs_root);
+
     // Attempt start upload with invalid repo
     let res = client
         .post(format!("{base_url}/v2/team/image___invalid/blobs/uploads/"))
@@ -1192,15 +1240,11 @@ async fn test_18_zero_storage_mutation_on_invalid_input() {
 
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
-    // Check filesystem state
-    let uploads_entries = std::fs::read_dir(fs_root.join("uploads")).unwrap().count();
-    assert_eq!(uploads_entries, 0);
-
-    let repos_entries = std::fs::read_dir(fs_root.join("repos")).unwrap().count();
-    assert_eq!(repos_entries, 0);
-
-    let blobs_entries = std::fs::read_dir(fs_root.join("blobs").join("sha256"))
-        .unwrap()
-        .count();
-    assert_eq!(blobs_entries, 0);
+    // The uploads/repos/blobs trees are exactly the startup baseline: the
+    // rejected request created no session, repo, or blob entry.
+    assert_eq!(
+        request_storage_snapshot(&fs_root),
+        storage_baseline,
+        "invalid repository input must cause no request-induced storage mutation"
+    );
 }
