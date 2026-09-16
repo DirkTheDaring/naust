@@ -34,6 +34,9 @@ use registry_rust::storage::{
     TagMutation, TagMutationPolicy,
 };
 use registry_rust::supervisor::{SupervisorOptions, run_server_supervisor};
+use registry_rust::upload_coordinator::{
+    BlobUploadCoordinator, BlobUploadCoordinatorConfig, CrossMountResult,
+};
 
 // ================================================================================================
 // LIVE S3 TEST HARNESS & SAFETY GUARDRAILS
@@ -1939,5 +1942,467 @@ async fn test_live_s3_gc_graceful_shutdown_releases_authority_once() {
         "lock must be released exactly once on graceful shutdown"
     );
 
+    harness.cleanup().await;
+}
+
+// ================================================================================================
+// R6 — COMPLETE LIVE-PROVIDER QUALIFICATION EXTENSION (test-only)
+//
+// Closes the three live-harness coverage gaps documented by R5:
+//   * streaming  — registry-visible blob read contract over live S3, size matrix + FS equivalence
+//   * range      — HTTP byte-range contract end-to-end against a live-S3-backed blob
+//   * cross-mount — BlobUploadCoordinator::cross_mount_blob over live S3 + accounting invariants
+//
+// AccessDenied is intentionally not exercised here: the production S3 driver accepts credentials
+// only via process-global environment, so a scoped-identity classification test must live in an
+// isolated, env-gated binary (see tests/s3_live_accessdenied.rs) rather than in the concurrent
+// suite.
+// ================================================================================================
+
+/// R6 streaming: `Storage::open_blob` must return the exact stored bytes over
+/// live S3 for empty, single-byte, small, and multi-MiB blobs that cross
+/// internal async read-buffer boundaries, and must be byte-for-byte equivalent
+/// to the accepted filesystem backend for identical fixtures.
+#[tokio::test]
+async fn test_r6_live_s3_streaming_open_blob_equivalence() {
+    use tokio::io::AsyncReadExt;
+
+    let harness = LiveS3Harness::new().await.unwrap();
+    let s3 = harness.create_storage();
+
+    let fs_dir = TempDir::new().unwrap();
+    let fs: Arc<registry_rust::storage::fs::FsStorage> = Arc::new(
+        registry_rust::storage::fs::FsStorage::new(fs_dir.path().to_path_buf(), 64 * 1024 * 1024),
+    );
+
+    // Empty object, single byte, small blob, 1 MiB, and a 5 MiB+7 blob that
+    // crosses typical read-buffer chunking.
+    let sizes: [usize; 5] = [0, 1, 4096, 1024 * 1024, 5 * 1024 * 1024 + 7];
+
+    for size in sizes {
+        // Position-dependent content catches truncation and off-by-one errors.
+        let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+        let s3_digest = write_test_blob(&s3, "r6-stream/repo", &content).await;
+        let fs_digest = write_test_blob(&fs, "r6-stream/repo", &content).await;
+        assert_eq!(
+            s3_digest, fs_digest,
+            "content-addressed digest must match across backends for size {size}"
+        );
+        assert_eq!(
+            s3_digest,
+            sha256_digest(&content),
+            "digest integrity for size {size}"
+        );
+
+        let (s3_meta, mut s3_reader) = s3.open_blob(&s3_digest).await.unwrap();
+        assert_eq!(s3_meta.size, size as u64, "S3 meta.size for size {size}");
+        let mut s3_buf = Vec::new();
+        s3_reader.read_to_end(&mut s3_buf).await.unwrap();
+
+        let (fs_meta, mut fs_reader) = fs.open_blob(&fs_digest).await.unwrap();
+        assert_eq!(fs_meta.size, size as u64, "FS meta.size for size {size}");
+        let mut fs_buf = Vec::new();
+        fs_reader.read_to_end(&mut fs_buf).await.unwrap();
+
+        assert_eq!(s3_buf.len(), size, "S3 streamed byte count for size {size}");
+        assert_eq!(
+            s3_buf, content,
+            "S3 streamed bytes must equal stored content for size {size}"
+        );
+        assert_eq!(
+            s3_buf, fs_buf,
+            "S3/FS streamed bytes must be identical for size {size}"
+        );
+    }
+
+    harness.cleanup().await;
+}
+
+/// R6 range: the registry-visible HTTP byte-range contract must behave
+/// correctly when the underlying blob is stored in live S3. The registry
+/// supports closed `bytes=start-end` ranges (206 + Content-Range + exact
+/// bytes) and returns 416 for unsatisfiable, open-ended, and suffix ranges.
+#[tokio::test]
+async fn test_r6_live_s3_http_range_matrix() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage = harness.create_storage();
+    let temp = TempDir::new().unwrap();
+
+    // Public repo (anonymous pull is the default; the name avoids private prefixes).
+    let repo = "r6-range/repo";
+    let content: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+    let digest = write_test_blob(&storage, repo, &content).await;
+    let size = content.len() as u64;
+    // The supervisor fails closed if storage holds data without the initialized
+    // membership marker; this is exactly what `migrate-membership apply` sets.
+    storage.mark_membership_ready().await.unwrap();
+
+    // Start the production HTTP server against the same live-S3 prefix.
+    let cfg = Arc::new(harness.create_server_config(&temp));
+    let (bound_tx, bound_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let opts = SupervisorOptions {
+        notify_bound_addr: Some(bound_tx),
+        shutdown_rx: Some(shutdown_rx),
+        fault_injector: None,
+    };
+    let srv = tokio::spawn(async move { run_server_supervisor(cfg, Some(opts)).await });
+    let addr = bound_rx.await.unwrap();
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/v2/{repo}/blobs/{}", digest.as_str());
+
+    // Full blob (no Range) -> 200 with exact bytes and Content-Length.
+    let resp = client.get(&base).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "full GET status");
+    let cl = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    assert_eq!(cl, Some(size), "full GET Content-Length");
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), content.as_slice(), "full GET body");
+
+    struct RangeCase {
+        header: String,
+        expect_status: u16,
+        expect_content_range: String,
+        expect_body: Option<Vec<u8>>,
+    }
+    let last = size - 1;
+    let cases = vec![
+        RangeCase {
+            header: "bytes=0-0".to_string(),
+            expect_status: 206,
+            expect_content_range: format!("bytes 0-0/{size}"),
+            expect_body: Some(content[0..1].to_vec()),
+        },
+        RangeCase {
+            header: "bytes=10-19".to_string(),
+            expect_status: 206,
+            expect_content_range: format!("bytes 10-19/{size}"),
+            expect_body: Some(content[10..20].to_vec()),
+        },
+        RangeCase {
+            header: format!("bytes={last}-{last}"),
+            expect_status: 206,
+            expect_content_range: format!("bytes {last}-{last}/{size}"),
+            expect_body: Some(content[last as usize..].to_vec()),
+        },
+        // Unsatisfiable: end >= size.
+        RangeCase {
+            header: format!("bytes=0-{size}"),
+            expect_status: 416,
+            expect_content_range: format!("bytes */{size}"),
+            expect_body: None,
+        },
+        // Open-ended range is not supported by the registry -> 416.
+        RangeCase {
+            header: "bytes=10-".to_string(),
+            expect_status: 416,
+            expect_content_range: format!("bytes */{size}"),
+            expect_body: None,
+        },
+        // Suffix range is not supported by the registry -> 416.
+        RangeCase {
+            header: "bytes=-10".to_string(),
+            expect_status: 416,
+            expect_content_range: format!("bytes */{size}"),
+            expect_body: None,
+        },
+    ];
+
+    for case in cases {
+        let resp = client
+            .get(&base)
+            .header("Range", &case.header)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            case.expect_status,
+            "status for Range '{}'",
+            case.header
+        );
+        let got_cr = resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        assert_eq!(
+            got_cr.as_deref(),
+            Some(case.expect_content_range.as_str()),
+            "Content-Range for '{}'",
+            case.header
+        );
+        if let Some(expected_body) = &case.expect_body {
+            let cl = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok());
+            assert_eq!(
+                cl,
+                Some(expected_body.len()),
+                "range Content-Length for '{}'",
+                case.header
+            );
+            let body = resp.bytes().await.unwrap();
+            assert_eq!(
+                body.as_ref(),
+                expected_body.as_slice(),
+                "range body for '{}'",
+                case.header
+            );
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    srv.await.unwrap().unwrap();
+    harness.cleanup().await;
+}
+
+/// R6 cross-mount: `BlobUploadCoordinator::cross_mount_blob` over live S3 must
+/// mount an existing source blob into a destination repository as an
+/// accounting/metadata operation, preserve the source contribution, keep the
+/// content-addressed identity, remain idempotent, and fall back safely for a
+/// non-existent source. Removing the source contribution must not erase the
+/// target's, matching the corrected cross-repository accounting invariant.
+#[tokio::test]
+async fn test_r6_live_s3_cross_mount() {
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage = harness.create_storage();
+
+    let ref_dir = TempDir::new().unwrap();
+    let ref_index = Arc::new(BlobRefIndex::open(ref_dir.path().to_path_buf()).unwrap());
+    ref_index
+        .ensure_healthy_or_rebuild(&storage, true, true)
+        .await
+        .unwrap();
+
+    let config = BlobUploadCoordinatorConfig {
+        signing_key: b"r6-live-cross-mount-key".to_vec(),
+        max_upload_bytes: 64 * 1024 * 1024,
+        abort_on_digest_mismatch: false,
+        disallow_monolithic_uploads: false,
+        upload_chunk_min_bytes: None,
+        gc_pin_duration_secs: 3600,
+    };
+    let coordinator = BlobUploadCoordinator::new(
+        storage.clone(),
+        Some(ref_index.clone()),
+        ConsistencyCoordinator::new(),
+        config,
+    );
+
+    let source_repo = "r6-xm/source";
+    let target_repo = "r6-xm/target";
+    let content = b"r6 cross-mount payload over live s3";
+    let digest = write_test_blob(&storage, source_repo, content).await;
+
+    // Precondition: destination does not yet reference the blob.
+    assert!(
+        storage
+            .get_repo_blob_membership(target_repo, &digest)
+            .await
+            .unwrap()
+            .is_none(),
+        "target must not own the blob before mount"
+    );
+
+    // Mount source -> target.
+    let res = coordinator
+        .cross_mount_blob(target_repo, Some(source_repo), &digest)
+        .await
+        .unwrap();
+    match res {
+        CrossMountResult::Mounted(fin) => assert_eq!(fin.digest, digest),
+        other => panic!("expected Mounted, got {other:?}"),
+    }
+
+    // Accounting: both source and target now contribute membership.
+    assert!(
+        storage
+            .get_repo_blob_membership(source_repo, &digest)
+            .await
+            .unwrap()
+            .is_some(),
+        "source membership preserved after mount"
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(target_repo, &digest)
+            .await
+            .unwrap()
+            .is_some(),
+        "target membership present after mount"
+    );
+
+    // Content-addressed identity preserved (metadata-only mount, no byte copy).
+    let bytes = read_blob_bytes(&storage, &digest).await;
+    assert_eq!(
+        bytes.as_ref(),
+        content,
+        "blob content unchanged after mount"
+    );
+
+    // Idempotent re-mount: still resolves as Mounted, memberships intact.
+    let res2 = coordinator
+        .cross_mount_blob(target_repo, Some(source_repo), &digest)
+        .await
+        .unwrap();
+    assert!(
+        matches!(res2, CrossMountResult::Mounted(_)),
+        "idempotent re-mount must still resolve as Mounted"
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(target_repo, &digest)
+            .await
+            .unwrap()
+            .is_some(),
+        "target membership intact after idempotent re-mount"
+    );
+
+    // Non-existent source -> safe fallback (no mount performed).
+    let other = b"r6 blob that no source repo owns";
+    let other_digest = sha256_digest(other);
+    let fb = coordinator
+        .cross_mount_blob("r6-xm/target2", Some("r6-xm/missing-source"), &other_digest)
+        .await
+        .unwrap();
+    assert!(
+        matches!(fb, CrossMountResult::Fallback(_)),
+        "non-existent source must fall back to a normal upload session"
+    );
+
+    // Cross-repository accounting invariant: removing the SOURCE contribution
+    // must not erase the TARGET contribution; the blob stays reachable while
+    // any valid membership exists.
+    assert!(
+        storage
+            .unlink_repo_blob(source_repo, &digest)
+            .await
+            .unwrap(),
+        "source membership unlink"
+    );
+    assert!(
+        storage
+            .get_repo_blob_membership(target_repo, &digest)
+            .await
+            .unwrap()
+            .is_some(),
+        "target contribution survives source removal"
+    );
+    let bytes_after = read_blob_bytes(&storage, &digest).await;
+    assert_eq!(
+        bytes_after.as_ref(),
+        content,
+        "blob still readable while target references it"
+    );
+
+    harness.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// R6 gap 3 — live AccessDenied classification (isolated, ignore-gated).
+//
+// Proves the production S3 read path surfaces a genuine provider 403 as a
+// permission error and NEVER masks it as NotFound / successful-absence /
+// precondition failure.
+//
+// Ignored by default AND gated on scoped credentials because it mutates the
+// process-global AWS_ACCESS_KEY_ID/SECRET while switching to a deliberately
+// denied identity; running it inside the concurrent suite would race other
+// tests' credential resolution. The R6 harness creates a narrowly scoped,
+// no-policy MinIO user (implicit deny), exports its keys via
+// R6_ACCESSDENIED_SCOPED_AK / R6_ACCESSDENIED_SCOPED_SK, runs this test alone
+// with `--ignored --test-threads=1`, then destroys the temporary user.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "R6 live AccessDenied: requires a scoped denied identity (R6_ACCESSDENIED_SCOPED_AK/SK) and mutates process-global AWS credentials; run alone with --ignored --test-threads=1"]
+async fn test_r6_live_s3_access_denied_not_masked_as_notfound() {
+    use registry_rust::storage::StorageErrorKind;
+
+    let (scoped_ak, scoped_sk) = match (
+        std::env::var("R6_ACCESSDENIED_SCOPED_AK"),
+        std::env::var("R6_ACCESSDENIED_SCOPED_SK"),
+    ) {
+        (Ok(ak), Ok(sk)) if !ak.is_empty() && !sk.is_empty() => (ak, sk),
+        _ => {
+            eprintln!(
+                "R6 AccessDenied test skipped: scoped denied credentials not provided \
+                 (set R6_ACCESSDENIED_SCOPED_AK / R6_ACCESSDENIED_SCOPED_SK)."
+            );
+            return;
+        }
+    };
+
+    // Precondition: the root path must be active (env creds unset) so the
+    // harness seeds the fixture object with the local minioadmin root identity.
+    assert!(
+        std::env::var("AWS_ACCESS_KEY_ID").is_err(),
+        "AWS_ACCESS_KEY_ID must be unset at test start so the fixture is seeded with root creds"
+    );
+
+    let harness = LiveS3Harness::new().await.expect("live harness");
+
+    // Phase 1 — seed a REAL object under this run's isolated prefix (root creds).
+    let root = harness.create_storage();
+    let repo = "r6-accessdenied/repo";
+    let content = b"r6 accessdenied fixture payload - object exists but access is denied";
+    let digest = write_test_blob(root.as_ref(), repo, content).await;
+
+    // Sanity: the object is genuinely readable with the root identity.
+    let root_read = read_blob_bytes(root.as_ref(), &digest).await;
+    assert_eq!(
+        root_read.as_ref(),
+        content,
+        "root identity can read the seeded object"
+    );
+
+    // Phase 2 — switch to the scoped, denied identity and build a fresh store.
+    // SAFETY: this test runs alone (ignore-gated + --test-threads=1), so the
+    // process-global credential mutation cannot race another test.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", &scoped_ak);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", &scoped_sk);
+    }
+    let denied = harness.create_storage();
+
+    // Phase 3 — the denied identity reads the SAME existing object.
+    let denied_result = denied.open_blob(&digest).await;
+
+    // Restore the root environment BEFORE asserting so an assertion unwind
+    // cannot leave scoped creds set for the cleanup path.
+    unsafe {
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    }
+
+    // Phase 4 — the critical invariant: AccessDenied must not be masked.
+    match &denied_result {
+        Err(StorageError::NotFound) => panic!(
+            "CONTRACT VIOLATION: provider AccessDenied on an EXISTING object was masked as NotFound"
+        ),
+        Ok(_) => panic!(
+            "CONTRACT VIOLATION: denied identity unexpectedly read the object (successful absence / access leak)"
+        ),
+        Err(e) => {
+            assert_eq!(
+                e.internal_kind(),
+                Some(StorageErrorKind::PermissionDenied),
+                "AccessDenied must classify as PermissionDenied (not precondition/corruption/other), got {e:?}"
+            );
+            println!(
+                "R6 ACCESSDENIED PROOF: existing-object read under denied identity -> PermissionDenied (not NotFound)"
+            );
+        }
+    }
+
+    // Phase 5 — cleanup the seeded object (root creds restored above).
     harness.cleanup().await;
 }
