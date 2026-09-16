@@ -742,7 +742,7 @@ async fn fs_symlink_fail_closed() {
 async fn fs_durability_and_enospc_classification() {
     use storage_fs::mutate::fault::{self, FaultPoint};
 
-    let _fault_guard = crate::storage::store_common::FAULT_TEST_LOCK.lock().await;
+    let _fault_guard = crate::storage::store_common::fault_scenario::begin().await;
     let b = fs_backend();
     let Backend::Fs { storage, .. } = &b else {
         unreachable!()

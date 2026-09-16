@@ -2360,17 +2360,178 @@ async fn test_fs_get_finalized_receipt_after_uploads_replacement_uses_pin() {
 // and reset the table before and after each case.
 // --------------------------------------------------------------------------
 
-/// Serializes the fault-injection tests (the dep's fault registry is a single
-/// process-global table). Recover from poisoning so one failing case does not
-/// cascade into spurious failures in the others.
-static FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Begins an exclusive fault-injection scenario on the process-wide guard
+/// (`store_common::fault_scenario`): the dep's fault registry is a single
+/// process-global table and `fault::reset` clears every armed rule, so ALL
+/// scenarios — these and the domain-level fault tests — must serialize on the
+/// same lock. A second, module-local lock here is exactly the historical
+/// defect (a reset under one lock wiped rules armed under the other). The
+/// returned guard resets the table on entry and again on Drop, so cleanup
+/// survives assertion panics and early returns.
+async fn fault_test_guard() -> crate::storage::store_common::fault_scenario::FaultScenario {
+    crate::storage::store_common::fault_scenario::begin().await
+}
 
-fn fault_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    let g = FAULT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    storage_fs::mutate::fault::reset();
-    g
+/// Isolation: a scenario's armed rules cannot be wiped by another scenario's
+/// begin/reset. A competing `begin()` must block until the open scenario
+/// drops, and the open scenario's armed fault must still fire when consumed.
+/// This is the deterministic regression for the historical two-lock defect
+/// (domain fault tests failing "failed durable barrier must propagate" when a
+/// storage-fs fault test's global reset landed between their arm and consume).
+#[tokio::test]
+async fn test_fault_scenario_serializes_and_preserves_armed_rules() {
+    use crate::storage::repo_membership::{
+        RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+
+    let scenario = fault_test_guard().await;
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0xA1);
+    let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+    arm(FaultPoint::RenameLeaf, Some(digest.hex()), 1, libc::EIO);
+
+    // A competing scenario (historically: an fs fault test's guard, which
+    // globally reset the table under an independent lock) must not begin
+    // while this scenario is open.
+    let b_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let b_flag = b_done.clone();
+    let b = tokio::spawn(async move {
+        let _competing = crate::storage::store_common::fault_scenario::begin().await;
+        b_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !b_done.load(std::sync::atomic::Ordering::SeqCst),
+        "a second scenario must not begin (and reset the table) while a scenario is open"
+    );
+
+    // The armed rule survived the competing begin attempt and still fires.
+    storage
+        .link_repo_blob(&record)
+        .await
+        .expect_err("the armed publication fault must still fire: no concurrent reset wiped it");
+
+    drop(scenario);
+    b.await.unwrap();
+    assert!(
+        b_done.load(std::sync::atomic::Ordering::SeqCst),
+        "the competing scenario proceeds once the open scenario drops"
+    );
+}
+
+/// Needle scoping: an armed rule anchored to one storage root must never fire
+/// for operations on a different root, and must still fire for its own. This
+/// is the regression for the historical broad DirSync needles
+/// ("blobs"/"quarantine"), which matched the authority display path of ANY
+/// concurrent test's tree — injecting spurious EIO into unrelated tests
+/// (observed live as reaper-test EIO failures) while eating the arming test's
+/// own expected fault.
+#[tokio::test]
+async fn test_fault_scenario_root_anchored_needle_does_not_cross_roots() {
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+
+    let _g = fault_test_guard().await;
+
+    let root_a = tmp_fs_root();
+    let root_b = tmp_fs_root();
+    let storage_a = FsStorage::new(root_a.clone(), 1024 * 1024);
+    let storage_b = FsStorage::new(root_b.clone(), 1024 * 1024);
+    let (_session_a, prepared_a, _digest_a) =
+        prepare_finalizable_session(&storage_a, "xroota", b"cross-root-payload-a").await;
+    let (_session_b, prepared_b, _digest_b) =
+        prepare_finalizable_session(&storage_b, "xrootb", b"cross-root-payload-b").await;
+
+    // Arm the publication-barrier fault anchored to root A's CAS tree.
+    let needle_a = format!("{}/blobs", root_a.display());
+    arm(FaultPoint::DirSync, Some(&needle_a), 1, libc::EIO);
+
+    // The same publication on root B must not consume root A's rule.
+    storage_b
+        .commit_finalize(&prepared_b)
+        .await
+        .expect("a rule anchored to another root must not fire here");
+
+    // Root A's own publication still observes the armed fault.
+    storage_a
+        .commit_finalize(&prepared_a)
+        .await
+        .expect_err("the root-anchored rule must still fire for its own root");
+}
+
+/// Cleanup: dropping a scenario clears its remaining armed rules, so
+/// operations after the scenario (here: outside any scenario, with no
+/// entry-reset to mask the Drop path) do not inherit its faults. The needle
+/// is the probe record's own digest — unique to this test, per the fault
+/// seam's needle-uniqueness contract (a broad/None needle would be consumed
+/// by unrelated concurrent tests' operations, injecting spurious faults).
+#[tokio::test]
+async fn test_fault_scenario_drop_clears_unconsumed_rules() {
+    use crate::storage::repo_membership::{
+        RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0xA2);
+    let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+
+    let scenario = fault_test_guard().await;
+    arm(FaultPoint::AtomicWrite, Some(digest.hex()), 1, libc::EIO);
+    drop(scenario);
+
+    storage
+        .link_repo_blob(&record)
+        .await
+        .expect("no fault inherited from the dropped scenario");
+}
+
+/// Failure cleanup: a scenario that panics mid-test (the shape of any failed
+/// fault-test assertion between arm and reset) still clears its armed rules
+/// via Drop during unwind, and the guard is usable afterwards — the tokio
+/// mutex does not poison, so one failing fault test cannot cascade. The
+/// armed needle targets this test's own probe digest only.
+#[tokio::test]
+async fn test_fault_scenario_panic_clears_rules_and_does_not_poison() {
+    use crate::storage::repo_membership::{
+        RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
+    };
+    use storage_fs::mutate::fault::{FaultPoint, arm};
+
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 1024 * 1024);
+    let repo = CanonicalRepoName::parse("repo").unwrap();
+    let digest = membership_digest(0xA3);
+    let record = RepoBlobMembershipRecord::new_upload(repo.clone(), digest.clone(), None);
+
+    let needle = digest.hex().to_string();
+    let failed = tokio::spawn(async move {
+        let _scenario = crate::storage::store_common::fault_scenario::begin().await;
+        arm(FaultPoint::AtomicWrite, Some(&needle), 1, libc::EIO);
+        panic!("simulated failing fault test");
+    })
+    .await;
+    assert!(
+        failed.is_err(),
+        "the simulated fault test must have panicked"
+    );
+
+    // The rule armed by the panicked scenario was cleared by Drop during
+    // unwind: the write it targeted succeeds.
+    storage
+        .link_repo_blob(&record)
+        .await
+        .expect("no fault survives a panicked scenario");
+
+    // And the scenario guard remains acquirable (no poisoning).
+    let _next = fault_test_guard().await;
 }
 
 fn membership_digest(seed: u8) -> Digest {
@@ -2390,7 +2551,7 @@ async fn test_fs_atomic_primary_write_failure_surfaces_and_leaves_no_destination
         RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
     };
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2424,7 +2585,7 @@ async fn test_fs_atomic_rename_failure_preserves_prior_destination() {
         MembershipState, RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
     };
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2480,7 +2641,7 @@ async fn test_fs_atomic_secondary_cleanup_failure_surfaces() {
         RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
     };
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2523,7 +2684,7 @@ async fn test_fs_atomic_write_failure_retry_heals() {
         RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
     };
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2555,7 +2716,7 @@ async fn test_fs_atomic_write_failure_retry_heals() {
 #[tokio::test]
 async fn test_fs_commit_finalize_membership_write_failure_is_surfaced() {
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2620,7 +2781,7 @@ async fn append_n(storage: &FsStorage, session: &UploadSessionId, appends: u64) 
 #[tokio::test]
 async fn test_fs_abort_data_unlink_failure_preserves_meta_and_retries() {
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2669,7 +2830,7 @@ async fn test_fs_abort_data_unlink_failure_preserves_meta_and_retries() {
 #[tokio::test]
 async fn test_fs_abort_hash_unlink_failure_after_earlier_deletion_preserves_meta() {
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2787,7 +2948,7 @@ async fn test_fs_abort_removes_sparse_later_hash_generations() {
 #[tokio::test]
 async fn test_fs_reaper_does_not_count_incomplete_abort() {
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2828,7 +2989,7 @@ async fn test_fs_reaper_does_not_count_incomplete_abort() {
 #[tokio::test]
 async fn test_fs_abort_removes_residual_generation_from_real_append_unlink_failure() {
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -2916,7 +3077,7 @@ async fn test_fs_abort_removes_residual_generation_from_real_append_unlink_failu
 #[tokio::test]
 async fn test_fs_abort_removes_residual_generation_from_real_finalize_unlink_failure() {
     use storage_fs::mutate::fault::{FaultPoint, arm};
-    let _g = fault_test_guard();
+    let _g = fault_test_guard().await;
 
     let root = tmp_fs_root();
     let storage = FsStorage::new(root.clone(), 1024 * 1024);
@@ -17184,7 +17345,7 @@ mod durability_barriers {
     // staging state survives, and a retry heals to a successful publication.
     #[tokio::test]
     async fn test_commit_publication_dir_sync_failure_propagates_and_retry_heals() {
-        let _g = fault_test_guard();
+        let _g = fault_test_guard().await;
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let data = b"DURABILITY_COMMIT_BARRIER";
@@ -17192,7 +17353,12 @@ mod durability_barriers {
             prepare_finalizable_session(&storage, "myrepo", data).await;
 
         // Fail the blobs-shard directory sync (the second barrier), once.
-        arm(FaultPoint::DirSync, Some("blobs"), 1, libc::EIO);
+        // The needle is anchored to this test's unique root: DirSync matches
+        // the authority DISPLAY PATH, so a bare "blobs" needle is consumed by
+        // whichever concurrent test syncs a blobs directory first — injecting
+        // a spurious EIO there and eating this test's own expected fault.
+        let blobs_needle = format!("{}/blobs", root.display());
+        arm(FaultPoint::DirSync, Some(&blobs_needle), 1, libc::EIO);
         let err = storage.commit_finalize(&prepared).await;
         assert!(err.is_err(), "publication sync failure must propagate");
 
@@ -17246,7 +17412,7 @@ mod durability_barriers {
     // restored blob is already visible in the CAS namespace (no rollback).
     #[tokio::test]
     async fn test_restore_dir_sync_failure_propagates_blob_visible() {
-        let _g = fault_test_guard();
+        let _g = fault_test_guard().await;
         let root = tmp_fs_root();
         let storage = FsStorage::new(root.clone(), 1024 * 1024);
         let authority = RuntimeMutationAuthority::acquire(
@@ -17285,8 +17451,11 @@ mod durability_barriers {
             .unwrap();
         assert!(matches!(q, GcQuarantineResult::Quarantined { .. }));
 
-        // Fail the quarantine-shard (source) directory sync, once.
-        arm(FaultPoint::DirSync, Some("quarantine"), 1, libc::EIO);
+        // Fail the quarantine-shard (source) directory sync, once. Anchored
+        // to this test's unique root for the same display-path-matching
+        // reason as the blobs needle above.
+        let quarantine_needle = format!("{}/quarantine", root.display());
+        arm(FaultPoint::DirSync, Some(&quarantine_needle), 1, libc::EIO);
         let err = storage
             .restore_quarantined_blob(&permit, &digest)
             .await

@@ -1005,7 +1005,7 @@ async fn fs_internal_namespace_unaddressable() {
 async fn fs_durable_publication_fault_propagates() {
     use storage_fs::mutate::fault::{self, FaultPoint};
 
-    let _fault_guard = crate::storage::store_common::FAULT_TEST_LOCK.lock().await;
+    let _fault_guard = crate::storage::store_common::fault_scenario::begin().await;
     let b = fs_backend();
 
     // Rename fault: the staged publication of this unique leaf fails.
