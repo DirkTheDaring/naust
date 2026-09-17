@@ -408,7 +408,7 @@ async fn blob_gc_delete_fs_with_authority(
     quarantine_delay: Duration,
     limits: BlobGcLimits,
 ) -> Result<BlobGcStats, BlobGcError> {
-    use storage_fs::{DirEntryType, DirEnumerationLimits, FileName, FsMutateError};
+    use storage_fs::{DirEntryType, FileName, FsMutateError};
 
     let mut stats = BlobGcStats::default();
 
@@ -462,15 +462,17 @@ async fn blob_gc_delete_fs_with_authority(
         };
     }
 
-    let prefixes = q_root
-        .list(DirEnumerationLimits::new(usize::MAX, usize::MAX))
-        .await
-        .map_err(|e| BlobGcError::FsReadDir {
+    let mut prefix_stream = q_root.stream().map_err(|e| BlobGcError::FsReadDir {
+        path: root.clone(),
+        source: fs_mutate_to_io(e),
+    })?;
+
+    while let Some(prefix_res) = prefix_stream.next_entry().await {
+        let prefix_ent = prefix_res.map_err(|e| BlobGcError::FsReadDir {
             path: root.clone(),
-            source: fs_mutate_to_io(e),
+            source: fs_dir_to_io(e),
         })?;
 
-    for prefix_ent in prefixes {
         if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
             break;
         }
@@ -497,6 +499,7 @@ async fn blob_gc_delete_fs_with_authority(
         let prefix_path = root.join(prefix_name);
         let prefix_dir = match q_root.open_subdir(&prefix_file_name).await {
             Ok(d) => d,
+            Err(FsMutateError::NotFound) => continue, // Benign race: shard directory removed concurrently
             Err(source) => {
                 return Err(BlobGcError::FsReadDir {
                     path: prefix_path,
@@ -505,15 +508,17 @@ async fn blob_gc_delete_fs_with_authority(
             }
         };
 
-        let entries = prefix_dir
-            .list(DirEnumerationLimits::new(usize::MAX, usize::MAX))
-            .await
-            .map_err(|e| BlobGcError::FsReadDir {
+        let mut entry_stream = prefix_dir.stream().map_err(|e| BlobGcError::FsReadDir {
+            path: prefix_path.clone(),
+            source: fs_mutate_to_io(e),
+        })?;
+
+        while let Some(ent_res) = entry_stream.next_entry().await {
+            let ent = ent_res.map_err(|e| BlobGcError::FsReadDir {
                 path: prefix_path.clone(),
-                source: fs_mutate_to_io(e),
+                source: fs_dir_to_io(e),
             })?;
 
-        for ent in entries {
             if t0.elapsed() > Duration::from_secs(limits.max_seconds) {
                 break;
             }
@@ -833,6 +838,13 @@ fn fs_mutate_to_io(err: storage_fs::FsMutateError) -> std::io::Error {
         storage_fs::FsMutateError::NotFound => {
             std::io::Error::new(std::io::ErrorKind::NotFound, "contained target not found")
         }
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
+fn fs_dir_to_io(err: storage_fs::FsDirError) -> std::io::Error {
+    match err {
+        storage_fs::FsDirError::Io { source } => source,
         other => std::io::Error::other(other.to_string()),
     }
 }

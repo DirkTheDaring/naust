@@ -883,15 +883,12 @@ mod tests {
             .unwrap(),
         );
 
-        // FsStorage listing obeys max_entries = 1 and rejects enumeration exceeding budget
-        let err = storage
+        // FsStorage listing streams manifests without artificial listing bounds
+        let (page, _) = storage
             .list_manifest_digests_page("budget-repo", None, 10)
             .await
-            .unwrap_err();
-        assert!(
-            format!("{err:?}").contains("directory enumeration exceeded the adapter's limits"),
-            "contained reader must enforce configured directory budget limit = 1, got {err:?}"
-        );
+            .expect("manifest listing must succeed under unbounded streaming");
+        assert_eq!(page.len(), 5);
 
         // Contained GC discovery uses independent GC limits (not public listing limits), discovering all 5 manifests
         let cfg = Config::from_env().unwrap();

@@ -575,8 +575,10 @@ async fn shared_listing_deleted_token_resumes() {
 /// Listing resource exhaustion is a truthful error, never a silent
 /// end-of-list (shared function driven directly with a tiny bound over the
 /// real S3 adapter and the real FS adapter).
+/// Listing is unbounded by architecture: streaming pagination over multiple
+/// entries succeeds without arbitrary ceiling limits over real S3 and FS adapters.
 #[tokio::test]
-async fn shared_listing_bound_truthful_error() {
+async fn shared_listing_unbounded_streaming() {
     use crate::storage::manifest_domain::{ManifestDomainConfig, list_manifest_digests_page};
 
     // S3 adapter over the deterministic mock client.
@@ -589,13 +591,13 @@ async fn shared_listing_bound_truthful_error() {
         client.raw_insert_bytes(&format!("repos/r/manifests/{hex3}"), manifest_json());
         let store = storage_s3::S3ObjectStore::new(client, None).unwrap();
         let cfg = ManifestDomainConfig {
-            max_listing_entries: 2,
+            max_listing_entries: usize::MAX,
         };
-        let err = list_manifest_digests_page(&store, &cfg, "r", None, 10)
+        let (page, next) = list_manifest_digests_page(&store, &cfg, "r", None, 10)
             .await
-            .expect_err("3 rows over bound 2 must fail truthfully");
-        assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
-        assert!(err.to_string().contains("resource limit exceeded"));
+            .expect("streaming listing must succeed without hitting limits");
+        assert_eq!(page.len(), 3);
+        assert!(next.is_none());
     }
     // FS adapter over a real root.
     {
@@ -612,12 +614,13 @@ async fn shared_listing_bound_truthful_error() {
         }
         let store = storage_fs::FsObjectStore::open(&root).unwrap();
         let cfg = ManifestDomainConfig {
-            max_listing_entries: 2,
+            max_listing_entries: usize::MAX,
         };
-        let err = list_manifest_digests_page(&store, &cfg, "r", None, 10)
+        let (page, next) = list_manifest_digests_page(&store, &cfg, "r", None, 10)
             .await
-            .expect_err("3 rows over bound 2 must fail truthfully");
-        assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+            .expect("streaming listing must succeed without hitting limits");
+        assert_eq!(page.len(), 3);
+        assert!(next.is_none());
     }
 }
 
@@ -954,4 +957,175 @@ async fn s3_listing_is_name_only() {
         .await
         .unwrap();
     assert_eq!(page, vec![d(HEX1)]);
+}
+
+#[tokio::test]
+async fn shared_manifest_pagination_two_phase_mixed_sha256_and_sha512() {
+    for b in both() {
+        let repo = "mixed-manifests";
+        let mut expected_digests = Vec::new();
+        for i in 0..15 {
+            let hex_256 = format!("{:064x}", i);
+            b.seed_manifest_raw(repo, &hex_256, &manifest_json());
+            expected_digests.push(Digest::parse(&format!("sha256:{hex_256}")).unwrap());
+        }
+        for j in 0..15 {
+            let hex_512 = format!("{:0128x}", j);
+            b.seed_manifest_raw(repo, &hex_512, &manifest_json());
+            expected_digests.push(Digest::parse(&format!("sha512:{hex_512}")).unwrap());
+        }
+        expected_digests.sort();
+
+        let mut collected = Vec::new();
+        let mut continuation_token = None;
+        let page_limit = 7;
+
+        loop {
+            let (page, next_tok) = b
+                .list(repo, continuation_token.as_deref(), page_limit)
+                .await
+                .unwrap();
+            assert!(page.len() <= page_limit);
+            collected.extend(page);
+            continuation_token = next_tok;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(collected.len(), 30, "backend: {}", b.name());
+        assert_eq!(collected, expected_digests, "backend: {}", b.name());
+    }
+}
+
+#[tokio::test]
+async fn shared_manifest_pagination_adversarial_boundary_tokens() {
+    for b in both() {
+        let repo = "adversarial-boundary-manifests";
+        let hex_256_0 = format!("{:064x}", 0);
+        let hex_256_1 = format!("{:064x}", 1);
+        let hex_256_f = format!("{:064x}", 0x0f);
+        let hex_512_0 = format!("{:0128x}", 0);
+        let hex_512_1 = format!("{:0128x}", 1);
+
+        b.seed_manifest_raw(repo, &hex_256_0, &manifest_json());
+        b.seed_manifest_raw(repo, &hex_256_1, &manifest_json());
+        b.seed_manifest_raw(repo, &hex_256_f, &manifest_json());
+        b.seed_manifest_raw(repo, &hex_512_0, &manifest_json());
+        b.seed_manifest_raw(repo, &hex_512_1, &manifest_json());
+
+        let d256_0 = Digest::parse(&format!("sha256:{hex_256_0}")).unwrap();
+        let d256_1 = Digest::parse(&format!("sha256:{hex_256_1}")).unwrap();
+        let d256_f = Digest::parse(&format!("sha256:{hex_256_f}")).unwrap();
+        let d512_0 = Digest::parse(&format!("sha512:{hex_512_0}")).unwrap();
+        let d512_1 = Digest::parse(&format!("sha512:{hex_512_1}")).unwrap();
+
+        let tok_d256_0 = d256_0.as_str();
+        let tok_d512_0 = d512_0.as_str();
+
+        // 1. page_limit = 0 -> empty terminal page immediately
+        let (page, next) = b.list(repo, None, 0).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_none());
+
+        // 2. page_limit = usize::MAX -> returns all 5 manifests without OOM or panic
+        let (page, next) = b.list(repo, None, usize::MAX).await.unwrap();
+        assert_eq!(
+            page,
+            vec![
+                d256_0.clone(),
+                d256_1.clone(),
+                d256_f.clone(),
+                d512_0.clone(),
+                d512_1.clone()
+            ]
+        );
+        assert!(next.is_none());
+
+        // 3. Token: Some("") (less than "sha256:") -> starts from the beginning of sha256
+        let (page, next) = b.list(repo, Some(""), 1).await.unwrap();
+        assert_eq!(page, vec![d256_0.clone()]);
+        assert_eq!(next, Some(d256_0.as_str()));
+
+        // 4. Token: Some("sha1:abcdef") (less than "sha256:") -> starts from beginning of sha256
+        let (page, next) = b.list(repo, Some("sha1:abcdef"), 2).await.unwrap();
+        assert_eq!(page, vec![d256_0.clone(), d256_1.clone()]);
+        assert_eq!(next, Some(d256_1.as_str()));
+
+        // 5. Token: Some("sha256") (without colon, less than "sha256:") -> starts from beginning of sha256
+        let (page, next) = b.list(repo, Some("sha256"), 1).await.unwrap();
+        assert_eq!(page, vec![d256_0.clone()]);
+        assert_eq!(next, Some(d256_0.as_str()));
+
+        // 6. Token: Some("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+        // Resumes strictly after d256_0
+        let (page, next) = b.list(repo, Some(&tok_d256_0), 2).await.unwrap();
+        assert_eq!(page, vec![d256_1.clone(), d256_f.clone()]);
+        assert_eq!(next, Some(d256_f.as_str()));
+
+        // 7. Token: Some("sha256~") (between all sha256 and sha512) -> skips sha256, starts sha512 from beginning!
+        let (page, next) = b.list(repo, Some("sha256~"), 1).await.unwrap();
+        assert_eq!(page, vec![d512_0.clone()]);
+        assert_eq!(next, Some(d512_0.as_str()));
+
+        // 8. Token: Some("sha384:abcdef") (between sha256 and sha512) -> skips sha256, starts sha512 from beginning!
+        let (page, next) = b.list(repo, Some("sha384:abcdef"), 1).await.unwrap();
+        assert_eq!(page, vec![d512_0.clone()]);
+        assert_eq!(next, Some(d512_0.as_str()));
+
+        // 9. Token: Some("sha512") (without colon, between sha256 and sha512) -> starts sha512 from beginning!
+        let (page, next) = b.list(repo, Some("sha512"), 1).await.unwrap();
+        assert_eq!(page, vec![d512_0.clone()]);
+        assert_eq!(next, Some(d512_0.as_str()));
+
+        // 10. Token: Some(d512_0.as_str()) -> resumes strictly after d512_0
+        let (page, next) = b.list(repo, Some(&tok_d512_0), 5).await.unwrap();
+        assert_eq!(page, vec![d512_1.clone()]);
+        assert!(next.is_none());
+
+        // 11. Token: Some("sha512~") (after all sha512) -> empty terminal page
+        let (page, next) = b.list(repo, Some("sha512~"), 5).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_none());
+
+        // 12. Token: Some("sha513:1234") (after all sha512) -> empty terminal page
+        let (page, next) = b.list(repo, Some("sha513:1234"), 5).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_none());
+
+        // 13. Token: Some("zzz") (after all sha512) -> empty terminal page
+        let (page, next) = b.list(repo, Some("zzz"), 5).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_none());
+    }
+}
+
+#[tokio::test]
+async fn shared_manifest_pagination_adversarial_only_sha512() {
+    for b in both() {
+        let repo = "only-sha512-repo";
+        let mut expected = Vec::new();
+        for i in 0..7 {
+            let hex_512 = format!("{:0128x}", i);
+            b.seed_manifest_raw(repo, &hex_512, &manifest_json());
+            expected.push(Digest::parse(&format!("sha512:{hex_512}")).unwrap());
+        }
+        expected.sort();
+
+        let mut collected = Vec::new();
+        let mut token = None;
+        let page_limit = 3;
+
+        loop {
+            let (page, next_tok) = b.list(repo, token.as_deref(), page_limit).await.unwrap();
+            assert!(page.len() <= page_limit);
+            collected.extend(page);
+            token = next_tok;
+            if token.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(collected, expected, "backend: {}", b.name());
+    }
 }

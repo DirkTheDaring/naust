@@ -4273,45 +4273,15 @@ async fn test_manifest_listing_lifecycle_error_propagation_on_promoted_listing_f
     service.publish_proxy_cached_manifest(ev3).await.unwrap();
 
     // Evict m1:
-    // 1. Storage deletes m1 manifest file
-    // 2. Journal updates to ProxyManifestDeleted
-    // 3. Lifecycle service calls is_blob_referenced_in_repo to discover if remaining manifests reference blobs
-    // 4. Remaining manifests are m2 and m3 (2 entries > limit 1), triggering budget exhaustion
-    let err = service
+    // With unbounded streaming, eviction streams remaining manifests to evaluate blob references
+    // and completes successfully without hitting arbitrary directory limits
+    let res = service
         .evict_proxy_cached_entry(repo, Some("v1"), &m1_d)
         .await
-        .expect_err("eviction should fail on promoted listing budget exhaustion");
+        .expect("eviction should succeed under unbounded streaming");
 
-    // Assert propagated error
-    match err {
-        ManifestLifecycleError::Storage(storage_err) => {
-            assert!(
-                storage_err
-                    .to_string()
-                    .contains("directory enumeration exceeded the adapter's limits"),
-                "expected budget exhaustion error, got: {storage_err:?}"
-            );
-        }
-        other => panic!("expected ManifestLifecycleError::Storage, got {other:?}"),
-    }
-
-    // Establish the fixture's successful journal persistence before asserting an exact phase
-    let journal_bytes = storage
-        .read_lifecycle_journal(repo)
-        .await
-        .expect("journal read must succeed")
-        .expect("journal must be present");
-    let journal: LifecycleJournalRecord =
-        serde_json::from_slice(&journal_bytes).expect("parse journal");
-    assert_eq!(
-        journal.phase,
-        LifecyclePhase::ProxyManifestDeleted,
-        "journal phase must remain at ProxyManifestDeleted"
-    );
-    assert_eq!(
-        journal.target_digest, m1_d,
-        "journal target digest must match evicted manifest"
-    );
+    assert_eq!(res.tag_removed.as_deref(), Some("v1"));
+    assert!(res.manifest_removed);
 
     // Assert preserved candidate membership
     assert!(

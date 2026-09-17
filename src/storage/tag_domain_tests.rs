@@ -1410,3 +1410,233 @@ async fn shared_replace_race_outcomes() {
         }
     }
 }
+
+/// A continuation token that was deleted in the interim still resumes at the
+/// exact same position: strictly-after value semantics guarantee no skipping
+/// and no duplicate rows.
+#[tokio::test]
+async fn shared_listing_deleted_continuation_token_resumes() {
+    for b in both() {
+        let repo = "deleted-tok-repo";
+        b.set_tag(repo, "tag-01", &d(HEX1)).await.unwrap();
+        b.set_tag(repo, "tag-02", &d(HEX2)).await.unwrap();
+        b.set_tag(repo, "tag-03", &d(HEX1)).await.unwrap();
+        b.set_tag(repo, "tag-04", &d(HEX2)).await.unwrap();
+        b.set_tag(repo, "tag-05", &d(HEX1)).await.unwrap();
+
+        // Page 1
+        let (p1, tok1) = b.list_tags_page(repo, None, 2).await.unwrap();
+        assert_eq!(p1.len(), 2, "backend: {}", b.name());
+        assert_eq!(p1[0].0, "tag-01");
+        assert_eq!(p1[1].0, "tag-02");
+        assert_eq!(tok1, Some("tag-02".to_string()));
+
+        // Delete tag-02 (the continuation token)
+        b.delete_tag(repo, "tag-02").await.unwrap();
+
+        // Page 2 resuming from tag-02
+        let (p2, tok2) = b.list_tags_page(repo, tok1.as_deref(), 2).await.unwrap();
+        assert_eq!(p2.len(), 2, "backend: {}", b.name());
+        assert_eq!(p2[0].0, "tag-03");
+        assert_eq!(p2[1].0, "tag-04");
+        assert_eq!(tok2, Some("tag-04".to_string()));
+
+        // Page 3
+        let (p3, tok3) = b.list_tags_page(repo, tok2.as_deref(), 2).await.unwrap();
+        assert_eq!(p3.len(), 1, "backend: {}", b.name());
+        assert_eq!(p3[0].0, "tag-05");
+        assert_eq!(tok3, None);
+    }
+}
+
+/// Concurrent mutations (writes, updates, unlinks) during bounded pagination:
+/// guarantees monotonic ascending order, zero torn reads, and zero panics.
+#[tokio::test]
+async fn shared_concurrent_tag_mutations_during_bounded_pagination() {
+    for b in both() {
+        let repo = "concur-pag-repo";
+        // Seed 30 tags
+        for i in 0..30 {
+            let name = format!("tag-{:03}", i);
+            b.set_tag(repo, &name, &d(HEX1)).await.unwrap();
+        }
+
+        let b = Arc::new(b);
+        let b_clone = b.clone();
+        let repo_s = repo.to_string();
+
+        let mutator = tokio::spawn(async move {
+            for i in 0..10 {
+                let _ = b_clone
+                    .set_tag(&repo_s, &format!("tag-dyn-{:03}", i), &d(HEX2))
+                    .await;
+                let _ = b_clone
+                    .delete_tag(&repo_s, &format!("tag-{:03}", i * 2))
+                    .await;
+            }
+        });
+
+        // Reader continuously paginates
+        let mut continuation_token = None;
+        let mut last_seen_tag = String::new();
+        let mut total_pages = 0;
+
+        loop {
+            let (page, next_tok) = b
+                .list_tags_page(repo, continuation_token.as_deref(), 5)
+                .await
+                .unwrap();
+            total_pages += 1;
+            assert!(page.len() <= 5, "backend: {}", b.name());
+
+            for (tag, digest) in &page {
+                assert!(
+                    tag.as_str() > last_seen_tag.as_str(),
+                    "monotonic ordering invariant breached: {tag} <= {last_seen_tag}"
+                );
+                assert!(
+                    *digest == d(HEX1) || *digest == d(HEX2),
+                    "torn or invalid digest observed under race: {digest:?}"
+                );
+                last_seen_tag = tag.clone();
+            }
+
+            continuation_token = next_tok;
+            if continuation_token.is_none() || total_pages > 20 {
+                break;
+            }
+        }
+
+        let _ = mutator.await;
+    }
+}
+
+#[tokio::test]
+async fn shared_tag_listing_adversarial_page_limit_extremes_and_boundary_tokens() {
+    for b in both() {
+        let repo = "adv-tag-limits";
+        b.set_tag(repo, "tag-01", &d(HEX1)).await.unwrap();
+        b.set_tag(repo, "tag-02", &d(HEX1)).await.unwrap();
+        b.set_tag(repo, "tag-03", &d(HEX2)).await.unwrap();
+
+        // 1. page_limit = 0 -> empty terminal page immediately, no reads
+        let (page, next) = b.list_tags_page(repo, None, 0).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_none());
+
+        // 2. page_limit = usize::MAX -> returns all 3 tags without panic or allocation failure
+        let (page, next) = b.list_tags_page(repo, None, usize::MAX).await.unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].0, "tag-01");
+        assert_eq!(page[1].0, "tag-02");
+        assert_eq!(page[2].0, "tag-03");
+        assert!(next.is_none());
+
+        // 3. page_limit = usize::MAX - 1 -> safe from integer overflow
+        let (page, next) = b.list_tags_page(repo, None, usize::MAX - 1).await.unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(next.is_none());
+
+        // 4. Token: Some("") -> starts from beginning
+        let (page, next) = b.list_tags_page(repo, Some(""), 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "tag-01");
+        assert_eq!(next.as_deref(), Some("tag-01"));
+
+        // 5. Token: Some("tag-01") -> resumes strictly after tag-01
+        let (page, next) = b.list_tags_page(repo, Some("tag-01"), 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "tag-02");
+        assert_eq!(next.as_deref(), Some("tag-02"));
+
+        // 6. Token: Some("tag-015") (non-existent token between tag-01 and tag-02) -> resumes at tag-02
+        let (page, next) = b.list_tags_page(repo, Some("tag-015"), 5).await.unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].0, "tag-02");
+        assert_eq!(page[1].0, "tag-03");
+        assert!(next.is_none());
+
+        // 7. Token: Some("zzz") -> past end
+        let (page, next) = b.list_tags_page(repo, Some("zzz"), 5).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_none());
+    }
+}
+
+/// Verifies that high-cardinality repositories stream across pages without
+/// memory explosion or artificial listing limit errors, and that manifest
+/// deletion cleanup runs to completion unlinking all tags.
+#[tokio::test]
+async fn shared_high_cardinality_unbounded_streaming_and_cleanup() {
+    for b in both() {
+        let repo = "high-card-repo";
+        let target_digest = d(HEX1);
+        let other_digest = d(HEX2);
+
+        // Seed 300 tags pointing to target_digest and 100 pointing to other_digest
+        for i in 0..300 {
+            let name = format!("tag-{:04}", i);
+            b.set_tag(repo, &name, &target_digest).await.unwrap();
+        }
+        for i in 300..400 {
+            let name = format!("tag-{:04}", i);
+            b.set_tag(repo, &name, &other_digest).await.unwrap();
+        }
+
+        // 1. Paginate through all 400 tags with a prime page size (17)
+        let mut token = None;
+        let mut total_listed = 0;
+        let mut last_tag = String::new();
+
+        loop {
+            let (page, next) = b.list_tags_page(repo, token.as_deref(), 17).await.unwrap();
+            assert!(page.len() <= 17);
+            for (tag, _) in &page {
+                assert!(
+                    tag.as_str() > last_tag.as_str(),
+                    "monotonic ascending order"
+                );
+                last_tag = tag.clone();
+                total_listed += 1;
+            }
+            token = next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            total_listed, 400,
+            "all 400 tags listed under unbounded streaming"
+        );
+
+        // 2. Put manifest and then delete it -> triggers unbounded streaming cleanup
+        let manifest =
+            br#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
+        b.put_manifest(repo, &target_digest, bytes::Bytes::from_static(manifest))
+            .await;
+
+        b.delete_manifest(repo, &target_digest).await.unwrap();
+
+        // 3. Verify exactly 100 surviving tags remain (the other_digest ones)
+        let mut surviving = Vec::new();
+        let mut token = None;
+        loop {
+            let (page, next) = b.list_tags_page(repo, token.as_deref(), 32).await.unwrap();
+            for (tag, digest) in page {
+                assert_eq!(digest, other_digest);
+                surviving.push(tag);
+            }
+            token = next;
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            surviving.len(),
+            100,
+            "cleanup correctly unlinked all 300 target tags"
+        );
+        assert_eq!(surviving.first().unwrap(), "tag-0300");
+        assert_eq!(surviving.last().unwrap(), "tag-0399");
+    }
+}

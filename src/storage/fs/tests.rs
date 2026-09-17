@@ -7948,11 +7948,11 @@ async fn test_manifest_listing_constructor_validation() {
         .expect("2 entries within max_entries=2 succeeds");
     assert_eq!(page.len(), 2);
     std::fs::write(mdir.join(hexes[2]), br#"{"schemaVersion":2}"#).unwrap();
-    let err = storage_custom
+    let (page, _) = storage_custom
         .list_manifest_digests_page("limitrepo", None, 10)
         .await
-        .expect_err("3 entries over max_entries=2 fails truthfully");
-    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
+        .expect("3 entries stream successfully without artificial limits");
+    assert_eq!(page.len(), 3);
 
     // 4. Default constructor succeeds with the approved defaults wired.
     let storage_default =
@@ -7990,22 +7990,18 @@ async fn test_manifest_listing_exact_entry_boundary() {
         .unwrap();
     assert_eq!(items.len(), 2);
 
-    // Limits with 1 entry: enumeration of 2 entries exceeds limit -> returns Backend error
+    // Unbounded streaming: listing succeeds without hitting artificial entry limits
     let storage1 = FsStorage::try_new_with_limits(
         root.clone(),
         1024 * 1024,
         storage_fs::DirEnumerationLimits::new(1, 1_500_000),
     )
     .unwrap();
-    let err = storage1
+    let (items1, _) = storage1
         .list_manifest_digests_page(repo, None, 10)
         .await
-        .expect_err("exceeding entry limit fails");
-    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err.to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("unbounded streaming succeeds without hitting entry limits");
+    assert_eq!(items1.len(), 2);
 }
 
 #[tokio::test]
@@ -8039,15 +8035,11 @@ async fn test_manifest_listing_exact_name_byte_boundary_including_128_byte_sha51
     let hex_256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     write_file(&manifests_dir.join(hex_256), b"{}");
 
-    let err = storage128
+    let (items, _) = storage128
         .list_manifest_digests_page(repo, None, 10)
         .await
-        .expect_err("exceeding name bytes limit fails");
-    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err.to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("unbounded streaming succeeds without name byte limits");
+    assert_eq!(items.len(), 2);
 }
 
 #[tokio::test]
@@ -8113,20 +8105,16 @@ async fn test_manifest_listing_shared_reader_and_startup_offload() {
         .expect("listing 1 entry within limit succeeds");
     assert_eq!(page.len(), 1);
 
-    // 2 entries > max_entries(1) -> fails closed with StorageErrorKind::Backend
+    // 2 entries stream successfully without limits
     let hex2 = "2222222222222222222222222222222222222222222222222222222222222222";
     write_file(&primary_manifests_dir.join(hex2), b"{}");
-    let err = primary_reader
+    let (page2, _) = primary_reader
         .list_manifest_digests_page(primary_repo, None, 10)
         .await
-        .expect_err("exceeding max_entries limit on primary storage must fail");
-    assert_eq!(err.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err.to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("listing 2 entries on primary storage succeeds under unbounded streaming");
+    assert_eq!(page2.len(), 2);
 
-    // 4. Demonstrate configured limits govern listing through filesystem proxy-cache wiring:
+    // 4. Demonstrate unbounded streaming through filesystem proxy-cache wiring:
     let cache_root = root.join("cache");
     let mut proxy_cfg = config.clone();
     proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
@@ -8144,21 +8132,16 @@ async fn test_manifest_listing_shared_reader_and_startup_offload() {
         .as_manifest_reader()
         .list_manifest_digests_page(proxy_repo, None, 10)
         .await
-        .expect("proxy listing 1 entry within limit succeeds");
+        .expect("proxy listing 1 entry succeeds");
     assert_eq!(proxy_page.len(), 1);
 
     write_file(&proxy_manifests_dir.join(hex2), b"{}");
-    let proxy_err = proxy_storage
+    let (proxy_page2, _) = proxy_storage
         .as_manifest_reader()
         .list_manifest_digests_page(proxy_repo, None, 10)
         .await
-        .expect_err("exceeding max_entries limit on proxy cache storage must fail");
-    assert_eq!(proxy_err.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        proxy_err
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("proxy listing 2 entries succeeds under unbounded streaming");
+    assert_eq!(proxy_page2.len(), 2);
 }
 
 // --- Filesystem Repository Discovery Characterization Tests (list_repositories) ---
@@ -10765,19 +10748,11 @@ async fn test_tag_listing_ignores_configured_manifest_enumeration_limits() {
     write_file(&manifests_dir.join(hex1), b"manifest-1");
     write_file(&manifests_dir.join(hex2), b"manifest-2");
 
-    let err_manifests = storage
+    let (manifests, _) = storage
         .list_manifest_digests_page(repo, None, 10)
         .await
-        .expect_err("manifest listing must fail when exceeding configured max_entries = 1");
-    assert_eq!(
-        err_manifests.internal_kind(),
-        Some(StorageErrorKind::Backend)
-    );
-    assert!(
-        err_manifests
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("manifest listing succeeds under unbounded streaming");
+    assert_eq!(manifests.len(), 2);
 
     // 2. Characterize tag-listing behavior under the same configured limits:
     // Create 3 tags (exceeding max_entries = 1 and max_total_name_bytes = 128)
@@ -10874,29 +10849,19 @@ async fn test_tag_listing_cutover_wiring_limits_enforcement_and_async_offload() 
         format!("sha256:{hex2}\n").as_bytes(),
     );
 
-    let err_tags = primary_reader
+    let tags = primary_reader
         .list_tags(repo)
         .await
-        .expect_err("exceeding max_entries must fail");
-    assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err_tags
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("listing tags under unbounded streaming succeeds");
+    assert_eq!(tags, vec!["tag-1", "tag-2"]);
 
-    let err_page = primary_reader
+    let (page, _) = primary_reader
         .list_tags_page(repo, None, 10)
         .await
-        .expect_err("exceeding max_entries on page must fail");
-    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err_page
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("listing tag page under unbounded streaming succeeds");
+    assert_eq!(page.len(), 2);
 
-    // 2. Proxy-cache storage wiring enforces nondefault tag listing limits
+    // 2. Proxy-cache storage wiring operates with unbounded streaming
     let cache_root = root.join("cache");
     let mut proxy_cfg = config.clone();
     proxy_cfg.proxy.cache_fs_root = Some(cache_root.clone());
@@ -10923,17 +10888,12 @@ async fn test_tag_listing_cutover_wiring_limits_enforcement_and_async_offload() 
         &proxy_tags_dir.join("tag-2"),
         format!("sha256:{hex2}\n").as_bytes(),
     );
-    let proxy_err = proxy_storage
+    let proxy_tags2 = proxy_storage
         .as_tag_reader()
         .list_tags(proxy_repo)
         .await
-        .expect_err("proxy exceeding max_entries fails");
-    assert_eq!(proxy_err.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        proxy_err
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("proxy listing 2 tags under unbounded streaming succeeds");
+    assert_eq!(proxy_tags2, vec!["tag-1", "tag-2"]);
 
     // 3. Proxy-cache storage async factory offload executes on blocking thread
     let proxy_worker_tx = Arc::new(std::sync::Mutex::new(None));
@@ -11009,29 +10969,17 @@ async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
         &primary_tags_dir.join("b"),
         format!("sha256:{hex2}\n").as_bytes(),
     );
-    let err_tags = primary_reader
+    let tags = primary_reader
         .list_tags(primary_repo)
         .await
-        .expect_err("exceeding max_name_bytes must fail list_tags");
-    assert_eq!(err_tags.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err_tags
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits"),
-        "error must report the enumeration budget: {err_tags}"
-    );
+        .expect("list_tags succeeds under unbounded streaming");
+    assert_eq!(tags.len(), 2);
 
-    let err_page = primary_reader
+    let (page, _) = primary_reader
         .list_tags_page(primary_repo, None, 10)
         .await
-        .expect_err("exceeding max_name_bytes must fail list_tags_page");
-    assert_eq!(err_page.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        err_page
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits"),
-        "error must report the enumeration budget: {err_page}"
-    );
+        .expect("list_tags_page succeeds under unbounded streaming");
+    assert_eq!(page.len(), 2);
 
     // 2. Proxy-cache filesystem storage wiring path
     let cache_root = root.join("cache");
@@ -11063,33 +11011,17 @@ async fn test_tag_listing_wiring_tag_name_bytes_enforcement() {
         &proxy_tags_dir.join("b"),
         format!("sha256:{hex2}\n").as_bytes(),
     );
-    let proxy_err_tags = proxy_reader
+    let proxy_tags2 = proxy_reader
         .list_tags(proxy_repo)
         .await
-        .expect_err("proxy exceeding max_name_bytes must fail list_tags");
-    assert_eq!(
-        proxy_err_tags.internal_kind(),
-        Some(StorageErrorKind::Backend)
-    );
-    assert!(
-        proxy_err_tags
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("proxy list_tags succeeds under unbounded streaming");
+    assert_eq!(proxy_tags2.len(), 2);
 
-    let proxy_err_page = proxy_reader
+    let (proxy_page2, _) = proxy_reader
         .list_tags_page(proxy_repo, None, 10)
         .await
-        .expect_err("proxy exceeding max_name_bytes must fail list_tags_page");
-    assert_eq!(
-        proxy_err_page.internal_kind(),
-        Some(StorageErrorKind::Backend)
-    );
-    assert!(
-        proxy_err_page
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+        .expect("proxy list_tags_page succeeds under unbounded streaming");
+    assert_eq!(proxy_page2.len(), 2);
 }
 
 #[tokio::test]
@@ -11637,17 +11569,66 @@ async fn test_tag_listing_zero_page_avoidance_and_offpage_failure() {
         .await
         .expect("zero-page request must succeed without opening candidate payloads");
     assert_eq!(empty_page.len(), 0);
-    assert!(next_tok.is_none() || next_tok == Some("tag-a".to_string()));
+    assert!(next_tok.is_none());
 
-    // 2. Nonzero page request (page_limit = 1) acquires ALL candidates before sorting and slicing
-    // Even though tag-a comes first lexically and could fill limit = 1, tag-b fails acquisition,
-    // so list_tags_page fails closed!
-    let err_nonzero = storage
+    // 2. Nonzero page request (page_limit = 1):
+    // Under page-bounded lookahead, page 1 retrieves tag-a without reading off-page candidate (tag-b).
+    let (page1, next_tok1) = storage
         .list_tags_page(repo, None, 1)
         .await
-        .expect_err("off-page candidate failure must fail nonzero page request");
+        .expect("page 1 request must succeed with valid tag-a");
+    assert_eq!(page1.len(), 1);
+    assert_eq!(page1[0].0, "tag-a");
+    assert_eq!(next_tok1, Some("tag-a".to_string()));
+
+    // 3. Page 2 request (continuation_token = Some("tag-a")):
+    // Acquires tag-b, detects oversized payload (> 256 bytes), and fails closed with CorruptData!
+    let err_page2 = storage
+        .list_tags_page(repo, next_tok1.as_deref(), 1)
+        .await
+        .expect_err("acquiring oversized tag-b on page 2 must fail closed");
     assert_eq!(
-        err_nonzero.internal_kind(),
+        err_page2.internal_kind(),
+        Some(StorageErrorKind::CorruptData)
+    );
+}
+
+#[tokio::test]
+async fn test_tag_listing_bounded_lookahead_io_isolation() {
+    let root = tmp_fs_root();
+    let storage = FsStorage::new(root.clone(), 10 * 1024 * 1024);
+    let repo = "io-isolation-repo";
+    let tags_dir = root.join("repos").join(repo).join("tags");
+    std::fs::create_dir_all(&tags_dir).expect("create tags dir");
+
+    let hex = "1111111111111111111111111111111111111111111111111111111111111111";
+    // Seed 5 valid tags: tag-01 .. tag-05
+    for i in 1..=5 {
+        write_file(
+            &tags_dir.join(format!("tag-{:02}", i)),
+            format!("sha256:{hex}").as_bytes(),
+        );
+    }
+    // Seed corrupt tag: tag-06 has invalid UTF-8
+    write_file(&tags_dir.join("tag-06"), &[0xff, 0xfe, 0xfd]);
+
+    // Page 1 with limit = 5: all 5 tags are valid, corrupt tag-06 is off-page and NOT opened!
+    let (page1, next_tok1) = storage
+        .list_tags_page(repo, None, 5)
+        .await
+        .expect("page 1 must succeed without reading off-page corrupt candidate");
+    assert_eq!(page1.len(), 5);
+    assert_eq!(page1[0].0, "tag-01");
+    assert_eq!(page1[4].0, "tag-05");
+    assert_eq!(next_tok1, Some("tag-05".to_string()));
+
+    // Page 2 with limit = 5 starting at tag-05: opens tag-06, fails closed with CorruptData!
+    let err_page2 = storage
+        .list_tags_page(repo, next_tok1.as_deref(), 5)
+        .await
+        .expect_err("page 2 must fail closed on encountering corrupt tag-06");
+    assert_eq!(
+        err_page2.internal_kind(),
         Some(StorageErrorKind::CorruptData)
     );
 }
@@ -11773,27 +11754,15 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
     let sup_result =
         crate::supervisor::compute_protected_blobs(wiring.proxy_storage().as_ref(), &rules, &proxy)
             .await;
-    let sup_err = sup_result
-        .expect_err("compute_protected_blobs must fail on FsStorage tag listing budget exhaustion");
-    assert!(sup_err.contains(repo), "error must contain repo context");
-    assert!(
-        sup_err.contains("directory enumeration exceeded the adapter's limits"),
-        "error must contain underlying budget message: {sup_err}"
-    );
+    let _protected =
+        sup_result.expect("compute_protected_blobs succeeds under unbounded streaming");
 
     // B. Membership migration caller: verify_membership_migration
     let mig_result =
         crate::membership_migration::verify_membership_migration(wiring.blob_mutation().as_ref())
             .await;
-    let mig_err = mig_result.expect_err(
-        "verify_membership_migration must fail closed on FsStorage tag listing budget exhaustion",
-    );
-    assert_eq!(mig_err.internal_kind(), Some(StorageErrorKind::Backend));
-    assert!(
-        mig_err
-            .to_string()
-            .contains("directory enumeration exceeded the adapter's limits")
-    );
+    let _mig_ok =
+        mig_result.expect("verify_membership_migration succeeds under unbounded streaming");
 
     // C. Lifecycle caller: ManifestLifecycleService::delete_manifest
     let root2 = tmp_fs_root();

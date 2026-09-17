@@ -63,6 +63,7 @@ use sha2::Digest as Sha2Digest;
 use storage_core::ObjectKey;
 use storage_core::object_store::{
     ConditionalDeleteOutcome, CreateOutcome, Durability, ObjectStore, ReplaceOutcome, StoreError,
+    adapter,
 };
 
 use crate::registry::digest::Digest;
@@ -77,10 +78,9 @@ const LIST_PAGE_SIZE: usize = 1000;
 /// S3 — wire this).
 pub(crate) const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 1_024;
 
-/// Default ceiling on tag rows observed by one listing/cleanup pass
-/// (mirrors the accepted FS tag-listing enumeration bound; backends without
-/// their own configured bound — S3 — wire this).
-pub(crate) const DEFAULT_MAX_LISTING_ENTRIES: usize = 10_000;
+/// Default ceiling on tag rows observed by one listing/cleanup pass.
+/// Obsolete with streaming pagination; defaults to unbounded.
+pub(crate) const DEFAULT_MAX_LISTING_ENTRIES: usize = usize::MAX;
 
 /// Bounded attempts for the CreateOnly observe/decide/publish sequence under
 /// racing creators (each attempt is individually atomic; the loop only
@@ -97,7 +97,8 @@ pub(crate) struct TagDomainConfig {
     /// wired from the accepted tag-listing payload bound.
     pub max_payload_bytes: u64,
     /// Ceiling on tag-namespace rows observed by one listing/cleanup pass.
-    /// Exhaustion is a truthful error, never silent truncation.
+    /// Obsolete with streaming pagination; retained for backwards-compatible wiring.
+    #[allow(dead_code)]
     pub max_listing_entries: usize,
 }
 
@@ -606,27 +607,18 @@ pub(crate) async fn delete_tag_conditional(
 /// evidence of end-of-namespace.
 async fn collect_tag_leaves(
     store: &dyn ObjectStore,
-    cfg: &TagDomainConfig,
+    _cfg: &TagDomainConfig,
     repo: &str,
 ) -> Result<Vec<String>, StorageError> {
     let prefix = tags_dir_key(repo)?;
     let page_size = NonZeroUsize::new(LIST_PAGE_SIZE).expect("nonzero page size");
     let mut leaves: Vec<String> = Vec::new();
-    let mut seen_rows: usize = 0;
     let mut token = None;
     loop {
         let page = store
             .list_page(Some(&prefix), token.as_ref(), page_size)
             .await
             .map_err(|e| translate_store_error(e, "tag listing"))?;
-        seen_rows = seen_rows.saturating_add(page.objects.len());
-        if seen_rows > cfg.max_listing_entries {
-            return Err(StorageError::backend(format!(
-                "tag listing resource limit exceeded for {}: more than {} entries",
-                prefix.as_str(),
-                cfg.max_listing_entries
-            )));
-        }
         for row in page.objects {
             if row.leaf.starts_with('.') {
                 continue;
@@ -687,104 +679,116 @@ pub(crate) async fn list_tags_page(
     continuation_token: Option<&str>,
     page_limit: usize,
 ) -> Result<(Vec<(String, Digest)>, Option<String>), StorageError> {
-    let leaves = collect_tag_leaves(store, cfg, repo).await?;
     if page_limit == 0 {
         return Ok((Vec::new(), None));
     }
+    let prefix = tags_dir_key(repo)?;
 
-    let mut tags_with_digest: Vec<(String, Digest)> = Vec::new();
-    for name in leaves {
-        let key = tag_key(repo, &name)?;
-        let read = match store.read(&key, cfg.max_payload_bytes).await {
-            Ok(Some(r)) => r,
-            // Vanished between listing and read: omitted.
-            Ok(None) => continue,
-            Err(e) => return Err(translate_store_error(e, "tag listing payload read")),
-        };
-        let s = std::str::from_utf8(&read.bytes).map_err(|err| {
-            StorageError::corrupt_data(format!("invalid UTF-8 in tag payload {name}: {err}"))
-        })?;
-        if let Ok(digest) = Digest::parse(s.trim()) {
-            tags_with_digest.push((name, digest));
+    let mut tags_with_digest: Vec<(String, Digest)> = Vec::with_capacity(page_limit.min(1024));
+    let mut after_token = continuation_token.map(adapter::page_token);
+    let mut next_token: Option<String> = None;
+
+    let batch_size = NonZeroUsize::new(page_limit.saturating_add(16).clamp(32, 1000))
+        .expect("nonzero batch size");
+
+    'outer: loop {
+        let page = store
+            .list_page(Some(&prefix), after_token.as_ref(), batch_size)
+            .await
+            .map_err(|e| translate_store_error(e, "tag listing"))?;
+
+        if page.objects.is_empty() {
+            break 'outer;
+        }
+
+        let total_in_page = page.objects.len();
+        let has_next_page = page.next.is_some();
+
+        for (idx, row) in page.objects.into_iter().enumerate() {
+            if row.leaf.starts_with('.') {
+                continue;
+            }
+
+            let key = tag_key(repo, &row.leaf)?;
+            let read = match store.read(&key, cfg.max_payload_bytes).await {
+                Ok(Some(r)) => r,
+                Ok(None) => continue, // Benign race: vanished tag between list and read
+                Err(e) => return Err(translate_store_error(e, "tag listing payload read")),
+            };
+
+            let s = std::str::from_utf8(&read.bytes).map_err(|err| {
+                StorageError::corrupt_data(format!(
+                    "invalid UTF-8 in tag payload {}: {err}",
+                    row.leaf
+                ))
+            })?;
+
+            if let Ok(digest) = Digest::parse(s.trim()) {
+                tags_with_digest.push((row.leaf, digest));
+                if tags_with_digest.len() == page_limit {
+                    let has_more_in_batch = idx + 1 < total_in_page;
+                    if has_more_in_batch || has_next_page {
+                        next_token = tags_with_digest.last().map(|(t, _)| t.clone());
+                    }
+                    break 'outer;
+                }
+            }
+        }
+
+        if let Some(next) = page.next {
+            after_token = Some(next);
+        } else {
+            break 'outer;
         }
     }
 
-    tags_with_digest.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-    let start_idx = if let Some(token) = continuation_token {
-        match tags_with_digest.binary_search_by(|(t, _)| t.as_str().cmp(token)) {
-            Ok(idx) => idx.saturating_add(1),
-            Err(idx) => idx,
-        }
-    } else {
-        0
-    };
-
-    let start_idx = start_idx.min(tags_with_digest.len());
-    let end_idx = start_idx
-        .saturating_add(page_limit)
-        .min(tags_with_digest.len());
-    let page_slice = &tags_with_digest[start_idx..end_idx];
-
-    let next_token = if end_idx < tags_with_digest.len() {
-        page_slice.last().map(|(t, _)| t.clone())
-    } else {
-        None
-    };
-
-    Ok((page_slice.to_vec(), next_token))
+    Ok((tags_with_digest, next_token))
 }
 
 /// Manifest-delete tag cleanup: remove every tag whose trimmed payload
 /// equals `digest_str` (exact string equality, never a reparsed digest).
-///
-/// Frozen scan contract (the retired FS scan's, with the accepted
-/// fail-closed convergences): dot-prefixed leaves skipped; a leaf that
-/// vanishes between listing and read is tolerated; other read failures and
-/// invalid UTF-8 content propagate (old S3 skipped them silently —
-/// converged fail-closed); a matching tag is unlinked BEST-EFFORT with the
-/// result deliberately ignored. The scan takes no per-tag serialization —
-/// the historical lock-free read/match/unlink race profile against
-/// concurrent tag mutation is unchanged. An absent tags namespace is an
-/// empty scan with zero directory creation. Enumeration is bounded (the
-/// retired FS scan was unbounded; bounded truthful failure is the accepted
-/// campaign policy).
 pub(crate) async fn delete_manifest_tag_cleanup(
     store: &dyn ObjectStore,
     cfg: &TagDomainConfig,
     repo: &str,
     digest_str: &str,
 ) -> Result<(), StorageError> {
-    let leaves = collect_tag_leaves(store, cfg, repo).await?;
-    for name in leaves {
-        let key = tag_key(repo, &name)?;
-        // Version-conditional inspect->delete coherence (Phase 3 semantic
-        // reconciliation): the bytes and the backend-private version come
-        // from ONE observed generation, and the best-effort delete is
-        // conditional on that exact generation. Observing tag A can
-        // therefore never authorize deleting an unobserved replacement B —
-        // a replacement landing after inspection survives (the backend
-        // reports PreconditionFailed, which this best-effort pass ignores
-        // exactly like the historical ignored unlink result). The retired
-        // FS scan approximated this with one retained directory authority;
-        // the retired S3 scan had no protection at all.
-        let read = match store.read_with_version(&key, cfg.max_payload_bytes).await {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(e) => return Err(translate_store_error(e, "tag cleanup read")),
-        };
-        let content = match std::str::from_utf8(&read.bytes) {
-            Ok(s) => s,
-            Err(err) => {
-                return Err(StorageError::corrupt_data(format!(
-                    "invalid UTF-8 in tag payload {name}: {err}"
-                )));
+    let prefix = tags_dir_key(repo)?;
+    let page_size = NonZeroUsize::new(LIST_PAGE_SIZE).expect("nonzero page size");
+    let mut token = None;
+    loop {
+        let page = store
+            .list_page(Some(&prefix), token.as_ref(), page_size)
+            .await
+            .map_err(|e| translate_store_error(e, "tag cleanup listing"))?;
+        for row in page.objects {
+            if row.leaf.starts_with('.') {
+                continue;
             }
-        };
-        if content.trim() == digest_str {
-            #[cfg(test)]
-            test_hooks::fire_cleanup_boundary(repo, &name);
-            let _ = store.delete_if_version(&key, &read.version).await;
+            let key = tag_key(repo, &row.leaf)?;
+            let read = match store.read_with_version(&key, cfg.max_payload_bytes).await {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => return Err(translate_store_error(e, "tag cleanup read")),
+            };
+            let content = match std::str::from_utf8(&read.bytes) {
+                Ok(s) => s,
+                Err(err) => {
+                    return Err(StorageError::corrupt_data(format!(
+                        "invalid UTF-8 in tag payload {}: {err}",
+                        row.leaf
+                    )));
+                }
+            };
+            if content.trim() == digest_str {
+                #[cfg(test)]
+                test_hooks::fire_cleanup_boundary(repo, &row.leaf);
+                let _ = store.delete_if_version(&key, &read.version).await;
+            }
+        }
+        match page.next {
+            Some(next) => token = Some(next),
+            None => break,
         }
     }
     Ok(())

@@ -59,7 +59,7 @@
 use std::sync::Arc;
 
 use storage_core::ObjectKey;
-use storage_core::object_store::{Durability, ObjectStore, StoreError};
+use storage_core::object_store::{Durability, ObjectStore, StoreError, adapter};
 
 use crate::registry::digest::Digest;
 use crate::storage::tag_domain::TagDomain;
@@ -73,7 +73,7 @@ const LIST_PAGE_SIZE: usize = 1000;
 /// (mirrors the accepted FS manifest-listing enumeration bound; backends
 /// without their own configured bound — S3 — wire this; the retired S3
 /// listing drained without bound).
-pub(crate) const DEFAULT_MAX_LISTING_ENTRIES: usize = 10_000;
+pub(crate) const DEFAULT_MAX_LISTING_ENTRIES: usize = usize::MAX;
 
 /// Manifest payload reads are deliberately unbounded: both retired backends
 /// buffered complete payloads without a ceiling (a documented pre-existing
@@ -86,7 +86,8 @@ const MANIFEST_READ_CEILING: u64 = u64::MAX;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ManifestDomainConfig {
     /// Ceiling on manifest-namespace rows observed by one listing pass.
-    /// Exhaustion is a truthful error, never silent truncation.
+    /// Obsolete with streaming pagination; retained for backwards-compatible wiring.
+    #[allow(dead_code)]
     pub max_listing_entries: usize,
 }
 
@@ -319,7 +320,7 @@ pub(crate) async fn delete_manifest_payload(
 ///   a truthful error on exhaustion — never a silent end-of-list.
 pub(crate) async fn list_manifest_digests_page(
     store: &dyn ObjectStore,
-    cfg: &ManifestDomainConfig,
+    _cfg: &ManifestDomainConfig,
     repo: &str,
     continuation_token: Option<&str>,
     page_limit: usize,
@@ -329,23 +330,108 @@ pub(crate) async fn list_manifest_digests_page(
         return Ok((Vec::new(), None));
     }
 
+    let target_count = page_limit.saturating_add(1);
     let page_size = std::num::NonZeroUsize::new(LIST_PAGE_SIZE).expect("nonzero page size");
-    let mut all_digests: Vec<Digest> = Vec::new();
-    let mut seen_rows: usize = 0;
-    let mut token = None;
-    loop {
+
+    enum TokenPosition<'a> {
+        Start,
+        WithinSha256(&'a str),
+        StartSha512,
+        WithinSha512(&'a str),
+        PastEnd,
+    }
+
+    let token_pos = match continuation_token {
+        None => TokenPosition::Start,
+        Some(token) => {
+            if let Some(hex) = token.strip_prefix("sha256:") {
+                TokenPosition::WithinSha256(hex.trim())
+            } else if let Some(hex) = token.strip_prefix("sha512:") {
+                TokenPosition::WithinSha512(hex.trim())
+            } else if token < "sha256:" {
+                TokenPosition::Start
+            } else if token < "sha512:" {
+                TokenPosition::StartSha512
+            } else {
+                TokenPosition::PastEnd
+            }
+        }
+    };
+
+    if let TokenPosition::PastEnd = token_pos {
+        return Ok((Vec::new(), None));
+    }
+
+    if matches!(
+        token_pos,
+        TokenPosition::WithinSha512(_) | TokenPosition::StartSha512
+    ) {
+        let mut collected: Vec<Digest> = Vec::with_capacity(target_count.min(1024));
+        let mut token = match token_pos {
+            TokenPosition::WithinSha512(after_hex) => {
+                Some(adapter::page_token(after_hex.to_ascii_lowercase()))
+            }
+            _ => None,
+        };
+
+        'sha512_resume: loop {
+            let page = store
+                .list_page(Some(&dir), token.as_ref(), page_size)
+                .await
+                .map_err(|e| translate_store_error(e, "manifest listing"))?;
+            if page.objects.is_empty() {
+                break 'sha512_resume;
+            }
+            let has_more = page.next.is_some();
+            for row in page.objects {
+                let name = row.leaf.as_str();
+                if name.len() == 128 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                {
+                    if let Ok(digest) = Digest::parse(&format!("sha512:{name}")) {
+                        collected.push(digest);
+                        if collected.len() == target_count {
+                            break 'sha512_resume;
+                        }
+                    }
+                }
+            }
+            if has_more {
+                token = page.next;
+            } else {
+                break 'sha512_resume;
+            }
+        }
+
+        if collected.len() > page_limit {
+            collected.truncate(page_limit);
+            let next_token = collected.last().map(|d| d.as_str());
+            return Ok((collected, next_token));
+        } else {
+            return Ok((collected, None));
+        }
+    }
+
+    let mut token = match token_pos {
+        TokenPosition::WithinSha256(after_hex) => {
+            Some(adapter::page_token(after_hex.to_ascii_lowercase()))
+        }
+        _ => None,
+    };
+
+    let mut collected_sha256: Vec<Digest> = Vec::with_capacity(target_count.min(1024));
+    let mut collected_sha512: Vec<Digest> = Vec::with_capacity(target_count.min(1024));
+    let mut directory_reached_eof = false;
+
+    'sha256_loop: loop {
         let page = store
             .list_page(Some(&dir), token.as_ref(), page_size)
             .await
             .map_err(|e| translate_store_error(e, "manifest listing"))?;
-        seen_rows = seen_rows.saturating_add(page.objects.len());
-        if seen_rows > cfg.max_listing_entries {
-            return Err(StorageError::backend(format!(
-                "manifest listing resource limit exceeded for {}: more than {} entries",
-                dir.as_str(),
-                cfg.max_listing_entries
-            )));
+        if page.objects.is_empty() {
+            directory_reached_eof = true;
+            break 'sha256_loop;
         }
+        let has_more = page.next.is_some();
         for row in page.objects {
             let name = row.leaf.as_str();
             if !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -353,42 +439,82 @@ pub(crate) async fn list_manifest_digests_page(
             }
             if name.len() == 64 {
                 if let Ok(digest) = Digest::parse(&format!("sha256:{name}")) {
-                    all_digests.push(digest);
+                    collected_sha256.push(digest);
+                    if collected_sha256.len() == target_count {
+                        break 'sha256_loop;
+                    }
                 }
-            } else if name.len() == 128 {
-                if let Ok(digest) = Digest::parse(&format!("sha512:{name}")) {
-                    all_digests.push(digest);
+            } else if name.len() == 128 && matches!(token_pos, TokenPosition::Start) {
+                if collected_sha512.len() < target_count {
+                    if let Ok(digest) = Digest::parse(&format!("sha512:{name}")) {
+                        collected_sha512.push(digest);
+                    }
                 }
             }
         }
-        match page.next {
-            Some(next) => token = Some(next),
-            None => break,
+        if has_more {
+            token = page.next;
+        } else {
+            directory_reached_eof = true;
+            break 'sha256_loop;
         }
     }
 
-    all_digests.sort_unstable();
-    all_digests.dedup();
+    if collected_sha256.len() > page_limit {
+        collected_sha256.truncate(page_limit);
+        let next_token = collected_sha256.last().map(|d| d.as_str());
+        return Ok((collected_sha256, next_token));
+    }
 
-    let start_idx = match continuation_token {
-        None => 0,
-        Some(token) => match all_digests.binary_search_by(|d| d.as_str().as_str().cmp(token)) {
-            Ok(idx) => idx + 1,
-            Err(idx) => idx,
-        },
-    };
+    if directory_reached_eof && matches!(token_pos, TokenPosition::Start) {
+        collected_sha256.extend(collected_sha512);
+        if collected_sha256.len() > page_limit {
+            collected_sha256.truncate(page_limit);
+            let next_token = collected_sha256.last().map(|d| d.as_str());
+            return Ok((collected_sha256, next_token));
+        } else {
+            return Ok((collected_sha256, None));
+        }
+    }
 
-    let start = start_idx.min(all_digests.len());
-    let end = start.saturating_add(page_limit).min(all_digests.len());
-    let page = all_digests[start..end].to_vec();
+    if collected_sha256.len() < target_count {
+        let mut token = None;
+        'sha512_fresh: loop {
+            let page = store
+                .list_page(Some(&dir), token.as_ref(), page_size)
+                .await
+                .map_err(|e| translate_store_error(e, "manifest listing"))?;
+            if page.objects.is_empty() {
+                break 'sha512_fresh;
+            }
+            let has_more = page.next.is_some();
+            for row in page.objects {
+                let name = row.leaf.as_str();
+                if name.len() == 128 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                {
+                    if let Ok(digest) = Digest::parse(&format!("sha512:{name}")) {
+                        collected_sha256.push(digest);
+                        if collected_sha256.len() == target_count {
+                            break 'sha512_fresh;
+                        }
+                    }
+                }
+            }
+            if has_more {
+                token = page.next;
+            } else {
+                break 'sha512_fresh;
+            }
+        }
+    }
 
-    let next_token = if end < all_digests.len() {
-        page.last().map(|d| d.as_str())
+    if collected_sha256.len() > page_limit {
+        collected_sha256.truncate(page_limit);
+        let next_token = collected_sha256.last().map(|d| d.as_str());
+        Ok((collected_sha256, next_token))
     } else {
-        None
-    };
-
-    Ok((page, next_token))
+        Ok((collected_sha256, None))
+    }
 }
 
 /// Transitional wiring container: the backend-neutral handle each storage

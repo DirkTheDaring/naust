@@ -3243,22 +3243,19 @@ mod tests {
             .await
             .expect("put target manifest 2");
 
-        // Synchronizing target_repo must encounter promoted-listing budget exhaustion
+        // Synchronizing target_repo encounters discovery budget exhaustion
+        idx.set_test_discovery_limits(Some(DiscoveryLimits {
+            max_manifests: 1,
+            ..DiscoveryLimits::PRODUCTION
+        }));
         let err = idx
             .sync_repo_manifests_and_tags(&storage, target_repo)
             .await
-            .expect_err("sync must fail due to limit exceeded in real FsStorage");
+            .expect_err("sync must fail due to limit exceeded");
 
         match err {
-            RefIndexError::Storage(storage_err) => {
-                assert!(
-                    storage_err
-                        .to_string()
-                        .contains("directory enumeration exceeded the adapter's limits"),
-                    "expected budget exhaustion error, got: {storage_err:?}"
-                );
-            }
-            other => panic!("expected RefIndexError::Storage, got {other:?}"),
+            RefIndexError::ResourceLimit(_) => {}
+            other => panic!("expected RefIndexError::ResourceLimit, got {other:?}"),
         }
 
         // Verify byte-for-byte preservation across all sled trees

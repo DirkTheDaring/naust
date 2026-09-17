@@ -661,8 +661,7 @@ impl FsStorage {
         // existence probe reuses the contained metadata reader — repository
         // existence is repository-family state, deferred to a later phase.
         let tag_store = storage_fs::FsObjectStore::open(&root)
-            .map_err(|e| StorageError::io(format!("open tag object store root: {e}")))?
-            .with_enumeration_limits(tag_listing_limits.tags_dir_limits);
+            .map_err(|e| StorageError::io(format!("open tag object store root: {e}")))?;
         let tag_domain = crate::storage::tag_domain::TagDomain::new(
             std::sync::Arc::new(tag_store),
             crate::storage::tag_domain::TagDomainConfig {
@@ -670,7 +669,7 @@ impl FsStorage {
                     .payload_limits
                     .max_payload_bytes
                     .unwrap_or(tag_listing::DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES),
-                max_listing_entries: tag_listing_limits.tags_dir_limits.max_entries(),
+                max_listing_entries: usize::MAX,
             },
             std::sync::Arc::new(tag_listing::FsTagRepoProbe::new(
                 std::sync::Arc::clone(&reader),
@@ -683,12 +682,11 @@ impl FsStorage {
         // limits (each migrated family keeps its own configured enumeration
         // budget).
         let manifest_store = storage_fs::FsObjectStore::open(&root)
-            .map_err(|e| StorageError::io(format!("open manifest object store root: {e}")))?
-            .with_enumeration_limits(manifest_listing_limits);
+            .map_err(|e| StorageError::io(format!("open manifest object store root: {e}")))?;
         let manifest_domain = crate::storage::manifest_domain::ManifestDomain::new(
             std::sync::Arc::new(manifest_store),
             crate::storage::manifest_domain::ManifestDomainConfig {
-                max_listing_entries: manifest_listing_limits.max_entries(),
+                max_listing_entries: usize::MAX,
             },
         );
 
@@ -729,11 +727,7 @@ impl FsStorage {
         // the real contained repository-existence probe (the accepted
         // Phase 3 pattern — repository existence remains a backend notion).
         let timestamp_store = storage_fs::FsObjectStore::open(&root)
-            .map_err(|e| StorageError::io(format!("open timestamp object store root: {e}")))?
-            .with_enumeration_limits(storage_fs::DirEnumerationLimits::new(
-                usize::MAX,
-                usize::MAX,
-            ));
+            .map_err(|e| StorageError::io(format!("open timestamp object store root: {e}")))?;
         let repo_timestamp_domain = crate::storage::repo_timestamp_domain::RepoTimestampDomain::new(
             std::sync::Arc::new(timestamp_store),
             crate::storage::repo_timestamp_domain::RepoExistencePolicy::Probe(std::sync::Arc::new(
