@@ -836,17 +836,6 @@ impl FsStorage {
         &self.reader
     }
 
-    /// Internal test helper to list CAS blobs with explicitly injected listing budgets.
-    #[cfg(test)]
-    pub(crate) async fn list_cas_blobs_page_with_budgets(
-        &self,
-        cursor: Option<&GcCursor>,
-        limit: usize,
-        budgets: listing::FsListingBudgets,
-    ) -> Result<GcBlobPage, StorageError> {
-        listing::list_cas_blobs_page_impl(self.reader.as_ref(), cursor, limit, budgets).await
-    }
-
     /// Computes the repository root directory for a validated canonical repository identity.
     pub fn repo_dir(&self, repo: &CanonicalRepoName) -> Result<PathBuf, StorageError> {
         fs_repo_dir(&self.root, repo)
@@ -4000,13 +3989,7 @@ impl GcStorage for FsStorage {
         cursor: Option<&GcCursor>,
         limit: usize,
     ) -> Result<GcBlobPage, StorageError> {
-        listing::list_cas_blobs_page_impl(
-            self.reader.as_ref(),
-            cursor,
-            limit,
-            listing::FsListingBudgets::unbounded(),
-        )
-        .await
+        listing::list_cas_blobs_page_impl(self.reader.as_ref(), cursor, limit).await
     }
 
     async fn quarantine_blob(

@@ -6201,48 +6201,6 @@ async fn test_fs_storage_list_cas_blobs_page_production_delegation() {
 }
 
 #[tokio::test]
-async fn test_fs_storage_list_cas_blobs_page_custom_budgets_exhaustion() {
-    use crate::storage::{StorageError, StorageErrorKind};
-    use storage_fs::DirEnumerationLimits;
-
-    let fixture = tempfile::tempdir().expect("create test fixture");
-    let root = fixture.path().join("storage-root");
-    put_cas_blob_file(
-        &root,
-        "0a00000000000000000000000000000000000000000000000000000000000001",
-        b"blob 1",
-    );
-    put_cas_blob_file(
-        &root,
-        "0b00000000000000000000000000000000000000000000000000000000000002",
-        b"blob 2",
-    );
-
-    let storage = FsStorage::new(root.clone(), 1024 * 1024);
-
-    // Root budget max_entries = 1, but there are 2 shards (0a and 0b)
-    let small_root_budget = super::listing::FsListingBudgets::new(
-        DirEnumerationLimits::new(1, 1024),
-        DirEnumerationLimits::new(100, 1024 * 1024),
-    );
-
-    let err = storage
-        .list_cas_blobs_page_with_budgets(None, 10, small_root_budget)
-        .await
-        .expect_err("exceeding root budget must fail closed with Backend");
-    match err {
-        StorageError::Internal { kind, message } => {
-            assert_eq!(kind, StorageErrorKind::Backend);
-            assert!(message.contains("enumeration resource limit exceeded"));
-        }
-        other => panic!("expected Backend, got {other:?}"),
-    }
-
-    drop(storage);
-    drop(fixture);
-}
-
-#[tokio::test]
 async fn test_cas_blob_traverser_over_real_fs_storage() {
     use crate::blob_gc::traverser::CasBlobTraverser;
 

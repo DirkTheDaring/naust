@@ -65,7 +65,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use storage_core::{ObjectKey, ReadError};
-use storage_fs::{DirEntry, DirEntryType, DirEnumerationLimits, FsDirError, FsFileMetadata};
+use storage_fs::{DirEntryType, DirStream, FsDirError, FsFileMetadata};
 
 use crate::registry::digest::Digest;
 use crate::storage::{
@@ -76,14 +76,9 @@ use crate::storage::{
 ///
 /// Enables exercising both the concrete [`storage_fs::FsMetadataReader`] and deterministic
 /// recording fakes for failure injection.
-#[async_trait]
 pub(crate) trait CasDirEnumerator: Send + Sync {
-    /// Enumerates a directory relative to the storage root descriptor.
-    async fn enumerate_dir(
-        &self,
-        target: Option<&ObjectKey>,
-        limits: DirEnumerationLimits,
-    ) -> Result<Vec<DirEntry>, FsDirError>;
+    /// Streams directory entries relative to the storage root descriptor with backpressure.
+    fn stream_dir(&self, target: Option<&ObjectKey>) -> Result<DirStream, FsDirError>;
 }
 
 /// Narrow registry-owned test abstraction for descriptor-relative file metadata inspection.
@@ -100,14 +95,9 @@ pub(crate) trait CasMetadataInspector: Send + Sync {
 pub(crate) trait CasListingSource: CasDirEnumerator + CasMetadataInspector {}
 impl<T: CasDirEnumerator + CasMetadataInspector + ?Sized> CasListingSource for T {}
 
-#[async_trait]
 impl CasDirEnumerator for storage_fs::FsMetadataReader {
-    async fn enumerate_dir(
-        &self,
-        target: Option<&ObjectKey>,
-        limits: DirEnumerationLimits,
-    ) -> Result<Vec<DirEntry>, FsDirError> {
-        self.enumerate_dir(target, limits).await
+    fn stream_dir(&self, target: Option<&ObjectKey>) -> Result<DirStream, FsDirError> {
+        self.stream_dir(target)
     }
 }
 
@@ -118,14 +108,9 @@ impl CasMetadataInspector for storage_fs::FsMetadataReader {
     }
 }
 
-#[async_trait]
 impl<T: CasDirEnumerator + ?Sized> CasDirEnumerator for &T {
-    async fn enumerate_dir(
-        &self,
-        target: Option<&ObjectKey>,
-        limits: DirEnumerationLimits,
-    ) -> Result<Vec<DirEntry>, FsDirError> {
-        (**self).enumerate_dir(target, limits).await
+    fn stream_dir(&self, target: Option<&ObjectKey>) -> Result<DirStream, FsDirError> {
+        (**self).stream_dir(target)
     }
 }
 
@@ -136,14 +121,9 @@ impl<T: CasMetadataInspector + ?Sized> CasMetadataInspector for &T {
     }
 }
 
-#[async_trait]
 impl<T: CasDirEnumerator + ?Sized> CasDirEnumerator for Arc<T> {
-    async fn enumerate_dir(
-        &self,
-        target: Option<&ObjectKey>,
-        limits: DirEnumerationLimits,
-    ) -> Result<Vec<DirEntry>, FsDirError> {
-        (**self).enumerate_dir(target, limits).await
+    fn stream_dir(&self, target: Option<&ObjectKey>) -> Result<DirStream, FsDirError> {
+        (**self).stream_dir(target)
     }
 }
 
@@ -305,66 +285,12 @@ pub(crate) fn candidate_version(modified: Option<SystemTime>, size: u64) -> Blob
     BlobObjectVersion(format!("{version_seconds}:{size}"))
 }
 
-/// Registry-owned resource limits for CAS listing enumeration.
-///
-/// Encapsulates separate operational bounds for the CAS root directory (`blobs/sha256`)
-/// and individual shard directories (`blobs/sha256/<p2>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FsListingBudgets {
-    /// Budget applied when enumerating the CAS root directory (`blobs/sha256`).
-    pub root: DirEnumerationLimits,
-    /// Budget applied when enumerating individual shard directories (`blobs/sha256/<p2>`).
-    pub shard: DirEnumerationLimits,
-}
-
-impl FsListingBudgets {
-    /// Default maximum entries permitted in the CAS root directory (`blobs/sha256`).
-    pub const DEFAULT_ROOT_MAX_ENTRIES: usize = 512;
-    /// Default maximum total raw filename bytes permitted in the CAS root directory.
-    pub const DEFAULT_ROOT_MAX_NAME_BYTES: usize = 16 * 1024; // 16,384
-
-    /// Default maximum entries permitted in a single CAS shard directory (`blobs/sha256/<p2>`).
-    pub const DEFAULT_SHARD_MAX_ENTRIES: usize = 100_000;
-    /// Default maximum total raw filename bytes permitted in a single CAS shard directory.
-    pub const DEFAULT_SHARD_MAX_NAME_BYTES: usize = 8 * 1024 * 1024; // 8,388,608
-
-    /// Constructs a new budget pair with distinct root and shard enumeration limits.
-    #[allow(dead_code)]
-    pub fn new(root: DirEnumerationLimits, shard: DirEnumerationLimits) -> Self {
-        Self { root, shard }
-    }
-
-    /// Constructs unbounded budgets suitable for high-scale production operations.
-    pub fn unbounded() -> Self {
-        Self {
-            root: DirEnumerationLimits::new(usize::MAX, usize::MAX),
-            shard: DirEnumerationLimits::new(usize::MAX, usize::MAX),
-        }
-    }
-}
-
-impl Default for FsListingBudgets {
-    fn default() -> Self {
-        Self {
-            root: DirEnumerationLimits::new(
-                Self::DEFAULT_ROOT_MAX_ENTRIES,
-                Self::DEFAULT_ROOT_MAX_NAME_BYTES,
-            ),
-            shard: DirEnumerationLimits::new(
-                Self::DEFAULT_SHARD_MAX_ENTRIES,
-                Self::DEFAULT_SHARD_MAX_NAME_BYTES,
-            ),
-        }
-    }
-}
-
-/// Executes paginated CAS blob listing through a directory enumerator and metadata inspector seam.
+/// Executes paginated CAS blob listing through a directory streaming enumerator and metadata inspector seam.
 ///
 /// # Arguments
 /// - `source`: Combined directory enumerator and metadata inspector (e.g. `FsMetadataReader` or fake).
 /// - `cursor`: Optional continuation cursor from a preceding page.
 /// - `limit`: Requested candidate limit, clamped to `[1, 1000]`.
-/// - `budgets`: Registry-owned resource limits containing distinct root and shard enumeration bounds.
 ///
 /// # Invariants Enforced
 /// - Target directory is `blobs/sha256` relative to the root descriptor.
@@ -380,12 +306,12 @@ impl Default for FsListingBudgets {
 /// - Disappeared candidates fail the page immediately with `StorageErrorKind::Io` without partial results.
 /// - Substituted symlinks or non-regular objects fail closed with typed errors.
 /// - Exact-full-page returns `Some(next_cursor)`; subsequent terminal page returns `None`.
-/// - Budget exhaustion fails closed immediately without partial results.
+/// - Shards are traversed via asynchronous streaming (`stream_dir`) with bounded channel backpressure;
+///   no full directory vectors are materialized in memory. Memory is bounded by O(limit).
 pub(crate) async fn list_cas_blobs_page_impl(
     source: &(impl CasListingSource + ?Sized),
     cursor: Option<&GcCursor>,
     limit: usize,
-    budgets: FsListingBudgets,
 ) -> Result<GcBlobPage, StorageError> {
     let max_limit = 1000;
     let limit = limit.min(max_limit).max(1);
@@ -394,11 +320,8 @@ pub(crate) async fn list_cas_blobs_page_impl(
     let cas_root_key = ObjectKey::parse("blobs/sha256")
         .map_err(|e| StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string()))?;
 
-    let root_entries = match source
-        .enumerate_dir(Some(&cas_root_key), budgets.root)
-        .await
-    {
-        Ok(entries) => entries,
+    let mut root_stream = match source.stream_dir(Some(&cas_root_key)) {
+        Ok(stream) => stream,
         Err(FsDirError::NotFound { .. }) => {
             return Ok(GcBlobPage {
                 items: Vec::new(),
@@ -409,7 +332,17 @@ pub(crate) async fn list_cas_blobs_page_impl(
     };
 
     let mut prefix_dirs = Vec::new();
-    for ent in root_entries {
+    while let Some(entry_res) = root_stream.next_entry().await {
+        let ent = match entry_res {
+            Ok(ent) => ent,
+            Err(FsDirError::NotFound { .. }) => {
+                return Ok(GcBlobPage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+            Err(err) => return Err(translate_dir_error(err)),
+        };
         let name_str = ent.name().to_str().ok_or_else(|| {
             StorageError::corrupt_data(format!(
                 "malformed non-utf8 entry in CAS root: {:?}",
@@ -441,8 +374,8 @@ pub(crate) async fn list_cas_blobs_page_impl(
             StorageError::internal(StorageErrorKind::InternalInvariant, e.to_string())
         })?;
 
-        let shard_entries = match source.enumerate_dir(Some(&shard_key), budgets.shard).await {
-            Ok(entries) => entries,
+        let mut shard_stream = match source.stream_dir(Some(&shard_key)) {
+            Ok(stream) => stream,
             Err(FsDirError::NotFound { .. }) => {
                 return Err(StorageError::io(format!(
                     "CAS shard directory disappeared during listing: {p2}"
@@ -454,7 +387,16 @@ pub(crate) async fn list_cas_blobs_page_impl(
         let remaining_needed = limit.saturating_sub(candidates.len());
         let mut heap = std::collections::BinaryHeap::with_capacity(remaining_needed.min(1024));
 
-        for ent in shard_entries {
+        while let Some(entry_res) = shard_stream.next_entry().await {
+            let ent = match entry_res {
+                Ok(ent) => ent,
+                Err(FsDirError::NotFound { .. }) => {
+                    return Err(StorageError::io(format!(
+                        "CAS shard directory disappeared during listing: {p2}"
+                    )));
+                }
+                Err(err) => return Err(translate_dir_error(err)),
+            };
             let name_str = ent.name().to_str().ok_or_else(|| {
                 StorageError::corrupt_data(format!(
                     "malformed non-utf8 blob filename in CAS shard directory {p2}: {:?}",
@@ -536,14 +478,17 @@ pub(crate) async fn list_cas_blobs_page_impl(
 
 /// Backwards-compatible seam forwarder for tests calling `list_cas_blobs_page_seam`.
 #[cfg(test)]
-pub(crate) async fn list_cas_blobs_page_seam(
+pub(crate) async fn list_cas_blobs_page_seam<B>(
     source: &(impl CasListingSource + ?Sized),
     cursor: Option<&GcCursor>,
     limit: usize,
-    budgets: FsListingBudgets,
+    _budgets: B,
 ) -> Result<GcBlobPage, StorageError> {
-    list_cas_blobs_page_impl(source, cursor, limit, budgets).await
+    list_cas_blobs_page_impl(source, cursor, limit).await
 }
+
+#[cfg(test)]
+pub(crate) fn default_test_budget() {}
 
 #[cfg(test)]
 mod tests {
@@ -551,6 +496,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
     use std::time::Duration;
+    use storage_fs::DirEntry;
 
     use crate::blob_gc::policy::{AgeEligibility, check_candidate_age};
     use crate::blob_gc::traverser::{CasBlobTraverser, GcPaginationError};
@@ -558,7 +504,7 @@ mod tests {
     /// Recording fake enumerator and metadata inspector for deterministic call order,
     /// inspection verification, and failure injection.
     struct RecordingFakeDirEnumerator {
-        calls: Mutex<Vec<(Option<ObjectKey>, DirEnumerationLimits)>>,
+        calls: Mutex<Vec<Option<ObjectKey>>>,
         responses: Mutex<HashMap<Option<ObjectKey>, VecDeque<Result<Vec<DirEntry>, FsDirError>>>>,
         inspect_calls: Mutex<Vec<ObjectKey>>,
         inspect_responses: Mutex<HashMap<ObjectKey, VecDeque<Result<FsFileMetadata, ReadError>>>>,
@@ -598,17 +544,12 @@ mod tests {
             *self.default_metadata.lock().unwrap() = Some(metadata);
         }
 
-        fn calls(&self) -> Vec<(Option<ObjectKey>, DirEnumerationLimits)> {
+        fn calls(&self) -> Vec<Option<ObjectKey>> {
             self.calls.lock().unwrap().clone()
         }
 
         fn called_targets(&self) -> Vec<Option<ObjectKey>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(t, _)| t.clone())
-                .collect()
+            self.calls.lock().unwrap().clone()
         }
 
         fn inspect_calls(&self) -> Vec<ObjectKey> {
@@ -616,21 +557,20 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl CasDirEnumerator for RecordingFakeDirEnumerator {
-        async fn enumerate_dir(
-            &self,
-            target: Option<&ObjectKey>,
-            limits: DirEnumerationLimits,
-        ) -> Result<Vec<DirEntry>, FsDirError> {
-            self.calls.lock().unwrap().push((target.cloned(), limits));
+        fn stream_dir(&self, target: Option<&ObjectKey>) -> Result<DirStream, FsDirError> {
+            self.calls.lock().unwrap().push(target.cloned());
             let mut responses = self.responses.lock().unwrap();
             let queue = responses.get_mut(&target.cloned()).unwrap_or_else(|| {
-                panic!("unexpected call to RecordingFakeDirEnumerator::enumerate_dir with target: {target:?}")
+                panic!("unexpected call to RecordingFakeDirEnumerator::stream_dir with target: {target:?}")
             });
-            queue
+            let res = queue
                 .pop_front()
-                .unwrap_or_else(|| panic!("no more scripted dir responses for target: {target:?}"))
+                .unwrap_or_else(|| panic!("no more scripted dir responses for target: {target:?}"));
+            match res {
+                Ok(entries) => Ok(DirStream::from_entries(entries)),
+                Err(err) => Err(err),
+            }
         }
     }
 
@@ -654,35 +594,6 @@ mod tests {
                 "unexpected call to RecordingFakeDirEnumerator::inspect_file_metadata with key: {key}"
             );
         }
-    }
-
-    fn default_test_budget() -> FsListingBudgets {
-        FsListingBudgets::default()
-    }
-
-    #[test]
-    fn test_default_listing_budget_values() {
-        let defaults = FsListingBudgets::default();
-        assert_eq!(defaults.root.max_entries(), 512);
-        assert_eq!(defaults.root.max_total_name_bytes(), 16_384);
-        assert_eq!(defaults.shard.max_entries(), 100_000);
-        assert_eq!(defaults.shard.max_total_name_bytes(), 8_388_608);
-        assert_eq!(
-            defaults.root.max_entries(),
-            FsListingBudgets::DEFAULT_ROOT_MAX_ENTRIES
-        );
-        assert_eq!(
-            defaults.root.max_total_name_bytes(),
-            FsListingBudgets::DEFAULT_ROOT_MAX_NAME_BYTES
-        );
-        assert_eq!(
-            defaults.shard.max_entries(),
-            FsListingBudgets::DEFAULT_SHARD_MAX_ENTRIES
-        );
-        assert_eq!(
-            defaults.shard.max_total_name_bytes(),
-            FsListingBudgets::DEFAULT_SHARD_MAX_NAME_BYTES
-        );
     }
 
     fn cas_key(path: &str) -> ObjectKey {
@@ -912,7 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_distinct_root_and_shard_budgets_forwarded_to_respective_calls() {
+    async fn test_distinct_root_and_shard_streamed_in_order() {
         let fake = RecordingFakeDirEnumerator::new();
         let root_key = cas_key("blobs/sha256");
         let shard_key = cas_key("blobs/sha256/0a");
@@ -923,47 +834,36 @@ mod tests {
         );
         fake.script(Some(shard_key.clone()), Ok(vec![]));
 
-        // Use deliberately distinct entry and byte limits so accidentally reusing
-        // either budget fails the test.
-        let root_limits = DirEnumerationLimits::new(111, 222);
-        let shard_limits = DirEnumerationLimits::new(333, 444);
-        let budgets = FsListingBudgets::new(root_limits, shard_limits);
-
-        let _ = list_cas_blobs_page_seam(&fake, None, 10, budgets)
-            .await
-            .unwrap();
+        let _ = list_cas_blobs_page_seam(&fake, None, 10, ()).await.unwrap();
 
         let calls = fake.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], (Some(root_key), root_limits));
-        assert_eq!(calls[1], (Some(shard_key), shard_limits));
+        assert_eq!(calls[0], Some(root_key));
+        assert_eq!(calls[1], Some(shard_key));
     }
 
     #[tokio::test]
-    async fn test_root_limit_failure_prevents_shard_enumeration_and_candidate_inspection() {
+    async fn test_root_error_prevents_shard_enumeration_and_candidate_inspection() {
         let fake = RecordingFakeDirEnumerator::new();
         let root_key = cas_key("blobs/sha256");
 
         fake.script(
             Some(root_key),
-            Err(FsDirError::LimitExceeded {
-                reason: storage_fs::LimitExceededReason::MaxEntries(512),
+            Err(FsDirError::Io {
+                source: std::io::Error::other("disk failure"),
             }),
         );
         // Do NOT script any shard or inspect responses: if called, fake will panic.
 
-        let res = list_cas_blobs_page_seam(&fake, None, 10, default_test_budget()).await;
-        assert!(
-            res.is_err(),
-            "root limit failure must fail closed immediately"
-        );
+        let res = list_cas_blobs_page_seam(&fake, None, 10, ()).await;
+        assert!(res.is_err(), "root failure must fail closed immediately");
         let err = res.unwrap_err();
         match err {
             StorageError::Internal { kind, message } => {
-                assert_eq!(kind, StorageErrorKind::Backend);
-                assert!(message.contains("enumeration resource limit exceeded"));
+                assert_eq!(kind, StorageErrorKind::Io);
+                assert!(message.contains("disk failure"));
             }
-            other => panic!("expected Backend error, got {other:?}"),
+            other => panic!("expected Io error, got {other:?}"),
         }
 
         // Verify root call occurred, but 0 shard calls and 0 candidate inspections occurred
@@ -973,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shard_limit_failure_preserves_typed_error_and_whole_page_failure() {
+    async fn test_shard_error_preserves_typed_error_and_whole_page_failure() {
         let fake = RecordingFakeDirEnumerator::new();
         let root_key = cas_key("blobs/sha256");
         let shard_key = cas_key("blobs/sha256/0a");
@@ -984,24 +884,21 @@ mod tests {
         );
         fake.script(
             Some(shard_key),
-            Err(FsDirError::LimitExceeded {
-                reason: storage_fs::LimitExceededReason::MaxTotalNameBytes(8_388_608),
+            Err(FsDirError::Io {
+                source: std::io::Error::other("shard io error"),
             }),
         );
         // Do NOT script inspect responses: if called, fake will panic.
 
-        let res = list_cas_blobs_page_seam(&fake, None, 10, default_test_budget()).await;
-        assert!(
-            res.is_err(),
-            "shard limit failure must fail the entire page"
-        );
+        let res = list_cas_blobs_page_seam(&fake, None, 10, ()).await;
+        assert!(res.is_err(), "shard error must fail the entire page");
         let err = res.unwrap_err();
         match err {
             StorageError::Internal { kind, message } => {
-                assert_eq!(kind, StorageErrorKind::Backend);
-                assert!(message.contains("enumeration resource limit exceeded"));
+                assert_eq!(kind, StorageErrorKind::Io);
+                assert!(message.contains("shard io error"));
             }
-            other => panic!("expected Backend error, got {other:?}"),
+            other => panic!("expected Io error, got {other:?}"),
         }
 
         assert_eq!(fake.calls().len(), 2);
@@ -1009,13 +906,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_success_when_root_and_shard_require_different_budgets() {
+    async fn test_success_streaming_shards_without_limits() {
         let fake = RecordingFakeDirEnumerator::new();
         let root_key = cas_key("blobs/sha256");
         let shard_key = cas_key("blobs/sha256/0a");
 
         fake.script(
-            Some(root_key),
+            Some(root_key.clone()),
             Ok(vec![DirEntry::new("0a".into(), DirEntryType::Directory)]),
         );
 
@@ -1025,24 +922,17 @@ mod tests {
             let hex = format!("0a{:062x}", i);
             shard_entries.push(DirEntry::new(hex.into(), DirEntryType::Regular));
         }
-        fake.script(Some(shard_key), Ok(shard_entries));
+        fake.script(Some(shard_key.clone()), Ok(shard_entries));
         fake.with_default_metadata(FsFileMetadata::new(128, Some(SystemTime::UNIX_EPOCH)));
 
-        // Configure asymmetric budgets:
-        // Root has max_entries: 5 (less than shard's 10 entries)
-        // Shard has max_entries: 20 (enough for shard's 10 entries)
-        let root_limits = DirEnumerationLimits::new(5, 500);
-        let shard_limits = DirEnumerationLimits::new(20, 2000);
-        let asymmetric_budgets = FsListingBudgets::new(root_limits, shard_limits);
-
-        let page = list_cas_blobs_page_seam(&fake, None, 10, asymmetric_budgets)
+        let page = list_cas_blobs_page_seam(&fake, None, 10, ())
             .await
-            .expect("page succeeds when root and shard require different budgets");
+            .expect("page succeeds without artificial limits");
 
         assert_eq!(page.items.len(), 10);
         assert_eq!(fake.calls().len(), 2);
-        assert_eq!(fake.calls()[0].1, root_limits);
-        assert_eq!(fake.calls()[1].1, shard_limits);
+        assert_eq!(fake.calls()[0], Some(root_key));
+        assert_eq!(fake.calls()[1], Some(shard_key));
         assert_eq!(fake.inspect_calls().len(), 10);
     }
 
@@ -1253,10 +1143,7 @@ mod tests {
         );
         fake.script(Some(shard_key.clone()), Ok(entries.clone()));
 
-        let budgets = FsListingBudgets::new(
-            DirEnumerationLimits::new(512, 16_384),
-            DirEnumerationLimits::new(2000, 200_000),
-        );
+        let budgets = ();
 
         let page1 = list_cas_blobs_page_seam(&fake, None, 50_000, budgets)
             .await
@@ -1928,17 +1815,12 @@ mod tests {
             }
         }
 
-        #[async_trait]
         impl<'a, T: CasListingSource + ?Sized> CasDirEnumerator for InterceptingListingWrapper<'a, T> {
-            async fn enumerate_dir(
-                &self,
-                target: Option<&ObjectKey>,
-                limits: DirEnumerationLimits,
-            ) -> Result<Vec<DirEntry>, FsDirError> {
+            fn stream_dir(&self, target: Option<&ObjectKey>) -> Result<DirStream, FsDirError> {
                 if let Some(ref mut hook) = *self.on_before_enumerate.lock().unwrap() {
                     hook(target);
                 }
-                self.inner.enumerate_dir(target, limits).await
+                self.inner.stream_dir(target)
             }
         }
 
@@ -2281,178 +2163,22 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_real_fs_budget_limits_entry_count() {
-            let (_fixture, root) = create_test_root();
-            for p2 in ["0a", "0b", "0c"] {
-                std::fs::create_dir_all(root.join("blobs").join("sha256").join(p2)).unwrap();
-            }
-
-            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-
-            let tight_budget = FsListingBudgets::new(
-                DirEnumerationLimits::new(1, 100_000),
-                DirEnumerationLimits::new(100_000, 8 * 1024 * 1024),
-            );
-            let res = list_cas_blobs_page_seam(&reader, None, 10, tight_budget).await;
-            assert!(
-                res.is_err(),
-                "enumeration exceeding root max_entries budget must fail closed"
-            );
-            let err = res.unwrap_err();
-            match err {
-                StorageError::Internal { kind, message } => {
-                    assert_eq!(kind, StorageErrorKind::Backend);
-                    assert!(message.contains("enumeration resource limit exceeded"));
-                }
-                other => panic!("expected Backend, got {other:?}"),
-            }
-        }
-
-        #[tokio::test]
-        async fn test_real_fs_budget_limits_name_bytes() {
-            let (_fixture, root) = create_test_root();
-            for p2 in ["0a", "0b"] {
-                std::fs::create_dir_all(root.join("blobs").join("sha256").join(p2)).unwrap();
-            }
-
-            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-
-            let tight_budget = FsListingBudgets::new(
-                DirEnumerationLimits::new(100, 2),
-                DirEnumerationLimits::new(100_000, 8 * 1024 * 1024),
-            );
-            let res = list_cas_blobs_page_seam(&reader, None, 10, tight_budget).await;
-            assert!(
-                res.is_err(),
-                "enumeration exceeding root max_total_name_bytes must fail closed"
-            );
-            let err = res.unwrap_err();
-            match err {
-                StorageError::Internal { kind, message } => {
-                    assert_eq!(kind, StorageErrorKind::Backend);
-                    assert!(message.contains("enumeration resource limit exceeded"));
-                }
-                other => panic!("expected Backend, got {other:?}"),
-            }
-        }
-
-        #[tokio::test]
-        async fn test_real_fs_shard_budget_limits_entry_count() {
+        async fn test_real_fs_streaming_without_artificial_limits() {
             let (_fixture, root) = create_test_root();
             let shard_dir = root.join("blobs").join("sha256").join("0a");
             std::fs::create_dir_all(&shard_dir).unwrap();
-            let hex1 = "0a00000000000000000000000000000000000000000000000000000000000001";
-            let hex2 = "0a00000000000000000000000000000000000000000000000000000000000002";
-            std::fs::write(shard_dir.join(hex1), b"data1").unwrap();
-            std::fs::write(shard_dir.join(hex2), b"data2").unwrap();
-
-            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-
-            // Ample root budget (512, 16 KiB), tight shard budget (1 entry)
-            let tight_shard_budget = FsListingBudgets::new(
-                DirEnumerationLimits::new(512, 16 * 1024),
-                DirEnumerationLimits::new(1, 100_000),
-            );
-            let res = list_cas_blobs_page_seam(&reader, None, 10, tight_shard_budget).await;
-            assert!(
-                res.is_err(),
-                "enumeration exceeding shard max_entries budget must fail closed"
-            );
-            let err = res.unwrap_err();
-            match err {
-                StorageError::Internal { kind, message } => {
-                    assert_eq!(kind, StorageErrorKind::Backend);
-                    assert!(message.contains("enumeration resource limit exceeded"));
-                }
-                other => panic!("expected Backend, got {other:?}"),
-            }
-        }
-
-        #[tokio::test]
-        async fn test_real_fs_shard_budget_limits_name_bytes() {
-            let (_fixture, root) = create_test_root();
-            let shard_dir = root.join("blobs").join("sha256").join("0a");
-            std::fs::create_dir_all(&shard_dir).unwrap();
-            let hex = "0a00000000000000000000000000000000000000000000000000000000000001";
-            std::fs::write(shard_dir.join(hex), b"data").unwrap();
-
-            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-
-            // Ample root budget (512, 16 KiB), tight shard byte budget (10 bytes < 64 byte filename)
-            let tight_shard_budget = FsListingBudgets::new(
-                DirEnumerationLimits::new(512, 16 * 1024),
-                DirEnumerationLimits::new(100, 10),
-            );
-            let res = list_cas_blobs_page_seam(&reader, None, 10, tight_shard_budget).await;
-            assert!(
-                res.is_err(),
-                "enumeration exceeding shard max_total_name_bytes must fail closed"
-            );
-            let err = res.unwrap_err();
-            match err {
-                StorageError::Internal { kind, message } => {
-                    assert_eq!(kind, StorageErrorKind::Backend);
-                    assert!(message.contains("enumeration resource limit exceeded"));
-                }
-                other => panic!("expected Backend, got {other:?}"),
-            }
-        }
-
-        #[tokio::test]
-        async fn test_real_fs_success_when_root_and_shard_require_different_budgets() {
-            let (_fixture, root) = create_test_root();
-            let shard_dir = root.join("blobs").join("sha256").join("0a");
-            std::fs::create_dir_all(&shard_dir).unwrap();
-            for i in 1..=3 {
+            for i in 1..=15 {
                 let hex = format!("0a{:062x}", i);
                 std::fs::write(shard_dir.join(hex), b"blob").unwrap();
             }
 
             let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
 
-            // Root has max_entries: 2 (enough for 1 prefix dir "0a", but LESS than 3 shard blobs)
-            // Shard has max_entries: 5 (enough for 3 shard blobs)
-            let asymmetric_budgets = FsListingBudgets::new(
-                DirEnumerationLimits::new(2, 500),
-                DirEnumerationLimits::new(5, 2000),
-            );
-            let page = list_cas_blobs_page_seam(&reader, None, 10, asymmetric_budgets)
+            let page = list_cas_blobs_page_impl(&reader, None, 10)
                 .await
-                .expect("page succeeds when root and shard require different budgets");
-            assert_eq!(page.items.len(), 3);
-        }
-
-        #[tokio::test]
-        async fn test_real_fs_zero_limit_empty_vs_non_empty() {
-            let (_fixture, root) = create_test_root();
-            let cas_root = root.join("blobs").join("sha256");
-            std::fs::create_dir_all(&cas_root).unwrap();
-
-            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-            let zero_budget = FsListingBudgets::new(
-                DirEnumerationLimits::new(0, 0),
-                DirEnumerationLimits::new(0, 0),
-            );
-
-            let page_empty = list_cas_blobs_page_seam(&reader, None, 10, zero_budget)
-                .await
-                .expect("empty directory succeeds with zero limits");
-            assert!(page_empty.items.is_empty());
-
-            std::fs::create_dir_all(cas_root.join("0a")).unwrap();
-            let res = list_cas_blobs_page_seam(&reader, None, 10, zero_budget).await;
-            assert!(
-                res.is_err(),
-                "non-empty directory must fail closed under zero limit"
-            );
-            let err = res.unwrap_err();
-            match err {
-                StorageError::Internal { kind, message } => {
-                    assert_eq!(kind, StorageErrorKind::Backend);
-                    assert!(message.contains("enumeration resource limit exceeded"));
-                }
-                other => panic!("expected Backend, got {other:?}"),
-            }
+                .expect("streaming succeeds without limits");
+            assert_eq!(page.items.len(), 10);
+            assert!(page.next_cursor.is_some());
         }
 
         #[tokio::test]
@@ -2778,7 +2504,7 @@ mod tests {
                 }
             });
 
-            let err = list_cas_blobs_page_impl(&wrapper, None, 10, default_test_budget())
+            let err = list_cas_blobs_page_impl(&wrapper, None, 10)
                 .await
                 .expect_err("shard disappeared before enumeration must fail closed with Io");
             match err {
@@ -2799,7 +2525,7 @@ mod tests {
                 .expect("write sha256 file");
 
             let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-            let err = list_cas_blobs_page_impl(&reader, None, 10, default_test_budget())
+            let err = list_cas_blobs_page_impl(&reader, None, 10)
                 .await
                 .expect_err("final non-directory component must fail closed with CorruptData");
             match err {
@@ -2859,7 +2585,7 @@ mod tests {
             }
 
             let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-            let res = list_cas_blobs_page_impl(&reader, None, 10, default_test_budget()).await;
+            let res = list_cas_blobs_page_impl(&reader, None, 10).await;
 
             let err = res.expect_err("permission denied on CAS root must fail closed");
             match err {
@@ -2885,34 +2611,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_real_fs_budget_limits_shard_entries() {
-            let (_fixture, root) = create_test_root();
-            let hex1 = "0a00000000000000000000000000000000000000000000000000000000000001";
-            let hex2 = "0a00000000000000000000000000000000000000000000000000000000000002";
-            put_blob(&root, hex1, b"blob 1");
-            put_blob(&root, hex2, b"blob 2");
-
-            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-            let budget = FsListingBudgets::new(
-                DirEnumerationLimits::new(10, 1024),
-                DirEnumerationLimits::new(1, 1024 * 1024),
-            );
-
-            let err = list_cas_blobs_page_impl(&reader, None, 10, budget)
-                .await
-                .expect_err("exceeding shard max_entries must fail closed with Backend");
-            match err {
-                StorageError::Internal { kind, message } => {
-                    assert_eq!(kind, StorageErrorKind::Backend);
-                    assert!(message.contains("enumeration resource limit exceeded"));
-                    assert!(message.contains("MaxEntries"));
-                }
-                other => panic!("expected StorageErrorKind::Backend, got {other:?}"),
-            }
-        }
-
-        #[tokio::test]
-        async fn test_real_fs_unbounded_budget_allows_large_shard() {
+        async fn test_real_fs_streaming_allows_large_shard() {
             let (_fixture, root) = create_test_root();
             let shard_dir = root.join("blobs").join("sha256").join("0a");
             std::fs::create_dir_all(&shard_dir).unwrap();
@@ -2923,31 +2622,21 @@ mod tests {
 
             let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
 
-            let page1 = list_cas_blobs_page_seam(&reader, None, 50, FsListingBudgets::unbounded())
+            let page1 = list_cas_blobs_page_impl(&reader, None, 50)
                 .await
-                .expect("page 1 with unbounded budget must succeed");
+                .expect("page 1 must succeed");
             assert_eq!(page1.items.len(), 50);
             assert!(page1.next_cursor.is_some());
 
-            let page2 = list_cas_blobs_page_seam(
-                &reader,
-                page1.next_cursor.as_ref(),
-                50,
-                FsListingBudgets::unbounded(),
-            )
-            .await
-            .expect("page 2 with unbounded budget must succeed");
+            let page2 = list_cas_blobs_page_impl(&reader, page1.next_cursor.as_ref(), 50)
+                .await
+                .expect("page 2 must succeed");
             assert_eq!(page2.items.len(), 50);
             assert!(page2.next_cursor.is_some());
 
-            let page3 = list_cas_blobs_page_seam(
-                &reader,
-                page2.next_cursor.as_ref(),
-                50,
-                FsListingBudgets::unbounded(),
-            )
-            .await
-            .expect("page 3 with unbounded budget must succeed");
+            let page3 = list_cas_blobs_page_impl(&reader, page2.next_cursor.as_ref(), 50)
+                .await
+                .expect("page 3 must succeed");
             assert_eq!(page3.items.len(), 20);
             assert!(page3.next_cursor.is_none());
         }
@@ -2961,12 +2650,11 @@ mod tests {
     /// to exercise [`CasBlobTraverser`] over real seam pages.
     struct SeamGcStorageBridge<'a, S: CasListingSource + ?Sized> {
         source: &'a S,
-        budgets: FsListingBudgets,
     }
 
     impl<'a, S: CasListingSource + ?Sized> SeamGcStorageBridge<'a, S> {
-        fn new(source: &'a S, budgets: FsListingBudgets) -> Self {
-            Self { source, budgets }
+        fn new(source: &'a S) -> Self {
+            Self { source }
         }
     }
 
@@ -2988,7 +2676,7 @@ mod tests {
             cursor: Option<&GcCursor>,
             limit: usize,
         ) -> Result<GcBlobPage, StorageError> {
-            list_cas_blobs_page_seam(self.source, cursor, limit, self.budgets).await
+            list_cas_blobs_page_impl(self.source, cursor, limit).await
         }
         async fn quarantine_blob(
             &self,
@@ -3046,7 +2734,7 @@ mod tests {
         }
 
         let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
-        let bridge = SeamGcStorageBridge::new(&reader, default_test_budget());
+        let bridge = SeamGcStorageBridge::new(&reader);
 
         // Run CasBlobTraverser with batch size 2
         let mut traverser = CasBlobTraverser::new(&bridge, 2);
@@ -3218,7 +2906,7 @@ mod tests {
             }),
         );
 
-        let err = list_cas_blobs_page_impl(&fake, None, 10, default_test_budget())
+        let err = list_cas_blobs_page_impl(&fake, None, 10)
             .await
             .expect_err("missing shard directory must fail with Io");
         match err {
