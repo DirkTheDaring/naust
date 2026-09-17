@@ -103,16 +103,23 @@ pub(crate) struct DiscoveryLimits {
 #[allow(dead_code)]
 pub(crate) type DiscoveryTestLimits = DiscoveryLimits;
 
+impl DiscoveryLimits {
+    /// Effectively unbounded limits preserving ambient traversal without artificial caps.
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            max_depth: usize::MAX,
+            max_dir_enumerations: usize::MAX,
+            max_total_entries: usize::MAX,
+            max_manifest_dirs: usize::MAX,
+            max_retained_path_bytes: usize::MAX,
+            per_dir_limits: DirEnumerationLimits::new(usize::MAX, usize::MAX),
+        }
+    }
+}
+
 impl Default for DiscoveryLimits {
     fn default() -> Self {
-        Self {
-            max_depth: 32,
-            max_dir_enumerations: 10_000,
-            max_total_entries: 250_000,
-            max_manifest_dirs: 10_000,
-            max_retained_path_bytes: 10 * 1024 * 1024,
-            per_dir_limits: DirEnumerationLimits::new(1000, 100_000),
-        }
+        Self::unbounded()
     }
 }
 

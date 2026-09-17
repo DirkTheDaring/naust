@@ -55,8 +55,8 @@ pub struct TagReadLimits {
     pub max_payload_bytes: Option<u64>,
 }
 
-/// Configured resource limits for filesystem tag listing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Configuration limits for tag listing and repository existence probing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagListingLimits {
     pub repo_probe_limits: storage_fs::DirEnumerationLimits,
     pub tags_dir_limits: storage_fs::DirEnumerationLimits,
@@ -66,10 +66,7 @@ pub struct TagListingLimits {
 impl Default for TagListingLimits {
     fn default() -> Self {
         Self {
-            repo_probe_limits: storage_fs::DirEnumerationLimits::new(
-                DEFAULT_TAG_LISTING_REPO_PROBE_MAX_ENTRIES,
-                DEFAULT_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES,
-            ),
+            repo_probe_limits: storage_fs::DirEnumerationLimits::new(usize::MAX, usize::MAX),
             tags_dir_limits: storage_fs::DirEnumerationLimits::new(
                 DEFAULT_TAG_LISTING_MAX_ENTRIES,
                 DEFAULT_TAG_LISTING_MAX_NAME_BYTES,
@@ -92,6 +89,18 @@ impl TagListingLimits {
             repo_probe_limits,
             tags_dir_limits,
             payload_limits,
+        }
+    }
+
+    /// Constructs unbounded tag listing limits.
+    #[allow(dead_code)]
+    pub fn unbounded() -> Self {
+        Self {
+            repo_probe_limits: storage_fs::DirEnumerationLimits::new(usize::MAX, usize::MAX),
+            tags_dir_limits: storage_fs::DirEnumerationLimits::new(usize::MAX, usize::MAX),
+            payload_limits: TagReadLimits {
+                max_payload_bytes: None,
+            },
         }
     }
 }
@@ -145,19 +154,60 @@ fn repo_key(repo: &str) -> Result<ObjectKey, StorageError> {
 }
 
 /// Contained repository-existence probe for the `list_tags`
-/// missing-repository contract: enumerates `repos/<repo>` beneath the
-/// pinned root with the configured probe budget (the retired listing
-/// seam's exact probe: `NotFound` → repository missing, any successful —
-/// even empty — enumeration → repository exists, other failures translate
-/// through [`translate_tag_dir_error`]).
+/// missing-repository contract: opens `repos/<repo>` beneath the
+/// pinned root directly without enumerating directory entries when unbounded,
+/// or enforces explicit caller bounds when limits are configured.
 pub(crate) struct FsTagRepoProbe {
     reader: Arc<FsMetadataReader>,
-    limits: DirEnumerationLimits,
+    limits: Option<DirEnumerationLimits>,
 }
 
 impl FsTagRepoProbe {
     pub(crate) fn new(reader: Arc<FsMetadataReader>, limits: DirEnumerationLimits) -> Self {
-        Self { reader, limits }
+        Self {
+            reader,
+            limits: Some(limits),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn unbounded(reader: Arc<FsMetadataReader>) -> Self {
+        Self {
+            reader,
+            limits: None,
+        }
+    }
+}
+
+fn translate_probe_error(err: storage_fs::FsMutateError, dir_key: &str) -> StorageError {
+    match err {
+        storage_fs::FsMutateError::NotFound => {
+            StorageError::io(format!("directory vanished before probe: {dir_key}"))
+        }
+        storage_fs::FsMutateError::NotADirectory => {
+            StorageError::corrupt_data(format!("path is not a directory: {dir_key}"))
+        }
+        storage_fs::FsMutateError::PermissionDenied => StorageError::permission_denied(format!(
+            "permission denied opening directory {dir_key}"
+        )),
+        storage_fs::FsMutateError::ResolutionRejected { raw_os_error } => StorageError::io(
+            format!("path resolution rejected for directory {dir_key} (os error {raw_os_error:?})"),
+        ),
+        storage_fs::FsMutateError::PlatformUnsupported => {
+            StorageError::configuration(format!("platform unsupported for {dir_key}"))
+        }
+        storage_fs::FsMutateError::Io(source) => {
+            StorageError::io(format!("I/O error probing directory {dir_key}: {source}"))
+        }
+        storage_fs::FsMutateError::RuntimeMissing(err) => StorageError::backend(format!(
+            "tokio runtime missing during probe of {dir_key}: {err}"
+        )),
+        storage_fs::FsMutateError::TaskJoinFailed(err) => {
+            StorageError::backend(format!("blocking task join failed for {dir_key}: {err}"))
+        }
+        other => StorageError::backend(format!(
+            "unexpected error probing directory {dir_key}: {other}"
+        )),
     }
 }
 
@@ -165,10 +215,46 @@ impl FsTagRepoProbe {
 impl TagRepoProbe for FsTagRepoProbe {
     async fn repo_exists(&self, repo: &str) -> Result<bool, StorageError> {
         let key = repo_key(repo)?;
-        match self.reader.enumerate_dir(Some(&key), self.limits).await {
-            Ok(_) => Ok(true),
-            Err(FsDirError::NotFound { .. }) => Ok(false),
-            Err(err) => Err(translate_tag_dir_error(err, key.as_str())),
+        if let Some(limits) = self.limits {
+            if limits.max_entries() < usize::MAX || limits.max_total_name_bytes() < usize::MAX {
+                return match self.reader.enumerate_dir(Some(&key), limits).await {
+                    Ok(_) => Ok(true),
+                    Err(FsDirError::NotFound { .. }) => Ok(false),
+                    Err(err) => Err(translate_tag_dir_error(err, key.as_str())),
+                };
+            }
         }
+        match self.reader.open_contained_dir(key.as_str()).await {
+            Ok(_) => Ok(true),
+            Err(storage_fs::FsMutateError::NotFound) => Ok(false),
+            Err(storage_fs::FsMutateError::NotADirectory) => Ok(false),
+            Err(err) => Err(translate_probe_error(err, key.as_str())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_repo_probe_unbounded_by_entry_count() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let reader = Arc::new(FsMetadataReader::open(root).unwrap());
+        let probe = FsTagRepoProbe::unbounded(reader);
+
+        // 1. Missing repo returns false
+        assert_eq!(probe.repo_exists("my-repo").await.unwrap(), false);
+
+        // 2. Existing repo with 200 entries (> 64 limit) succeeds with true
+        let repo_path = root.join("repos").join("my-repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        for i in 0..200 {
+            std::fs::write(repo_path.join(format!("entry_{i}")), b"test").unwrap();
+        }
+
+        assert_eq!(probe.repo_exists("my-repo").await.unwrap(), true);
     }
 }

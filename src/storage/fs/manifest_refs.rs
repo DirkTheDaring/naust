@@ -68,17 +68,24 @@ pub(crate) struct ManifestReferenceLimits {
 #[allow(dead_code)]
 pub(crate) type ManifestReferenceTestLimits = ManifestReferenceLimits;
 
-impl Default for ManifestReferenceLimits {
-    fn default() -> Self {
+impl ManifestReferenceLimits {
+    /// Effectively unbounded limits preserving ambient reference extraction without artificial caps.
+    pub(crate) fn unbounded() -> Self {
         Self {
-            max_terminal_dir_enumerations: 10_000,
-            per_dir_limits: DirEnumerationLimits::new(10_000, 1_500_000),
-            max_total_manifest_entries: 250_000,
-            max_manifests_read: 50_000,
-            max_total_references: 250_000,
-            max_retained_logical_bytes: 32 * 1024 * 1024,
+            max_terminal_dir_enumerations: usize::MAX,
+            per_dir_limits: DirEnumerationLimits::new(usize::MAX, usize::MAX),
+            max_total_manifest_entries: usize::MAX,
+            max_manifests_read: usize::MAX,
+            max_total_references: usize::MAX,
+            max_retained_logical_bytes: usize::MAX,
             max_manifest_payload_bytes: None,
         }
+    }
+}
+
+impl Default for ManifestReferenceLimits {
+    fn default() -> Self {
+        Self::unbounded()
     }
 }
 

@@ -333,6 +333,14 @@ impl FsListingBudgets {
     pub fn new(root: DirEnumerationLimits, shard: DirEnumerationLimits) -> Self {
         Self { root, shard }
     }
+
+    /// Constructs unbounded budgets suitable for high-scale production operations.
+    pub fn unbounded() -> Self {
+        Self {
+            root: DirEnumerationLimits::new(usize::MAX, usize::MAX),
+            shard: DirEnumerationLimits::new(usize::MAX, usize::MAX),
+        }
+    }
 }
 
 impl Default for FsListingBudgets {
@@ -443,7 +451,9 @@ pub(crate) async fn list_cas_blobs_page_impl(
             Err(err) => return Err(translate_dir_error(err)),
         };
 
-        let mut file_names = Vec::new();
+        let remaining_needed = limit.saturating_sub(candidates.len());
+        let mut heap = std::collections::BinaryHeap::with_capacity(remaining_needed.min(1024));
+
         for ent in shard_entries {
             let name_str = ent.name().to_str().ok_or_else(|| {
                 StorageError::corrupt_data(format!(
@@ -466,17 +476,31 @@ pub(crate) async fn list_cas_blobs_page_impl(
                     "malformed blob file name in CAS shard {p2}: {name_str}"
                 )));
             }
-            file_names.push(name_str.to_ascii_lowercase());
-        }
-        file_names.sort();
 
-        for hex in file_names {
-            let digest_str = format!("sha256:{hex}");
+            let hex_lower = name_str.to_ascii_lowercase();
             if let Some(c) = cursor_str {
+                let digest_str = format!("sha256:{hex_lower}");
                 if digest_str.as_str() <= c {
                     continue;
                 }
             }
+
+            if remaining_needed > 0 {
+                if heap.len() < remaining_needed {
+                    heap.push(hex_lower);
+                } else if let Some(max_elem) = heap.peek() {
+                    if hex_lower.as_str() < max_elem.as_str() {
+                        heap.pop();
+                        heap.push(hex_lower);
+                    }
+                }
+            }
+        }
+
+        let file_names = heap.into_sorted_vec();
+
+        for hex in file_names {
+            let digest_str = format!("sha256:{hex}");
 
             let digest = Digest::parse(&digest_str).map_err(|e| {
                 StorageError::internal_invariant(format!(
@@ -2885,6 +2909,47 @@ mod tests {
                 }
                 other => panic!("expected StorageErrorKind::Backend, got {other:?}"),
             }
+        }
+
+        #[tokio::test]
+        async fn test_real_fs_unbounded_budget_allows_large_shard() {
+            let (_fixture, root) = create_test_root();
+            let shard_dir = root.join("blobs").join("sha256").join("0a");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            for i in 0..120 {
+                let hex = format!("0a{:062x}", i);
+                std::fs::write(shard_dir.join(hex), b"blobdata").unwrap();
+            }
+
+            let reader = storage_fs::FsMetadataReader::open(&root).expect("open root reader");
+
+            let page1 = list_cas_blobs_page_seam(&reader, None, 50, FsListingBudgets::unbounded())
+                .await
+                .expect("page 1 with unbounded budget must succeed");
+            assert_eq!(page1.items.len(), 50);
+            assert!(page1.next_cursor.is_some());
+
+            let page2 = list_cas_blobs_page_seam(
+                &reader,
+                page1.next_cursor.as_ref(),
+                50,
+                FsListingBudgets::unbounded(),
+            )
+            .await
+            .expect("page 2 with unbounded budget must succeed");
+            assert_eq!(page2.items.len(), 50);
+            assert!(page2.next_cursor.is_some());
+
+            let page3 = list_cas_blobs_page_seam(
+                &reader,
+                page2.next_cursor.as_ref(),
+                50,
+                FsListingBudgets::unbounded(),
+            )
+            .await
+            .expect("page 3 with unbounded budget must succeed");
+            assert_eq!(page3.items.len(), 20);
+            assert!(page3.next_cursor.is_none());
         }
     }
 

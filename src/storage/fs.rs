@@ -402,6 +402,15 @@ fn map_fs_mutate_err(err: FsMutateError) -> StorageError {
     }
 }
 
+fn map_fs_dir_err(err: storage_fs::FsDirError) -> StorageError {
+    match err {
+        storage_fs::FsDirError::Io { source } => map_fs_io_err(source),
+        storage_fs::FsDirError::PermissionDenied { source, .. } => map_fs_io_err(source),
+        storage_fs::FsDirError::SyscallUnsupported(e) => map_fs_io_err(e),
+        other => StorageError::io(other.to_string()),
+    }
+}
+
 #[derive(Debug)]
 pub struct FsStorage {
     root: PathBuf,
@@ -2204,17 +2213,22 @@ fn session_hash_generations_by_scan(
     uuid: &str,
 ) -> Result<Vec<u64>, FsMutateError> {
     let prefix = format!("{uuid}.hash.");
-    let entries = dir.list(storage_fs::DirEnumerationLimits::new(
-        1_048_576,
-        256 * 1024 * 1024,
-    ))?;
+    let page_size = std::num::NonZeroUsize::new(1024).expect("nonzero page size");
+    let mut after = None;
     let mut generations = Vec::new();
-    for entry in entries {
-        let name = entry.name().to_string_lossy();
-        if let Some(rest) = name.strip_prefix(&prefix)
-            && let Ok(generation) = rest.parse::<u64>()
-        {
-            generations.push(generation);
+    loop {
+        let (names, more) = dir.list_page(after.as_deref(), page_size)?;
+        for name in &names {
+            if let Some(rest) = name.strip_prefix(&prefix)
+                && let Ok(generation) = rest.parse::<u64>()
+            {
+                generations.push(generation);
+            }
+        }
+        if more && let Some(last) = names.last() {
+            after = Some(last.clone());
+        } else {
+            break;
         }
     }
     generations.sort_unstable();
@@ -3335,14 +3349,9 @@ impl UploadSessionStorage for FsStorage {
         // `count` tallies only CONFIRMED cleanups; busy / not-expired / absent /
         // corrupt / changed candidates are distinguished from failures, per-candidate
         // failures are logged and skipped, and a fatal listing failure is surfaced.
-        let session_entries = uploads
-            .list(storage_fs::DirEnumerationLimits::new(
-                1_048_576,
-                256 * 1024 * 1024,
-            ))
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for entry in session_entries {
+        let mut session_stream = uploads.stream().map_err(map_fs_mutate_err)?;
+        while let Some(entry_res) = session_stream.next_entry().await {
+            let entry = entry_res.map_err(map_fs_dir_err)?;
             let file_name = entry.name().to_string_lossy().into_owned();
             let Some(uuid) = file_name.strip_suffix(".meta.json") else {
                 continue;
@@ -3458,14 +3467,9 @@ impl UploadSessionStorage for FsStorage {
         // Each receipt is unlinked only under the matching `.lock.{uuid}` session
         // lock, re-reading it under the lock so a concurrently (re)published or
         // identity-changed receipt, or a fresh same-UUID session, is respected.
-        let receipt_entries = finalized
-            .list(storage_fs::DirEnumerationLimits::new(
-                1_048_576,
-                256 * 1024 * 1024,
-            ))
-            .await
-            .map_err(map_fs_mutate_err)?;
-        for entry in receipt_entries {
+        let mut receipt_stream = finalized.stream().map_err(map_fs_mutate_err)?;
+        while let Some(entry_res) = receipt_stream.next_entry().await {
+            let entry = entry_res.map_err(map_fs_dir_err)?;
             let file_name = entry.name().to_string_lossy().into_owned();
             let Some(uuid) = file_name.strip_suffix(".json") else {
                 continue;
@@ -4000,7 +4004,7 @@ impl GcStorage for FsStorage {
             self.reader.as_ref(),
             cursor,
             limit,
-            listing::FsListingBudgets::default(),
+            listing::FsListingBudgets::unbounded(),
         )
         .await
     }
