@@ -1,7 +1,9 @@
 # Contained Filesystem Quarantine and Upload Inspection Point Reads (Partial — Reaper Cutover Deferred)
 
+> **Historical snapshot.** Point-read containment in this note landed (`00676c7`). The deferred ambient reaper described here was later cut over (`f555e5f` and `filesystem-upload-lifecycle-contained-cleanup.md`). Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-quarantine-upload-inspection-containment.md`
-- **Status:** Implementation & Compatibility Record with Mutation-Path Audit and a DEFERRED-path blocker record (working tree, not committed)
+- **Status:** Historical implementation record (working tree at `0cd6a73`; subsequently committed and superseded for the reaper)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `0cd6a734475555ffe315ba6db8775031b248ee36` (`master`), changes applied in the working tree only.
 - **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — the required capability, including nanosecond mtime via `inspect_file_metadata`, exists; no gap).
 - **Scope:** Gap items R-13–R-15. This batch contains the three standalone

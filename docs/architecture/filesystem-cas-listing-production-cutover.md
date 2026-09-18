@@ -1,5 +1,7 @@
 # Filesystem CAS Listing Production Cutover
 
+> **Partial supersession:** this slice’s **fixed `FsListingBudgets` (Option A)** was later **removed**, not merely unconfigured. At `master` `9405991`, CAS listing streams (`stream_dir`) with a bounded heap and no `FsListingBudgets` / `with_budgets` entry points (`src/storage/fs/listing.rs`). Contained listing itself remains. The “No Push or Commit” line in §1 below is also obsolete (the cutover shipped, then the budget contract was replaced). Current inventory: [`current-state.md`](current-state.md).
+
 ## 1. Executive Summary and Scope
 
 This document records the approved production cutover of Content Addressable Storage (CAS) blob listing in `registry-rust` to the contained, descriptor-relative listing implementation backed by `storage-fs`.

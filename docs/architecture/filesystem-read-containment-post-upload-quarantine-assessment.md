@@ -1,7 +1,9 @@
 # Architecture Assessment Update: Filesystem Read-Containment Gaps After Quarantine/Upload Inspection Point-Read Containment (Reaper Deferred)
 
+> **Historical snapshot — not HEAD remaining work.** Recorded against `0cd6a73` plus an uncommitted working tree. Later `master` commits contained the reaper and mutation paths (`f555e5f` and following). Current residual inventory: [`current-state.md`](current-state.md). Index: [`README.md`](README.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-upload-quarantine-assessment.md`
-- **Status:** Gap Assessment Delta (supersedes the R-13–R-15 rows of `filesystem-read-containment-post-journal-assessment.md`; earlier assessments preserved unchanged as historical records)
+- **Status:** Historical gap delta (superseded as current inventory by `current-state.md`). Originally superseded the R-13–R-15 rows of `filesystem-read-containment-post-journal-assessment.md`.
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `0cd6a734475555ffe315ba6db8775031b248ee36` (`master`), with the quarantine/upload inspection point-read batch applied in the working tree (uncommitted).
 - **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
 - **Implementation Record:** `docs/architecture/filesystem-quarantine-upload-inspection-containment.md`

@@ -1,5 +1,7 @@
 # Architecture Assessment Update: Filesystem Read-Containment Gaps After Membership Read Containment
 
+> **Historical snapshot.** Membership **point** ops later moved onto `membership_domain` (`6ed8b3e`). Listing/count/readiness **reads** stay on the contained `membership_read` seam (pinned reader). Marker/checkpoint **writes** stay pathname `atomic_write_file`. Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-membership-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the R-7–R-11 rows of `filesystem-read-containment-post-timestamps-assessment.md`; earlier assessments preserved unchanged as historical records)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `634da23b1f4f015fb38fa0dd9baea95236583a62` (`master`), with the membership read-containment batch applied in the working tree (uncommitted).

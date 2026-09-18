@@ -1,5 +1,7 @@
 # Architecture Assessment Update: Filesystem Read-Containment Gaps After Lifecycle-Journal Read Containment
 
+> **Historical snapshot.** Journal *reads* described here landed; later commits also contained journal *writes* via the shared domain (`f5f9bf7`, `8c0ac64`). Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-journal-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the R-12 row of `filesystem-read-containment-post-membership-assessment.md`; earlier assessments preserved unchanged as historical records)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `ef50360da7ac7640a628e2f808c242d914ca4c14` (`master`), with the lifecycle-journal read-containment batch applied in the working tree (uncommitted).

@@ -1,8 +1,10 @@
 # Architecture Assessment: Remaining Filesystem Read-Containment Gaps
 
+> **Historical snapshot — not HEAD remaining work.** Written at `2fc21aab`. Later `master` contained CAS/manifest/tag/referrer/catalog/membership/journal reads, mutation cutover, and the upload reaper. There is no production `list_tag_files`. Current residual inventory: [`current-state.md`](current-state.md). Index: [`README.md`](README.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-remaining-gaps.md`
-- **Status:** Read-Only Assessment & Characterization Slice Recommendation
-- **Canonical Quality Gates:** `O-03`, `O-04`, `O-05`, `O-06`, `O-13`, `O-15`, `O-16`, and `D-06` remain explicitly **OPEN**
+- **Status:** Historical read-only assessment (superseded as current inventory by `current-state.md`)
+- **Canonical Quality Gates:** `O-03`, `O-04`, `O-05`, `O-06`, `O-13`, `O-15`, `O-16`, and filesystem-doc `D-06` remain explicitly **OPEN** as *acceptance* criteria, not as “cutovers did not happen.”
 - **Registry-Rust Baseline:** `2fc21aabdae9c64ba1dd8b3d8c1a1cbc69ddcb2e`
 - **Storage-Layer-Rust Baseline:** `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`
 

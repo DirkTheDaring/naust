@@ -6,6 +6,8 @@
 * **Scope:** Server Runtime Composition Root, Supervisor Boundary Narrowing, Centralized Graph Assembly, Startup Preflight & Failure Unwinding
 * **Refines:** `docs/architecture/adr-001-first-refactoring-boundary.md`, `docs/architecture/adr-002-application-service-boundary.md`, `docs/architecture/adr-003-storage-capability-ports.md`, `docs/architecture/adr-004-application-read-services.md`, `docs/architecture/current-code-assessment.md`
 
+**Implementation note (`master` `9405991`):** `ServerRuntime` stores `app_state: AppState`, optional `ref_index`, and `Arc<tokio::sync::Mutex<Option<RuntimeMutationAuthority>>>` (`src/runtime.rs`). The §2.1 sketch that also keeps `storage_wiring` and `consistency_coordinator` on the struct is not the post-assembly layout; those are still built in `build_server_runtime` and injected into services. Living inventory: [`current-state.md`](current-state.md).
+
 ---
 
 ## 1. Context & Problem Statement

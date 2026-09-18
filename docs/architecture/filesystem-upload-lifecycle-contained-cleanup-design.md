@@ -1,7 +1,11 @@
 # Filesystem Upload-Lifecycle Contained Cleanup — Design and Prototype
 
-**Status:** DESIGN AND PROTOTYPE READY — PRODUCTION UNCHANGED — DECISIONS
+> **Historical design package.** Production now runs the contained reaper / `UploadAuthorities` path documented in [`filesystem-upload-lifecycle-contained-cleanup.md`](filesystem-upload-lifecycle-contained-cleanup.md). Current residual inventory: [`current-state.md`](current-state.md).
+
+**Status (as written):** DESIGN AND PROTOTYPE READY — PRODUCTION UNCHANGED — DECISIONS
 IDENTIFIED — **NOT PRODUCTION-READY** — NOT COMMITTED.
+
+**Status at `master` `9405991`:** design landed; this file is not current remaining work.
 
 This document is the consolidated decision package for making the filesystem
 upload-session and receipt reaper (`FsStorage::reap_expired_sessions`) coherent:

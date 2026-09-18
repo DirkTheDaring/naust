@@ -1,5 +1,7 @@
 # Architecture Assessment Update: Filesystem Read-Containment Gaps After Catalog Discovery Cutover
 
+> **Historical snapshot.** Catalog discovery containment described here landed; remaining-work tables below are not HEAD. Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-catalog-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the catalog rows of `filesystem-read-containment-post-referrers-assessment.md`)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `906ef891baab47780856132df6e25492f3cd3499` (`master`), with the contained catalog-discovery cutover applied in the working tree (uncommitted).

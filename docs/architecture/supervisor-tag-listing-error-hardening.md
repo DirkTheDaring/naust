@@ -3,8 +3,8 @@
 - **Document:** `docs/architecture/supervisor-tag-listing-error-hardening.md`
 - **Target Repository:** `registry-rust` (HEAD: `5779f7f97f1109bcbb15bb6ad47e845bd4686bbf`)
 - **Dependency Repository:** `storage-layer-rust` (HEAD: `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`, strictly read-only)
-- **Status:** **IMPLEMENTED & VERIFIED — READY FOR REVIEW — STORAGE ROUTING UNCHANGED — NOT COMMITTED**
-- **Canonical Quality Gates:** All eight quality gates remain explicitly **OPEN** (`O-03, O-04, O-05, O-06, O-13, O-15, O-16, D-06`).
+- **Status:** **IMPLEMENTED** on `master` (error propagation in `compute_protected_blobs`; `NotFound` → empty tag list, other errors fail the proxy-GC path). The original “NOT COMMITTED / before contained tag listing” framing is obsolete. Production tag listing is `tag_domain`, not `contained_list_tags_seam`. Current inventory: [`current-state.md`](current-state.md).
+- **Canonical Quality Gates:** All eight quality gates remain explicitly **OPEN** as acceptance criteria (`O-03, O-04, O-05, O-06, O-13, O-15, O-16, D-06`).
 
 ---
 

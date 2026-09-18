@@ -1,5 +1,7 @@
 # Filesystem Tag Listing Production Cutover
 
+> **Partial supersession:** production `list_tags` / `list_tags_page` / `resolve_tag` now go through `crate::storage::tag_domain` over `ObjectStore` (`32c42c6`). Tag **mutation** is the same domain (not this listing-cutover document). `src/storage/fs/tag_listing.rs` retains limits wiring and the repository-existence probe only. Current inventory: [`current-state.md`](current-state.md).
+
 ## 1. Executive Summary and Scope
 
 This document records the bounded production cutover of contained filesystem tag listing in `registry-rust`, promoting the contained test seam into active production service and routing both `FsStorage::list_tags` and `FsStorage::list_tags_page` through it.

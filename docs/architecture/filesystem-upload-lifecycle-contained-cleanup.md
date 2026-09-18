@@ -3,11 +3,12 @@
 - **Document**: `docs/architecture/filesystem-upload-lifecycle-contained-cleanup.md`
 - **Repository**: `registry-rust` (with coordinated additive primitives in `storage-layer-rust`)
 - **Date**: 2026-09-13
-- **Status**: IMPLEMENTED (production integration) — NOT COMMITTED — NOT PUSHED
-- **Baseline HEADs**:
+- **Status**: IMPLEMENTED on `master` (`UploadAuthorities` / contained reaper). The original “NOT COMMITTED — NOT PUSHED” stamp is obsolete. Broader FS mutation cutover is `f555e5f`; this note is the upload-lifecycle behavior record.
+- **Aligned HEAD:** `9405991` (2026-09-18). See [`current-state.md`](current-state.md).
+- **Baseline HEADs (when this note was written):**
   - `registry-rust`: `00676c721fde2687196eececbc2cdb097bb1fd9c`
   - `storage-layer-rust`: `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`
-- **Canonical Quality Gates** (remain explicitly **OPEN**): `O-03`, `O-04`, `O-05`,
+- **Canonical Quality Gates** (remain explicitly **OPEN** as acceptance criteria): `O-03`, `O-04`, `O-05`,
   `O-06`, `O-13`, `O-15`, `O-16`, `D-06`.
 
 This document describes the **actual behavior** of the shipped implementation, not a

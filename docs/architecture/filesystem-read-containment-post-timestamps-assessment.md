@@ -1,5 +1,7 @@
 # Architecture Assessment Update: Filesystem Read-Containment Gaps After Timestamps/Emptiness Containment
 
+> **Historical snapshot.** Timestamps later also sit on `repo_timestamp_domain` (`84dbe13`). Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-timestamps-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the R-4/R-5 rows of `filesystem-read-containment-post-catalog-assessment.md`; earlier assessments preserved unchanged as historical records)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `3b647132f867accd7551ddb0ca297064be89abb9` (`master`), with the timestamps/emptiness containment batch applied in the working tree (uncommitted).

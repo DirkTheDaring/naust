@@ -1,5 +1,7 @@
 # Architecture Assessment Update: Filesystem Read-Containment Gaps After Referrers Cutover
 
+> **Historical snapshot.** Referrers later sit on `referrer_domain` (`b1e607c`). Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-referrers-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the referrers rows of `filesystem-read-containment-post-tag-listing-assessment.md`)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `2419d46e89d88151c18972210ba79826bf776b59` (`master`), with the contained referrers read cutover applied in the working tree (uncommitted).

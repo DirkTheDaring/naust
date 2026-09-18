@@ -1,5 +1,7 @@
 # Architecture Assessment: Refreshed Filesystem Read-Containment Gaps
 
+> **Historical snapshot.** Tag listing later sits on `tag_domain` (`32c42c6`). Current residual inventory: [`current-state.md`](current-state.md).
+
 - **Document:** `docs/architecture/filesystem-read-containment-post-tag-listing-assessment.md`
 - **Status:** Read-Only Architectural Gap Assessment & Next Slice Proposal (Corrected Record)
 - **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD [`f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe`](file:///home/dietmar/devel/rust/registry-rust) (`master`)

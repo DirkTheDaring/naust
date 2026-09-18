@@ -5,6 +5,23 @@
 **Assessment Date:** 2026-08-26  
 **Auditor:** Senior Software Architect (OCI Distribution & Storage Systems)
 
+**Living inventory (supersedes leftover “current remaining work” in this file):** [`current-state.md`](current-state.md) at `master` `9405991` (2026-09-18). Document index: [`README.md`](README.md).
+
+---
+
+## Addendum: Code-aligned status at `9405991` (2026-09-18)
+
+This assessment’s baseline sections (§1–§8 diagrams and traces, §11 original slice numbering) describe **2026-08-26** structure. They are not a description of HEAD. The §9 register **was updated** in this addendum pass (D-01/D-02 are no longer “Planned”).
+
+At `9405991`:
+
+- **Wave 1 (ADRs 001–009, slices 1–11) landed for production consumers.** OCI blob/manifest/catalog/tag/referrer routes go through seven application services. `StorageWiring::from_backend` takes **port** trait bounds, not `dyn Storage`. `ConsistencyCoordinator`, CLI `CommandPolicy`, test sidecars, and `StorageErrorKind` are in tree. Admin GC and token mint still read `AppState` config/`gc_service`.
+- **Wave 2 filesystem/ObjectStore cutovers landed after this assessment’s remaining-gap notes.** Contained mutation authorities (`f555e5f`), durability barriers (`8c0ac64`), shared domains phases 3–8, streaming CAS listing (`9405991`). The upload reaper is not ambient `read_dir`.
+- **Residual coupling (code):** omnibus `impl Storage` remains on adapters (tests + same concrete type as the ports); `AppState` still a process bag (services + proxy/GC/semaphores); pathname `atomic_write_file` for `meta/` membership **writes**; pathname repo `flock`; repository-existence probe not on `ObjectStore`.
+- **Quality gates** in the later FS notes remain **OPEN** as acceptance criteria. That is not the same as “cutovers did not happen.” Assessment D-06 (stringly `StorageError`) is **Resolved (ADR-009)**; filesystem-doc D-06 is a different ID.
+
+Updated debt-register statuses are in §9 below.
+
 ---
 
 ## Post-Slice-10 Implementation Status (Slice 10 Implemented)
@@ -184,7 +201,9 @@ However, the baseline architecture exhibited **structural coupling, abstraction 
 
 ## 2. Current Architecture Map
 
-### 2.1 System Component Overview
+> **HEAD (`9405991`):** delivery → application services → domain engines → `StorageWiring` ports → `FsStorage` / `S3Storage` (pinned `FsMetadataReader` + ObjectStore domains). See [`current-state.md`](current-state.md). The diagram immediately below is the **baseline** map from 2026-08-26 and is retained as historical evidence of coupling that slices 1–11 and later storage cutovers addressed.
+
+### 2.1 System Component Overview (baseline 2026-08-26)
 
 ```
                                ┌───────────────────────────┐
@@ -245,6 +264,10 @@ However, the baseline architecture exhibited **structural coupling, abstraction 
 
 ### 2.2 Actual Dependency Direction Matrix
 
+**HEAD (`9405991`):** HTTP depends on application services, not `dyn Storage`. Application modules do not import Axum. Supervisor calls `build_server_runtime` and does not construct `FsStorage`/`S3Storage`. Remaining leaks: `AppState` still exposes config/proxy/GC/semaphores to transport; adapters still implement omnibus `Storage`; `Config` is still passed wholesale into assembly.
+
+**Baseline 2026-08-26 (historical):**
+
 | Consumer Layer | Permitted Dependencies | Actual Dependencies (Violations Flagged) | Status |
 |---|---|---|---|
 | **Delivery / HTTP (`http_api`)** | Application Services, Domain Types | `AppState` (all 22 fields), `Storage` direct methods, `BlobRefIndex`, `RepositoryMembershipLedger`, `Proxy` | ⚠️ Leaky |
@@ -256,6 +279,8 @@ However, the baseline architecture exhibited **structural coupling, abstraction 
 ---
 
 ## 3. Critical Use-Case Traces
+
+> Baseline traces (2026-08-26). At HEAD, handlers delegate mutations/reads to application services; proxy publication goes through those services; the FS upload reaper and GC quarantine mutations use contained authorities. See [`current-state.md`](current-state.md).
 
 ### Trace 1: Resumable Blob Upload and Finalization
 ```
@@ -441,8 +466,8 @@ Total Test Suite: 602 Tests
 
 | ID | Severity | Architectural Smell | Root Cause | Consequence | Affected Use Cases | Target Boundary | Recommended Correction | Status |
 |---|---|---|---|---|---|---|---|:---:|
-| **D-01** | **P1** | `Storage` God-Trait Overload | Rapid feature addition to single trait | Leaky abstraction; monolithic mock requirements | All storage access | `src/storage/ports/` | Segregate `Storage` into `BlobCasStorage`, `ManifestStorage`, `TagStorage`, `LockStorage` | Planned (Slice 3) |
-| **D-02** | **P1** | Unencapsulated `AppState` in Handlers | Direct handler access to 17 internal fields | Business logic leakage into transport layer | HTTP dispatch, Proxy caching | `src/services/` | Introduce `RegistryApplicationService` facade; pass focused contexts to handlers | Planned (Slice 2) |
+| **D-01** | **P1** | `Storage` God-Trait Overload | Rapid feature addition to single trait | Leaky abstraction; monolithic mock requirements | All storage access | `src/storage/ports/` | Segregate `Storage` into capability ports | **Mostly resolved (ADR-003).** `StorageWiring::from_backend` requires port traits, not `Storage`. Residual: adapters still `impl Storage` (tests / same concrete type). |
+| **D-02** | **P1** | Unencapsulated `AppState` in Handlers | Direct handler access to 17 internal fields | Business logic leakage into transport layer | HTTP dispatch, Proxy caching | `src/application/` (not `src/services/`) | Introduce application services; handlers parse/auth/map only | **Mostly resolved (ADR-002/004).** Mutations/reads go through seven services. Residual: `AppState` still holds proxy, GC, semaphores, config. |
 | **D-03** | **P2** | Conventional `consistency_gate` Synchronization | Unwrapped `Arc<Mutex<()>>` | Risk of future mutators bypassing gate | Manifest publish, GC sweep, Upload finalize | `src/consistency.rs` | Encapsulate gate inside transactional coordinator guards | **Resolved (ADR-001)** |
 | **D-04** | **P2** | In-Source Test Footprint Bloat | Historical co-location of extensive mocks | 55% of `src/` is test code; hinders maintainability | Development & Review | `tests/` or `src/fixtures/` | Extract mock drivers and unit tests into dedicated submodules or integration tests | **Resolved (Slices 8–10)** |
 | **D-05** | **P3** | Ghost Re-export Module | Partial refactoring of `manifest_publication` | Redundant 972-line file with duplicate tests | Build / Navigation | `src/manifest_lifecycle.rs` | Deprecate `manifest_publication.rs` and migrate residual test cases to `manifest_lifecycle_tests.rs` | **Resolved (ADR-007)** |
