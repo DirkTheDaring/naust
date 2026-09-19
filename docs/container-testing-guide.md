@@ -1,3 +1,5 @@
+> *Ops guide. Last reviewed 2026-09-19 (documentation reconciliation at `master` `2718bc16`); no architectural claims — content not re-validated against a live deployment.*
+
 # Container Image Testing Guide
 
 This guide describes how to run and test the `registry-rust` container image locally with authentication, OCI compliance checks, and API workflows.

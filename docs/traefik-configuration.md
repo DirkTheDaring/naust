@@ -1,3 +1,5 @@
+> *Ops guide. Last reviewed 2026-09-19 (documentation reconciliation at `master` `2718bc16`); no architectural claims — content not re-validated against a live deployment.*
+
 # Traefik configuration for registry-rust
 
 This document captures Traefik settings that are commonly required for reliable Docker/OCI pushes (especially large blobs) through Traefik.

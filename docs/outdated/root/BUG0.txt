@@ -1,0 +1,3 @@
+[2026-09-19] Migrated to docs/known-issues.md (KI-16). Retained as the original record; do not update here.
+
+docker buildx imagetools create --tag registry.synology.kaupon.de/nginx:latest docker.io/library/nginx:latest

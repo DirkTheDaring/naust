@@ -1,3 +1,0 @@
-* i am still wondering how to see how many images are stored
-   it seems right now only to show amd64, but what if there are also images for another platform like arm?
-

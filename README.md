@@ -84,7 +84,7 @@ If the process hits the OS file descriptor limit, you may see logs like:
 
 `ERROR axum::serve: accept error: Too many open files (os error 24)`
 
-- **systemd**: set `LimitNOFILE` in the service unit (the packaged unit sets `65536`).
+- **systemd**: set `LimitNOFILE` in the service unit (the packaged **RPM** unit sets `65536`; the packaged **DEB** unit currently sets no `LimitNOFILE` — see `docs/technical-debt.md` KI-21).
 - **docker-compose**: set `ulimits.nofile` (the example compose sets it).
 
 To inspect at runtime:
@@ -186,8 +186,10 @@ docker compose -f docker-compose.yml -f docker-compose.tls.yml up --build
 
 Docker usually requires either TLS or marking the registry as insecure.
 
-Note: when auth is configured, `GET /v2/` may return `401` with `WWW-Authenticate: Bearer ...`.
-This is expected: Docker/Podman use it to discover the token endpoint.
+Note: `GET /v2/` (the ping) itself always answers without auth. When a protected
+operation needs credentials, the registry returns `401` with
+`WWW-Authenticate: Bearer ...` on that operation's response; Docker/Podman use
+that challenge to discover the token endpoint.
 
 - For local dev, configure Docker daemon with an insecure registry entry for `127.0.0.1:5000`.
 - Then:
@@ -218,7 +220,7 @@ podman pull --tls-verify=false 127.0.0.1:5000/myrepo:latest
 
 For complete step-by-step container image testing, raw `curl` API validation, and automated Python test scripts, see [`docs/container-testing-guide.md`](docs/container-testing-guide.md).
 
-## Environment variables
+Documentation entry point (requirements, architecture, decisions, known issues): [`docs/README.md`](docs/README.md).
 
 ## CLI helpers
 
@@ -229,11 +231,14 @@ For complete step-by-step container image testing, raw `curl` API validation, an
 - `registry-rust ref-index check [--config <PATH>]`: verify the blob reference index is healthy
 - `registry-rust ref-index rebuild [--config <PATH>]`: rebuild the blob reference index from storage
 - `registry-rust ref-index ensure [--config <PATH>]`: check and rebuild the blob reference index if needed
-- `registry-rust blob-gc plan|quarantine|delete [--config <PATH>]`: reclaim storage by quarantining/deleting unreferenced blobs (filesystem backend only; refuses to run while the server is active on the same `fs_root`)
+- `registry-rust blob-gc plan|quarantine|delete [--config <PATH>]`: reclaim storage by quarantining/deleting unreferenced blobs. Works on both backends: on the filesystem backend it refuses to run while a server is active on the same `fs_root`; on the S3 backend, destructive subcommands require `--confirm-all-writers-stopped`. Supports `--policy`, `--min-age-secs`, `--max-per-run`, `--quarantine-delay-secs`. Note: the offline CLI runs regardless of the `[blob_gc]` enable switches (see `docs/technical-debt.md` KI-05); current GC behavior reference: `docs/operations.md`
+- `registry-rust migrate-membership plan|apply|verify [--config <PATH>]`: backfill repository↔blob membership records for pre-existing data (the server refuses to start on non-empty storage until this has been applied)
+- `registry-rust inspect-lock [--config <PATH>]`: print deployment writer lock metadata
+- `registry-rust admin-clear-lock` (alias `force-unlock`): break-glass clear of an abandoned writer lock; requires an explicit `--confirm` phrase
 
 ## Online blob GC (admin API)
 
-This repo also implements an *in-process* online-safe blob GC (see `docs/blob-gc-online.md`).
+This repo also implements an *in-process* online-safe blob GC (see `docs/operations.md` §1).
 It is driven via admin-only HTTP endpoints and is disabled by default.
 
 To enable it in TOML:
@@ -330,6 +335,11 @@ This registry can act as a pull-through cache for selected upstream repositories
 
 Important: cached pull-through content is stored in a separate storage root/prefix (filesystem default: `./data/cache`).
 This prevents pushed images from being mixed into the cache and makes cache cleanup as simple as removing the cache directory.
+
+Two current limitations to know about:
+
+- **Cache eviction and scrub run on the filesystem backend only.** With `storage.backend = "s3"` the eviction/scrub workers log a message and do nothing, so `max_cache_bytes` is not enforced and the S3 cache grows without bound (`docs/technical-debt.md` KI-02).
+- `max_cache_bytes` is **required** when the proxy is enabled (per upstream route when using `[[proxy.upstreams]]`); config loading fails without it.
 
 Minimal working config: `configs/registry.simple.toml`.
 
@@ -461,7 +471,7 @@ Push tokens are authorized via deterministic repo-prefix grants (deny-by-default
 - **Users + groups**: `[auth.users]` + `[[auth.users.accounts]]` + `[[auth.groups]]` (config-only)
 
 These settings are TOML-only to keep reviewable policy in source control.
-See `docs/rbac.md` and `docs/harbor-lite-phase2.md`.
+See `docs/operations.md` §2 (playbooks) and `docs/requirements.md` REQ-005/REQ-007.
 
 ### Config option inventory
 
@@ -518,7 +528,8 @@ key = "<old-long-random-secret>"
 | TLS ACME ispone base URL | `server.tls.acme.ispone.base_url` | `REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL` | `TLS_ACME_ISPONE_BASE_URL` | unset |
 | TLS ACME ispone auth | `server.tls.acme.ispone.authorization` | `REGISTRY__SERVER__TLS__ACME__ISPONE__AUTHORIZATION` | `TLS_ACME_ISPONE_AUTHORIZATION` | unset |
 | TLS ACME exec hook path | `server.tls.acme.exec_path.exec_path` | `REGISTRY__SERVER__TLS__ACME__EXEC_PATH__EXEC_PATH` | `TLS_ACME_EXEC_PATH` | unset |
-| Push auth mode | `auth.push.mode` | `REGISTRY__AUTH__PUSH__MODE` | `PUSH_AUTH_MODE` | `token_only` |
+| Auth strategy | `auth.strategy` | `REGISTRY__AUTH__STRATEGY` | `AUTH_STRATEGY` | `token` (also: `basic`, `both`) |
+| Anonymous pull | `auth.anonymous_pull` | `REGISTRY__AUTH__ANONYMOUS_PULL` | `AUTH_ANONYMOUS_PULL` | `true` |
 | Push username | `auth.push.username` | `REGISTRY__AUTH__PUSH__USERNAME` | `REGISTRY_USERNAME` | unset |
 | Push password | `auth.push.password` | `REGISTRY__AUTH__PUSH__PASSWORD` | `REGISTRY_PASSWORD` | unset |
 | Push allowlist | `auth.push.allow_repos` | `REGISTRY__AUTH__PUSH__ALLOW_REPOS` | `REGISTRY_PUSH_ALLOW_REPOS` | unset |
@@ -552,6 +563,18 @@ key = "<old-long-random-secret>"
 | Token signing keys (overlap rotation) | `token.signing_keys` | (n/a) | (n/a) | unset |
 | Token TTL | `token.ttl_secs` | `REGISTRY__TOKEN__TTL_SECS` | `TOKEN_TTL_SECS` | `600` |
 
+Connection and slow-client protection (see `tests/slow_connection_tests.rs` for behavior):
+
+| Purpose | TOML key | Canonical env | Legacy env | Default |
+| --- | --- | --- | --- | --- |
+| Max connections per client IP | `limits.max_connections_per_ip` | `REGISTRY__LIMITS__MAX_CONNECTIONS_PER_IP` | `MAX_CONNECTIONS_PER_IP` | see `configs/registry.example.toml` |
+| Trusted bypass CIDRs (IP limiter) | `limits.trusted_bypass_cidrs` | `REGISTRY__LIMITS__TRUSTED_BYPASS_CIDRS` | `TRUSTED_BYPASS_CIDRS` | unset |
+| Trusted proxies (honor `X-Forwarded-For`) | `limits.trusted_proxies` | `REGISTRY__LIMITS__TRUSTED_PROXIES` | `TRUSTED_PROXIES` | unset — XFF ignored unless the peer is listed |
+| Upload chunk idle timeout | `timeouts.upload_chunk_idle_timeout_secs` | `REGISTRY__TIMEOUTS__UPLOAD_CHUNK_IDLE_TIMEOUT_SECS` | `UPLOAD_CHUNK_IDLE_TIMEOUT_SECS` | see example config |
+| Min upload rate | `timeouts.min_upload_bytes_per_sec` (+ `upload_rate_window_secs`, `upload_rate_grace_period_secs`) | `REGISTRY__TIMEOUTS__MIN_UPLOAD_BYTES_PER_SEC` | `MIN_UPLOAD_BYTES_PER_SEC` | see example config |
+| Header read timeout | `timeouts.header_read_timeout_secs` | `REGISTRY__TIMEOUTS__HEADER_READ_TIMEOUT_SECS` | `HEADER_READ_TIMEOUT_SECS` | see example config |
+| Slow-connection policy | `timeouts.slow_connection_policy` | `REGISTRY__TIMEOUTS__SLOW_CONNECTION_POLICY` | `SLOW_CONNECTION_POLICY` | `enforce` \| `audit_only` \| `disabled` |
+
 Proxy cache maintenance:
 
 | Purpose | TOML key | Canonical env | Legacy env | Default |
@@ -560,9 +583,12 @@ Proxy cache maintenance:
 | Cache scrub interval | `proxy.cache.scrub_interval_secs` | `REGISTRY__PROXY__CACHE__SCRUB_INTERVAL_SECS` | `PROXY_SCRUB_INTERVAL_SECS` | `3600` |
 | Cache scrub max files | `proxy.cache.scrub_max_files_per_run` | `REGISTRY__PROXY__CACHE__SCRUB_MAX_FILES_PER_RUN` | `PROXY_SCRUB_MAX_FILES_PER_RUN` | `2000` |
 
+### Environment variables (legacy names, quick reference)
+
 - `LISTEN_ADDR` (default `127.0.0.1:5000`)
-- `PUSH_AUTH_MODE` / `REGISTRY__AUTH__PUSH__MODE` (`deny_if_no_basic` | `basic_or_token` | `token_only`)
-- `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (required unless `PUSH_AUTH_MODE=token_only`)
+- `AUTH_STRATEGY` / `REGISTRY__AUTH__STRATEGY` (`token` (default) | `basic` | `both`)
+- `AUTH_ANONYMOUS_PULL` / `REGISTRY__AUTH__ANONYMOUS_PULL` (`1`/`0`; default `1`) — when `0`, pulls also require auth
+- `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` (optional legacy global push credentials; robots/users are the reviewed alternative)
 - `REGISTRY_PUSH_ALLOW_REPOS` (optional, comma-separated; supports `org/*` prefixes and `*`)
 - `STORAGE_BACKEND` (`fs` or `s3`)
 - `STORAGE_FS_ROOT` (default `./data`)
@@ -578,7 +604,7 @@ Proxy cache maintenance:
 
 Inventory/listing endpoints:
 
-- `CATALOG_REQUIRES_AUTH` (`1`/`0`; default `0`) — if enabled, `/v2/_catalog` and `/_meta/*` require Basic or Bearer auth.
+- `CATALOG_REQUIRES_AUTH` (`1`/`0`; default `0`) — if enabled, `/v2/_catalog` and `/_meta/*` require Basic or Bearer auth. Note: `/v2/_catalog` additionally requires auth whenever anonymous pull is off or any credential source (`REGISTRY_USERNAME`, robots, users) is configured; `/_meta/*` is gated on this flag alone.
 
 Endpoints:
 
@@ -600,7 +626,7 @@ Auth/token (for Docker/Podman clients):
 
 - `PUBLIC_URL` (recommended; e.g. `http://127.0.0.1:5000` or `https://127.0.0.1:5000`)
 - `TOKEN_SERVICE` (default `registry-rust`)
-- `TOKEN_SIGNING_KEY` (default: random per process; set a fixed secret for stable long-running deployments)
+- `TOKEN_SIGNING_KEY` (default: random per process; set a fixed secret for stable long-running deployments). Ignored when `[[token.signing_keys]]` is configured in TOML — the keyring always wins (see "Token signing key rotation" above).
 - `TOKEN_TTL_SECS` (default `600`)
 
 TLS:
