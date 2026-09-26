@@ -187,6 +187,11 @@ pub enum BlobGcCommand {
         /// Explicit confirmation that all active registry writers operating against this S3 bucket are stopped.
         #[arg(long, default_value_t = false)]
         confirm_all_writers_stopped: bool,
+
+        /// Run even though blob_gc.enabled=false in the configuration (KI-05):
+        /// without this flag the CLI respects the kill switch and refuses.
+        #[arg(long, default_value_t = false)]
+        force_gc: bool,
     },
 
     /// Permanently delete blobs from quarantine after a delay (re-checks reachability).
@@ -205,6 +210,12 @@ pub enum BlobGcCommand {
         /// Explicit confirmation that all active registry writers operating against this S3 bucket are stopped.
         #[arg(long, default_value_t = false)]
         confirm_all_writers_stopped: bool,
+
+        /// Run even though blob_gc.enabled=false / blob_gc.enable_delete=false
+        /// in the configuration (KI-05): without this flag the CLI respects
+        /// the kill switches and refuses.
+        #[arg(long, default_value_t = false)]
+        force_gc: bool,
     },
 }
 
@@ -401,9 +412,10 @@ pub async fn execute_cli(cli: Cli) -> Result<(), CliError> {
                     policy,
                     min_age_secs,
                     max_per_run,
+                    force_gc,
                     ..
                 } => runtime
-                    .blob_gc_quarantine(policy, min_age_secs, max_per_run)
+                    .blob_gc_quarantine(policy, min_age_secs, max_per_run, force_gc)
                     .await
                     .map(|stats| {
                         println!(
@@ -418,9 +430,10 @@ pub async fn execute_cli(cli: Cli) -> Result<(), CliError> {
                     policy,
                     quarantine_delay_secs,
                     max_per_run,
+                    force_gc,
                     ..
                 } => runtime
-                    .blob_gc_delete(policy, quarantine_delay_secs, max_per_run)
+                    .blob_gc_delete(policy, quarantine_delay_secs, max_per_run, force_gc)
                     .await
                     .map(|stats| {
                         println!(

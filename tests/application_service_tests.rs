@@ -38,6 +38,7 @@ async fn setup_services() -> (
         disallow_monolithic_uploads: false,
         upload_chunk_min_bytes: None,
         gc_pin_duration_secs: 60,
+        finalize_grace_secs: 0,
     };
 
     let blob_service = Arc::new(BlobMutationService::new(

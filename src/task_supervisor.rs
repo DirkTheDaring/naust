@@ -685,6 +685,7 @@ mod tests {
                 disallow_monolithic_uploads: false,
                 upload_chunk_min_bytes: None,
                 gc_pin_duration_secs: 3600,
+                finalize_grace_secs: 0,
             },
         ));
 

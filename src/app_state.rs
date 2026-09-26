@@ -22,6 +22,18 @@ pub struct AuthMetrics {
 }
 
 impl AuthMetrics {
+    pub fn token_issued_total(&self) -> u64 {
+        self.token_issued_total.load(Ordering::Relaxed)
+    }
+
+    pub fn token_denied_total(&self) -> u64 {
+        self.token_denied_total.load(Ordering::Relaxed)
+    }
+
+    pub fn token_internal_error_total(&self) -> u64 {
+        self.token_internal_error_total.load(Ordering::Relaxed)
+    }
+
     pub fn inc_token_issued(&self) -> u64 {
         self.token_issued_total.fetch_add(1, Ordering::Relaxed) + 1
     }

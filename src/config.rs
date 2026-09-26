@@ -112,6 +112,11 @@ pub struct Config {
 
     pub auth_strategy: AuthStrategy,
     pub anonymous_pull: bool,
+    /// Repositories whose first path segment starts with one of these prefixes
+    /// require auth even when `anonymous_pull` is on (KI-17).
+    pub private_name_prefixes: Vec<String>,
+    /// Whether an explicit `*` RBAC grant also confers registry catalog scope (KI-18).
+    pub star_grants_catalog: bool,
 
     pub storage_backend: StorageBackend,
 
@@ -245,6 +250,9 @@ pub struct Config {
     pub token_signing_key: String,
     pub token_signing_keys: Vec<crate::security::TokenSigningKey>,
     pub token_ttl_secs: u64,
+    /// /token fixed-window rate limit: max requests per window (0 disables).
+    pub token_rate_limit_rpm: u32,
+    pub token_rate_limit_window_secs: u64,
 
     // Robot accounts + scoped grants for token minting.
     pub robots: RobotsConfig,
@@ -912,6 +920,12 @@ struct FileAuth {
     anonymous_pull: Option<bool>,
 
     #[serde(default)]
+    private_name_prefixes: Option<Vec<String>>,
+
+    #[serde(default)]
+    star_grants_catalog: Option<bool>,
+
+    #[serde(default)]
     push: FilePushAuth,
 
     #[serde(default)]
@@ -1006,6 +1020,10 @@ struct FileToken {
     signing_keys: Vec<FileTokenSigningKey>,
     #[serde(default)]
     ttl_secs: Option<u64>,
+    #[serde(default)]
+    rate_limit_rpm: Option<u32>,
+    #[serde(default)]
+    rate_limit_window_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1516,6 +1534,20 @@ impl Config {
         ])?
         .or_else(|| file_cfg.auth.anonymous_pull)
         .unwrap_or(true);
+
+        let private_name_prefixes = env_str_opt(&["REGISTRY__AUTH__PRIVATE_NAME_PREFIXES"])
+            .map(|v| {
+                v.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| file_cfg.auth.private_name_prefixes.clone())
+            .unwrap_or_else(default_private_name_prefixes);
+
+        let star_grants_catalog = env_bool_opt(&["REGISTRY__AUTH__STAR_GRANTS_CATALOG"])?
+            .or(file_cfg.auth.star_grants_catalog)
+            .unwrap_or(true);
 
         let push_allow_repos_raw = env_str_opt(&[
             "REGISTRY__AUTH__PUSH__ALLOW_REPOS",
@@ -2385,6 +2417,18 @@ impl Config {
             (token_signing_key, token_signing_keys)
         };
 
+        let token_rate_limit_rpm =
+            env_u64_opt(&["REGISTRY__TOKEN__RATE_LIMIT_RPM", "TOKEN_RATE_LIMIT_RPM"])?
+                .map(|v| v.min(u32::MAX as u64) as u32)
+                .or(file_cfg.token.rate_limit_rpm)
+                .unwrap_or(1200);
+        let token_rate_limit_window_secs = env_u64_opt(&[
+            "REGISTRY__TOKEN__RATE_LIMIT_WINDOW_SECS",
+            "TOKEN_RATE_LIMIT_WINDOW_SECS",
+        ])?
+        .or(file_cfg.token.rate_limit_window_secs)
+        .unwrap_or(60);
+
         let token_ttl_secs = env_u64_opt(&["REGISTRY__TOKEN__TTL_SECS", "TOKEN_TTL_SECS"])?
             .or(file_cfg.token.ttl_secs)
             .unwrap_or(600);
@@ -2748,6 +2792,8 @@ impl Config {
             push_implies_delete,
             auth_strategy,
             anonymous_pull,
+            private_name_prefixes,
+            star_grants_catalog,
             storage_backend,
             fs_root,
             fs_manifest_listing_max_entries,
@@ -2838,6 +2884,8 @@ impl Config {
             token_signing_key,
             token_signing_keys,
             token_ttl_secs,
+            token_rate_limit_rpm,
+            token_rate_limit_window_secs,
 
             robots,
             users,
@@ -2871,6 +2919,10 @@ impl Config {
             || (self.users.enabled && !self.users.accounts.is_empty())
     }
 
+    /// KI-17 (resolved): the private-name override is explicit configuration
+    /// (`auth.private_name_prefixes`), defaulting to the historical list.
+    /// Angle-bracket/encoding smells stay hardcoded — they indicate injection
+    /// attempts, not naming policy.
     pub fn is_repo_private(&self, repo: &str) -> bool {
         if !self.anonymous_pull {
             return true;
@@ -2878,15 +2930,21 @@ impl Config {
         let raw = repo.trim_start_matches('/');
         let norm = raw.to_ascii_lowercase();
         let r = norm.strip_prefix("library/").unwrap_or(&norm);
-        r.starts_with("private")
-            || r.starts_with("secret")
-            || r.starts_with("protected")
-            || r.starts_with("restricted")
+        self.private_name_prefixes
+            .iter()
+            .any(|p| !p.is_empty() && r.starts_with(p.to_ascii_lowercase().as_str()))
             || r.contains('<')
             || r.contains('>')
             || r.contains("%3c")
             || r.contains("%3e")
     }
+}
+
+pub fn default_private_name_prefixes() -> Vec<String> {
+    ["private", "secret", "protected", "restricted"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 fn merge_toml_value(into: &mut Value, overlay: Value) {

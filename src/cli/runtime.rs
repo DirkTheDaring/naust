@@ -263,6 +263,8 @@ impl MaintenanceRuntime {
             Err(err) => return Err(CliError::Index(err)),
         };
 
+        // Past the KI-05 gate (or --force-gc): the constructed one-shot service
+        // must actually run, so the per-run policy enables both switches.
         let mut gc_policy = crate::policy::GcPolicy::from(self.config.as_ref());
         gc_policy.enabled = true;
         gc_policy.enable_delete = true;
@@ -295,7 +297,12 @@ impl MaintenanceRuntime {
         policy: BlobGcPolicy,
         min_age_secs: u64,
         max_per_run: usize,
+        force_gc: bool,
     ) -> Result<BlobGcStats, CliError> {
+        // KI-05: respect the operator kill switch unless explicitly overridden.
+        if !self.config.blob_gc_enabled && !force_gc {
+            return Err(CliError::GcDisabled("blob_gc.enabled=false"));
+        }
         let auth = self.authority.as_ref().ok_or_else(|| {
             CliError::LockContention(crate::storage::StorageError::ExclusiveWriterLocked(
                 "mutation authority missing for quarantine".to_string(),
@@ -312,6 +319,8 @@ impl MaintenanceRuntime {
         .await
         .map_err(CliError::Index)?;
 
+        // Past the KI-05 gate (or --force-gc): the constructed one-shot service
+        // must actually run, so the per-run policy enables both switches.
         let mut gc_policy = crate::policy::GcPolicy::from(self.config.as_ref());
         gc_policy.enabled = true;
         gc_policy.enable_delete = true;
@@ -344,7 +353,15 @@ impl MaintenanceRuntime {
         policy: BlobGcPolicy,
         quarantine_delay_secs: u64,
         max_per_run: usize,
+        force_gc: bool,
     ) -> Result<BlobGcStats, CliError> {
+        // KI-05: respect BOTH operator kill switches unless explicitly overridden.
+        if !self.config.blob_gc_enabled && !force_gc {
+            return Err(CliError::GcDisabled("blob_gc.enabled=false"));
+        }
+        if !self.config.blob_gc_enable_delete && !force_gc {
+            return Err(CliError::GcDisabled("blob_gc.enable_delete=false"));
+        }
         let auth = self.authority.as_ref().ok_or_else(|| {
             CliError::LockContention(crate::storage::StorageError::ExclusiveWriterLocked(
                 "mutation authority missing for delete".to_string(),
@@ -361,6 +378,8 @@ impl MaintenanceRuntime {
         .await
         .map_err(CliError::Index)?;
 
+        // Past the KI-05 gate (or --force-gc): the constructed one-shot service
+        // must actually run, so the per-run policy enables both switches.
         let mut gc_policy = crate::policy::GcPolicy::from(self.config.as_ref());
         gc_policy.enabled = true;
         gc_policy.enable_delete = true;

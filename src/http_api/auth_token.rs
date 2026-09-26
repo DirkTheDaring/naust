@@ -169,7 +169,11 @@ pub fn decide_token_scopes_for_request(
                     let granted = if token_scopes.is_empty() {
                         Vec::new()
                     } else {
-                        crate::rbac::grant_scopes_by_prefix(token_scopes, &account.grants)
+                        crate::rbac::grant_scopes_by_prefix_with_options(
+                            token_scopes,
+                            &account.grants,
+                            cfg.star_grants_catalog,
+                        )
                     };
                     if !token_scopes.is_empty() && granted.is_empty() {
                         return Err(TokenRejection::Denied("action not allowed by robot policy"));
@@ -210,7 +214,11 @@ pub fn decide_token_scopes_for_request(
                     let granted = if token_scopes.is_empty() {
                         Vec::new()
                     } else {
-                        crate::rbac::grant_scopes_by_prefix(token_scopes, &union_grants)
+                        crate::rbac::grant_scopes_by_prefix_with_options(
+                            token_scopes,
+                            &union_grants,
+                            cfg.star_grants_catalog,
+                        )
                     };
                     if !token_scopes.is_empty() && granted.is_empty() {
                         return Err(TokenRejection::Denied("action not allowed by user policy"));
@@ -384,6 +392,13 @@ pub async fn token(
     }
 
     if !service_param_is_valid(service_param.as_deref(), &state.config.token_service) {
+        state.auth_metrics.inc_token_denied();
+        tracing::info!(
+            event = "token_denied",
+            reason = "invalid_service",
+            service = ?service_param,
+            "token request denied"
+        );
         return errors::denied("invalid token service").into_response();
     }
     let scopes = scopes_raw
@@ -400,9 +415,22 @@ pub async fn token(
     let decision = match decide_token_scopes_for_request(&state.config, &token_scopes, basic) {
         Ok(d) => d,
         Err(TokenRejection::Unauthorized) => {
+            state.auth_metrics.inc_token_denied();
+            tracing::info!(
+                event = "token_denied",
+                reason = "unauthorized",
+                "token request denied"
+            );
             return token_unauthorized();
         }
         Err(TokenRejection::Denied(msg)) => {
+            state.auth_metrics.inc_token_denied();
+            tracing::info!(
+                event = "token_denied",
+                reason = "policy",
+                detail = %msg,
+                "token request denied"
+            );
             return errors::denied(msg).into_response();
         }
     };
@@ -421,6 +449,13 @@ pub async fn token(
                         return errors::name_invalid();
                     };
                     if !crate::auth::push_repository_allowed(allowlist, &canonical_repo) {
+                        state.auth_metrics.inc_token_denied();
+                        tracing::info!(
+                            event = "token_denied",
+                            reason = "push_allowlist",
+                            repository = %scope.name,
+                            "token request denied"
+                        );
                         return errors::denied("push not allowed for this repository")
                             .into_response();
                     }
@@ -444,6 +479,8 @@ pub async fn token(
     ) {
         Ok(t) => t,
         Err(_) => {
+            state.auth_metrics.inc_token_internal_error();
+            tracing::error!(event = "token_error", "token signing failed");
             return errors::internal_error().into_response();
         }
     };
@@ -473,6 +510,15 @@ pub async fn token(
         Ok(b) => b,
         Err(_) => return errors::internal_error().into_response(),
     };
+
+    state.auth_metrics.inc_token_issued();
+    tracing::info!(
+        event = "token_issued",
+        subject = ?decision.subject,
+        scopes = decision.scopes.len(),
+        ttl_secs = decision.ttl_secs,
+        "token issued"
+    );
 
     let mut resp_headers = registry_headers();
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());

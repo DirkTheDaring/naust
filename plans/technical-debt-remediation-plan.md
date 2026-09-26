@@ -177,3 +177,14 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 * Delivered: permit-free `CacheEvictionPort` (+ blanket, + `impl_cache_eviction_port!` for test doubles, + minimal impl for the supervisor's injected double); FS contained unlink with optional version validation; S3 ETag-conditional delete; core `cache_eviction` LRU planner; `proxy_gc_once` rewritten onto port+planner with per-blob conditional deletes (NotFound/PreconditionFailed = concurrently refreshed content is left alone); FS-only spawn guards removed; scrub S3 residual recorded at the guard.
 * Two-commit S1 discipline held: enumerate-only leg (4ee6522) landed with parity + planner tests before any delete code ran.
 * Acceptance: fmt/gate clean; workspace green (non-live); conformance fs/basic/token + s3 green; **live-MinIO 33/0/1 ×2** including the new port acceptance test (real ETag conditional refusal + bounding); MinIO restored to stopped.
+
+### R3 learnings (2026-09-26, completed — KI-03/04/05/09/17/18 CLOSED; REQ-006 adopted, REQ-012 wired)
+
+* KI-03/REQ-012: wired as an auto-expiring `finalize-grace` pin (dedicated pin id, placed at STEP 7 for `Published` outcomes only — cross-mounts skip it since membership already protects them). One historical test asserted "unpinned after publish"; that assertion now holds only with grace=0 — updated, plus a dedicated grace test.
+* KI-04/REQ-006 adopted: `token_issued`/`token_denied`(reason)/`token_error` events + wired `AuthMetrics` (accessors added; endpoint test asserts both counters).
+* KI-05: CLI quarantine/delete now respect the kill switches; `--force-gc` restores the old behavior. Learning: `blob_gc.enabled` defaults to **false**, so the shared CLI-test fixture needed explicit enablement — proof the old behavior silently bypassed the operator default.
+* KI-09: rate-limit knobs in `Config` (`[token]`), env kept as override; limiter unit-tested (its API is `retry_after()`, not an acquire bool).
+* KI-17: `auth.private_name_prefixes` (default = historical list; empty list disables). Deliberate scope cut: the angle-bracket/percent-encoding checks stay hardcoded — they are injection detection, not naming policy.
+* KI-18: `auth.star_grants_catalog` (default true) via a new `grant_scopes_by_prefix_with_options`; the old signature delegates with the historical behavior, so RBAC tests stay valid.
+* Register/requirements/operations/README all reconciled in the same commit.
+* Acceptance: fmt/gate clean; workspace 1511 passed / env-gated live suite only; conformance fs/basic/token green.

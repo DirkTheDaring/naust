@@ -570,6 +570,8 @@ fn minimal_config_for_token_tests() -> Config {
         tls_acme: None,
         auth_strategy: crate::config::AuthStrategy::Token,
         anonymous_pull: true,
+        private_name_prefixes: crate::config::default_private_name_prefixes(),
+        star_grants_catalog: true,
         push_username: None,
         push_password: None,
         push_allow_repos: Some(vec![crate::registry::RepositoryAccessPattern::All]),
@@ -676,6 +678,8 @@ fn minimal_config_for_token_tests() -> Config {
             key: "test-key".to_string(),
         }],
         token_ttl_secs: 600,
+        token_rate_limit_rpm: 0,
+        token_rate_limit_window_secs: 60,
         robots: RobotsConfig::default(),
         users: crate::config::UsersConfig::default(),
         proxy: ProxyConfig {
@@ -1523,4 +1527,87 @@ async fn test_repo_named_quota_or_limited_behaves_normally() {
     assert_eq!(resp_oversize.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
     let _ = std::fs::remove_dir_all(&fs_root);
+}
+
+/// REQ-006 (KI-04): the /token endpoint emits observability events and the
+/// AuthMetrics counters actually move — issued on success, denied on policy
+/// rejection.
+#[tokio::test]
+async fn token_endpoint_increments_auth_metrics() {
+    use axum::extract::RawQuery;
+
+    let mut cfg = minimal_config_for_token_tests();
+    cfg.anonymous_pull = true;
+    let cfg = Arc::new(cfg);
+    let storage = Arc::new(crate::storage::fs::FsStorage::new(
+        cfg.fs_root.clone(),
+        cfg.max_upload_bytes,
+    ));
+    let state = test_app_state(cfg, storage, None);
+
+    // Anonymous pull-scope request: issued.
+    let resp = crate::http_api::auth_token::token(
+        State(state.clone()),
+        RawQuery(Some(
+            "service=registry-rust&scope=repository:library/app:pull".to_string(),
+        )),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(state.auth_metrics.token_issued_total(), 1);
+
+    // Wrong service: denied.
+    let resp = crate::http_api::auth_token::token(
+        State(state.clone()),
+        RawQuery(Some("service=wrong-service".to_string())),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::OK);
+    assert_eq!(state.auth_metrics.token_denied_total(), 1);
+}
+
+/// KI-17: the private-name override is configuration; custom prefixes work and
+/// clearing the list disables the heuristic (injection smells stay hardcoded).
+#[test]
+fn private_name_prefixes_are_configurable() {
+    let mut cfg = minimal_config_for_token_tests();
+    cfg.anonymous_pull = true;
+
+    // Historical defaults.
+    assert!(cfg.is_repo_private("private-repo"));
+    assert!(cfg.is_repo_private("library/secret-stuff"));
+    assert!(!cfg.is_repo_private("public/app"));
+
+    // Custom list replaces the defaults.
+    cfg.private_name_prefixes = vec!["internal".to_string()];
+    assert!(cfg.is_repo_private("internal/tools"));
+    assert!(!cfg.is_repo_private("private-repo"));
+
+    // Empty list disables prefix-based privacy; injection smells stay caught.
+    cfg.private_name_prefixes = Vec::new();
+    assert!(!cfg.is_repo_private("private-repo"));
+    assert!(cfg.is_repo_private("weird%3cname"));
+}
+
+/// KI-18: `*` grants confer catalog scope only when the policy option is on
+/// (default preserves the historical behavior).
+#[test]
+fn star_grants_catalog_is_a_policy_option() {
+    use crate::rbac::{Grant, grant_scopes_by_prefix_with_options};
+    use crate::security::TokenScope;
+
+    let grants = vec![Grant::try_new("*", vec!["pull".to_string()]).expect("star grant")];
+    let requested = vec![TokenScope {
+        typ: "registry".to_string(),
+        name: "catalog".to_string(),
+        actions: vec!["*".to_string()],
+    }];
+
+    let with = grant_scopes_by_prefix_with_options(&requested, &grants, true);
+    assert_eq!(with.len(), 1, "historical behavior: star confers catalog");
+
+    let without = grant_scopes_by_prefix_with_options(&requested, &grants, false);
+    assert!(without.is_empty(), "option off: catalog scope denied");
 }

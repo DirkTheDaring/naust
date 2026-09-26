@@ -1142,6 +1142,8 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         push_implies_delete: false,
         auth_strategy: AuthStrategy::Token,
         anonymous_pull: true,
+        private_name_prefixes: registry_rust::config::default_private_name_prefixes(),
+        star_grants_catalog: true,
         storage_backend: StorageBackend::Filesystem,
         fs_root,
         fs_manifest_listing_max_entries: 10_000,
@@ -1236,6 +1238,8 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
             key: "test".to_string(),
         }],
         token_ttl_secs: 600,
+        token_rate_limit_rpm: 0,
+        token_rate_limit_window_secs: 60,
         robots: RobotsConfig::default(),
         users: UsersConfig::default(),
         proxy: ProxyConfig {

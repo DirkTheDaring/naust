@@ -44,6 +44,12 @@ root = "{}"
 enabled = true
 path = "{}"
 
+# GC tests in this suite exercise GC function, not the KI-05 kill switch;
+# the switch itself is covered by test_cli_respects_blob_gc_kill_switch.
+[blob_gc]
+enabled = true
+enable_delete = true
+
 [token]
 signing_key = "test-secret-key-12345678901234567890"
 "#,
@@ -158,6 +164,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             },
         },
         CliCommand::BlobGc {
@@ -166,6 +173,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
                 quarantine_delay_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             },
         },
     ];
@@ -1003,6 +1011,7 @@ fn test_command_policy_exhaustive_classification_matrix() {
                 min_age_secs: 100,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             }
         }
         .policy(),
@@ -1017,6 +1026,7 @@ fn test_command_policy_exhaustive_classification_matrix() {
                 quarantine_delay_secs: 100,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             }
         }
         .policy(),
@@ -1393,6 +1403,7 @@ async fn test_membership_backfill_required_blocks_gc_and_ref_index() {
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             },
         }),
     };
@@ -1444,6 +1455,7 @@ async fn test_blob_gc_quarantine_failure_unwinds_and_releases_authority() {
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             },
         }),
     };
@@ -1490,6 +1502,7 @@ async fn test_blob_gc_delete_failure_unwinds_and_releases_authority() {
                 quarantine_delay_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             },
         }),
     };
@@ -2038,6 +2051,7 @@ path = "{}"
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
+                force_gc: false,
             },
         }),
     };
@@ -2097,4 +2111,85 @@ path = "{}"
         0,
         "prefix must be empty after cleanup"
     );
+}
+
+/// KI-05: with `blob_gc.enabled=false` (the default) the CLI refuses
+/// destructive GC unless --force-gc is passed; plan stays available.
+#[tokio::test]
+async fn test_cli_respects_blob_gc_kill_switch() {
+    let temp = TempDir::new().unwrap();
+    let fs_root = temp.path().join("registry");
+    let ref_index = temp.path().join("ref_index.db");
+    let cfg_path = temp.path().join("config.toml");
+    let toml = format!(
+        r#"
+[server]
+listen_addr = "127.0.0.1:0"
+
+[storage]
+backend = "filesystem"
+
+[storage.fs]
+root = "{}"
+
+[storage.ref_index]
+enabled = true
+path = "{}"
+
+[token]
+signing_key = "test-secret-key-12345678901234567890"
+"#,
+        fs_root.display(),
+        ref_index.display()
+    );
+    tokio::fs::write(&cfg_path, toml).await.unwrap();
+    let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
+    assert!(!cfg.blob_gc_enabled, "default must be disabled");
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    wiring
+        .membership_reader()
+        .mark_membership_ready()
+        .await
+        .unwrap();
+
+    let quarantine = |force_gc: bool| Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Quarantine {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                min_age_secs: 0,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+                force_gc,
+            },
+        }),
+    };
+
+    // Refused without force…
+    match execute_cli(quarantine(false)).await {
+        Err(CliError::GcDisabled(which)) => assert_eq!(which, "blob_gc.enabled=false"),
+        other => panic!("expected GcDisabled, got {other:?}"),
+    }
+    // …and delete is refused the same way.
+    let delete = Cli {
+        config: vec![cfg_path.clone()],
+        command: Some(CliCommand::BlobGc {
+            command: BlobGcCommand::Delete {
+                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                quarantine_delay_secs: 0,
+                max_per_run: 10,
+                confirm_all_writers_stopped: true,
+                force_gc: false,
+            },
+        }),
+    };
+    match execute_cli(delete).await {
+        Err(CliError::GcDisabled(_)) => {}
+        other => panic!("expected GcDisabled for delete, got {other:?}"),
+    }
+
+    // --force-gc reproduces the historical behavior (runs on a clean store).
+    execute_cli(quarantine(true))
+        .await
+        .expect("--force-gc must run despite the kill switch");
 }

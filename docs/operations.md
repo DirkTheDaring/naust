@@ -12,7 +12,7 @@ One GC engine (`src/blob_gc/`), backend-selected strategy:
 
 **Three entry points:**
 
-1. **CLI (offline):** `registry-rust blob-gc {plan|quarantine|delete}` — guarded by `FsRootLock` (`fs_root/.locks/registry-rust.lock`) and `RuntimeMutationAuthority`; S3 destructive ops additionally require `--confirm-all-writers-stopped`. **Caution (KI-05):** the CLI force-enables the `[blob_gc]` switches internally — `blob_gc.enabled=false` does **not** gate offline CLI GC.
+1. **CLI (offline):** `registry-rust blob-gc {plan|quarantine|delete}` — guarded by `FsRootLock` (`fs_root/.locks/registry-rust.lock`) and `RuntimeMutationAuthority`; S3 destructive ops additionally require `--confirm-all-writers-stopped`. Since 2026-09-26 (KI-05 resolved) the CLI **respects** `blob_gc.enabled=false` (and `enable_delete=false` for delete) and refuses with a clear error; pass `--force-gc` to override deliberately. `plan` remains read-only and ungated.
 2. **Admin HTTP:** `/_admin/gc/{health,plan,quarantine,delete}`, registered only when `admin_api.enabled`. `plan` is read-only and not kill-switch gated; `quarantine` needs `blob_gc.enabled=true`; `delete` additionally `blob_gc.enable_delete=true`.
 3. **Background scheduler:** gated by `blob_gc.schedule_enabled` (interval `schedule_interval_secs`, missed ticks skipped). Each run first executes the **repository-membership sweep** (Active → Candidate → Unlink aging); the sweep has no CLI or admin route.
 
@@ -22,7 +22,7 @@ One GC engine (`src/blob_gc/`), backend-selected strategy:
 
 | Knob | Default | Effect |
 |---|---|---|
-| `blob_gc.enabled` / `.enable_delete` | false / false | Gate admin quarantine/delete + scheduler. **Not** the CLI (KI-05), not admin `plan` |
+| `blob_gc.enabled` / `.enable_delete` | false / false | Gate admin quarantine/delete + scheduler **and** CLI quarantine/delete (override: `--force-gc`; KI-05 resolved); not admin/CLI `plan` |
 | `blob_gc.default_min_age_secs` / `default_quarantine_delay_secs` | 7 d / 24 h | candidate age floor / FS delete delay |
 | `blob_gc.default_max_{blobs,bytes,seconds}` | 1000 / u64::MAX / 60 | per-run budgets |
 | `blob_gc.schedule_enabled` / `schedule_interval_secs` | false / 7 d | background scheduler |
@@ -40,7 +40,7 @@ One GC engine (`src/blob_gc/`), backend-selected strategy:
 
 ## 2. Identity, RBAC, and tokens
 
-Model: single auth middleware on `/v2/*`; anonymous pull default-on (`auth.anonymous_pull`), overridden per-repo by a hardcoded private-name heuristic (KI-17); Basic auth (robots → users → legacy `REGISTRY_USERNAME`/`PASSWORD`; robots shadow users on name collision — `audit-permissions` warns); `/token` mints HMAC-SHA256 Bearer tokens bound to `token.service` with bounded TTL. RBAC invariants (deny-by-default; granted ⊆ requested ∩ policy; prefix-boundary-safe; no arbitrary wildcards) are REQ-005 and are test-covered. An explicit `*` grant also confers catalog scope (KI-18).
+Model: single auth middleware on `/v2/*`; anonymous pull default-on (`auth.anonymous_pull`), overridden per-repo by the configurable `auth.private_name_prefixes` list (default: private/secret/protected/restricted; KI-17 resolved); Basic auth (robots → users → legacy `REGISTRY_USERNAME`/`PASSWORD`; robots shadow users on name collision — `audit-permissions` warns); `/token` mints HMAC-SHA256 Bearer tokens bound to `token.service` with bounded TTL. RBAC invariants (deny-by-default; granted ⊆ requested ∩ policy; prefix-boundary-safe; no arbitrary wildcards) are REQ-005 and are test-covered. An explicit `*` grant confers catalog scope only while `auth.star_grants_catalog=true` (the default; KI-18 resolved).
 
 **Config shape (TOML-only for policy, so it stays in source control):**
 
@@ -70,7 +70,7 @@ grants = [ { repo_prefix = "org1/", actions = ["pull","push"] } ]
 
 - *Rotate a robot/user secret:* generate a new hash (`registry-rust hash-secret`, secret on stdin), replace `secret_hash`, restart. Old secrets stop working immediately.
 - *Rotate token signing keys (overlap):* add the new key as the FIRST `[[token.signing_keys]]` entry, keep old keys listed for ≥ max token TTL, restart; then remove old keys and restart. The first entry mints; all entries verify. `TOKEN_SIGNING_KEY` env is ignored while the keyring is present.
-- *Suspected leakage:* rotate the affected `secret_hash` or remove the compromised signing key, restart. **Caveat (KI-04):** the documented `token_issued`/`token_denied` audit events are not implemented — use access logs and `registry-rust audit-permissions` output instead.
+- *Suspected leakage:* rotate the affected `secret_hash` or remove the compromised signing key, restart. the `token_issued`/`token_denied`/`token_error` tracing events (with denial reasons) are emitted since 2026-09-26 (KI-04 resolved) — filter on `event = "token_denied"` to follow the staged-rollout playbook.
 - *Token endpoint rate limit:* global fixed window, env-only (`TOKEN_RATE_LIMIT_RPM`, default 1200/60 s; `0` disables). Outside `Config`, so `check-config` does not validate it (KI-09).
 
 ## 3. TLS / ACME

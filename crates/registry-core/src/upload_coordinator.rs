@@ -190,6 +190,11 @@ pub struct BlobUploadCoordinatorConfig {
     pub disallow_monolithic_uploads: bool,
     pub upload_chunk_min_bytes: Option<u64>,
     pub gc_pin_duration_secs: u64,
+    /// Post-finalize protection window (REQ-012): a freshly published blob is
+    /// pin-protected for this long so a slow client can still push the
+    /// referencing manifest even under aggressive GC min-age settings.
+    /// 0 disables the grace pin.
+    pub finalize_grace_secs: u64,
 }
 
 impl Default for BlobUploadCoordinatorConfig {
@@ -201,6 +206,7 @@ impl Default for BlobUploadCoordinatorConfig {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         }
     }
 }
@@ -297,6 +303,24 @@ impl PinLeaseGuard {
             handle.abort();
             let _ = handle.await;
         }
+    }
+
+    /// Places the post-finalize grace pin (REQ-012) under a dedicated pin id;
+    /// it expires on its own and is never explicitly released.
+    pub fn grace_pin(&self, until: SystemTime) -> Result<(), CoordinatorError> {
+        self.idx
+            .acquire_pin(
+                &self.digest,
+                "finalize-grace",
+                until,
+                "finalize grace (REQ-012)",
+            )
+            .map_err(|e| {
+                CoordinatorError::Storage(map_ref_index_error_with_context(
+                    e,
+                    "failed to place finalize grace pin",
+                ))
+            })
     }
 
     pub fn release_pin(&mut self) -> Result<(), CoordinatorError> {
@@ -670,9 +694,20 @@ impl BlobUploadCoordinator {
         }
         drop(_guard);
 
-        // STEP 7: Stop renewal and release pin
+        // STEP 7: Stop renewal and release the operational pin. Freshly
+        // published content first receives a fixed-TTL grace pin (REQ-012):
+        // pins auto-expire, so no release path is needed for it.
         if let Some(ref mut guard) = pin_guard {
             guard.stop().await;
+            if self.config.finalize_grace_secs > 0
+                && matches!(outcome, FinalizeOutcome::Published(_))
+            {
+                let until =
+                    SystemTime::now() + Duration::from_secs(self.config.finalize_grace_secs);
+                if let Err(err) = guard.grace_pin(until) {
+                    tracing::warn!(error = %err, "failed to place finalize grace pin");
+                }
+            }
             let _ = guard.release_pin();
         }
 
@@ -943,6 +978,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         };
         let coordinator = test_coordinator(storage.clone(), None, config);
 
@@ -983,6 +1019,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         };
         let coordinator = test_coordinator(storage.clone(), None, config);
 
@@ -1054,6 +1091,62 @@ mod tests {
         assert_eq!(fin.size, full.len() as u64);
     }
 
+    /// REQ-012 (KI-03): a freshly published blob carries a finalize-grace pin
+    /// so slow clients can push the referencing manifest before GC may act;
+    /// the pin expires on its own and uses a dedicated pin id.
+    #[tokio::test]
+    async fn test_finalize_grace_pin_protects_fresh_publication() {
+        let temp_dir = TempDir::new().unwrap();
+        let fs_root = temp_dir.path().join("fs_root");
+        let ref_path = temp_dir.path().join("ref_index");
+        std::fs::create_dir_all(&ref_path).unwrap();
+        let storage: Arc<dyn BlobUploadCoordinatorStoragePort> =
+            Arc::new(crate::storage::fs::FsStorage::new(fs_root, 104857600));
+        let ref_index = Arc::new(BlobRefIndex::open(ref_path).unwrap());
+        ref_index
+            .ensure_healthy_or_rebuild(storage.as_ref(), true, false)
+            .await
+            .unwrap();
+
+        let config = BlobUploadCoordinatorConfig {
+            signing_key: b"grace-test".to_vec(),
+            max_upload_bytes: 104857600,
+            abort_on_digest_mismatch: false,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 3600,
+        };
+        let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
+
+        let data = b"grace pinned payload";
+        let digest = Digest::parse(&format!("sha256:{}", hex_sha256(data))).unwrap();
+        let stream = Box::pin(futures_util::stream::once(async move {
+            Ok(bytes::Bytes::from_static(data))
+        }));
+        let res = coordinator
+            .monolithic_upload("grace/repo", &digest, Some(stream))
+            .await
+            .unwrap();
+        assert!(matches!(res, MonolithicUploadResult::Created(_)));
+
+        // Protected by the grace pin (the operational pin itself is released).
+        assert!(
+            ref_index
+                .is_blob_pinned(&digest, SystemTime::now())
+                .unwrap(),
+            "fresh publication must be grace-pinned"
+        );
+        // It is exactly the dedicated finalize-grace pin…
+        assert!(ref_index.unpin_blob(&digest, "finalize-grace").unwrap());
+        // …and nothing else keeps it pinned afterwards.
+        assert!(
+            !ref_index
+                .is_blob_pinned(&digest, SystemTime::now())
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn test_coordinator_gc_pin_race_preserves_pinned_blob_during_finalization() {
         let temp_dir = TempDir::new().unwrap();
@@ -1076,6 +1169,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 0,
         };
         let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
@@ -1241,6 +1335,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         };
         let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
@@ -1288,6 +1383,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         };
         let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
@@ -1333,6 +1429,7 @@ mod tests {
             disallow_monolithic_uploads: true,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         };
         let coordinator = test_coordinator(storage, None, config);
 
@@ -1383,6 +1480,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 72 * 3600,
         };
         let coordinator = test_coordinator(storage, None, config);
 
@@ -1498,6 +1596,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 2,
+            finalize_grace_secs: 0,
         };
         let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 
@@ -1618,6 +1717,7 @@ mod tests {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 2,
+            finalize_grace_secs: 0,
         };
         let coordinator = test_coordinator(storage.clone(), Some(ref_index.clone()), config);
 

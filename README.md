@@ -532,6 +532,10 @@ key = "<old-long-random-secret>"
 | TLS ACME renew check interval | `server.tls.acme.renew_check_interval_secs` | `REGISTRY__SERVER__TLS__ACME__RENEW_CHECK_INTERVAL_SECS` | `TLS_ACME_RENEW_CHECK_INTERVAL_SECS` | `43200` |
 | TLS ACME allow SAN mismatch | `server.tls.acme.allow_san_mismatch` | `REGISTRY__SERVER__TLS__ACME__ALLOW_SAN_MISMATCH` | `TLS_ACME_ALLOW_SAN_MISMATCH` | `false` |
 | TLS reload poll (external certs) | `server.tls.reload_poll_secs` | `REGISTRY__SERVER__TLS__RELOAD_POLL_SECS` | `TLS_RELOAD_POLL_SECS` | `300` |
+| Token rate limit (rpm; 0 disables) | `token.rate_limit_rpm` | `REGISTRY__TOKEN__RATE_LIMIT_RPM` | `TOKEN_RATE_LIMIT_RPM` | `1200` |
+| Token rate-limit window | `token.rate_limit_window_secs` | `REGISTRY__TOKEN__RATE_LIMIT_WINDOW_SECS` | `TOKEN_RATE_LIMIT_WINDOW_SECS` | `60` |
+| Private-name prefixes (auth override) | `auth.private_name_prefixes` | `REGISTRY__AUTH__PRIVATE_NAME_PREFIXES` (comma-sep) | — | `private,secret,protected,restricted` |
+| `*` grant confers catalog scope | `auth.star_grants_catalog` | `REGISTRY__AUTH__STAR_GRANTS_CATALOG` | — | `true` |
 | TLS ACME debug | `server.tls.acme.debug` | `REGISTRY__SERVER__TLS__ACME__DEBUG` | `TLS_ACME_DEBUG` | off |
 | TLS ACME proxy | `server.tls.acme.proxy` | `REGISTRY__SERVER__TLS__ACME__PROXY` | `TLS_ACME_PROXY` | unset |
 | TLS ACME ispone base URL | `server.tls.acme.ispone.base_url` | `REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL` | `TLS_ACME_ISPONE_BASE_URL` | unset |

@@ -233,16 +233,10 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::http_api::catalog::meta_repo),
         );
 
-    let token_rate_limit_rpm = std::env::var("REGISTRY__TOKEN__RATE_LIMIT_RPM")
-        .ok()
-        .or_else(|| std::env::var("TOKEN_RATE_LIMIT_RPM").ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(1200);
-    let token_rate_limit_window_secs = std::env::var("REGISTRY__TOKEN__RATE_LIMIT_WINDOW_SECS")
-        .ok()
-        .or_else(|| std::env::var("TOKEN_RATE_LIMIT_WINDOW_SECS").ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(60);
+    // KI-09: knobs live in Config (TOML [token] + env), visible to strict
+    // validation and check-config.
+    let token_rate_limit_rpm = state.config.token_rate_limit_rpm;
+    let token_rate_limit_window_secs = state.config.token_rate_limit_window_secs;
 
     let token_rate_limiter = if token_rate_limit_rpm == 0 {
         TokenRateLimiter::disabled()

@@ -2190,6 +2190,7 @@ async fn test_r6_live_s3_cross_mount() {
         disallow_monolithic_uploads: false,
         upload_chunk_min_bytes: None,
         gc_pin_duration_secs: 3600,
+        finalize_grace_secs: 0,
     };
     let coordinator = BlobUploadCoordinator::new(
         storage.clone(),

@@ -108,6 +108,7 @@ pub(crate) fn assemble_application_services(
         disallow_monolithic_uploads: config.disallow_monolithic_uploads,
         upload_chunk_min_bytes: config.upload_chunk_min_bytes.map(|v| v as u64),
         gc_pin_duration_secs: config.gc_pin_duration_secs,
+        finalize_grace_secs: config.blob_gc_finalize_grace_secs,
     };
 
     let blob_service = Arc::new(BlobMutationService::new(

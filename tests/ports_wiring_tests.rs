@@ -584,6 +584,7 @@ async fn test_minimal_fake_blob_upload_coordinator_and_mutation_service() {
         disallow_monolithic_uploads: false,
         upload_chunk_min_bytes: Some(0),
         gc_pin_duration_secs: 60,
+        finalize_grace_secs: 0,
     };
 
     // Construct BlobMutationService using ONLY BlobUploadCoordinatorStoragePort (no Storage)

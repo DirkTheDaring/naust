@@ -197,6 +197,17 @@ pub fn grant_scopes_by_prefix(
     requested: &[security::TokenScope],
     grants: &[Grant],
 ) -> Vec<security::TokenScope> {
+    grant_scopes_by_prefix_with_options(requested, grants, true)
+}
+
+/// KI-18 (resolved): whether an explicit `*` grant confers registry catalog
+/// scope is a policy option (`auth.star_grants_catalog`, default preserves the
+/// historical behavior).
+pub fn grant_scopes_by_prefix_with_options(
+    requested: &[security::TokenScope],
+    grants: &[Grant],
+    star_grants_catalog: bool,
+) -> Vec<security::TokenScope> {
     if requested.is_empty() || grants.is_empty() {
         return Vec::new();
     }
@@ -210,9 +221,10 @@ pub fn grant_scopes_by_prefix(
 
     for req in requested {
         if req.typ == "registry" && (req.name == "catalog" || req.name == "*") {
-            let has_catalog = grants
-                .iter()
-                .any(|g| matches!(g.repo_pattern, RbacRepoPattern::All));
+            let has_catalog = star_grants_catalog
+                && grants
+                    .iter()
+                    .any(|g| matches!(g.repo_pattern, RbacRepoPattern::All));
             if has_catalog {
                 out.push(req.clone());
             }

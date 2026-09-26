@@ -14,6 +14,9 @@ pub enum CliError {
     #[error("ref-index is disabled (storage.ref_index.enabled=false)")]
     RefIndexDisabled,
 
+    #[error("blob GC is disabled by configuration ({0}); pass --force-gc to run anyway (KI-05)")]
+    GcDisabled(&'static str),
+
     #[error("refusing to run while registry is active ({0}); stop the server first")]
     ServerActive(String),
 

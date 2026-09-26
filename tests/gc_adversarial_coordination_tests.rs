@@ -874,6 +874,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
         disallow_monolithic_uploads: false,
         upload_chunk_min_bytes: None,
         gc_pin_duration_secs: 300,
+        finalize_grace_secs: 0,
     };
     let upload_coordinator = registry_rust::upload_coordinator::BlobUploadCoordinator::new(
         storage.clone(),
@@ -1339,6 +1340,7 @@ async fn test_integration_upload_finalization_holds_guard_through_membership_dur
                 disallow_monolithic_uploads: false,
                 upload_chunk_min_bytes: None,
                 gc_pin_duration_secs: 3600,
+                finalize_grace_secs: 0,
             },
         ),
     );
@@ -1491,6 +1493,7 @@ async fn test_integration_proxy_blob_publication_holds_guard_through_membership_
                 disallow_monolithic_uploads: false,
                 upload_chunk_min_bytes: None,
                 gc_pin_duration_secs: 3600,
+                finalize_grace_secs: 0,
             },
         ),
     );
@@ -1643,6 +1646,7 @@ async fn test_integration_cross_mount_cannot_race_gc_deletion() {
                 disallow_monolithic_uploads: false,
                 upload_chunk_min_bytes: None,
                 gc_pin_duration_secs: 3600,
+                finalize_grace_secs: 0,
             },
         ),
     );
@@ -2226,6 +2230,7 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
                 disallow_monolithic_uploads: false,
                 upload_chunk_min_bytes: None,
                 gc_pin_duration_secs: 3600,
+                finalize_grace_secs: 0,
             },
         ),
     );

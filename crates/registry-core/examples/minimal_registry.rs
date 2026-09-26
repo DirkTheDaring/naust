@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             disallow_monolithic_uploads: false,
             upload_chunk_min_bytes: None,
             gc_pin_duration_secs: 60,
+            finalize_grace_secs: 0,
         },
     );
     let manifests = ManifestMutationService::new(
