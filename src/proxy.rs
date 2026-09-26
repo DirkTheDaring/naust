@@ -5,7 +5,7 @@ use sha2::Digest as _;
 use std::{
     collections::HashMap,
     fmt,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -1166,11 +1166,40 @@ impl SingleFlight {
     }
 }
 
+/// IPv4 embedded in the well-known NAT64 prefix `64:ff9b::/96` (RFC 6052).
+fn nat64_well_known_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = v6.octets();
+    let well_known = o[0] == 0x00
+        && o[1] == 0x64
+        && o[2] == 0xff
+        && o[3] == 0x9b
+        && o[4..12].iter().all(|b| *b == 0);
+    if well_known {
+        Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+    } else {
+        None
+    }
+}
+
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4() {
+                return IpAddr::V4(v4);
+            }
+            if let Some(v4) = nat64_well_known_ipv4(v6) {
+                return IpAddr::V4(v4);
+            }
+            IpAddr::V6(v6)
+        }
         other => other,
     }
+}
+
+/// Carrier-grade NAT, `100.64.0.0/10` (RFC 6598).
+fn is_cgnat(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (64..128).contains(&o[1])
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {
@@ -1178,6 +1207,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 || v4.is_private()
+                || is_cgnat(v4)
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_unspecified()
@@ -1338,6 +1368,24 @@ mod tests {
         assert!(!is_blocked_ip(mapped_public));
         assert!(!is_blocked_ip(public_v6));
         assert!(is_blocked_ip("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn nat64_to_a_blocked_ipv4_and_cgnat_are_blocked() {
+        let nat64_loopback: IpAddr = "64:ff9b::7f00:1".parse().unwrap();
+        let nat64_private: IpAddr = "64:ff9b::c0a8:1".parse().unwrap();
+        let nat64_public: IpAddr = "64:ff9b::101:101".parse().unwrap();
+        let cgnat_low: IpAddr = "100.64.0.1".parse().unwrap();
+        let cgnat_high: IpAddr = "100.127.255.1".parse().unwrap();
+        let below_cgnat: IpAddr = "100.63.255.255".parse().unwrap();
+        let above_cgnat: IpAddr = "100.128.0.1".parse().unwrap();
+        assert!(is_blocked_ip(nat64_loopback));
+        assert!(is_blocked_ip(nat64_private));
+        assert!(!is_blocked_ip(nat64_public));
+        assert!(is_blocked_ip(cgnat_low));
+        assert!(is_blocked_ip(cgnat_high));
+        assert!(!is_blocked_ip(below_cgnat));
+        assert!(!is_blocked_ip(above_cgnat));
     }
 
     #[test]

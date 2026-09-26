@@ -101,7 +101,9 @@ pub(crate) fn assemble_application_services(
     buffered_body_sem: Option<Arc<Semaphore>>,
 ) -> ApplicationServices {
     let upload_coord_config = BlobUploadCoordinatorConfig {
-        signing_key: config.token_primary_signing_key().key.as_bytes().to_vec(),
+        signing_key: crate::security::upload_state_signing_key(
+            config.token_primary_signing_key().key.as_bytes(),
+        ),
         max_upload_bytes: config.max_upload_bytes,
         abort_on_digest_mismatch: config.upload_policy.abort_on_digest_mismatch,
         disallow_monolithic_uploads: config.disallow_monolithic_uploads,

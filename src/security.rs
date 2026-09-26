@@ -139,8 +139,9 @@ pub fn decode_token_parts(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), Token
     }
 
     let parts: Vec<&str> = token.split('.').collect();
+    // Bearers are three-part only (ADR-016). A two-part token is the upload-state
+    // construction and must not verify here.
     let (signed_input, payload_b64, sig_b64) = match parts.len() {
-        2 => (parts[0], parts[0], parts[1]),
         3 => {
             let signed_len = parts[0].len() + 1 + parts[1].len();
             (&token[..signed_len], parts[1], parts[2])
@@ -208,7 +209,6 @@ pub fn verify_bearer_token_with_keys(
 
     let (signed_input, sig, payload_bytes) = decode_token_parts(token)?;
 
-    let parts: Vec<&str> = token.split('.').collect();
     let mut verified = false;
     for k in signing_keys {
         let mut mac = Hmac::<Sha256>::new_from_slice(k.key.as_bytes())
@@ -217,15 +217,6 @@ pub fn verify_bearer_token_with_keys(
         if mac.verify_slice(&sig).is_ok() {
             verified = true;
             break;
-        }
-        if parts.len() == 3 {
-            let mut mac2 = Hmac::<Sha256>::new_from_slice(k.key.as_bytes())
-                .map_err(|_| TokenError::InvalidSigningKey)?;
-            mac2.update(parts[1].as_bytes());
-            if mac2.verify_slice(&sig).is_ok() {
-                verified = true;
-                break;
-            }
         }
     }
 
@@ -374,20 +365,21 @@ pub fn issue_bearer_token_with_key(
 fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
     let s = scope_name.trim().trim_start_matches('/');
     let t = target_name.trim().trim_start_matches('/');
-    // Repository scope names are exact (ADR-015). `*` and `…/*` authorize nothing.
-    // Namespace wildcards stay on RBAC grants; the token carries one canonical name.
+    // The scope names the stored repository (ADR-016). `library/name` and `name`
+    // are different repositories. `*` and `…/*` authorize nothing.
     if s.is_empty() || t.is_empty() || s.contains('*') {
         return false;
     }
-    if s == t {
-        return true;
-    }
-    let s_no_lib = s.strip_prefix("library/").unwrap_or(s);
-    let t_no_lib = t.strip_prefix("library/").unwrap_or(t);
-    if s_no_lib.is_empty() || t_no_lib.is_empty() {
-        return false;
-    }
-    s_no_lib == t_no_lib
+    s == t
+}
+
+/// Key for upload-state tokens. Distinct from the bearer signing key so an
+/// upload-state MAC cannot verify as a bearer (ADR-016).
+pub(crate) fn upload_state_signing_key(token_key: &[u8]) -> Vec<u8> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(token_key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(b"naust.upload-state.v1");
+    mac.finalize().into_bytes().to_vec()
 }
 
 pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAction) -> bool {
@@ -845,13 +837,13 @@ mod tests {
             RepoAction::Pull
         ));
 
-        // 3. Docker library/ alias symmetry and boundary
+        // 3. library/ubuntu is the stored name. ubuntu is a different repository.
         assert!(token_allows_repo_action(
             &claims,
             "library/ubuntu",
             RepoAction::Pull
         ));
-        assert!(token_allows_repo_action(
+        assert!(!token_allows_repo_action(
             &claims,
             "ubuntu",
             RepoAction::Pull
@@ -922,5 +914,73 @@ mod tests {
             ..claims
         };
         assert!(token_allows_catalog_action(&catalog));
+    }
+
+    #[test]
+    fn bearer_rejects_two_part_and_payload_only_macs() {
+        let signing_key = "test-signing-key";
+        let aud = "registry";
+        let now = now_secs();
+        let token =
+            issue_bearer_token(signing_key, aud, Some("user"), &[], now, now + 60).expect("issue");
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let two_part = format!("{}.{}", parts[1], parts[2]);
+        assert!(matches!(
+            verify_bearer_token(signing_key, &two_part),
+            Err(TokenError::InvalidFormat)
+        ));
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes()).expect("hmac");
+        mac.update(parts[1].as_bytes());
+        let payload_sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let payload_only = format!("{}.{}.{}", parts[0], parts[1], payload_sig);
+        assert!(matches!(
+            verify_bearer_token(signing_key, &payload_only),
+            Err(TokenError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn upload_state_mac_is_not_a_bearer() {
+        let token_key = b"test-signing-key";
+        let state = naust_core::upload_lifecycle::state::UploadStateData::new(
+            "org/app",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        );
+        let signed_with_token_key = state.encode_and_sign(token_key);
+        assert!(verify_bearer_token("test-signing-key", &signed_with_token_key).is_err());
+        assert!(
+            naust_core::upload_lifecycle::state::UploadStateData::verify_and_decode(
+                &signed_with_token_key,
+                token_key,
+                "org/app",
+            )
+            .is_ok()
+        );
+
+        let derived = upload_state_signing_key(token_key);
+        assert_ne!(derived.as_slice(), token_key);
+        let signed_with_derived = state.encode_and_sign(&derived);
+        assert!(verify_bearer_token("test-signing-key", &signed_with_derived).is_err());
+        assert!(
+            naust_core::upload_lifecycle::state::UploadStateData::verify_and_decode(
+                &signed_with_derived,
+                &derived,
+                "org/app",
+            )
+            .is_ok()
+        );
+        assert!(
+            naust_core::upload_lifecycle::state::UploadStateData::verify_and_decode(
+                &signed_with_token_key,
+                &derived,
+                "org/app",
+            )
+            .is_err()
+        );
     }
 }

@@ -1,6 +1,6 @@
 # ADR-015: Catalog predicate, credential hosts, and exact repository scopes
 
-* **Status:** Accepted (2026-09-26)
+* **Status:** Accepted (2026-09-26). The `library/` alias in clause 3 is removed by [ADR-016](adr-016-mac-egress-and-repo-identity.md): a repository scope authorizes the stored name only.
 * **Amends:** [ADR-014](adr-014-auth-and-proxy-trust-boundaries.md) clauses 2, 3, and 5
 * **Scope:** The three residuals left after the ADR-014 implementation. Does not decide multi-instance sled, the `read`→`pull` alias, or length-leaking secret compares.
 
