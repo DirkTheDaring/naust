@@ -41,14 +41,14 @@ jobs:
           mkdir -p ../acmecert ../storage-layer-rust
           cp -a vendor/acmecert/. ../acmecert/
           cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
-      # Service containers cannot pass a command and the official minio image
-      # needs `server /data`, so start it explicitly (pinned to the tag used
-      # for local qualification).
+      # MinIO's official images no longer allow anonymous pulls (docker.io and
+      # quay.io both deny); the frozen bitnami legacy archive still does and is
+      # env-configured (no command needed). Pinned by digest.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
           for i in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/ready && exit 0
             sleep 2

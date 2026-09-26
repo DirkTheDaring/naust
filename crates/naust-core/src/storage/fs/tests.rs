@@ -1,4 +1,6 @@
-use super::test_helpers::{make_test_stream, prepare_finalizable_session, tmp_fs_root, write_file};
+use super::test_helpers::{
+    make_test_stream, occupy_freed_inode, prepare_finalizable_session, tmp_fs_root, write_file,
+};
 use super::*;
 use crate::storage::StorageErrorKind;
 use std::sync::Arc;
@@ -13505,7 +13507,9 @@ mod manifest_write_containment {
 
         // Remove and recreate the repository directory at the same pathname.
         std::fs::remove_dir_all(root.join("repos").join("delrepo")).unwrap();
+        let keeper = occupy_freed_inode(&root.join("repos"));
         std::fs::create_dir_all(root.join("repos").join("delrepo")).unwrap();
+        std::fs::remove_file(keeper).unwrap();
         let second_inode = std::fs::metadata(root.join("repos").join("delrepo"))
             .unwrap()
             .ino();
@@ -14498,9 +14502,11 @@ mod membership_mutation_containment {
             .join(encode_canonical_repo_key(&canonical("delrepo")));
         let first_inode = std::fs::metadata(&key_dir).unwrap().ino();
         std::fs::remove_dir_all(&key_dir).unwrap();
+        let keeper = occupy_freed_inode(key_dir.parent().unwrap());
 
         // Recreate via the production link path; new inode.
         let mut rec = link(&storage, "delrepo", &digest).await;
+        std::fs::remove_file(keeper).unwrap();
         assert_ne!(
             std::fs::metadata(&key_dir).unwrap().ino(),
             first_inode,
@@ -15913,7 +15919,9 @@ mod gc_quarantine_containment {
             assert_eq!(hex, hook_digest.hex());
             let leaf = cas_path(&hook_root, &hook_digest);
             std::fs::remove_file(&leaf).unwrap();
+            let keeper = occupy_freed_inode(leaf.parent().unwrap());
             std::fs::write(&leaf, replacement).unwrap();
+            std::fs::remove_file(keeper).unwrap();
             set_mtime_secs(&leaf, 1_700_000_555);
             fired_hook.store(true, std::sync::atomic::Ordering::SeqCst);
         }));

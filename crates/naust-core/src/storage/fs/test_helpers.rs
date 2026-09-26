@@ -62,3 +62,14 @@ pub async fn prepare_finalizable_session(
         .unwrap();
     (session, prepared, digest)
 }
+
+/// ext4 immediately reuses freed inode numbers, so a remove-then-recreate at
+/// the same path can yield the SAME identity and defeat swap-scenario staging
+/// (btrfs, by contrast, never reuses inode numbers). Consume the just-freed
+/// inode with a keeper entry created in `parent`; callers remove the keeper
+/// once the real replacement exists.
+pub fn occupy_freed_inode(parent: &Path) -> PathBuf {
+    let keeper = parent.join(".inode-keeper");
+    std::fs::write(&keeper, b"inode keeper").unwrap();
+    keeper
+}
