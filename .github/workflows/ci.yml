@@ -26,8 +26,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Core boundary gate (ADR-010)
         run: make core-boundary
-      - name: Workspace tests (live-S3 suite runs in its own job)
-        run: cargo test --workspace --locked --no-fail-fast -- --skip test_live_s3
+      - name: Workspace tests (the live-S3 suite is ignore-gated; see the live-s3 job)
+        run: cargo test --workspace --locked --no-fail-fast
       - name: Conformance (fs, basic, token)
         run: tests/compliance/run.sh fs basic token
 
@@ -48,13 +48,13 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           for i in $(seq 1 60); do
             curl -sf http://127.0.0.1:9000/minio/health/ready && exit 0
             sleep 2
           done
           echo "MinIO did not become ready" >&2; docker logs minio; exit 1
       - name: Live S3 suite
-        run: cargo test --locked --test s3_live_integration -- --test-threads=1
+        run: cargo test --locked --test s3_live_integration -- --ignored --test-threads=1
       - name: Conformance (s3)
         run: tests/compliance/run.sh s3

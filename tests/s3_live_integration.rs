@@ -411,6 +411,7 @@ async fn write_test_blob(storage: &(impl Storage + ?Sized), repo: &str, content:
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_safety_guardrails_reject_non_local_without_override() {
     let local_policy = LiveS3SafetyPolicy {
         allow_non_local_destructive_tests: false,
@@ -451,6 +452,7 @@ async fn test_safety_guardrails_reject_non_local_without_override() {
 }
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_safety_guardrails_generate_unique_prefix_and_isolate_runs() {
     let h1 = LiveS3Harness::new().await.unwrap();
     let h2 = LiveS3Harness::new().await.unwrap();
@@ -484,6 +486,7 @@ async fn test_safety_guardrails_generate_unique_prefix_and_isolate_runs() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_production_s3_storage_adapter_construction() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -500,6 +503,7 @@ async fn test_production_s3_storage_adapter_construction() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_writer_lock_1_to_6_full_lifecycle() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage1 = harness.create_storage();
@@ -557,6 +561,7 @@ async fn test_live_s3_writer_lock_1_to_6_full_lifecycle() {
 }
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_writer_lock_7_to_10_admin_recovery_and_supervisor_competition() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage1 = harness.create_storage();
@@ -641,6 +646,7 @@ async fn test_live_s3_writer_lock_7_to_10_admin_recovery_and_supervisor_competit
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_tag_cas_full_matrix() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -742,6 +748,7 @@ async fn test_live_s3_tag_cas_full_matrix() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_pagination_under_mutation() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -823,6 +830,7 @@ fn make_upload_stream(bytes: Bytes) -> naust::storage::upload_session::UploadByt
 }
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_upload_session_storage_api_contract() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -942,6 +950,7 @@ async fn test_live_s3_upload_session_storage_api_contract() {
 }
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_upload_legacy_and_monolithic_helpers() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -986,6 +995,7 @@ async fn test_live_s3_upload_legacy_and_monolithic_helpers() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_lifecycle_service_and_recovery() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage1 = harness.create_storage();
@@ -1051,6 +1061,7 @@ async fn test_live_s3_lifecycle_service_and_recovery() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_membership_contract() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1109,6 +1120,7 @@ async fn test_live_s3_membership_contract() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_referrers_concurrent_additions() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1164,6 +1176,7 @@ async fn test_live_s3_referrers_concurrent_additions() {
 // ================================================================================================
 
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_error_classification_contracts() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1197,6 +1210,7 @@ async fn test_live_s3_error_classification_contracts() {
 
 // 1. S3 service construction in the supervisor
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_service_construction_in_supervisor() {
     let harness = LiveS3Harness::new().await.unwrap();
     let temp = TempDir::new().unwrap();
@@ -1226,6 +1240,7 @@ async fn test_live_s3_gc_service_construction_in_supervisor() {
 
 // 2. S3 scheduler no longer returning early (dispatches through GcStorageStrategy)
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1269,6 +1284,7 @@ async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
 
 // 3. S3 admin plan succeeds
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_admin_plan_succeeds() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1313,6 +1329,7 @@ async fn test_live_s3_gc_admin_plan_succeeds() {
 
 // 4. S3 admin delete removes genuinely unreferenced object
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1369,6 +1386,7 @@ async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
 
 // 5. S3 quarantine returns the explicit strategy response
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1417,6 +1435,7 @@ async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
 
 // 6. Repository membership protects an object
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_repository_membership_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1470,6 +1489,7 @@ async fn test_live_s3_gc_repository_membership_protects_blob() {
 
 // 7. Manifest-root reachability protects an object
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_manifest_reachability_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1551,6 +1571,7 @@ async fn test_live_s3_gc_manifest_reachability_protects_blob() {
 
 // 8. Upload pin/finalizing state protects an object
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_upload_pin_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1610,6 +1631,7 @@ async fn test_live_s3_gc_upload_pin_protects_blob() {
 
 // 9. Active lifecycle journal protects an object
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1693,6 +1715,7 @@ async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
 
 // 10. Changed ETag produces PreconditionFailed and preserves the replacement
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_changed_etag_produces_precondition_failed_and_preserves() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1739,6 +1762,7 @@ async fn test_live_s3_gc_changed_etag_produces_precondition_failed_and_preserves
 
 // 11. Empty filtered pages with continuation are traversed
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_empty_filtered_pages_traversed_with_continuation() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1761,6 +1785,7 @@ async fn test_live_s3_gc_empty_filtered_pages_traversed_with_continuation() {
 
 // 12. More objects than one page are processed exactly once
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1819,6 +1844,7 @@ async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
 
 // 13. A repeated continuation token fails closed
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_repeated_continuation_token_fails_closed() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1830,6 +1856,7 @@ async fn test_live_s3_gc_repeated_continuation_token_fails_closed() {
 
 // 14. Concurrent lifecycle mutation is serialized only for the bounded candidate transaction
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bounded_transaction() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -1884,6 +1911,7 @@ async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bound
 
 // 15. A second mutation-capable S3 process is rejected by writer authority
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_second_mutation_process_rejected_by_authority() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage1 = harness.create_storage();
@@ -1905,6 +1933,7 @@ async fn test_live_s3_gc_second_mutation_process_rejected_by_authority() {
 
 // 16. Graceful shutdown releases the writer lease exactly once
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_gc_graceful_shutdown_releases_authority_once() {
     let harness = LiveS3Harness::new().await.unwrap();
     let temp = TempDir::new().unwrap();
@@ -1960,6 +1989,7 @@ async fn test_live_s3_gc_graceful_shutdown_releases_authority_once() {
 /// internal async read-buffer boundaries, and must be byte-for-byte equivalent
 /// to the accepted filesystem backend for identical fixtures.
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_r6_live_s3_streaming_open_blob_equivalence() {
     use tokio::io::AsyncReadExt;
 
@@ -2021,6 +2051,7 @@ async fn test_r6_live_s3_streaming_open_blob_equivalence() {
 /// supports closed `bytes=start-end` ranges (206 + Content-Range + exact
 /// bytes) and returns 416 for unsatisfiable, open-ended, and suffix ranges.
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_r6_live_s3_http_range_matrix() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -2169,6 +2200,7 @@ async fn test_r6_live_s3_http_range_matrix() {
 /// non-existent source. Removing the source contribution must not erase the
 /// target's, matching the corrected cross-repository accounting invariant.
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_r6_live_s3_cross_mount() {
     let harness = LiveS3Harness::new().await.unwrap();
     let storage = harness.create_storage();
@@ -2413,6 +2445,7 @@ async fn test_r6_live_s3_access_denied_not_masked_as_notfound() {
 /// yields real ETags, deletes are version-conditional (stale refused), and a
 /// bounded cache results once matching versions are applied.
 #[tokio::test]
+#[ignore = "live MinIO required — run with: cargo test --test s3_live_integration -- --ignored --test-threads=1"]
 async fn test_live_s3_cache_eviction_port_conditional_and_bounding() {
     use naust::storage::GcDeleteResult;
     use naust::storage::ports::CacheEvictionPort;
