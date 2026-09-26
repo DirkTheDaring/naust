@@ -1250,7 +1250,7 @@ async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
         .unwrap();
 
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1290,7 +1290,7 @@ async fn test_live_s3_gc_admin_plan_succeeds() {
         .unwrap();
 
     let service = GcService::new(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1341,7 +1341,7 @@ async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1390,7 +1390,7 @@ async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1441,7 +1441,7 @@ async fn test_live_s3_gc_repository_membership_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1522,7 +1522,7 @@ async fn test_live_s3_gc_manifest_reachability_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1584,7 +1584,7 @@ async fn test_live_s3_gc_upload_pin_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1664,7 +1664,7 @@ async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1791,7 +1791,7 @@ async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1860,7 +1860,7 @@ async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bound
         .await
         .unwrap();
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator,

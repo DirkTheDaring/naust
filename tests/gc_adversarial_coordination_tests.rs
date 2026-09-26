@@ -71,7 +71,7 @@ async fn test_manifest_publication_acquires_gate_first_gc_revalidates_and_preser
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -180,7 +180,7 @@ async fn test_gc_acquires_gate_first_publication_blocked_until_gc_finishes() {
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -272,7 +272,7 @@ async fn test_repo_membership_created_before_final_deletion_causes_candidate_ski
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -350,7 +350,7 @@ async fn test_pin_finalizing_upload_state_causes_candidate_skipped() {
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -428,7 +428,7 @@ async fn test_lifecycle_journal_appearing_before_validation_causes_candidate_ski
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -589,7 +589,7 @@ async fn test_admin_and_scheduler_have_no_permit_access() {
         .expect("authority");
 
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -648,7 +648,7 @@ async fn test_cli_acquires_authority_once_and_routes_through_service() {
         .expect("cli authority");
 
     let service = GcService::with_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -747,7 +747,7 @@ async fn test_concurrent_lifecycle_mutation_progresses_between_gc_candidates() {
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let service = GcService::with_coordinator_and_authority(
-        cfg.clone(),
+        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
         hooked_storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -883,7 +883,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
     );
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg.clone()),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -990,7 +990,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     let coordinator = ConsistencyCoordinator::new();
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         storage.clone(),
         idx.clone(),
         coordinator,
@@ -1897,7 +1897,7 @@ async fn test_integration_fs_deletion_requires_both_gc_proof_types() {
     );
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         storage.clone(),
         ref_index.clone(),
         coordinator,
@@ -1953,7 +1953,7 @@ async fn test_integration_s3_deletion_requires_both_gc_proof_types() {
     );
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         s3_storage_dyn.clone(),
         ref_index.clone(),
         coordinator,
@@ -2043,7 +2043,7 @@ async fn test_integration_gc_candidate_releases_guard_between_items() {
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         hooked_storage.clone(),
         ref_index.clone(),
         coordinator.clone(),
@@ -2296,7 +2296,6 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
 
     // 6. Verify orphan remains protected while durable pin lease is valid
     let policy_ctx = registry_rust::blob_gc::PolicyContext::build(
-        &cfg,
         &base_storage,
         &ref_index,
         BlobGcPolicy::ManifestRooted,
@@ -2315,7 +2314,7 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
 
     // 8. Service execution at expiry time: candidate is quarantined and deleted
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         base_storage.clone(),
         ref_index.clone(),
         coordinator.clone(),

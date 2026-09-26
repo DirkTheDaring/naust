@@ -117,7 +117,6 @@ pub struct PolicyContext {
 
 impl PolicyContext {
     pub async fn build(
-        cfg: &crate::config::Config,
         storage: &(impl storage::GcServiceStoragePort + ?Sized),
         idx: &BlobRefIndex,
         policy: BlobGcPolicy,
@@ -128,7 +127,7 @@ impl PolicyContext {
 
         let manifest_protected = match policy {
             BlobGcPolicy::TagRooted => None,
-            BlobGcPolicy::ManifestRooted => Some(build_manifest_protected_set(cfg, storage).await?),
+            BlobGcPolicy::ManifestRooted => Some(build_manifest_protected_set(storage).await?),
         };
 
         Ok(Self {
@@ -167,7 +166,6 @@ impl PolicyContext {
 }
 
 pub async fn build_manifest_protected_set(
-    _cfg: &crate::config::Config,
     storage: &(impl storage::GcServiceStoragePort + ?Sized),
 ) -> Result<HashSet<String>, GcPolicyError> {
     if let Some(set) = storage
@@ -231,7 +229,6 @@ pub async fn build_manifest_protected_set(
 mod tests {
     use super::*;
     use crate::blob_ref_index::BlobRefIndex;
-    use crate::config::Config;
     use std::sync::Arc;
 
     #[cfg(target_os = "linux")]
@@ -331,43 +328,39 @@ mod tests {
         .unwrap();
 
         let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
-        let mut cfg = Config::from_env().unwrap();
-        cfg.fs_root = fs_root.clone();
 
-        // Branch 1: storage.kind() == "fs" && cfg.fs_root.join("repos").is_ok()
+        // Branch 1: storage.kind() == "fs" && fs_root.join("repos").is_ok()
         assert_eq!(storage.kind(), "fs");
-        assert!(tokio::fs::metadata(cfg.fs_root.join("repos")).await.is_ok());
-        let protected_fs = build_manifest_protected_set(&cfg, storage.as_ref())
+        assert!(tokio::fs::metadata(fs_root.join("repos")).await.is_ok());
+        let protected_fs = build_manifest_protected_set(storage.as_ref())
             .await
             .expect("fs bypass discovery should succeed");
         assert!(protected_fs.contains(&format!("sha256:{hex}")));
         assert!(protected_fs.contains(cfg_digest));
         assert!(protected_fs.contains(layer_digest));
 
-        // Branch 2: storage.kind() == "fs" BUT cfg.fs_root.join("repos") does not exist
+        // Branch 2: storage.kind() == "fs" BUT fs_root.join("repos") does not exist
         let non_existent_root = temp.path().join("non_existent_root");
-        cfg.fs_root = non_existent_root;
         assert!(
-            tokio::fs::metadata(cfg.fs_root.join("repos"))
+            tokio::fs::metadata(non_existent_root.join("repos"))
                 .await
                 .is_err()
         );
         // Falls back to storage.list_repositories()
-        let protected_fallback = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected_fallback = build_manifest_protected_set(storage.as_ref())
             .await
             .expect("fallback to storage port should succeed");
         assert!(protected_fallback.contains(&format!("sha256:{hex}")));
         assert!(protected_fallback.contains(cfg_digest));
         assert!(protected_fallback.contains(layer_digest));
 
-        // Branch 3: storage.kind() == "s3" (non-fs) even if cfg.fs_root.join("repos") exists
-        cfg.fs_root = fs_root.clone();
+        // Branch 3: storage.kind() == "s3" (non-fs) even if fs_root.join("repos") exists
         let (s3_storage, driver) = crate::storage::s3::tests::create_mock_storage();
         let s3_arc: Arc<dyn GcServiceStoragePort> = Arc::new(s3_storage);
         assert_eq!(s3_arc.kind(), "s3");
-        assert!(tokio::fs::metadata(cfg.fs_root.join("repos")).await.is_ok());
+        assert!(tokio::fs::metadata(fs_root.join("repos")).await.is_ok());
         // Mock S3 driver currently has no repos in objects table -> returns empty
-        let protected_s3 = build_manifest_protected_set(&cfg, s3_arc.as_ref())
+        let protected_s3 = build_manifest_protected_set(s3_arc.as_ref())
             .await
             .expect("s3 port path should succeed");
         assert!(protected_s3.is_empty());
@@ -378,7 +371,7 @@ mod tests {
             s3_manifest_key,
             (bytes::Bytes::from(manifest_bytes), "\"etag\"".to_string()),
         );
-        let protected_s3_populated = build_manifest_protected_set(&cfg, s3_arc.as_ref())
+        let protected_s3_populated = build_manifest_protected_set(s3_arc.as_ref())
             .await
             .expect("s3 port path with repo should succeed");
         assert!(protected_s3_populated.contains(&format!("sha256:{hex}")));
@@ -390,32 +383,30 @@ mod tests {
     async fn test_gc_manifest_discovery_missing_and_empty_repository_trees() {
         let temp = tempfile::tempdir().unwrap();
         let fs_root = temp.path();
-        let mut cfg = Config::from_env().unwrap();
-        cfg.fs_root = fs_root.to_path_buf();
 
         // 1. Missing repos directory completely
         let storage = FsStorage::new(fs_root.to_path_buf(), 10 * 1024 * 1024);
-        let protected_missing = build_manifest_protected_set(&cfg, &storage).await.unwrap();
+        let protected_missing = build_manifest_protected_set(&storage).await.unwrap();
         assert!(protected_missing.is_empty());
 
         // 2. Empty repos directory
         let repos = fs_root.join("repos");
         tokio::fs::create_dir_all(&repos).await.unwrap();
-        let protected_empty_repos = build_manifest_protected_set(&cfg, &storage).await.unwrap();
+        let protected_empty_repos = build_manifest_protected_set(&storage).await.unwrap();
         assert!(protected_empty_repos.is_empty());
 
         // 3. Repo directory with no manifests/ directory
         tokio::fs::create_dir_all(repos.join("empty-repo"))
             .await
             .unwrap();
-        let protected_no_manifests = build_manifest_protected_set(&cfg, &storage).await.unwrap();
+        let protected_no_manifests = build_manifest_protected_set(&storage).await.unwrap();
         assert!(protected_no_manifests.is_empty());
 
         // 4. manifests/ directory exists but is completely empty
         tokio::fs::create_dir_all(repos.join("empty-repo").join("manifests"))
             .await
             .unwrap();
-        let protected_empty_manifests = build_manifest_protected_set(&cfg, &storage).await.unwrap();
+        let protected_empty_manifests = build_manifest_protected_set(&storage).await.unwrap();
         assert!(protected_empty_manifests.is_empty());
     }
 
@@ -451,9 +442,7 @@ mod tests {
         .unwrap();
 
         let storage = FsStorage::new(fs_root.to_path_buf(), 10 * 1024 * 1024);
-        let mut cfg = Config::from_env().unwrap();
-        cfg.fs_root = fs_root.to_path_buf();
-        let protected = build_manifest_protected_set(&cfg, &storage).await.unwrap();
+        let protected = build_manifest_protected_set(&storage).await.unwrap();
 
         // Both SHA-256 and SHA-512 manifests and their referenced blobs MUST be protected
         assert!(protected.contains(&format!("sha256:{sha256_hex}")));
@@ -520,10 +509,8 @@ mod tests {
         tokio::fs::write(manifests_dir.join(non_utf8_name), &dummy_content)
             .await
             .unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
 
@@ -578,10 +565,8 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
 
@@ -628,10 +613,8 @@ mod tests {
         let symlink_manifest_path = real_repo_manifests
             .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         std::os::unix::fs::symlink(&real_manifest_path, &symlink_manifest_path).unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
 
@@ -672,9 +655,8 @@ mod tests {
         std::os::unix::fs::symlink(&real_data, &link_root).unwrap();
 
         // Initial root symlink is resolved at initialization; contained discovery then traverses real_data
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(link_root.clone(), 50 * 1024 * 1024));
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
         assert!(protected.contains(&format!("sha256:{hex}")));
@@ -708,10 +690,8 @@ mod tests {
         tokio::fs::write(manifests.join(hex), make_test_manifest_json(cfg_d, layer_d))
             .await
             .unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
         assert!(protected.contains(&format!("sha256:{hex}")));
@@ -728,8 +708,6 @@ mod tests {
             .join("fail-repo")
             .join("manifests");
         tokio::fs::create_dir_all(&manifests).await.unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
 
         // Case A: Corrupted JSON content -> GcPolicyError::ManifestDiscovery(corrupt_data)
@@ -738,7 +716,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = build_manifest_protected_set(&cfg, storage.as_ref())
+        let err = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap_err();
         assert!(
@@ -763,7 +741,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = build_manifest_protected_set(&cfg, storage.as_ref())
+        let err = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap_err();
         assert!(
@@ -793,10 +771,8 @@ mod tests {
         let mut guard = PermissionsRestorationGuard::capture(unreadable_path.clone())
             .expect("must capture original file permissions");
         std::fs::set_permissions(&unreadable_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
-        let read_res = build_manifest_protected_set(&cfg, storage.as_ref()).await;
+        let read_res = build_manifest_protected_set(storage.as_ref()).await;
         let err = read_res.expect_err("unreadable manifest must fail closed");
 
         guard
@@ -827,10 +803,8 @@ mod tests {
         let mut guard = PermissionsRestorationGuard::capture(unreadable_dir.clone())
             .expect("must capture original directory permissions");
         std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let cfg = Config::from_env().unwrap();
         let storage = Arc::new(FsStorage::new(temp.path().to_path_buf(), 50 * 1024 * 1024));
-        let res = build_manifest_protected_set(&cfg, storage.as_ref()).await;
+        let res = build_manifest_protected_set(storage.as_ref()).await;
         let err = res.expect_err("unreadable directory must fail closed");
 
         guard
@@ -891,8 +865,7 @@ mod tests {
         assert_eq!(page.len(), 5);
 
         // Contained GC discovery uses independent GC limits (not public listing limits), discovering all 5 manifests
-        let cfg = Config::from_env().unwrap();
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
         for d in &digests {
@@ -949,12 +922,10 @@ mod tests {
         let storage = Arc::new(FsStorage::new(fs_root_a.clone(), 50 * 1024 * 1024));
 
         // Config points to distinct root fs_root_b
-        let mut cfg = Config::from_env().unwrap();
-        cfg.fs_root = fs_root_b.clone();
 
         // Contained discovery operates exclusively on storage's pinned root (fs_root_a),
-        // completely eliminating divergence with cfg.fs_root.
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        // completely eliminating divergence with fs_root.
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
         assert!(
@@ -963,14 +934,14 @@ mod tests {
         );
         assert!(
             !protected.contains(&format!("sha256:{hex_b}")),
-            "contained discovery must not read cfg.fs_root (fs_root_b)"
+            "contained discovery must not read fs_root (fs_root_b)"
         );
 
         // Even if repos in fs_root_b is deleted, discovery on storage still returns repo-a manifests
         tokio::fs::remove_dir_all(fs_root_b.join("repos"))
             .await
             .unwrap();
-        let protected_after_removal = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected_after_removal = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
         assert!(protected_after_removal.contains(&format!("sha256:{hex_a}")));
@@ -983,8 +954,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fs_root = temp.path().to_path_buf();
         let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
-        let mut cfg = Config::from_env().unwrap();
-        cfg.fs_root = fs_root.clone();
 
         let idx_path = temp.path().join("ref-index");
         let idx = Arc::new(BlobRefIndex::open(idx_path).unwrap());
@@ -1002,7 +971,7 @@ mod tests {
 
         // 1. ManifestRooted policy MUST fail closed when manifest discovery fails
         let res_manifest_rooted =
-            PolicyContext::build(&cfg, storage.as_ref(), &idx, BlobGcPolicy::ManifestRooted).await;
+            PolicyContext::build(storage.as_ref(), &idx, BlobGcPolicy::ManifestRooted).await;
         let err = match res_manifest_rooted {
             Err(e) => e,
             Ok(_) => panic!("manifest rooted build should have failed"),
@@ -1014,7 +983,7 @@ mod tests {
 
         // 2. TagRooted policy does not build manifest protected set, so it succeeds
         assert!(
-            PolicyContext::build(&cfg, storage.as_ref(), &idx, BlobGcPolicy::TagRooted)
+            PolicyContext::build(storage.as_ref(), &idx, BlobGcPolicy::TagRooted)
                 .await
                 .is_ok()
         );

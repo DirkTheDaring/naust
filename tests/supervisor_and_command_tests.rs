@@ -189,7 +189,7 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -254,7 +254,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -487,7 +487,7 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
     for phase in test_phases {
         let temp = TempDir::new().unwrap();
         let cfg = Arc::new(create_test_config(&temp));
-        let wiring = storage::from_config(cfg.as_ref());
+        let wiring = registry_rust::storage_wiring::from_config(cfg.as_ref());
 
         let injector = Arc::new(FailingFaultInjector { fail_at: phase });
         let options = SupervisorOptions {
@@ -517,7 +517,7 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
 async fn test_supervisor_graceful_shutdown_order() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let wiring = storage::from_config(cfg.as_ref());
+    let wiring = registry_rust::storage_wiring::from_config(cfg.as_ref());
 
     let injector = Arc::new(RecordingFaultInjector::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -594,7 +594,7 @@ async fn test_supervisor_worker_panic_or_exit_triggers_global_shutdown() {
 async fn test_supervisor_mutation_authority_loss_stops_workers_and_fails_closed() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let wiring = storage::storage_wiring_from_config(cfg.as_ref());
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(cfg.as_ref());
 
     let authority = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "worker-test")
         .await
@@ -694,7 +694,7 @@ async fn test_server_auto_initializes_membership_on_fresh_empty_storage() {
 async fn test_server_serves_http_requests_and_shuts_down_cleanly() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let wiring = storage::from_config(cfg.as_ref());
+    let wiring = registry_rust::storage_wiring::from_config(cfg.as_ref());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (bound_tx, bound_rx) = oneshot::channel();
@@ -958,7 +958,7 @@ async fn test_supervisor_partial_startup_failure_unwinds_and_releases_authority(
     );
 
     // Verify storage lock is released and can be acquired immediately by a new process
-    let storage = storage::storage_wiring_from_config(&cfg).cluster_lock();
+    let storage = registry_rust::storage_wiring::storage_wiring_from_config(&cfg).cluster_lock();
     let mut auth2 = RuntimeMutationAuthority::acquire(storage, "recovery-after-failed-startup")
         .await
         .expect("must be able to acquire authority after failed startup unwind");
@@ -989,7 +989,9 @@ async fn test_supervisor_graceful_shutdown_releases_authority_exactly_once() {
     let srv_res = srv.await.expect("join");
     assert!(srv_res.is_ok());
 
-    let storage = storage::storage_wiring_from_config(&create_test_config(&temp)).cluster_lock();
+    let storage =
+        registry_rust::storage_wiring::storage_wiring_from_config(&create_test_config(&temp))
+            .cluster_lock();
     let mut auth = RuntimeMutationAuthority::acquire(storage, "post-shutdown-check")
         .await
         .expect("must acquire authority after clean supervisor shutdown");
@@ -1052,7 +1054,7 @@ async fn test_supervisor_runtime_composition_and_full_lifecycle_contract() {
     );
 
     // 4. Verify authority released cleanly and can be acquired by another process
-    let wiring = storage::storage_wiring_from_config(cfg.as_ref());
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(cfg.as_ref());
     let mut auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "post-lifecycle-check")
         .await
         .expect("authority must be free after supervisor shutdown");
@@ -1332,7 +1334,7 @@ path = "{}"
 
     // Initialize membership ready marker so preflight passes and index check is tested
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1399,7 +1401,7 @@ async fn test_migration_plan_apply_verify_readiness_rules() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
 
     // Initial state: not ready
     assert!(
@@ -1463,7 +1465,7 @@ async fn test_server_versus_cli_lock_contention_s3_and_fs() {
             .unwrap();
 
         let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-        let wiring = storage::storage_wiring_from_config(&cfg);
+        let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
         wiring
             .membership_reader()
             .mark_membership_ready()
@@ -1522,7 +1524,7 @@ async fn test_membership_backfill_required_blocks_gc_and_ref_index() {
 
     // Verify authority is free
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     let mut auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "reacquire-check")
         .await
         .expect("authority must be released after MembershipBackfillRequired failure");
@@ -1538,7 +1540,7 @@ async fn test_blob_gc_quarantine_failure_unwinds_and_releases_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1585,7 +1587,7 @@ async fn test_blob_gc_delete_failure_unwinds_and_releases_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1631,7 +1633,7 @@ async fn test_two_simultaneous_maintenance_commands_contention() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1724,7 +1726,7 @@ async fn test_teardown_command_failure_plus_release_failure() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1777,7 +1779,7 @@ async fn test_teardown_early_validation_failure_plus_release_failure() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1836,7 +1838,7 @@ async fn test_teardown_success_plus_release_failure() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1876,7 +1878,7 @@ async fn test_ordinary_success_releases_authority_exactly_once() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1910,7 +1912,7 @@ async fn test_local_filesystem_exclusion_reacquirable_after_distributed_release_
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -2109,7 +2111,7 @@ path = "{}"
 
     // 3. S3 server-versus-CLI contention: simulate active server holding writer lock on S3
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = storage::storage_wiring_from_config(&cfg);
+    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
     let mut server_auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "server")
         .await
         .expect("server authority acquire on S3");

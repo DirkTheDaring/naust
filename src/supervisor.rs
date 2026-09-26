@@ -1388,7 +1388,7 @@ mod tests {
         let mut cfg = crate::config::Config::from_env().unwrap();
         cfg.fs_root = fs_root;
         cfg.max_upload_bytes = 10 * 1024 * 1024;
-        let storage = crate::storage::storage_wiring_try_from_config(&cfg).unwrap();
+        let storage = crate::storage_wiring::storage_wiring_try_from_config(&cfg).unwrap();
         let proxy_db_path = temp_dir.path().join("proxy.db");
         let proxy_cfg = crate::config::ProxyConfig {
             enabled: true,

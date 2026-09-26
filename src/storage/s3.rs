@@ -737,7 +737,7 @@ pub struct S3SessionConfig {
     pub max_retry_attempts: u32,
     pub receipt_lifetime_secs: u64,
     pub upload_expiration_secs: u64,
-    pub legacy_multipart_cleanup_policy: crate::config::LegacyMultipartCleanupPolicy,
+    pub legacy_multipart_cleanup_policy: crate::policy::LegacyMultipartCleanupPolicy,
 }
 
 impl Default for S3SessionConfig {
@@ -748,7 +748,7 @@ impl Default for S3SessionConfig {
             max_retry_attempts: S3_MAX_RETRY_ATTEMPTS,
             receipt_lifetime_secs: 72 * 3600,
             upload_expiration_secs: 24 * 3600,
-            legacy_multipart_cleanup_policy: crate::config::LegacyMultipartCleanupPolicy::Disabled,
+            legacy_multipart_cleanup_policy: crate::policy::LegacyMultipartCleanupPolicy::Disabled,
         }
     }
 }
@@ -1056,7 +1056,7 @@ impl S3Storage {
                     Ok(None) => {
                         // No session doc exists. Evaluate against explicit cleanup policy.
                         match self.session_config.legacy_multipart_cleanup_policy {
-                            crate::config::LegacyMultipartCleanupPolicy::Disabled => {
+                            crate::policy::LegacyMultipartCleanupPolicy::Disabled => {
                                 tracing::debug!(
                                     key = %u.key,
                                     upload_id = %u.upload_id,
@@ -1064,7 +1064,7 @@ impl S3Storage {
                                 );
                                 continue;
                             }
-                            crate::config::LegacyMultipartCleanupPolicy::CurrentFormatOnly => {
+                            crate::policy::LegacyMultipartCleanupPolicy::CurrentFormatOnly => {
                                 tracing::debug!(
                                     key = %u.key,
                                     upload_id = %u.upload_id,
@@ -1072,7 +1072,7 @@ impl S3Storage {
                                 );
                                 continue;
                             }
-                            crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown => {
+                            crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown => {
                                 // Operator explicitly confirmed all unknown uploads may be cleaned up.
                             }
                         }

@@ -310,7 +310,7 @@ async fn test_capability_forwarding_through_production_wiring_and_arc() {
     cfg.fs_root = fs_root.clone();
 
     // Production wiring construction
-    let wiring = registry_rust::storage::storage_wiring_try_from_config(&cfg)
+    let wiring = registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg)
         .expect("storage wiring must construct from config");
     let storage = wiring.gc_service_port();
 
@@ -354,7 +354,7 @@ async fn test_routing_some_empty_proves_catalog_fallback_avoided() {
     assert!(refs.is_empty());
 
     // build_manifest_protected_set must return empty set without triggering fail_on_catalog_listing
-    let protected = build_manifest_protected_set(&cfg, &recording)
+    let protected = build_manifest_protected_set(&recording)
         .await
         .expect("must succeed without calling catalog fallback");
     assert!(protected.is_empty());
@@ -382,9 +382,7 @@ async fn test_routing_err_fails_closed_proving_catalog_fallback_avoided() {
     let recording = RecordingGcServiceStoragePort::new(base_storage, true);
     let cfg = Config::from_env_with_files(&[]).unwrap();
 
-    let err = build_manifest_protected_set(&cfg, &recording)
-        .await
-        .unwrap_err();
+    let err = build_manifest_protected_set(&recording).await.unwrap_err();
 
     match err {
         GcPolicyError::ManifestDiscovery(storage_err) => {
@@ -409,7 +407,7 @@ async fn test_routing_none_invokes_generic_traversal() {
     cfg.storage_backend = StorageBackend::S3;
     cfg.s3_bucket = Some("test-bucket".to_string());
 
-    let wiring = registry_rust::storage::storage_wiring_try_from_config(&cfg)
+    let wiring = registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg)
         .expect("s3 wiring must construct");
     let base_storage = wiring.gc_service_port();
 
@@ -421,7 +419,7 @@ async fn test_routing_none_invokes_generic_traversal() {
 
     let recording = RecordingGcServiceStoragePort::new(base_storage, false);
     // Calling build_manifest_protected_set with None should trigger generic catalog traversal
-    let _ = build_manifest_protected_set(&cfg, &recording).await;
+    let _ = build_manifest_protected_set(&recording).await;
     assert!(
         recording.list_repositories_called.load(Ordering::SeqCst),
         "generic traversal must invoke catalog listing when discover_manifest_references returns None"
@@ -508,7 +506,7 @@ async fn test_storage_wiring_constructor_validation_rejects_invalid_limits() {
 
     // Invalid max_depth = 0
     cfg.fs_gc_discovery_max_depth = 0;
-    let err = match registry_rust::storage::storage_wiring_try_from_config(&cfg) {
+    let err = match registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg) {
         Err(e) => e,
         Ok(_) => panic!("should have failed with invalid max_depth"),
     };
@@ -518,7 +516,7 @@ async fn test_storage_wiring_constructor_validation_rejects_invalid_limits() {
     // Reset and test invalid name bytes < 128
     cfg.fs_gc_discovery_max_depth = 32;
     cfg.fs_gc_discovery_terminal_dir_max_name_bytes = 64;
-    let err = match registry_rust::storage::storage_wiring_try_from_config(&cfg) {
+    let err = match registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg) {
         Err(e) => e,
         Ok(_) => panic!("should have failed with invalid name bytes"),
     };
@@ -558,7 +556,8 @@ async fn test_configured_limits_reaching_discovery_and_refs_independently() {
     cfg_disc.fs_root = fs_root.clone();
     cfg_disc.fs_gc_discovery_max_manifest_dirs = 2;
 
-    let wiring_disc = registry_rust::storage::storage_wiring_try_from_config(&cfg_disc).unwrap();
+    let wiring_disc =
+        registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg_disc).unwrap();
     let storage_disc = wiring_disc.gc_service_port();
 
     let err = storage_disc
@@ -578,7 +577,8 @@ async fn test_configured_limits_reaching_discovery_and_refs_independently() {
     cfg_ref.fs_root = fs_root.clone();
     cfg_ref.fs_gc_discovery_max_terminal_dir_enumerations = 1;
 
-    let wiring_ref = registry_rust::storage::storage_wiring_try_from_config(&cfg_ref).unwrap();
+    let wiring_ref =
+        registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg_ref).unwrap();
     let storage_ref = wiring_ref.gc_service_port();
 
     let err = storage_ref
@@ -640,7 +640,6 @@ async fn test_actual_gc_planning_fails_closed_on_discovery_error_and_preserves_c
 
     // Execute actual blob_gc_plan entry point
     let plan_res = blob_gc_plan(
-        &cfg,
         &recording_port,
         &idx,
         BlobGcPolicy::ManifestRooted,
@@ -718,7 +717,6 @@ async fn test_actual_gc_quarantine_fails_closed_on_discovery_error_and_preserves
 
     // Execute actual blob_gc_quarantine_with_authority entry point
     let q_res = blob_gc_quarantine_with_authority(
-        &cfg,
         &recording_port,
         &idx,
         &consistency,
@@ -832,7 +830,7 @@ async fn test_actual_gc_deletion_fails_closed_on_discovery_error_and_preserves_q
 
     // Execute actual blob_gc_delete_with_authority entry point
     let del_res = blob_gc_delete_with_authority(
-        &cfg,
+        &cfg.fs_root,
         &recording_port,
         &idx,
         &consistency,
@@ -930,7 +928,7 @@ async fn test_real_deletion_loop_initializes_quarantine_timestamp_and_preserves_
     // Initial deletion run: clean repository state
     // The deletion loop discovers the un-timestamped blob, initializes timestamp, and continues.
     let del_stats = blob_gc_delete_with_authority(
-        &cfg,
+        &cfg.fs_root,
         &storage,
         &idx,
         &consistency,
@@ -969,7 +967,7 @@ async fn test_real_deletion_loop_initializes_quarantine_timestamp_and_preserves_
     .unwrap();
 
     let failure_res = blob_gc_delete_with_authority(
-        &cfg,
+        &cfg.fs_root,
         &storage,
         &idx,
         &consistency,

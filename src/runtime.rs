@@ -253,7 +253,7 @@ pub(crate) async fn init_server_storage_wiring<F>(
 where
     F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
 {
-    crate::storage::storage_wiring_try_from_config_async_with_factory(
+    crate::storage_wiring::storage_wiring_try_from_config_async_with_factory(
         config.as_ref(),
         storage_factory,
     )
@@ -269,7 +269,7 @@ pub(crate) async fn build_server_runtime(
     build_server_runtime_with_storage_factory(
         config,
         injector,
-        crate::storage::storage_wiring_try_from_config,
+        crate::storage_wiring::storage_wiring_try_from_config,
     )
     .await
 }
@@ -287,7 +287,7 @@ where
         config,
         injector,
         storage_factory,
-        crate::storage::proxy_cache_storage_try_from_config,
+        crate::storage_wiring::proxy_cache_storage_try_from_config,
     )
     .await
 }
@@ -505,7 +505,7 @@ where
 
             let pcf = proxy_cache_factory.clone();
             let cache =
-                match crate::storage::proxy_cache_storage_try_from_config_async_with_factory(
+                match crate::storage_wiring::proxy_cache_storage_try_from_config_async_with_factory(
                     config.as_ref(),
                     Some(up),
                     move |c, u| pcf(c, u),
@@ -549,7 +549,7 @@ where
     let proxy_cache: Option<Arc<dyn crate::storage::ports::ProxyStoragePort>> =
         if config.proxy.enabled && config.proxy.upstreams.is_empty() {
             let pcf = proxy_cache_factory.clone();
-            match crate::storage::proxy_cache_storage_try_from_config_async_with_factory(
+            match crate::storage_wiring::proxy_cache_storage_try_from_config_async_with_factory(
                 config.as_ref(),
                 None,
                 move |c, u| pcf(c, u),
@@ -579,7 +579,7 @@ where
 
     let gc_service = match &ref_index {
         Some(idx) => Some(Arc::new(GcService::with_coordinator_and_authority(
-            config.clone(),
+            Arc::new(crate::policy::GcPolicy::from(config.as_ref())),
             storage_wiring.gc_service_port(),
             idx.clone(),
             consistency.clone(),
@@ -876,7 +876,7 @@ mod tests {
         let runtime = build_server_runtime_with_storage_factory(cfg.clone(), None, move |c| {
             let current_id = std::thread::current().id();
             let _ = worker_tx.send(current_id);
-            crate::storage::storage_wiring_try_from_config(c)
+            crate::storage_wiring::storage_wiring_try_from_config(c)
         })
         .await
         .expect("runtime build must succeed");
@@ -921,7 +921,7 @@ mod tests {
                         "test worker synchronization wait failed (timeout or disconnection): {err}"
                     );
                 }
-                crate::storage::storage_wiring_try_from_config(c)
+                crate::storage_wiring::storage_wiring_try_from_config(c)
             })
             .await
         });
@@ -999,7 +999,8 @@ mod tests {
         let cfg = Arc::new(cfg);
 
         // Obtain expected error directly from existing synchronous factory on the same fixture
-        let expected_err = match crate::storage::storage_wiring_try_from_config(cfg.as_ref()) {
+        let expected_err = match crate::storage_wiring::storage_wiring_try_from_config(cfg.as_ref())
+        {
             Err(err) => err,
             Ok(_) => panic!("synchronous factory must fail on invalid root fixture"),
         };
@@ -1083,7 +1084,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cfg = Arc::new(create_test_config(&temp));
 
-        let wiring = crate::storage::storage_wiring_from_config(cfg.as_ref());
+        let wiring = crate::storage_wiring::storage_wiring_from_config(cfg.as_ref());
         assert!(
             wiring
                 .readiness_inspector()
@@ -1125,7 +1126,7 @@ mod tests {
         .await
         .unwrap();
 
-        let wiring = crate::storage::storage_wiring_from_config(cfg.as_ref());
+        let wiring = crate::storage_wiring::storage_wiring_from_config(cfg.as_ref());
         assert!(
             !wiring
                 .readiness_inspector()
@@ -1167,7 +1168,7 @@ mod tests {
             .await
             .unwrap();
 
-        let wiring = crate::storage::storage_wiring_from_config(cfg.as_ref());
+        let wiring = crate::storage_wiring::storage_wiring_from_config(cfg.as_ref());
         assert!(
             !wiring
                 .readiness_inspector()
@@ -1229,7 +1230,7 @@ mod tests {
         tokio::fs::create_dir_all(&cfg.fs_root).await.unwrap();
         tokio::fs::write(&repos_path, b"not-a-dir").await.unwrap();
 
-        let wiring = crate::storage::storage_wiring_from_config(cfg.as_ref());
+        let wiring = crate::storage_wiring::storage_wiring_from_config(cfg.as_ref());
         let inspect_res = wiring.readiness_inspector().is_storage_empty().await;
         assert!(inspect_res.is_err(), "I/O error must propagate as Err");
 
@@ -1525,7 +1526,7 @@ mod tests {
         );
         let compound = unwind_and_fail(
             RuntimeMutationAuthority::acquire(
-                crate::storage::storage_wiring_from_config(&create_test_config(
+                crate::storage_wiring::storage_wiring_from_config(&create_test_config(
                     &TempDir::new().unwrap(),
                 ))
                 .cluster_lock(),
@@ -1581,7 +1582,7 @@ mod tests {
             }
 
             // Verify authority was released and can be reacquired cleanly
-            let wiring = crate::storage::storage_wiring_from_config(cfg.as_ref());
+            let wiring = crate::storage_wiring::storage_wiring_from_config(cfg.as_ref());
             let reacquired =
                 RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "verify_authority_freed")
                     .await;
@@ -1611,7 +1612,7 @@ mod tests {
         assert!(build_res.is_err());
 
         // Verify authority was freed and can be reacquired
-        let wiring = crate::storage::storage_wiring_from_config(cfg.as_ref());
+        let wiring = crate::storage_wiring::storage_wiring_from_config(cfg.as_ref());
         let mut a = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "post-index-fail")
             .await
             .expect("authority must be released after index failure");
@@ -1968,7 +1969,7 @@ mod tests {
         cfg.blob_gc_enabled = false;
         cfg.proxy.enabled = false;
 
-        let wiring = crate::storage::storage_wiring_from_config(&cfg);
+        let wiring = crate::storage_wiring::storage_wiring_from_config(&cfg);
         let empty_res = wiring.readiness_inspector().is_storage_empty().await;
         if empty_res.is_err() && !is_required {
             println!("Skipping empty check: MinIO endpoint unreachable at {endpoint}");
@@ -2009,13 +2010,13 @@ mod tests {
         let runtime = build_server_runtime_with_factories(
             cfg.clone(),
             None,
-            crate::storage::storage_wiring_try_from_config,
+            crate::storage_wiring::storage_wiring_try_from_config,
             move |c, u| {
                 let current_id = std::thread::current().id();
                 if let Some(tx) = worker_tx.lock().unwrap().take() {
                     let _ = tx.send(current_id);
                 }
-                crate::storage::proxy_cache_storage_try_from_config(c, u)
+                crate::storage_wiring::proxy_cache_storage_try_from_config(c, u)
             },
         )
         .await
@@ -2047,13 +2048,13 @@ mod tests {
         let runtime = build_server_runtime_with_factories(
             cfg.clone(),
             None,
-            crate::storage::storage_wiring_try_from_config,
+            crate::storage_wiring::storage_wiring_try_from_config,
             move |c, u| {
                 let current_id = std::thread::current().id();
                 if let Some(tx) = worker_tx.lock().unwrap().take() {
                     let _ = tx.send(current_id);
                 }
-                crate::storage::proxy_cache_storage_try_from_config(c, u)
+                crate::storage_wiring::proxy_cache_storage_try_from_config(c, u)
             },
         )
         .await
@@ -2081,7 +2082,7 @@ mod tests {
         let res = build_server_runtime_with_factories(
             cfg,
             None,
-            crate::storage::storage_wiring_try_from_config,
+            crate::storage_wiring::storage_wiring_try_from_config,
             |_c, _u| {
                 Err(StorageError::configuration(
                     "custom proxy cache config failure",
@@ -2117,7 +2118,7 @@ mod tests {
         let res = build_server_runtime_with_factories(
             cfg,
             None,
-            crate::storage::storage_wiring_try_from_config,
+            crate::storage_wiring::storage_wiring_try_from_config,
             |_c, _u| panic!("simulated proxy cache blocking worker panic"),
         )
         .await;
@@ -2138,7 +2139,7 @@ mod tests {
     async fn test_proxy_cache_s3_retains_existing_construction_path_on_calling_thread() {
         let temp = TempDir::new().unwrap();
         let fs_cfg = create_test_config(&temp);
-        let fs_wiring = crate::storage::storage_wiring_try_from_config(&fs_cfg).unwrap();
+        let fs_wiring = crate::storage_wiring::storage_wiring_try_from_config(&fs_cfg).unwrap();
 
         let mut cfg = create_test_config(&temp);
         cfg.storage_backend = StorageBackend::S3;
@@ -2166,7 +2167,7 @@ mod tests {
                 if let Some(tx) = worker_tx.lock().unwrap().take() {
                     let _ = tx.send(current_id);
                 }
-                crate::storage::proxy_cache_storage_try_from_config(c, u)
+                crate::storage_wiring::proxy_cache_storage_try_from_config(c, u)
             },
         )
         .await;
@@ -2209,7 +2210,7 @@ mod tests {
             build_server_runtime_with_factories(
                 cfg_clone,
                 None,
-                crate::storage::storage_wiring_try_from_config,
+                crate::storage_wiring::storage_wiring_try_from_config,
                 move |c, u| {
                     if let Some(tx) = started_tx.lock().unwrap().take() {
                         let _ = tx.send(());
@@ -2219,7 +2220,7 @@ mod tests {
                             panic!("worker wait failed: {err}");
                         }
                     }
-                    crate::storage::proxy_cache_storage_try_from_config(c, u)
+                    crate::storage_wiring::proxy_cache_storage_try_from_config(c, u)
                 },
             )
             .await

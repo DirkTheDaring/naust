@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf};
 use toml::Value;
 use url::Url;
@@ -276,13 +276,25 @@ pub enum AuthStrategy {
     Both,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyMultipartCleanupPolicy {
-    #[default]
-    Disabled,
-    CurrentFormatOnly,
-    OperatorConfirmedAllUnknown,
+// Moved to the core policy module (ADR-010 §2.3); re-exported here so server-side
+// consumers keep compiling until the Phase 2 crate split.
+pub use crate::policy::LegacyMultipartCleanupPolicy;
+
+/// Composition-time mapping into the core GC policy (ADR-010 §2.3).
+impl From<&Config> for crate::policy::GcPolicy {
+    fn from(cfg: &Config) -> Self {
+        crate::policy::GcPolicy {
+            enabled: cfg.blob_gc_enabled,
+            enable_delete: cfg.blob_gc_enable_delete,
+            default_min_age_secs: cfg.blob_gc_default_min_age_secs,
+            default_quarantine_delay_secs: cfg.blob_gc_default_quarantine_delay_secs,
+            default_max_blobs: cfg.blob_gc_default_max_blobs,
+            default_max_bytes: cfg.blob_gc_default_max_bytes,
+            default_max_seconds: cfg.blob_gc_default_max_seconds,
+            auto_rebuild_ref_index_on_corruption: cfg.ref_index.auto_rebuild_on_corruption,
+            fs_root: cfg.fs_root.clone(),
+        }
+    }
 }
 
 impl Config {
@@ -484,12 +496,9 @@ pub struct ProxyRepoRule {
     pub eviction_policy: EvictionPolicy,
 }
 
-#[derive(Clone, Debug)]
-pub enum TagPolicy {
-    DigestOnly,
-    TtlSeconds(u64),
-    AlwaysRevalidate,
-}
+// Moved to the core policy module (ADR-010 §2.3); re-exported here so server-side
+// consumers keep compiling until the Phase 2 crate split.
+pub use crate::policy::TagPolicy;
 
 #[derive(Clone, Debug)]
 pub enum EvictionPolicy {
@@ -4627,5 +4636,43 @@ tag_listing_max_payload_bytes = 10
                 assert_eq!(cfg.storage_backend, StorageBackend::S3);
             },
         );
+    }
+
+    #[test]
+    fn gc_policy_mapping_covers_every_field() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.blob_gc_enabled = true;
+        cfg.blob_gc_enable_delete = true;
+        cfg.blob_gc_default_min_age_secs = 11;
+        cfg.blob_gc_default_quarantine_delay_secs = 22;
+        cfg.blob_gc_default_max_blobs = 33;
+        cfg.blob_gc_default_max_bytes = 44;
+        cfg.blob_gc_default_max_seconds = 55;
+        cfg.ref_index.auto_rebuild_on_corruption = false;
+        cfg.fs_root = std::path::PathBuf::from("/tmp/gc-map-root");
+
+        // Exhaustive destructuring: adding a GcPolicy field breaks this test
+        // until the Config mapping is extended (plan risk R3).
+        let crate::policy::GcPolicy {
+            enabled,
+            enable_delete,
+            default_min_age_secs,
+            default_quarantine_delay_secs,
+            default_max_blobs,
+            default_max_bytes,
+            default_max_seconds,
+            auto_rebuild_ref_index_on_corruption,
+            fs_root,
+        } = crate::policy::GcPolicy::from(&cfg);
+
+        assert!(enabled);
+        assert!(enable_delete);
+        assert_eq!(default_min_age_secs, 11);
+        assert_eq!(default_quarantine_delay_secs, 22);
+        assert_eq!(default_max_blobs, 33);
+        assert_eq!(default_max_bytes, 44);
+        assert_eq!(default_max_seconds, 55);
+        assert!(!auto_rebuild_ref_index_on_corruption);
+        assert_eq!(fs_root, std::path::PathBuf::from("/tmp/gc-map-root"));
     }
 }

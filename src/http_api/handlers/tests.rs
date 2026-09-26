@@ -90,7 +90,7 @@ async fn admin_gc_maps_already_running_to_conflict() {
     let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
     idx.rebuild(&storage_raw).await.expect("rebuild");
     let service = Arc::new(crate::gc_service::GcService::new(
-        cfg.clone(),
+        Arc::new(crate::policy::GcPolicy::from(cfg.as_ref())),
         storage_raw.clone(),
         idx,
         crate::consistency::ConsistencyCoordinator::new(),
@@ -130,7 +130,7 @@ async fn admin_gc_quarantine_blocked_when_kill_switch_off() {
     let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
     idx.rebuild(&storage_raw).await.expect("rebuild");
     let service = Arc::new(crate::gc_service::GcService::new(
-        cfg.clone(),
+        Arc::new(crate::policy::GcPolicy::from(cfg.as_ref())),
         storage_raw.clone(),
         idx,
         crate::consistency::ConsistencyCoordinator::new(),
@@ -171,7 +171,7 @@ async fn admin_gc_delete_blocked_when_delete_gate_off() {
     let idx = Arc::new(crate::blob_ref_index::BlobRefIndex::open(ref_index_path).expect("idx"));
     idx.rebuild(&storage_raw).await.expect("rebuild");
     let service = Arc::new(crate::gc_service::GcService::new(
-        cfg.clone(),
+        Arc::new(crate::policy::GcPolicy::from(cfg.as_ref())),
         storage_raw.clone(),
         idx,
         crate::consistency::ConsistencyCoordinator::new(),

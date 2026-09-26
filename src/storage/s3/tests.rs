@@ -2733,7 +2733,7 @@ async fn test_s3_raw_multipart_reaper_comprehensive_safety() {
     let (mut storage, driver) = create_mock_storage();
     storage = storage.with_session_config(S3SessionConfig {
         legacy_multipart_cleanup_policy:
-            crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+            crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
         ..S3SessionConfig::default()
     });
     driver.advance_time(100_000);
@@ -3188,7 +3188,7 @@ async fn test_s3_reaper_fail_closed_on_metadata_read_error() {
     let (mut storage, driver) = create_mock_storage();
     storage = storage.with_session_config(S3SessionConfig {
         legacy_multipart_cleanup_policy:
-            crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+            crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
         ..S3SessionConfig::default()
     });
 
@@ -3231,7 +3231,7 @@ async fn test_s3_reaper_legacy_cleanup_policy_modes() {
         storage_disabled
             .session_config
             .legacy_multipart_cleanup_policy,
-        crate::config::LegacyMultipartCleanupPolicy::Disabled
+        crate::policy::LegacyMultipartCleanupPolicy::Disabled
     );
 
     // Create raw legacy multipart upload without session.json
@@ -3254,7 +3254,7 @@ async fn test_s3_reaper_legacy_cleanup_policy_modes() {
         .clone()
         .with_session_config(S3SessionConfig {
             legacy_multipart_cleanup_policy:
-                crate::config::LegacyMultipartCleanupPolicy::CurrentFormatOnly,
+                crate::policy::LegacyMultipartCleanupPolicy::CurrentFormatOnly,
             ..S3SessionConfig::default()
         });
     let reaped_current = storage_current
@@ -3268,7 +3268,7 @@ async fn test_s3_reaper_legacy_cleanup_policy_modes() {
         .clone()
         .with_session_config(S3SessionConfig {
             legacy_multipart_cleanup_policy:
-                crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+                crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
             ..S3SessionConfig::default()
         });
     let reaped_confirmed = storage_confirmed
@@ -3290,7 +3290,7 @@ async fn test_s3_reaper_revalidation_race_protects_upload() {
     let (mut storage, driver) = create_mock_storage();
     storage = storage.with_session_config(S3SessionConfig {
         legacy_multipart_cleanup_policy:
-            crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+            crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
         ..S3SessionConfig::default()
     });
 
@@ -3381,7 +3381,7 @@ async fn test_s3_reaper_error_matrix_all_non_not_found_fail_closed() {
         let (mut storage, driver) = create_mock_storage();
         storage = storage.with_session_config(S3SessionConfig {
             legacy_multipart_cleanup_policy:
-                crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+                crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
             ..S3SessionConfig::default()
         });
 
@@ -3427,7 +3427,7 @@ async fn test_s3_reaper_malformed_session_json_fails_closed() {
     let (mut storage, driver) = create_mock_storage();
     storage = storage.with_session_config(S3SessionConfig {
         legacy_multipart_cleanup_policy:
-            crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+            crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
         ..S3SessionConfig::default()
     });
 
@@ -3464,7 +3464,7 @@ async fn test_s3_reaper_pre_abort_revalidation_error_fails_closed() {
     let (mut storage, driver) = create_mock_storage();
     storage = storage.with_session_config(S3SessionConfig {
         legacy_multipart_cleanup_policy:
-            crate::config::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
+            crate::policy::LegacyMultipartCleanupPolicy::OperatorConfirmedAllUnknown,
         ..S3SessionConfig::default()
     });
 

@@ -227,7 +227,7 @@ impl TestServices {
             .expect("acquire authority");
 
         GcService::with_coordinator_and_authority(
-            Arc::new(cfg),
+            Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
             base_storage,
             self.ref_index.clone(),
             ConsistencyCoordinator::new(),
@@ -2261,7 +2261,7 @@ async fn test_proxy_blob_publication_crash_after_membership_before_pin_release_m
             .expect("acquire authority");
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         reopened_storage.clone(),
         reopened_index.clone(),
         ConsistencyCoordinator::new(),

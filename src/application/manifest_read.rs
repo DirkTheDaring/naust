@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use crate::config::TagPolicy;
+use crate::policy::TagPolicy;
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
 use crate::storage::StorageError;

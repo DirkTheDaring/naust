@@ -115,6 +115,16 @@ The 1a gate's first run found **100 violation lines across 12 files**, confirmin
 
 Gate: `scripts/check-core-boundary.sh` / `make core-boundary`.
 
+### Phase 1c learnings (2026-09-26, completed)
+
+* **The capability query already existed**: `GcServiceStoragePort::gc_strategy()` (`FilesystemQuarantine`/`S3DirectConditional`) was already how `blob_gc` branches; only `gc_service.rs:201` duplicated it via `config::StorageBackend`. Replaced + equivalence test added.
+* **`blob_gc`'s Config use was `fs_root`-only**, and after the fix several path params turned out dead: `build_manifest_protected_set`/`PolicyContext::build` had an *already-unused* `_cfg` parameter (removed entirely), and `blob_gc_plan`/`blob_gc_quarantine{,_with_authority}`/`blob_gc_delete_s3_with_authority` lost their path params — the core API shrank versus plan.
+* **Relocation beat abstraction for the wiring**: no core upstream-route type was needed. The 7 `Config`-consuming factory functions (218 lines) moved from `storage/mod.rs` to a new server-side `src/storage_wiring/` module, together with 8 wiring/composition tests (848 lines) that lived in `storage/fs/tests.rs`. `storage/mod.rs` no longer imports `config` at all.
+* **Gate limitation found**: multi-line `use crate::{ config::{…} }` trees evade the line-based regex (storage/mod.rs's import was invisible to the gate). Acceptable interim: the Phase 2 crate split makes the compiler the real gate.
+* `GcPolicy` lives in new core `src/policy/` with `TagPolicy` and `LegacyMultipartCleanupPolicy` (config re-exports for compat); `impl From<&Config> for GcPolicy` in config.rs with an exhaustive-destructuring mapping test (R3).
+* **Live-S3 suite is environment-gated**: `tests/s3_live_integration.rs` fails without a running MinIO (base-reproduced at the pre-1c commit — not a regression). Live qualification remains a Phase 4 item, as planned.
+* Verification at completion: fmt clean; lib 1127/0/13; all non-live integration suites green; gate violations reduced to the 24 proxy-seam lines in `application/` (= exactly the 1d scope).
+
 Reverse edge (server → core, legal after split): `proxy.rs:582,662` → `application::{Blob,Manifest}MutationService`.
 
 Verified clean: `membership_migration` (imports only `manifest_refs` + `storage`), `upload_state.rs` (zero crate imports), `consistency`, `fs_root_lock`, `task_supervisor`, `glob` (used only by `request_routing`/`rbac`/`config` — server side); no core production code touches `auth`, `rbac`, `security`, `audit`, or `request_routing`; storage layer imports nothing above it except the listed `config` sites.

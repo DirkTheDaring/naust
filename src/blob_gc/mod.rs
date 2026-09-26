@@ -127,14 +127,13 @@ impl BlobGcLimits {
 }
 
 pub async fn blob_gc_plan(
-    cfg: &crate::config::Config,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     policy: BlobGcPolicy,
     min_age: Duration,
     limits: BlobGcLimits,
 ) -> Result<BlobGcStats, BlobGcError> {
-    let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
+    let mut policy_ctx = PolicyContext::build(storage, idx, policy).await?;
     let mut stats = BlobGcStats::default();
 
     let t0 = Instant::now();
@@ -194,7 +193,6 @@ pub async fn blob_gc_plan(
 }
 
 pub(crate) async fn blob_gc_quarantine(
-    cfg: &crate::config::Config,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -210,21 +208,11 @@ pub(crate) async fn blob_gc_quarantine(
     if !auth.is_active() {
         return Err(BlobGcError::AuthorityReleased);
     }
-    blob_gc_quarantine_with_authority(
-        cfg,
-        storage,
-        idx,
-        consistency,
-        auth,
-        policy,
-        min_age,
-        limits,
-    )
-    .await
+    blob_gc_quarantine_with_authority(storage, idx, consistency, auth, policy, min_age, limits)
+        .await
 }
 
 pub async fn blob_gc_quarantine_with_authority(
-    cfg: &crate::config::Config,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -275,7 +263,7 @@ pub async fn blob_gc_quarantine_with_authority(
 
             let _reval_guard = consistency.acquire_gc_revalidation().await;
 
-            let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
+            let mut policy_ctx = PolicyContext::build(storage, idx, policy).await?;
 
             if policy_ctx.is_pinned(&candidate.digest, now)? {
                 drop(_reval_guard);
@@ -326,7 +314,7 @@ pub async fn blob_gc_quarantine_with_authority(
 }
 
 pub(crate) async fn blob_gc_delete(
-    cfg: &crate::config::Config,
+    fs_root: &std::path::Path,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -343,7 +331,7 @@ pub(crate) async fn blob_gc_delete(
         return Err(BlobGcError::AuthorityReleased);
     }
     blob_gc_delete_with_authority(
-        cfg,
+        fs_root,
         storage,
         idx,
         consistency,
@@ -356,7 +344,7 @@ pub(crate) async fn blob_gc_delete(
 }
 
 pub async fn blob_gc_delete_with_authority(
-    cfg: &crate::config::Config,
+    fs_root: &std::path::Path,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -371,7 +359,7 @@ pub async fn blob_gc_delete_with_authority(
     match storage.gc_strategy() {
         storage::GcStorageStrategy::FilesystemQuarantine => {
             blob_gc_delete_fs_with_authority(
-                cfg,
+                fs_root,
                 storage,
                 idx,
                 consistency,
@@ -384,7 +372,6 @@ pub async fn blob_gc_delete_with_authority(
         }
         storage::GcStorageStrategy::S3DirectConditional => {
             blob_gc_delete_s3_with_authority(
-                cfg,
                 storage,
                 idx,
                 consistency,
@@ -399,7 +386,7 @@ pub async fn blob_gc_delete_with_authority(
 }
 
 async fn blob_gc_delete_fs_with_authority(
-    cfg: &crate::config::Config,
+    fs_root: &std::path::Path,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -417,11 +404,11 @@ async fn blob_gc_delete_fs_with_authority(
 
     // Pathname used only for error reporting; all traversal below is
     // fd-relative beneath the sweep root pinned once per run.
-    let root = cfg.fs_root.join("quarantine").join("blobs").join("sha256");
+    let root = fs_root.join("quarantine").join("blobs").join("sha256");
 
     // Pin the sweep root once (contained, non-creating). A missing storage
     // root preserves the prior empty-sweep contract.
-    let sweep_root = match storage_fs::FsMetadataReader::open(&cfg.fs_root)
+    let sweep_root = match storage_fs::FsMetadataReader::open(&fs_root)
         .map_err(|e| io::Error::other(e.to_string()))
         .and_then(|r| {
             r.open_contained_dir_sync("")
@@ -429,7 +416,7 @@ async fn blob_gc_delete_fs_with_authority(
         }) {
         Ok(d) => d,
         Err(source) => {
-            if !cfg.fs_root.exists() {
+            if !fs_root.exists() {
                 return Ok(stats);
             }
             return Err(BlobGcError::FsReadDir { path: root, source });
@@ -552,10 +539,10 @@ async fn blob_gc_delete_fs_with_authority(
                 Err(_) => continue,
             };
 
-            let q_at = match read_quarantine_time(&sweep_root, cfg, &digest).await? {
+            let q_at = match read_quarantine_time(&sweep_root, fs_root, &digest).await? {
                 Some(t) => t,
                 None => {
-                    let _ = write_quarantine_time(&sweep_root, cfg, &digest, now).await;
+                    let _ = write_quarantine_time(&sweep_root, fs_root, &digest, now).await;
                     continue;
                 }
             };
@@ -576,7 +563,7 @@ async fn blob_gc_delete_fs_with_authority(
 
             let reval_guard = consistency.acquire_gc_revalidation().await;
 
-            let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
+            let mut policy_ctx = PolicyContext::build(storage, idx, policy).await?;
 
             if policy_ctx.is_pinned(&digest, now)? {
                 drop(reval_guard);
@@ -660,7 +647,6 @@ async fn blob_gc_delete_fs_with_authority(
 }
 
 async fn blob_gc_delete_s3_with_authority(
-    cfg: &crate::config::Config,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -708,7 +694,7 @@ async fn blob_gc_delete_s3_with_authority(
 
             let reval_guard = consistency.acquire_gc_revalidation().await;
 
-            let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;
+            let mut policy_ctx = PolicyContext::build(storage, idx, policy).await?;
 
             if policy_ctx.is_pinned(&candidate.digest, now)? {
                 drop(reval_guard);
@@ -764,7 +750,7 @@ async fn blob_gc_delete_s3_with_authority(
 }
 
 pub async fn blob_gc_sweep(
-    cfg: &crate::config::Config,
+    fs_root: &std::path::Path,
     storage: &Arc<dyn storage::GcServiceStoragePort>,
     idx: &BlobRefIndex,
     consistency: &crate::consistency::ConsistencyCoordinator,
@@ -776,7 +762,6 @@ pub async fn blob_gc_sweep(
     match storage.gc_strategy() {
         storage::GcStorageStrategy::FilesystemQuarantine => {
             let mut stats = blob_gc_quarantine(
-                cfg,
                 storage,
                 idx,
                 consistency,
@@ -788,7 +773,7 @@ pub async fn blob_gc_sweep(
             .await?;
 
             let del_stats = blob_gc_delete(
-                cfg,
+                fs_root,
                 storage,
                 idx,
                 consistency,
@@ -806,7 +791,7 @@ pub async fn blob_gc_sweep(
         }
         storage::GcStorageStrategy::S3DirectConditional => {
             blob_gc_delete(
-                cfg,
+                fs_root,
                 storage,
                 idx,
                 consistency,
@@ -820,8 +805,8 @@ pub async fn blob_gc_sweep(
     }
 }
 
-fn quarantine_meta_path(cfg: &crate::config::Config, digest: &Digest) -> PathBuf {
-    cfg.fs_root
+fn quarantine_meta_path(fs_root: &std::path::Path, digest: &Digest) -> PathBuf {
+    fs_root
         .join("quarantine")
         .join("meta")
         .join(digest.algorithm())
@@ -851,7 +836,7 @@ fn fs_dir_to_io(err: storage_fs::FsDirError) -> std::io::Error {
 
 async fn write_quarantine_time(
     root: &storage_fs::ContainedDir,
-    cfg: &crate::config::Config,
+    fs_root: &std::path::Path,
     digest: &Digest,
     at: SystemTime,
 ) -> Result<(), BlobGcError> {
@@ -859,7 +844,7 @@ async fn write_quarantine_time(
 
     // Pathnames are used only in error reports; all directory creation and the
     // write resolve fd-relative beneath the pinned sweep root.
-    let path = quarantine_meta_path(cfg, digest);
+    let path = quarantine_meta_path(fs_root, digest);
     let parent = path
         .parent()
         .map(PathBuf::from)
@@ -901,7 +886,7 @@ async fn write_quarantine_time(
 
 async fn read_quarantine_time(
     root: &storage_fs::ContainedDir,
-    cfg: &crate::config::Config,
+    fs_root: &std::path::Path,
     digest: &Digest,
 ) -> Result<Option<SystemTime>, BlobGcError> {
     use storage_fs::{FileName, FsMutateError};
@@ -913,7 +898,7 @@ async fn read_quarantine_time(
     // and corrupt/unrepresentable stored values must not be conflated with
     // absence, which previously overwrote the stored evidence with a fresh
     // timestamp and restarted the deletion clock.
-    let path = quarantine_meta_path(cfg, digest);
+    let path = quarantine_meta_path(fs_root, digest);
 
     let mut dir = root.clone();
     for seg in ["quarantine", "meta", digest.algorithm(), digest.prefix2()] {
@@ -982,13 +967,12 @@ mod tests {
     #[tokio::test]
     async fn test_read_quarantine_time_absence_vs_failure_and_checked_arithmetic() {
         let temp = tempfile::tempdir().unwrap();
-        let mut cfg = crate::config::Config::from_env().unwrap();
-        cfg.fs_root = temp.path().to_path_buf();
+        let fs_root = temp.path().to_path_buf();
         let digest = Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
-        let path = quarantine_meta_path(&cfg, &digest);
+        let path = quarantine_meta_path(&fs_root, &digest);
 
         // Pinned sweep root, as blob_gc_delete_fs_with_authority resolves it.
-        let root = storage_fs::FsMetadataReader::open(&cfg.fs_root)
+        let root = storage_fs::FsMetadataReader::open(&fs_root)
             .unwrap()
             .open_contained_dir_sync("")
             .unwrap();
@@ -996,7 +980,7 @@ mod tests {
         // Genuine absence -> Ok(None) (the sweep may then initialize a fresh
         // timestamp; that write path is unchanged).
         assert!(
-            read_quarantine_time(&root, &cfg, &digest)
+            read_quarantine_time(&root, &fs_root, &digest)
                 .await
                 .unwrap()
                 .is_none()
@@ -1006,7 +990,7 @@ mod tests {
         // observed at the expected pathname).
         write_quarantine_time(
             &root,
-            &cfg,
+            &fs_root,
             &digest,
             UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         )
@@ -1018,7 +1002,9 @@ mod tests {
             "timestamp bytes at the expected pathname"
         );
         assert_eq!(
-            read_quarantine_time(&root, &cfg, &digest).await.unwrap(),
+            read_quarantine_time(&root, &fs_root, &digest)
+                .await
+                .unwrap(),
             Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
         );
 
@@ -1026,7 +1012,7 @@ mod tests {
         // overwrote the stored evidence and restarted the deletion clock).
         std::fs::write(&path, "garbage").unwrap();
         assert!(matches!(
-            read_quarantine_time(&root, &cfg, &digest).await,
+            read_quarantine_time(&root, &fs_root, &digest).await,
             Err(BlobGcError::FsReadMeta { .. })
         ));
 
@@ -1034,7 +1020,7 @@ mod tests {
         // (previously an unchecked UNIX_EPOCH + Duration addition).
         std::fs::write(&path, format!("{}\n", u64::MAX)).unwrap();
         assert!(matches!(
-            read_quarantine_time(&root, &cfg, &digest).await,
+            read_quarantine_time(&root, &fs_root, &digest).await,
             Err(BlobGcError::FsReadMeta { .. })
         ));
 
@@ -1048,10 +1034,10 @@ mod tests {
             "1700000000\n",
         )
         .unwrap();
-        let algo_dir = cfg.fs_root.join("quarantine").join("meta").join("sha256");
+        let algo_dir = fs_root.join("quarantine").join("meta").join("sha256");
         std::os::unix::fs::symlink(&outside, algo_dir.join(digest2.prefix2())).unwrap();
         assert!(matches!(
-            read_quarantine_time(&root, &cfg, &digest2).await,
+            read_quarantine_time(&root, &fs_root, &digest2).await,
             Err(BlobGcError::FsReadMeta { .. })
         ));
     }
@@ -1133,13 +1119,12 @@ mod tests {
         .await
         .unwrap();
 
-        let cfg = crate::config::Config::from_env().unwrap();
         let storage = Arc::new(crate::storage::fs::FsStorage::new(
             fs_root.to_path_buf(),
             50 * 1024 * 1024,
         ));
 
-        let protected = build_manifest_protected_set(&cfg, storage.as_ref())
+        let protected = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap();
         assert!(
@@ -1166,7 +1151,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = build_manifest_protected_set(&cfg, storage.as_ref())
+        let err = build_manifest_protected_set(storage.as_ref())
             .await
             .unwrap_err();
         assert!(
@@ -1186,8 +1171,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut cfg = crate::config::Config::from_env().unwrap();
-        cfg.fs_root = temp.path().to_path_buf();
+        let fs_root = temp.path().to_path_buf();
 
         let candidate_bytes = b"test blob for malformed journal check";
         let hash = sha2::Sha256::digest(candidate_bytes);
@@ -1219,10 +1203,9 @@ mod tests {
             version: storage::BlobObjectVersion("\"etag\"".to_string()),
         };
 
-        let mut policy_ctx =
-            PolicyContext::build(&cfg, &storage, &idx, BlobGcPolicy::ManifestRooted)
-                .await
-                .unwrap();
+        let mut policy_ctx = PolicyContext::build(&storage, &idx, BlobGcPolicy::ManifestRooted)
+            .await
+            .unwrap();
         let coordinator = crate::consistency::ConsistencyCoordinator::new();
         let guard = coordinator.acquire_gc_revalidation().await;
         let err = revalidate_candidate_before_delete(
@@ -1256,8 +1239,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut cfg = crate::config::Config::from_env().unwrap();
-        cfg.fs_root = temp.path().to_path_buf();
+        let fs_root = temp.path().to_path_buf();
 
         let cluster_lock: Arc<dyn storage::ClusterLockStore> = s3_arc.clone();
         let authority = RuntimeMutationAuthority::acquire(cluster_lock, "test-gc")
@@ -1299,7 +1281,6 @@ mod tests {
         let authority_arc = Arc::new(Mutex::new(Some(authority)));
 
         let stats = blob_gc_plan(
-            &cfg,
             &storage,
             &idx,
             BlobGcPolicy::ManifestRooted,
@@ -1312,7 +1293,7 @@ mod tests {
         assert_eq!(stats.eligible_blobs, 1);
 
         let sweep_stats = blob_gc_sweep(
-            &cfg,
+            &fs_root,
             &storage,
             &idx,
             &coordinator,

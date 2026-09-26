@@ -77,7 +77,7 @@ use crate::storage::mutation_authority::RuntimeMutationAuthority;
 
 #[derive(Clone)]
 pub struct GcService {
-    config: Arc<crate::config::Config>,
+    policy: Arc<crate::policy::GcPolicy>,
     storage: Arc<dyn storage::GcServiceStoragePort>,
     idx: Arc<BlobRefIndex>,
     run_lock: Arc<Mutex<()>>,
@@ -107,13 +107,13 @@ pub struct ScheduledCleanupStats {
 
 impl GcService {
     pub fn new(
-        config: Arc<crate::config::Config>,
+        policy: Arc<crate::policy::GcPolicy>,
         storage: Arc<dyn storage::GcServiceStoragePort>,
         idx: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
     ) -> Self {
         Self::with_coordinator_and_authority(
-            config,
+            policy,
             storage,
             idx,
             consistency,
@@ -122,14 +122,14 @@ impl GcService {
     }
 
     pub fn with_authority(
-        config: Arc<crate::config::Config>,
+        policy: Arc<crate::policy::GcPolicy>,
         storage: Arc<dyn storage::GcServiceStoragePort>,
         idx: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
         authority: RuntimeMutationAuthority,
     ) -> Self {
         Self::with_coordinator_and_authority(
-            config,
+            policy,
             storage,
             idx,
             consistency,
@@ -138,14 +138,14 @@ impl GcService {
     }
 
     pub fn with_coordinator_and_authority(
-        config: Arc<crate::config::Config>,
+        policy: Arc<crate::policy::GcPolicy>,
         storage: Arc<dyn storage::GcServiceStoragePort>,
         idx: Arc<BlobRefIndex>,
         consistency: crate::consistency::ConsistencyCoordinator,
         mutation_authority: Arc<Mutex<Option<RuntimeMutationAuthority>>>,
     ) -> Self {
         Self {
-            config,
+            policy,
             storage,
             idx,
             run_lock: Arc::new(Mutex::new(())),
@@ -162,7 +162,7 @@ impl GcService {
     }
 
     async fn ensure_ref_index_ready(&self) -> Result<(), GcServiceError> {
-        let auto = self.config.ref_index.auto_rebuild_on_corruption;
+        let auto = self.policy.auto_rebuild_ref_index_on_corruption;
         self.idx
             .ensure_healthy_or_rebuild(self.storage.as_ref(), auto, false)
             .await?;
@@ -198,11 +198,11 @@ impl GcService {
     }
 
     async fn try_acquire_fs_gc_lock(&self) -> Result<Option<FsGcLock>, GcServiceError> {
-        if self.config.storage_backend != crate::config::StorageBackend::Filesystem {
+        if self.storage.gc_strategy() != storage::GcStorageStrategy::FilesystemQuarantine {
             return Ok(None);
         }
 
-        let lock_path: PathBuf = self.config.fs_root.join("quarantine").join("gc.lock");
+        let lock_path: PathBuf = self.policy.fs_root.join("quarantine").join("gc.lock");
 
         let res = tokio::task::spawn_blocking(move || {
             if let Some(parent) = lock_path.parent() {
@@ -250,7 +250,6 @@ impl GcService {
         self.ensure_ref_index_ready().await?;
         self.refresh_tag_rooted_index_if_needed(policy).await?;
         blob_gc_plan(
-            &self.config,
             &self.storage,
             &self.idx,
             policy,
@@ -303,7 +302,7 @@ impl GcService {
 
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
 
-        if !self.config.blob_gc_enabled {
+        if !self.policy.enabled {
             return Err(GcServiceError::Disabled);
         }
 
@@ -322,7 +321,6 @@ impl GcService {
         self.refresh_tag_rooted_index_if_needed(policy).await?;
 
         blob_gc_quarantine(
-            &self.config,
             &self.storage,
             &self.idx,
             &self.consistency,
@@ -373,7 +371,7 @@ impl GcService {
 
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
 
-        if !self.config.blob_gc_enabled {
+        if !self.policy.enabled {
             return Err(GcServiceError::Disabled);
         }
 
@@ -385,7 +383,6 @@ impl GcService {
         self.refresh_tag_rooted_index_if_needed(policy).await?;
 
         blob_gc_quarantine_with_authority(
-            &self.config,
             &self.storage,
             &self.idx,
             &self.consistency,
@@ -435,10 +432,10 @@ impl GcService {
 
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
 
-        if !self.config.blob_gc_enabled {
+        if !self.policy.enabled {
             return Err(GcServiceError::Disabled);
         }
-        if !self.config.blob_gc_enable_delete {
+        if !self.policy.enable_delete {
             return Err(GcServiceError::DeleteDisabled);
         }
 
@@ -467,7 +464,7 @@ impl GcService {
         }
 
         blob_gc_delete(
-            &self.config,
+            &self.policy.fs_root,
             &self.storage,
             &self.idx,
             &self.consistency,
@@ -509,10 +506,10 @@ impl GcService {
 
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
 
-        if !self.config.blob_gc_enabled {
+        if !self.policy.enabled {
             return Err(GcServiceError::Disabled);
         }
-        if !self.config.blob_gc_enable_delete {
+        if !self.policy.enable_delete {
             return Err(GcServiceError::DeleteDisabled);
         }
 
@@ -534,7 +531,7 @@ impl GcService {
         }
 
         blob_gc_delete_with_authority(
-            &self.config,
+            &self.policy.fs_root,
             &self.storage,
             &self.idx,
             &self.consistency,
@@ -698,7 +695,7 @@ impl GcService {
 
         let _fs_gc_lock = self.try_acquire_fs_gc_lock().await?;
 
-        if !self.config.blob_gc_enabled {
+        if !self.policy.enabled {
             return Err(GcServiceError::Disabled);
         }
 
@@ -714,7 +711,7 @@ impl GcService {
 
         self.ensure_ref_index_ready().await?;
 
-        let min_age = Duration::from_secs(self.config.blob_gc_default_min_age_secs);
+        let min_age = Duration::from_secs(self.policy.default_min_age_secs);
 
         // 1. Sweep repository memberships: Active -> Candidate(unreferenced_since) -> Unlink
         let _membership_stats = self
@@ -723,14 +720,14 @@ impl GcService {
 
         let policy = BlobGcPolicy::ManifestRooted;
         let budgets = GcBudgets {
-            max_blobs: self.config.blob_gc_default_max_blobs,
-            max_bytes: self.config.blob_gc_default_max_bytes,
-            max_seconds: self.config.blob_gc_default_max_seconds,
+            max_blobs: self.policy.default_max_blobs,
+            max_bytes: self.policy.default_max_bytes,
+            max_seconds: self.policy.default_max_seconds,
         };
 
         match self.storage.gc_strategy() {
             storage::GcStorageStrategy::S3DirectConditional => {
-                if !self.config.blob_gc_enable_delete {
+                if !self.policy.enable_delete {
                     return Ok(ScheduledCleanupStats {
                         quarantine: Default::default(),
                         delete: None,
@@ -744,7 +741,7 @@ impl GcService {
                         source: Some(e),
                     })?;
                 let delete = blob_gc_delete(
-                    &self.config,
+                    &self.policy.fs_root,
                     &self.storage,
                     &self.idx,
                     &self.consistency,
@@ -763,7 +760,6 @@ impl GcService {
             }
             storage::GcStorageStrategy::FilesystemQuarantine => {
                 let quarantine = blob_gc_quarantine(
-                    &self.config,
                     &self.storage,
                     &self.idx,
                     &self.consistency,
@@ -775,12 +771,12 @@ impl GcService {
                 .await
                 .map_err(GcServiceError::GcOperation)?;
 
-                let delete = if self.config.blob_gc_enable_delete {
+                let delete = if self.policy.enable_delete {
                     let quarantine_delay =
-                        Duration::from_secs(self.config.blob_gc_default_quarantine_delay_secs);
+                        Duration::from_secs(self.policy.default_quarantine_delay_secs);
                     Some(
                         blob_gc_delete(
-                            &self.config,
+                            &self.policy.fs_root,
                             &self.storage,
                             &self.idx,
                             &self.consistency,
@@ -828,149 +824,19 @@ mod tests {
         p
     }
 
-    fn minimal_config(fs_root: PathBuf, ref_index_path: PathBuf) -> crate::config::Config {
-        use crate::config::*;
-        use std::net::SocketAddr;
+    const TEST_MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024;
 
-        Config {
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], 5000)),
-            tls_cert_path: None,
-            tls_key_path: None,
-            tls_acme: None,
-            push_username: None,
-            push_password: None,
-            push_allow_repos: None,
-            push_actions: vec!["pull".to_string(), "push".to_string()],
-            push_implies_delete: false,
-            auth_strategy: crate::config::AuthStrategy::Token,
-            anonymous_pull: true,
-            storage_backend: StorageBackend::Filesystem,
+    fn minimal_policy(fs_root: PathBuf) -> crate::policy::GcPolicy {
+        crate::policy::GcPolicy {
+            enabled: true,
+            enable_delete: true,
+            default_min_age_secs: 7 * 24 * 3600,
+            default_quarantine_delay_secs: 24 * 3600,
+            default_max_blobs: 1000,
+            default_max_bytes: u64::MAX,
+            default_max_seconds: 60,
+            auto_rebuild_ref_index_on_corruption: true,
             fs_root,
-            fs_manifest_listing_max_entries:
-                crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_ENTRIES,
-            fs_manifest_listing_max_name_bytes:
-                crate::storage::fs::manifest_listing::DEFAULT_MANIFEST_LISTING_MAX_NAME_BYTES,
-            fs_tag_listing_max_entries:
-                crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_ENTRIES,
-            fs_tag_listing_max_name_bytes:
-                crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_NAME_BYTES,
-            fs_tag_listing_repo_probe_max_entries:
-                crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_REPO_PROBE_MAX_ENTRIES,
-            fs_tag_listing_repo_probe_max_name_bytes:
-                crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_REPO_PROBE_MAX_NAME_BYTES,
-            fs_tag_listing_max_payload_bytes:
-                crate::storage::fs::tag_listing::DEFAULT_TAG_LISTING_MAX_PAYLOAD_BYTES,
-            fs_gc_discovery_max_depth: 32,
-
-            fs_gc_discovery_max_dir_enumerations: 10_000,
-            fs_gc_discovery_max_total_discovery_entries: 250_000,
-            fs_gc_discovery_max_manifest_dirs: 10_000,
-            fs_gc_discovery_max_discovery_retained_path_bytes: 10 * 1024 * 1024,
-            fs_gc_discovery_intermediate_dir_max_entries: 10_000,
-            fs_gc_discovery_intermediate_dir_max_name_bytes: 1_500_000,
-            fs_gc_discovery_max_terminal_dir_enumerations: 10_000,
-            fs_gc_discovery_terminal_dir_max_entries: 10_000,
-            fs_gc_discovery_terminal_dir_max_name_bytes: 1_500_000,
-            fs_gc_discovery_max_total_manifest_entries: 250_000,
-            fs_gc_discovery_max_manifests_read: 50_000,
-            fs_gc_discovery_max_total_references: 250_000,
-            fs_gc_discovery_max_retained_logical_bytes: 32 * 1024 * 1024,
-            fs_gc_discovery_max_manifest_payload_bytes: None,
-            s3_endpoint: None,
-            s3_region: None,
-            s3_bucket: None,
-            s3_prefix: "registry".to_string(),
-            s3_single_instance_mode: false,
-            s3_lease_duration_secs: 300,
-            s3_lease_renewal_interval_secs: 60,
-            s3_max_retry_attempts: 3,
-            s3_legacy_multipart_cleanup_policy: Default::default(),
-            upload_receipt_lifetime_secs: 72 * 3600,
-            gc_pin_duration_secs: 3600,
-            ref_index: RefIndexConfig {
-                enabled: true,
-                path: ref_index_path,
-                rebuild_on_start: false,
-                auto_rebuild_on_corruption: true,
-            },
-            allow_tag_overwrite: false,
-            automatic_crossmount: false,
-            upload_gc_enabled: false,
-            upload_gc_interval_secs: 3600,
-            upload_gc_max_age_secs: 86400,
-            blob_gc_finalize_grace_secs: 72 * 3600,
-            blob_gc_enabled: true,
-            blob_gc_enable_delete: true,
-            blob_gc_default_min_age_secs: 7 * 24 * 3600,
-            blob_gc_default_quarantine_delay_secs: 24 * 3600,
-            blob_gc_default_max_blobs: 1000,
-            blob_gc_default_max_bytes: u64::MAX,
-            blob_gc_default_max_seconds: 60,
-            blob_gc_schedule_enabled: false,
-            blob_gc_schedule_interval_secs: 7 * 24 * 3600,
-            admin_api: AdminApiConfig {
-                enabled: false,
-                username: None,
-                password: None,
-            },
-            max_upload_bytes: 5 * 1024 * 1024,
-            max_request_body_bytes: 1024 * 1024,
-            upload_chunk_min_bytes: None,
-            max_concurrent_buffered_requests: 1,
-            max_concurrent_requests: 1,
-            max_concurrent_upload_requests: 1,
-            request_timeout_secs: 60,
-            upload_request_timeout_secs: 60,
-            upload_chunk_idle_timeout_secs: 20,
-            upload_rate_window_secs: 10,
-            upload_rate_grace_period_secs: 15,
-            min_upload_bytes_per_sec: 32768,
-            header_read_timeout_secs: 10,
-            slow_connection_policy: crate::config::SlowConnectionPolicy::Enforce,
-            max_connections_per_ip: 50,
-            trusted_bypass_cidrs: vec![],
-            trusted_proxies: vec![],
-            disallow_monolithic_uploads: false,
-            upload_policy: UploadPolicyConfig {
-                abort_on_error: false,
-                abort_on_digest_mismatch: false,
-                repo_rules: vec![],
-            },
-            catalog_requires_auth: false,
-            public_url: None,
-            token_service: "registry-rust".to_string(),
-            token_signing_key: "test".to_string(),
-            token_signing_keys: vec![crate::security::TokenSigningKey {
-                kid: "default".to_string(),
-                key: "test".to_string(),
-            }],
-            token_ttl_secs: 600,
-            robots: RobotsConfig::default(),
-            users: UsersConfig::default(),
-            proxy: ProxyConfig {
-                enabled: false,
-                mode: ProxyMode::Allowlist,
-                upstream_base_url: None,
-                upstream_username: None,
-                upstream_password: None,
-                allowed_upstream_hosts: vec![],
-                allowed_repo_prefixes: vec![],
-                block_private_networks: true,
-                redirect_policy: RedirectPolicy::AnyPublic,
-                max_concurrent_upstream: 1,
-                index_path: PathBuf::from("./data/proxy-index"),
-                cache_fs_root: None,
-                cache_s3_prefix: None,
-                gc_interval_secs: 3600,
-                scrub_enabled: false,
-                scrub_interval_secs: 3600,
-                scrub_max_files_per_run: 1,
-                max_cache_bytes: None,
-                repo_rules: vec![],
-                upstreams: vec![],
-                routing_proxy_hosts: vec![],
-                routing_trust_x_forwarded_host: false,
-            },
         }
     }
 
@@ -978,18 +844,18 @@ mod tests {
     async fn scheduled_cleanup_runs_quarantine_and_delete_when_enabled() {
         let fs_root = tmp_dir("sched-gc");
         let ref_index_path = fs_root.join("ref-index");
-        let mut cfg = minimal_config(fs_root.clone(), ref_index_path);
+        let mut cfg = minimal_policy(fs_root.clone());
 
-        cfg.blob_gc_enabled = true;
-        cfg.blob_gc_enable_delete = true;
-        cfg.blob_gc_default_min_age_secs = 0;
-        cfg.blob_gc_default_quarantine_delay_secs = 0;
-        cfg.blob_gc_default_max_blobs = 1000;
+        cfg.enabled = true;
+        cfg.enable_delete = true;
+        cfg.default_min_age_secs = 0;
+        cfg.default_quarantine_delay_secs = 0;
+        cfg.default_max_blobs = 1000;
 
         let cfg = Arc::new(cfg);
-        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), TEST_MAX_UPLOAD_BYTES));
         let wiring = storage::StorageWiring::from_backend(backend.clone());
-        let idx = Arc::new(BlobRefIndex::open(cfg.ref_index.path.clone()).expect("open idx"));
+        let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.ensure_healthy_or_rebuild(wiring.blob_ref_index().as_ref(), true, true)
             .await
             .expect("ensure idx");
@@ -1079,8 +945,8 @@ mod tests {
         let fs_root = tmp_dir("gc-fsroot");
         let ref_index_path = tmp_dir("gc-refindex");
 
-        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let cfg = Arc::new(minimal_policy(fs_root.clone()));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), TEST_MAX_UPLOAD_BYTES));
         let wiring = storage::StorageWiring::from_backend(backend.clone());
 
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
@@ -1162,8 +1028,8 @@ mod tests {
         let fs_root = tmp_dir("gc-fsroot2");
         let ref_index_path = tmp_dir("gc-refindex2");
 
-        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let cfg = Arc::new(minimal_policy(fs_root.clone()));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), TEST_MAX_UPLOAD_BYTES));
         let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(wiring.blob_ref_index().as_ref())
@@ -1217,8 +1083,8 @@ mod tests {
         let fs_root = tmp_dir("gc-fsroot3");
         let ref_index_path = tmp_dir("gc-refindex3");
 
-        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let cfg = Arc::new(minimal_policy(fs_root.clone()));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), TEST_MAX_UPLOAD_BYTES));
         let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(wiring.blob_ref_index().as_ref())
@@ -1256,8 +1122,8 @@ mod tests {
         let fs_root = tmp_dir("gc-fsroot-aging");
         let ref_index_path = tmp_dir("gc-refindex-aging");
 
-        let cfg = Arc::new(minimal_config(fs_root.clone(), ref_index_path.clone()));
-        let backend = Arc::new(FsStorage::new(fs_root.clone(), cfg.max_upload_bytes));
+        let cfg = Arc::new(minimal_policy(fs_root.clone()));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), TEST_MAX_UPLOAD_BYTES));
         let wiring = storage::StorageWiring::from_backend(backend.clone());
         let idx = Arc::new(BlobRefIndex::open(ref_index_path.clone()).expect("open idx"));
         idx.rebuild(wiring.blob_ref_index().as_ref())
@@ -1318,5 +1184,51 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&fs_root);
         let _ = std::fs::remove_dir_all(&ref_index_path);
+    }
+
+    #[tokio::test]
+    async fn fs_gc_lock_follows_port_strategy_not_backend_identity() {
+        // FilesystemQuarantine strategy: the ambient quarantine/gc.lock is taken.
+        let fs_root = tmp_dir("gc-lock-strategy");
+        let policy = Arc::new(minimal_policy(fs_root.clone()));
+        let backend = Arc::new(FsStorage::new(fs_root.clone(), TEST_MAX_UPLOAD_BYTES));
+        let wiring = storage::StorageWiring::from_backend(backend);
+        let idx = Arc::new(BlobRefIndex::open(fs_root.join("ref-index")).expect("open idx"));
+        let svc = GcService::new(
+            policy.clone(),
+            wiring.gc_service_port(),
+            idx.clone(),
+            crate::consistency::ConsistencyCoordinator::new(),
+        );
+        assert_eq!(
+            svc.storage.gc_strategy(),
+            storage::GcStorageStrategy::FilesystemQuarantine
+        );
+        let lock = svc.try_acquire_fs_gc_lock().await.expect("fs lock path");
+        assert!(lock.is_some(), "FS strategy must take the quarantine lock");
+        drop(lock);
+
+        // S3DirectConditional strategy: no filesystem lock is attempted even
+        // though the policy still carries an fs_root (equivalence with the
+        // former `config.storage_backend != Filesystem` branch).
+        let (s3_storage, _driver) = crate::storage::s3::tests::create_mock_storage();
+        let wiring_s3 = storage::StorageWiring::from_backend(Arc::new(s3_storage));
+        let svc_s3 = GcService::new(
+            policy,
+            wiring_s3.gc_service_port(),
+            idx,
+            crate::consistency::ConsistencyCoordinator::new(),
+        );
+        assert_eq!(
+            svc_s3.storage.gc_strategy(),
+            storage::GcStorageStrategy::S3DirectConditional
+        );
+        let none = svc_s3
+            .try_acquire_fs_gc_lock()
+            .await
+            .expect("s3 strategy skips the fs lock");
+        assert!(none.is_none());
+
+        let _ = std::fs::remove_dir_all(&fs_root);
     }
 }

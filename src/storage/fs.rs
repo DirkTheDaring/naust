@@ -4219,7 +4219,7 @@ impl GcStorage for FsStorage {
 
 #[cfg(test)]
 #[path = "fs/tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(all(target_os = "linux", test))]
 #[path = "fs/contained_metadata.rs"]

@@ -1324,7 +1324,7 @@ async fn test_minimal_fake_gc_service_and_policy_context() {
 
     // Construct GcService using ONLY GcServiceStoragePort (no Storage)
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(cfg.clone()),
+        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
         fake_gc_storage.clone(),
         idx.clone(),
         coordinator,
@@ -1346,14 +1346,10 @@ async fn test_minimal_fake_gc_service_and_policy_context() {
     assert_eq!(plan_res.scanned_blobs, 0);
 
     // Build PolicyContext with GcServiceStoragePort
-    let mut policy_ctx = PolicyContext::build(
-        &cfg,
-        fake_gc_storage.as_ref(),
-        &idx,
-        BlobGcPolicy::TagRooted,
-    )
-    .await
-    .expect("build policy ctx");
+    let mut policy_ctx =
+        PolicyContext::build(fake_gc_storage.as_ref(), &idx, BlobGcPolicy::TagRooted)
+            .await
+            .expect("build policy ctx");
     let unref = sha256_digest(b"unreferenced-blob");
     let is_ref = policy_ctx
         .is_referenced(&unref)

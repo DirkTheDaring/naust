@@ -13,13 +13,13 @@ use crate::membership_migration::{
     MigrationStats, apply_membership_migration, plan_membership_migration,
     verify_membership_migration,
 };
+use crate::storage::StorageError;
 use crate::storage::mutation_authority::{
     DeploymentWriterLockDoc, RuntimeMutationAuthority,
     admin_clear_abandoned_deployment_writer_lock, force_unlock_deployment_writer,
     inspect_deployment_writer_lock,
 };
 use crate::storage::ports::StorageWiring;
-use crate::storage::{self, StorageError};
 
 /// Bounded maintenance runtime managing configuration, storage wiring, filesystem exclusion,
 /// and distributed mutation authority leases with strict single-ownership unwinding.
@@ -33,8 +33,12 @@ pub struct MaintenanceRuntime {
 impl MaintenanceRuntime {
     /// Acquire and initialize the maintenance runtime according to the given command policy.
     pub async fn acquire(config: Arc<Config>, policy: CommandPolicy) -> Result<Self, CliError> {
-        Self::acquire_with_storage_factory(config, policy, storage::storage_wiring_try_from_config)
-            .await
+        Self::acquire_with_storage_factory(
+            config,
+            policy,
+            crate::storage_wiring::storage_wiring_try_from_config,
+        )
+        .await
     }
 
     pub(crate) async fn acquire_with_storage_factory<F>(
@@ -60,17 +64,18 @@ impl MaintenanceRuntime {
         };
 
         // 2. Storage wiring initialization
-        let storage_wiring = match storage::storage_wiring_try_from_config_async_with_factory(
-            config.as_ref(),
-            storage_factory,
-        )
-        .await
-        {
-            Ok(wiring) => wiring,
-            Err(err) => {
-                return Err(CliError::Storage(err));
-            }
-        };
+        let storage_wiring =
+            match crate::storage_wiring::storage_wiring_try_from_config_async_with_factory(
+                config.as_ref(),
+                storage_factory,
+            )
+            .await
+            {
+                Ok(wiring) => wiring,
+                Err(err) => {
+                    return Err(CliError::Storage(err));
+                }
+            };
 
         // 3. Distributed mutation authority acquisition (where applicable)
         let authority = if policy.requires_mutation_authority() {
@@ -258,13 +263,13 @@ impl MaintenanceRuntime {
             Err(err) => return Err(CliError::Index(err)),
         };
 
-        let mut gc_cfg = (*self.config).clone();
-        gc_cfg.blob_gc_enabled = true;
-        gc_cfg.blob_gc_enable_delete = true;
+        let mut gc_policy = crate::policy::GcPolicy::from(self.config.as_ref());
+        gc_policy.enabled = true;
+        gc_policy.enable_delete = true;
 
         let consistency = ConsistencyCoordinator::new();
         let service = GcService::new(
-            Arc::new(gc_cfg),
+            Arc::new(gc_policy),
             self.storage_wiring.gc_service_port(),
             Arc::new(idx),
             consistency,
@@ -307,13 +312,13 @@ impl MaintenanceRuntime {
         .await
         .map_err(CliError::Index)?;
 
-        let mut gc_cfg = (*self.config).clone();
-        gc_cfg.blob_gc_enabled = true;
-        gc_cfg.blob_gc_enable_delete = true;
+        let mut gc_policy = crate::policy::GcPolicy::from(self.config.as_ref());
+        gc_policy.enabled = true;
+        gc_policy.enable_delete = true;
 
         let consistency = ConsistencyCoordinator::new();
         let service = GcService::new(
-            Arc::new(gc_cfg),
+            Arc::new(gc_policy),
             self.storage_wiring.gc_service_port(),
             Arc::new(idx),
             consistency,
@@ -356,13 +361,13 @@ impl MaintenanceRuntime {
         .await
         .map_err(CliError::Index)?;
 
-        let mut gc_cfg = (*self.config).clone();
-        gc_cfg.blob_gc_enabled = true;
-        gc_cfg.blob_gc_enable_delete = true;
+        let mut gc_policy = crate::policy::GcPolicy::from(self.config.as_ref());
+        gc_policy.enabled = true;
+        gc_policy.enable_delete = true;
 
         let consistency = ConsistencyCoordinator::new();
         let service = GcService::new(
-            Arc::new(gc_cfg),
+            Arc::new(gc_policy),
             self.storage_wiring.gc_service_port(),
             Arc::new(idx),
             consistency,
@@ -445,7 +450,7 @@ impl MaintenanceRuntime {
             expected_owner,
             expected_etag,
             confirm,
-            storage::storage_wiring_try_from_config,
+            crate::storage_wiring::storage_wiring_try_from_config,
         )
         .await
     }
@@ -460,10 +465,12 @@ impl MaintenanceRuntime {
     where
         F: FnOnce(&Config) -> Result<StorageWiring, StorageError> + Send + 'static,
     {
-        let wiring =
-            storage::storage_wiring_try_from_config_async_with_factory(config, storage_factory)
-                .await
-                .map_err(CliError::Storage)?;
+        let wiring = crate::storage_wiring::storage_wiring_try_from_config_async_with_factory(
+            config,
+            storage_factory,
+        )
+        .await
+        .map_err(CliError::Storage)?;
         if confirm == "CONFIRM-CLEAR-ABANDONED-WRITER" {
             admin_clear_abandoned_deployment_writer_lock(
                 wiring.cluster_lock().as_ref(),
@@ -513,7 +520,7 @@ mod tests {
             move |c| {
                 let current_id = std::thread::current().id();
                 let _ = worker_tx.send(current_id);
-                crate::storage::storage_wiring_try_from_config(c)
+                crate::storage_wiring::storage_wiring_try_from_config(c)
             },
         )
         .await
@@ -542,7 +549,7 @@ mod tests {
             move |c| {
                 let current_id = std::thread::current().id();
                 let _ = worker_tx.send(current_id);
-                crate::storage::storage_wiring_try_from_config(c)
+                crate::storage_wiring::storage_wiring_try_from_config(c)
             },
         )
         .await;
@@ -585,7 +592,7 @@ mod tests {
                     if let Err(err) = release_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         panic!("worker wait failed: {err}");
                     }
-                    crate::storage::storage_wiring_try_from_config(c)
+                    crate::storage_wiring::storage_wiring_try_from_config(c)
                 },
             )
             .await
@@ -678,7 +685,7 @@ mod tests {
             move |c| {
                 let current_id = std::thread::current().id();
                 let _ = worker_tx.send(current_id);
-                crate::storage::storage_wiring_try_from_config(c)
+                crate::storage_wiring::storage_wiring_try_from_config(c)
             },
         )
         .await;
