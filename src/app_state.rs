@@ -54,6 +54,9 @@ pub type ProxyContext = ProxyTarget;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    /// Per-family handler policy snapshot (R4/KI-26): handlers read this,
+    /// not `config`, for transfer knobs.
+    pub transfer_policy: Arc<crate::http_api::policy::HttpTransferPolicy>,
     pub auth_metrics: Arc<AuthMetrics>,
     pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
     pub gc_service: Option<Arc<gc_service::GcService>>,

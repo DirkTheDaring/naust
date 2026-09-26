@@ -622,6 +622,9 @@ where
     );
 
     let state = AppState {
+        transfer_policy: Arc::new(crate::http_api::policy::HttpTransferPolicy::from(
+            config.as_ref(),
+        )),
         config: config.clone(),
         auth_metrics: Arc::new(AuthMetrics::default()),
         ref_index: ref_index.clone(),
@@ -695,6 +698,9 @@ pub(crate) fn build_test_app_state(
     );
 
     AppState {
+        transfer_policy: Arc::new(crate::http_api::policy::HttpTransferPolicy::from(
+            cfg.as_ref(),
+        )),
         config: cfg,
         auth_metrics: Arc::new(AuthMetrics::default()),
         ref_index,
