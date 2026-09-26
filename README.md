@@ -1,6 +1,14 @@
-# registry-rust
+# Naust
 
-Minimal Docker/OCI registry (Distribution v2-ish) in Rust.
+A self-hostable OCI/Docker container registry (Distribution v2) written in Rust —
+for private and public access alike. *Naust* (Old Norse) is the boathouse where
+vessels are stored over winter; this is the boathouse for your containers.
+
+The registry primitives live in the separately consumable [`naust-core`](crates/naust-core)
+crate — anyone can build their own registry on top of it
+(see `crates/naust-core/examples/minimal_registry.rs`).
+
+Licensed under the [MIT License](LICENSE).
 
 ## Run locally (cargo)
 
@@ -69,7 +77,7 @@ make conformance
 tests/compliance/run.sh fs token # selected matrices only
 ```
 
-Unit/integration tests span both workspace crates (`registry-core` + the server);
+Unit/integration tests span both workspace crates (`naust-core` + the server);
 run `cargo test --workspace --locked` — bare `cargo test` covers only the server package.
 
 See `tests/compliance/README.md` for matrices, environment knobs, and the
@@ -96,9 +104,9 @@ If the process hits the OS file descriptor limit, you may see logs like:
 To inspect at runtime:
 
 ```sh
-systemctl show registry-rust -p LimitNOFILE
-cat /proc/$(pidof registry-rust)/limits | grep -i "open files"
-ls /proc/$(pidof registry-rust)/fd | wc -l
+systemctl show naust -p LimitNOFILE
+cat /proc/$(pidof naust)/limits | grep -i "open files"
+ls /proc/$(pidof naust)/fd | wc -l
 ```
 
 ### Packaged configuration templates
@@ -144,7 +152,7 @@ If rootless Podman fails (e.g. because your home directory is mounted `noexec`),
 packaging/docker/build-deb-in-debian.sh --rootful trixie
 ```
 
-Artifacts are written to `./dist/registry-rust_<version>_<arch>.deb`.
+Artifacts are written to `./dist/naust_<version>_<arch>.deb`.
 
 ### Config file (optional)
 
@@ -238,17 +246,17 @@ Documentation entry point (requirements, architecture, decisions, known issues):
 
 ## CLI helpers
 
-- `registry-rust server [--config <PATH>]`: run the registry server
-- `registry-rust check-config [--config <PATH>]`: parse/validate config and exit
-- `registry-rust audit-permissions [--config <PATH>]`: print effective RBAC permissions and exit
-- `registry-rust hash-secret`: read a secret from stdin and print an Argon2id hash (for robots/users)
-- `registry-rust ref-index check [--config <PATH>]`: verify the blob reference index is healthy
-- `registry-rust ref-index rebuild [--config <PATH>]`: rebuild the blob reference index from storage
-- `registry-rust ref-index ensure [--config <PATH>]`: check and rebuild the blob reference index if needed
-- `registry-rust blob-gc plan|quarantine|delete [--config <PATH>]`: reclaim storage by quarantining/deleting unreferenced blobs. Works on both backends: on the filesystem backend it refuses to run while a server is active on the same `fs_root`; on the S3 backend, destructive subcommands require `--confirm-all-writers-stopped`. Supports `--policy`, `--min-age-secs`, `--max-per-run`, `--quarantine-delay-secs`. Note: the offline CLI runs regardless of the `[blob_gc]` enable switches (see `docs/technical-debt.md` KI-05); current GC behavior reference: `docs/operations.md`
-- `registry-rust migrate-membership plan|apply|verify [--config <PATH>]`: backfill repository↔blob membership records for pre-existing data (the server refuses to start on non-empty storage until this has been applied)
-- `registry-rust inspect-lock [--config <PATH>]`: print deployment writer lock metadata
-- `registry-rust admin-clear-lock` (alias `force-unlock`): break-glass clear of an abandoned writer lock; requires an explicit `--confirm` phrase
+- `naust server [--config <PATH>]`: run the registry server
+- `naust check-config [--config <PATH>]`: parse/validate config and exit
+- `naust audit-permissions [--config <PATH>]`: print effective RBAC permissions and exit
+- `naust hash-secret`: read a secret from stdin and print an Argon2id hash (for robots/users)
+- `naust ref-index check [--config <PATH>]`: verify the blob reference index is healthy
+- `naust ref-index rebuild [--config <PATH>]`: rebuild the blob reference index from storage
+- `naust ref-index ensure [--config <PATH>]`: check and rebuild the blob reference index if needed
+- `naust blob-gc plan|quarantine|delete [--config <PATH>]`: reclaim storage by quarantining/deleting unreferenced blobs. Works on both backends: on the filesystem backend it refuses to run while a server is active on the same `fs_root`; on the S3 backend, destructive subcommands require `--confirm-all-writers-stopped`. Supports `--policy`, `--min-age-secs`, `--max-per-run`, `--quarantine-delay-secs`. Note: the offline CLI runs regardless of the `[blob_gc]` enable switches (see `docs/technical-debt.md` KI-05); current GC behavior reference: `docs/operations.md`
+- `naust migrate-membership plan|apply|verify [--config <PATH>]`: backfill repository↔blob membership records for pre-existing data (the server refuses to start on non-empty storage until this has been applied)
+- `naust inspect-lock [--config <PATH>]`: print deployment writer lock metadata
+- `naust admin-clear-lock` (alias `force-unlock`): break-glass clear of an abandoned writer lock; requires an explicit `--confirm` phrase
 
 ## Online blob GC (admin API)
 
@@ -411,7 +419,7 @@ export REGISTRY__PROXY__UPSTREAM__PASSWORD="my-dockerhub-pat"
 
 ### Multiple upstream registries (and separate caches)
 
-One `registry-rust` process can proxy multiple upstream registries using `[[proxy.upstreams]]` (TOML-only).
+One `naust` process can proxy multiple upstream registries using `[[proxy.upstreams]]` (TOML-only).
 
 Each upstream route has:
 - `hosts`: host patterns (minimal `*` glob) that select the upstream
@@ -512,7 +520,7 @@ Example:
 
 ```toml
 [token]
-service = "registry-rust"
+service = "naust"
 
 [[token.signing_keys]]
 kid = "k2026_01"
@@ -579,7 +587,7 @@ key = "<old-long-random-secret>"
 | Upload request timeout | `timeouts.upload_request_timeout_secs` | `REGISTRY__TIMEOUTS__UPLOAD_REQUEST_TIMEOUT_SECS` | `UPLOAD_REQUEST_TIMEOUT_SECS` | `3600` (best-practice: `7200`) |
 | Disallow monolithic uploads | `uploads.disallow_monolithic_uploads` | `REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS` | `DISALLOW_MONOLITHIC_UPLOADS` | `false` (best-practice: `true`) |
 | Catalog requires auth | `catalog.requires_auth` | `REGISTRY__CATALOG__REQUIRES_AUTH` | `CATALOG_REQUIRES_AUTH` | `false` (best-practice: `true`) |
-| Token service | `token.service` | `REGISTRY__TOKEN__SERVICE` | `TOKEN_SERVICE` | `registry-rust` |
+| Token service | `token.service` | `REGISTRY__TOKEN__SERVICE` | `TOKEN_SERVICE` | `naust` |
 | Token signing key (legacy single key) | `token.signing_key` | `REGISTRY__TOKEN__SIGNING_KEY` | `TOKEN_SIGNING_KEY` | random per-process (best-practice: required) |
 | Token signing keys (overlap rotation) | `token.signing_keys` | (n/a) | (n/a) | unset |
 | Token TTL | `token.ttl_secs` | `REGISTRY__TOKEN__TTL_SECS` | `TOKEN_TTL_SECS` | `600` |
@@ -646,7 +654,7 @@ The server performs graceful shutdown on SIGTERM/SIGINT.
 Auth/token (for Docker/Podman clients):
 
 - `PUBLIC_URL` (recommended; e.g. `http://127.0.0.1:5000` or `https://127.0.0.1:5000`)
-- `TOKEN_SERVICE` (default `registry-rust`)
+- `TOKEN_SERVICE` (default `naust`)
 - `TOKEN_SIGNING_KEY` (default: random per process; set a fixed secret for stable long-running deployments). Ignored when `[[token.signing_keys]]` is configured in TOML — the keyring always wins (see "Token signing key rotation" above).
 - `TOKEN_TTL_SECS` (default `600`)
 

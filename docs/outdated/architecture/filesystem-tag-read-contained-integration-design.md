@@ -14,35 +14,35 @@
 
 ## 1. Executive Summary & Design Scope
 
-Following the empirical baseline recorded in [`docs/architecture/filesystem-tag-read-characterization.md`](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-tag-read-characterization.md) and the containment assessment in [`docs/architecture/filesystem-read-containment-remaining-gaps.md`](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-read-containment-remaining-gaps.md), this document specifies the architecture for a **test-only integration seam** evaluating descriptor-relative contained reads for filesystem tags in `registry-rust`.
+Following the empirical baseline recorded in [`docs/architecture/filesystem-tag-read-characterization.md`](docs/architecture/filesystem-tag-read-characterization.md) and the containment assessment in [`docs/architecture/filesystem-read-containment-remaining-gaps.md`](docs/architecture/filesystem-read-containment-remaining-gaps.md), this document specifies the architecture for a **test-only integration seam** evaluating descriptor-relative contained reads for filesystem tags in `registry-rust`.
 
 ### 1.1 Scope Demarcation & Module Boundary
-- **Authorized Deliverable:** Architecture design document [`docs/architecture/filesystem-tag-read-contained-integration-design.md`](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-tag-read-contained-integration-design.md) and supporting evidence package.
+- **Authorized Deliverable:** Architecture design document [`docs/architecture/filesystem-tag-read-contained-integration-design.md`](docs/architecture/filesystem-tag-read-contained-integration-design.md) and supporting evidence package.
 - **Proposed Module Scope:** The seam will reside strictly behind `#[cfg(test)]` in a dedicated test module:
   ```rust
   #[cfg(test)]
   #[path = "fs/tag_seam.rs"]
   mod tag_seam;
   ```
-- **Production Code Status:** **Strictly Unchanged**. Production routing in [`FsStorage::resolve_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L939-L951) and [`FsStorage::get_tag_with_version`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1250-L1269) remains 100% on legacy uncontained ambient path operations. No public interfaces, runtime configurations, dependencies, or mutation implementations are modified.
+- **Production Code Status:** **Strictly Unchanged**. Production routing in [`FsStorage::resolve_tag`](src/storage/fs.rs#L939-L951) and [`FsStorage::get_tag_with_version`](src/storage/fs.rs#L1250-L1269) remains 100% on legacy uncontained ambient path operations. No public interfaces, runtime configurations, dependencies, or mutation implementations are modified.
 - **`storage-layer-rust` Status:** **Strictly Read-Only**. No crates or files in `storage-layer-rust` are edited.
 - **Git Actions:** No staging, no commits, and no pushes.
 - **Test Execution:** No Cargo execution is performed for this documentation-only task. Prior characterization test executions (10 passed, 1 permission test ignored) remain prior recorded evidence.
 
 ### 1.2 Architectural Problem Statement
 In current production code, **both tag reads and tag mutations** execute via ambient pathname operations:
-1. Direct tag resolution ([`FsStorage::resolve_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L939-L951)) calls `tokio::fs::read_to_string(&path)`.
-2. Version-aware retrieval ([`FsStorage::get_tag_with_version`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1250-L1269)) calls `tokio::fs::read(&path)`.
-3. Tag mutation ([`FsStorage::mutate_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1030-L1140)) locks `.lock.{tag}` and writes through an atomic temporary file rename.
-4. Conditional tag deletion ([`FsStorage::delete_tag_conditional`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1271-L1335)) locks `.lock.{tag}` and unlinks the tag via ambient `std::fs` pathnames.
+1. Direct tag resolution ([`FsStorage::resolve_tag`](src/storage/fs.rs#L939-L951)) calls `tokio::fs::read_to_string(&path)`.
+2. Version-aware retrieval ([`FsStorage::get_tag_with_version`](src/storage/fs.rs#L1250-L1269)) calls `tokio::fs::read(&path)`.
+3. Tag mutation ([`FsStorage::mutate_tag`](src/storage/fs.rs#L1030-L1140)) locks `.lock.{tag}` and writes through an atomic temporary file rename.
+4. Conditional tag deletion ([`FsStorage::delete_tag_conditional`](src/storage/fs.rs#L1271-L1335)) locks `.lock.{tag}` and unlinks the tag via ambient `std::fs` pathnames.
 
 All operations construct paths dynamically using `self.root.join("repos").join(name).join("tags").join(tag)`. Consequently:
 - **Symlink Traversal:** Sibling and external symlinks are followed transparently, allowing file reads and potential manipulation outside the repository storage root.
 - **Path Traversal:** Unvalidated path segments (`..`) allow callers to escape the `repos/` and `tags/` directories.
 - **Pathname Resolution Reality:** Both tag reads and tag mutations currently resolve pathnames, but separate operations can still observe different trees when replacement occurs between them. Shared pathname resolution is not a coherence guarantee.
-- **Divergence Against Contained Readers:** Furthermore, `FsStorage` already shares a pinned directory descriptor ([`storage_fs::FsMetadataReader`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-fs/src/reader.rs#L458)) for contained CAS blob reads and GC discovery. If `self.root` is replaced, contained operations continue to observe the original pinned tree while uncontained operations observe the replacement tree.
+- **Divergence Against Contained Readers:** Furthermore, `FsStorage` already shares a pinned directory descriptor ([`storage_fs::FsMetadataReader`](storage-layer-rust/crates/storage-fs/src/reader.rs#L458)) for contained CAS blob reads and GC discovery. If `self.root` is replaced, contained operations continue to observe the original pinned tree while uncontained operations observe the replacement tree.
 
-This design defines a test-only seam leveraging the existing [`storage_core::ObjectPayloadReader`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-core/src/read.rs#L150-L158) implementation in [`storage_fs::FsMetadataReader`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-fs/src/reader/payload.rs#L109-L272) to evaluate descriptor-relative containment beneath the pinned root without altering production behavior.
+This design defines a test-only seam leveraging the existing [`storage_core::ObjectPayloadReader`](storage-layer-rust/crates/storage-core/src/read.rs#L150-L158) implementation in [`storage_fs::FsMetadataReader`](storage-layer-rust/crates/storage-fs/src/reader/payload.rs#L109-L272) to evaluate descriptor-relative containment beneath the pinned root without altering production behavior.
 
 ---
 
@@ -52,7 +52,7 @@ The proposed test seam builds entirely upon existing primitives from `storage-co
 
 ### 2.1 Domain-Neutral Contracts (`storage-core`)
 
-The read port abstractions reside in [`crates/storage-core/src/read.rs`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-core/src/read.rs):
+The read port abstractions reside in [`crates/storage-core/src/read.rs`](storage-layer-rust/crates/storage-core/src/read.rs):
 
 ```rust
 // [crates/storage-core/src/read.rs:150-158]
@@ -78,15 +78,15 @@ impl ObjectPayload {
 }
 ```
 
-- **`ObjectKey` ([`crates/storage-core/src/key.rs`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-core/src/key.rs)):** Enforces relative path safety (rejects leading/trailing slashes, `..`, empty segments, control characters).
-- **`ReadError` ([`crates/storage-core/src/error.rs`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-core/src/error.rs)):** Domain-neutral error enum:
+- **`ObjectKey` ([`crates/storage-core/src/key.rs`](storage-layer-rust/crates/storage-core/src/key.rs)):** Enforces relative path safety (rejects leading/trailing slashes, `..`, empty segments, control characters).
+- **`ReadError` ([`crates/storage-core/src/error.rs`](storage-layer-rust/crates/storage-core/src/error.rs)):** Domain-neutral error enum:
   - `ReadError::NotFound { key, message }`
   - `ReadError::PermissionDenied { key, message, source }`
   - `ReadError::Backend { key, message, source }`
 
 ### 2.2 Filesystem Containment Implementation (`storage-fs`)
 
-`FsMetadataReader` implements `ObjectPayloadReader` in [`crates/storage-fs/src/reader.rs:458-510`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-fs/src/reader.rs#L458-L510) and [`crates/storage-fs/src/reader/payload.rs:109-272`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-fs/src/reader/payload.rs#L109-L272):
+`FsMetadataReader` implements `ObjectPayloadReader` in [`crates/storage-fs/src/reader.rs:458-510`](storage-layer-rust/crates/storage-fs/src/reader.rs#L458-L510) and [`crates/storage-fs/src/reader/payload.rs:109-272`](storage-layer-rust/crates/storage-fs/src/reader/payload.rs#L109-L272):
 
 1. **Phase 1 (Contained Resolution):** Resolves the relative key against the pinned directory file descriptor (`root_fd`) using Linux `openat2` with `O_PATH | O_CLOEXEC` and containment flags:
    ```c
@@ -98,7 +98,7 @@ impl ObjectPayload {
 
 ### 2.3 Shared Reader Ownership in `FsStorage`
 
-In [`src/storage/fs.rs:190-230`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L190-L230), `FsStorage` already owns an initialized, capability-probed `Arc<storage_fs::FsMetadataReader>`:
+In [`src/storage/fs.rs:190-230`](src/storage/fs.rs#L190-L230), `FsStorage` already owns an initialized, capability-probed `Arc<storage_fs::FsMetadataReader>`:
 
 ```rust
 // [src/storage/fs.rs:190-198]
@@ -503,7 +503,7 @@ A critical architectural distinction must be maintained between current producti
 
 ### 7.1 What Advisory Locks and Version Tokens Do and Do Not Guarantee
 - **Advisory Locks (`.lock.{tag}`):**
-  - Acquired exclusively via `fs2::FileExt::lock_exclusive` by both [`mutate_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1030-L1140) and [`delete_tag_conditional`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1271-L1335).
+  - Acquired exclusively via `fs2::FileExt::lock_exclusive` by both [`mutate_tag`](src/storage/fs.rs#L1030-L1140) and [`delete_tag_conditional`](src/storage/fs.rs#L1271-L1335).
   - **Serializes cooperating operations only** when they open and lock the **identical lock-file inode**.
   - **Tag reads do not acquire this lock.** Tag reads remain unlocked. A read can execute concurrently with a mutation or deletion.
   - If `self.root` is replaced, or `.lock.{tag}` is unlinked and recreated, cooperating processes may open different inodes and fail to serialize. Non-cooperating writers ignore the lock entirely.

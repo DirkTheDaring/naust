@@ -7,7 +7,7 @@ name = "best_practice"
 listen_addr = "127.0.0.1:5000"
 
 [token]
-service = "registry-rust"
+service = "naust"
 # Set a stable secret in production.
 signing_key = "change-me"
 ttl_secs = 600

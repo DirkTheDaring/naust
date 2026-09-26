@@ -28,7 +28,7 @@
 
 ## 1. Executive Summary & Authorization Boundary
 
-In prior storage extraction milestones, descriptor-relative containment via Linux `openat2` flags (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`) was incrementally designed, tested, and integrated for CAS blobs and manifests. Point-in-time tag resolution (`resolve_tag`) and optimistic-concurrency versioned tag retrieval (`get_tag_with_version`) were cut over in [`src/storage/fs/tag_read.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tag_read.rs) (commit `5a0b4246e4c24e8db56d84f047eadae5387e7330`), followed by characterization of legacy listing semantics in commit `6d13cd983e10c15fa806d2d23385ae5752fe6362` ([`docs/architecture/filesystem-tag-listing-characterization.md`](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-tag-listing-characterization.md)).
+In prior storage extraction milestones, descriptor-relative containment via Linux `openat2` flags (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`) was incrementally designed, tested, and integrated for CAS blobs and manifests. Point-in-time tag resolution (`resolve_tag`) and optimistic-concurrency versioned tag retrieval (`get_tag_with_version`) were cut over in [`src/storage/fs/tag_read.rs`](src/storage/fs/tag_read.rs) (commit `5a0b4246e4c24e8db56d84f047eadae5387e7330`), followed by characterization of legacy listing semantics in commit `6d13cd983e10c15fa806d2d23385ae5752fe6362` ([`docs/architecture/filesystem-tag-listing-characterization.md`](docs/architecture/filesystem-tag-listing-characterization.md)).
 
 ### 1.1 Authorization Status: Design Only
 This document establishes an architectural design, probe analysis, and caller matrix for contained tag listing. **This task authorizes a design, not new production policies**:
@@ -40,7 +40,7 @@ This document establishes an architectural design, probe analysis, and caller ma
 
 ### 1.2 The Problem: Uncontained Pathname Enumeration
 While single-tag reads operate beneath the pinned root directory descriptor:
-1. **Bypass of Contained Reader**: [`FsStorage::list_tags`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L950-L984) and [`FsStorage::list_tags_page`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1169-L1214) bypass `self.reader: Arc<storage_fs::FsMetadataReader>` and execute uncontained ambient pathname operations starting from `self.root: PathBuf`.
+1. **Bypass of Contained Reader**: [`FsStorage::list_tags`](src/storage/fs.rs#L950-L984) and [`FsStorage::list_tags_page`](src/storage/fs.rs#L1169-L1214) bypass `self.reader: Arc<storage_fs::FsMetadataReader>` and execute uncontained ambient pathname operations starting from `self.root: PathBuf`.
 2. **Path Traversal & Symlink Follow**: Raw path composition does not validate repository strings. Intermediate `..` segments escape the storage root, and symlinks inside the repository are traversed transparently by the OS kernel.
 3. **Split-Brain Namespace Divergence**: Pinned reads (`resolve_tag`, `get_tag_with_version`) remain attached to the original directory descriptor (Tree A), while ambient listing and mutation operations observe replacement directories (Tree B) after external renames.
 4. **Asymmetric Error and Omission Semantics**:
@@ -183,7 +183,7 @@ While single-tag reads operate beneath the pinned root directory descriptor:
 
 ### 2.2 Retention of `list_tag_files` for Mutation Path (`delete_manifest`)
 A critical dependency in `src/storage/fs.rs` is that **`list_tag_files` cannot be deleted during listing cutover**.
-In [`src/storage/fs.rs:1796-1805`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1796-L1805), `FsStorage::delete_manifest` calls `self.list_tag_files`:
+In [`src/storage/fs.rs:1796-1805`](src/storage/fs.rs#L1796-L1805), `FsStorage::delete_manifest` calls `self.list_tag_files`:
 ```rust
 // src/storage/fs.rs:1794-1805
         // Remove any tags pointing to this digest.
@@ -223,7 +223,7 @@ In [`src/storage/fs.rs:1796-1805`](file:///home/dietmar/devel/rust/registry-rust
    - Payload limit overflow/excess maps to `StorageError::corrupt_data(...)` (`StorageErrorKind::CorruptData`).
    - `limits.max_payload_bytes == None` means no seam-imposed payload ceiling (the production default).
 4. **Existing Payload Error Translation**:
-   In [`src/storage/fs/read_adapter.rs:93-135`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/read_adapter.rs#L93-L135), `translate_read_error` translates:
+   In [`src/storage/fs/read_adapter.rs:93-135`](src/storage/fs/read_adapter.rs#L93-L135), `translate_read_error` translates:
    - `storage_core::ReadError::NotFound` -> `StorageError::NotFound`.
    - `storage_core::ReadError::PermissionDenied` -> `StorageError::io(...)`.
    - `storage_core::ReadError::Backend` wrapping `FsMetadataError::ResolutionRejected` -> `StorageError::io(...)`.
@@ -430,7 +430,7 @@ Every caller of `list_tags` and `list_tags_page` was inspected in `registry-rust
 ### 7.1 Conditional Caller Behavior Analysis
 
 #### 7.1.1 Application Tag Service (`src/application/tags.rs:49-52`)
-The service uses [`TagQueryError`](file:///home/dietmar/devel/rust/registry-rust/src/application/errors.rs#L232-L245) with variants `InvalidRepoName`, `NotFound`, `Storage`, and `Internal`. It maps `StorageError::NotFound` to `TagQueryError::NotFound` (HTTP 404), and other errors to `TagQueryError::Storage` (HTTP 500).
+The service uses [`TagQueryError`](src/application/errors.rs#L232-L245) with variants `InvalidRepoName`, `NotFound`, `Storage`, and `Internal`. It maps `StorageError::NotFound` to `TagQueryError::NotFound` (HTTP 404), and other errors to `TagQueryError::Storage` (HTTP 500).
 
 #### 7.1.2 Reference Index Sync (`src/blob_ref_index.rs:501-530, 632-652`)
 - **Staged Discovery**: `list_tags_page` errors abort discovery via `?` before Phase 2.

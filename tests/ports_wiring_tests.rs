@@ -1,32 +1,30 @@
 use bytes::Bytes;
-use registry_rust::application::blob::BlobMutationService;
-use registry_rust::application::manifest::ManifestMutationService;
-use registry_rust::blob_delete_safety::BlobDeleteService;
-use registry_rust::blob_gc::BlobGcPolicy;
-use registry_rust::blob_gc::policy::PolicyContext;
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::config::Config;
-use registry_rust::consistency::ConsistencyCoordinator;
-use registry_rust::gc_service::{GcBudgets, GcService};
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::repository_membership_ledger::RepositoryMembershipLedger;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::mutation_authority::{
+use naust::application::blob::BlobMutationService;
+use naust::application::manifest::ManifestMutationService;
+use naust::blob_delete_safety::BlobDeleteService;
+use naust::blob_gc::BlobGcPolicy;
+use naust::blob_gc::policy::PolicyContext;
+use naust::blob_ref_index::BlobRefIndex;
+use naust::config::Config;
+use naust::consistency::ConsistencyCoordinator;
+use naust::gc_service::{GcBudgets, GcService};
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::repository_membership_ledger::RepositoryMembershipLedger;
+use naust::storage::fs::FsStorage;
+use naust::storage::mutation_authority::{
     DeploymentWriterLockDoc, GcMutationPermit, RuntimeMutationAuthority,
 };
-use registry_rust::storage::ports::*;
-use registry_rust::storage::repo_membership::{
-    RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
-};
-use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::upload_session::UploadSessionStorage;
-use registry_rust::storage::{
+use naust::storage::ports::*;
+use naust::storage::repo_membership::{RepoBlobMembershipRecord, RepositoryBlobMembershipStorage};
+use naust::storage::s3::S3Storage;
+use naust::storage::upload_session::UploadSessionStorage;
+use naust::storage::{
     BlobMeta, BlobObjectVersion, ConditionalDeleteResult, GcBlobCandidate, GcBlobPage, GcCursor,
     GcDeleteResult, GcQuarantineResult, GcStorageStrategy, ManifestMeta, ReferrerDescriptor,
     RepoTimestamps, StorageError, TagMutation, TagMutationPolicy, UploadMeta,
 };
-use registry_rust::upload_coordinator::BlobUploadCoordinatorConfig;
+use naust::upload_coordinator::BlobUploadCoordinatorConfig;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -526,7 +524,7 @@ impl UploadSessionStorage for FakeBlobUploadStorage {
     async fn create_session(
         &self,
         repo: &str,
-    ) -> Result<registry_rust::storage::upload_session::UploadSessionId, StorageError> {
+    ) -> Result<naust::storage::upload_session::UploadSessionId, StorageError> {
         let uuid = Uuid::new_v4().to_string();
         self.uploads
             .lock()
@@ -534,7 +532,7 @@ impl UploadSessionStorage for FakeBlobUploadStorage {
             .insert(uuid.clone(), Vec::new());
         let canonical = CanonicalRepoName::parse(repo)
             .map_err(|e| StorageError::InvalidRepoName(e.to_string()))?;
-        Ok(registry_rust::storage::upload_session::UploadSessionId {
+        Ok(naust::storage::upload_session::UploadSessionId {
             repo: canonical,
             uuid,
         })
@@ -542,30 +540,28 @@ impl UploadSessionStorage for FakeBlobUploadStorage {
 
     async fn session_status(
         &self,
-        session: &registry_rust::storage::upload_session::UploadSessionId,
+        session: &naust::storage::upload_session::UploadSessionId,
     ) -> Result<
-        registry_rust::storage::upload_session::UploadSessionStatus,
-        registry_rust::storage::upload_session::UploadTransitionError,
+        naust::storage::upload_session::UploadSessionStatus,
+        naust::storage::upload_session::UploadTransitionError,
     > {
         let guard = self.uploads.lock().unwrap();
         if let Some(buf) = guard.get(&session.uuid) {
-            Ok(
-                registry_rust::storage::upload_session::UploadSessionStatus {
-                    session: session.clone(),
-                    state: registry_rust::storage::upload_session::UploadSessionState::Active,
-                    committed_offset: buf.len() as u64,
-                    created_at: SystemTime::now(),
-                    last_active_at: SystemTime::now(),
-                },
-            )
+            Ok(naust::storage::upload_session::UploadSessionStatus {
+                session: session.clone(),
+                state: naust::storage::upload_session::UploadSessionState::Active,
+                committed_offset: buf.len() as u64,
+                created_at: SystemTime::now(),
+                last_active_at: SystemTime::now(),
+            })
         } else {
-            Err(registry_rust::storage::upload_session::UploadTransitionError::NotFound)
+            Err(naust::storage::upload_session::UploadTransitionError::NotFound)
         }
     }
 
     async fn abort_session(
         &self,
-        session: &registry_rust::storage::upload_session::UploadSessionId,
+        session: &naust::storage::upload_session::UploadSessionId,
     ) -> Result<(), StorageError> {
         let mut guard = self.uploads.lock().unwrap();
         guard.remove(&session.uuid);
@@ -1325,7 +1321,7 @@ async fn test_minimal_fake_gc_service_and_policy_context() {
 
     // Construct GcService using ONLY GcServiceStoragePort (no Storage)
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         fake_gc_storage.clone(),
         idx.clone(),
         coordinator,
@@ -1423,7 +1419,7 @@ async fn test_minimal_fake_blob_delete_service() {
         .expect("delete repo blob");
     assert!(matches!(
         del_res,
-        registry_rust::blob_delete_safety::BlobDeleteResult::Success
+        naust::blob_delete_safety::BlobDeleteResult::Success
     ));
 }
 

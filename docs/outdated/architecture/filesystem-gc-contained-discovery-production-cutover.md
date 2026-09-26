@@ -37,7 +37,7 @@ This document records the production cutover from the uncontained raw filesystem
 ### Core Architectural Accomplishments
 
 1. **Elimination of Raw Filesystem Bypass**:
-   - The uncontained filesystem traversal routine (`build_manifest_protected_set_fs`) in [`src/blob_gc/policy.rs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs), which directly evaluated `cfg.fs_root.join("repos")` and performed unchecked `tokio::fs` operations, has been completely retired.
+   - The uncontained filesystem traversal routine (`build_manifest_protected_set_fs`) in [`src/blob_gc/policy.rs`](src/blob_gc/policy.rs), which directly evaluated `cfg.fs_root.join("repos")` and performed unchecked `tokio::fs` operations, has been completely retired.
    - All manifest reference discovery now routes through `build_manifest_protected_set`, invoking the required capability method `storage.discover_manifest_references()`.
 
 2. **Required Capability Methods Without Defaults**:
@@ -48,11 +48,11 @@ This document records the production cutover from the uncontained raw filesystem
    - All adapters, wrappers, and `Arc<T>` implementations explicitly delegate the call to the inner backend.
 
 3. **Fail-Closed Policy Integration**:
-   - Added a dedicated error variant `GcPolicyError::ManifestDiscovery(#[source] StorageError)` to [`src/blob_gc/policy.rs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs).
+   - Added a dedicated error variant `GcPolicyError::ManifestDiscovery(#[source] StorageError)` to [`src/blob_gc/policy.rs`](src/blob_gc/policy.rs).
    - If `discover_manifest_references` returns an `Err(StorageError)`, the GC policy immediately halts with `GcPolicyError::ManifestDiscovery`. It never swallows the error, never falls back to catalog listing, and never treats errors as an empty protected set.
 
 4. **15 Configurable Resource Limits**:
-   - Implemented 15 independently configurable resource limit settings in [`src/config.rs`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs).
+   - Implemented 15 independently configurable resource limit settings in [`src/config.rs`](src/config.rs).
    - Followed hierarchical environment variable > flat environment variable > configuration file > compiled default precedence.
    - Intermediate and terminal enumeration limits are decoupled, allowing granular tuning.
    - The production payload ceiling is left unset by default (`max_manifest_payload_bytes = None`), preserving compatibility with arbitrarily sized manifest payloads unless an operator chooses to set an explicit cap.
@@ -68,47 +68,47 @@ This document records the production cutover from the uncontained raw filesystem
 
 ### 2.1 Storage Core & Trait Interfaces
 
-- **[`src/storage/fs/repo_discovery.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/repo_discovery.rs)**:
+- **[`src/storage/fs/repo_discovery.rs`](src/storage/fs/repo_discovery.rs)**:
   - Promoted from test seam to production module.
   - Made `DiscoveryLimits` public in crate, implementing `Default` with compiled production defaults (depth: 16, enumerations: 10,000, entries: 100,000, manifest dirs: 10,000, retained path bytes: 1,500,000, intermediate batch entries: 1,000, intermediate name bytes: 100,000).
   - Aliased `DiscoveryTestLimits` to `DiscoveryLimits` under `#[cfg(test)]`.
   - Retained all unit tests and test fake directory engines.
 
-- **[`src/storage/fs/manifest_refs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/manifest_refs.rs)**:
+- **[`src/storage/fs/manifest_refs.rs`](src/storage/fs/manifest_refs.rs)**:
   - Promoted from seam (`manifest_refs_seam.rs` deleted) to production module.
   - Made `ManifestReferenceLimits` public in crate, implementing `Default` with compiled production defaults (terminal enumerations: 10,000, terminal batch entries: 10,000, terminal name bytes: 1,500,000, total manifest entries: 100,000, manifests read: 10,000, total references: 100,000, retained logical bytes: 10,000,000, max manifest payload bytes: `None`).
   - Aliased `ManifestRefTestLimits` to `ManifestReferenceLimits` under `#[cfg(test)]`.
   - Strictly partitioned imports: production code imports only standard and crate items (`Arc`, `HashSet`, `Digest`, `ObjectKey`, `StorageError`, `StorageErrorKind`); test mock items (`tokio::sync::Mutex`, `Cursor`, etc.) remain gated behind `#[cfg(test)]`.
 
-- **[`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs)**:
+- **[`src/storage/fs.rs`](src/storage/fs.rs)**:
   - Declared `pub(crate) mod manifest_refs;` and `pub(crate) mod repo_discovery;`.
   - Added `gc_discovery_limits: repo_discovery::DiscoveryLimits` and `gc_ref_limits: manifest_refs::ManifestReferenceLimits` fields to `FsStorage`.
   - Implemented crate-visible constructor `try_new_with_gc_limits` enforcing non-zero and non-underflow validation across all 15 limit parameters.
   - Preserved existing `try_new` and `new_with_default_limits` by delegating to `try_new_with_gc_limits` with `Default::default()`.
   - Implemented required method `discover_manifest_references(&self) -> Result<Option<HashSet<Digest>>, StorageError>` on `FsStorage`, delegating to `manifest_refs::collect_manifest_references_end_to_end` using `self.reader` and the configured limits.
 
-- **[`src/storage/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs)**:
+- **[`src/storage/mod.rs`](src/storage/mod.rs)**:
   - Added required method `discover_manifest_references` to `GcStorage` trait without default implementation.
   - Implemented required forwarding method on `Arc<T> where T: GcStorage + ?Sized`.
   - Updated `storage_wiring_try_from_config` to construct `FsStorage` via `try_new_with_gc_limits(&cfg.fs_root, discovery_limits, ref_limits)`.
 
-- **[`src/storage/ports/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/ports/mod.rs)**:
+- **[`src/storage/ports/mod.rs`](src/storage/ports/mod.rs)**:
   - Added required method `discover_manifest_references` to `GcStoragePort` trait without default implementation.
   - Updated `impl_gc_storage_port!` macro to forward `discover_manifest_references` to `$target`.
   - Implemented required forwarding method on `Arc<T> where T: GcStoragePort + ?Sized`.
 
-- **[`src/storage/s3.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/s3.rs)**:
+- **[`src/storage/s3.rs`](src/storage/s3.rs)**:
   - Implemented `discover_manifest_references` on `S3Storage` returning `Ok(None)`.
 
-- **[`src/blob_ref_index.rs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs)**:
+- **[`src/blob_ref_index.rs`](src/blob_ref_index.rs)**:
   - Implemented `discover_manifest_references` on `BlobRefIndexBridge` delegating to `self.storage.discover_manifest_references()`.
 
-- **[`src/storage/fs/listing.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/listing.rs)**:
+- **[`src/storage/fs/listing.rs`](src/storage/fs/listing.rs)**:
   - Implemented `discover_manifest_references` on `SeamGcStorageBridge` delegating to inner storage, and on `ScriptedCursorAdapter` returning `Ok(None)`.
 
 ### 2.2 Configuration
 
-- **[`src/config.rs`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs)**:
+- **[`src/config.rs`](src/config.rs)**:
   - Added 15 configuration fields to `Config` struct with full serde and default annotations:
     - `fs_gc_discovery_max_depth: usize` (default: 16)
     - `fs_gc_discovery_max_dir_enumerations: usize` (default: 10,000)
@@ -135,7 +135,7 @@ This document records the production cutover from the uncontained raw filesystem
 
 ### 2.3 GC Policy and Engine
 
-- **[`src/blob_gc/policy.rs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs)**:
+- **[`src/blob_gc/policy.rs`](src/blob_gc/policy.rs)**:
   - Added `GcPolicyError::ManifestDiscovery(#[source] StorageError)` error variant.
   - Completely deleted raw filesystem bypass walker `build_manifest_protected_set_fs`.
   - Updated `build_manifest_protected_set`:
@@ -145,13 +145,13 @@ This document records the production cutover from the uncontained raw filesystem
     - If `Err(e)`, aborts immediately with `GcPolicyError::ManifestDiscovery(e)`.
   - Updated all policy unit tests to test contained discovery behavior through mocked/wrapped `GcStorage` implementations.
 
-- **[`src/blob_gc/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs)**:
+- **[`src/blob_gc/mod.rs`](src/blob_gc/mod.rs)**:
   - Removed re-export of retired `build_manifest_protected_set_fs`.
   - Updated unit test `test_build_manifest_protected_set_aborts_on_unparsable_manifest` to exercise `build_manifest_protected_set`.
 
 ### 2.4 Test Suites & Test Support
 
-- **[`tests/gc_contained_discovery_integration_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/gc_contained_discovery_integration_tests.rs)** (NEW):
+- **[`tests/gc_contained_discovery_integration_tests.rs`](tests/gc_contained_discovery_integration_tests.rs)** (NEW):
   - Comprehensive integration test suite verifying:
     1. Full capability forwarding through real `StorageWiring` port views.
     2. Explicit non-filesystem (`S3Storage`) returns `Ok(None)` and invokes generic catalog traversal.
@@ -166,7 +166,7 @@ This document records the production cutover from the uncontained raw filesystem
     11. Production GC deletion (`blob_gc_delete_with_authority`) fails closed on discovery error, asserting neither `delete_blob_conditional` nor `restore_quarantined_blob` is invoked and candidate remains in quarantine.
     12. Real deletion loop initializes missing quarantine timestamp metadata on disk (`quarantine/meta/sha256/<prefix>/<hex>.ts`), and subsequent discovery failure aborts without rolling back or corrupting the persisted timestamp.
 
-- **[`tests/gc_contained_discovery_config_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/gc_contained_discovery_config_tests.rs)** (NEW):
+- **[`tests/gc_contained_discovery_config_tests.rs`](tests/gc_contained_discovery_config_tests.rs)** (NEW):
   - Dedicated process-isolated configuration test suite verifying:
     1. Compiled production defaults across all 15 discovery and reference limit fields in a clean isolated environment (`run_isolated`).
     2. TOML file overrides updating all 15 fields from config files.
@@ -177,19 +177,19 @@ This document records the production cutover from the uncontained raw filesystem
     7. Validation boundary enforcement: sub-minimum rejected, payload ceiling bound (`1024` valid boundary, `u64::MAX` rejected, unset defaulting to `None`).
     8. Storage wiring constructor validation (`storage_wiring_try_from_config`) validating limits and backend kind (`"fs"`).
 
-- **[`tests/ports_wiring_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/ports_wiring_tests.rs)**:
+- **[`tests/ports_wiring_tests.rs`](tests/ports_wiring_tests.rs)**:
   - Updated test fake storage implementations (`MinimalFakeStorage`, etc.) to explicitly implement `discover_manifest_references` returning `Ok(None)`.
 
-- **[`tests/manifest_lifecycle_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/manifest_lifecycle_tests.rs)**:
+- **[`tests/manifest_lifecycle_tests.rs`](tests/manifest_lifecycle_tests.rs)**:
   - Updated test fake storage implementations (`TestStorage`, etc.) to explicitly implement `discover_manifest_references` returning `Ok(None)`.
   - Replaced duplicate in-file `LifecycleFaultStorage` with shared implementation from `support::gc_coordination`.
 
-- **[`tests/support/gc_coordination.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/support/gc_coordination.rs)**:
+- **[`tests/support/gc_coordination.rs`](tests/support/gc_coordination.rs)**:
   - Added public `LifecycleFaultStorage` implementing all storage ports and `GcServiceStoragePort` registered via macros.
   - Implemented `discover_manifest_references` on `HookedStorage` and `LifecycleFaultStorage`.
   - Updated helper config instantiations to provide default values for the 15 new fields.
 
-- **[`src/gc_service.rs`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs)** & **[`src/http_api/handlers/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers/tests.rs)**:
+- **[`src/gc_service.rs`](src/gc_service.rs)** & **[`src/http_api/handlers/tests.rs`](src/http_api/handlers/tests.rs)**:
   - Updated test configuration struct literals with default discovery limit fields.
 
 ---
@@ -252,7 +252,7 @@ Validation is strictly enforced within the crate-visible constructor `FsStorage:
 
 ### 5.1 Test Execution Summary
 
-All compilation checks, linters, unit tests, focused integration tests, and coordination regressions were executed and verified clean. Complete logs and exit statuses were captured in `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-0340/logs/`.
+All compilation checks, linters, unit tests, focused integration tests, and coordination regressions were executed and verified clean. Complete logs and exit statuses were captured in `~/devel/rust/manifest-read-review-evidence/session-20260912-0340/logs/`.
 
 - `cargo fmt --check`: **PASSED** (Exit 0, 0 formatting discrepancies)
 - `cargo check --all-targets --all-features --locked`: **PASSED** (Exit 0)

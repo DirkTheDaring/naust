@@ -1,4 +1,4 @@
-//! Production filesystem CAS listing module for `registry-rust` using extracted
+//! Production filesystem CAS listing module for `naust` using extracted
 //! `storage-fs` directory enumeration (`FsMetadataReader::enumerate_dir`) and
 //! contained file metadata inspection (`FsMetadataReader::inspect_file_metadata`).
 //!
@@ -10,7 +10,7 @@
 //!   single-directory enumeration ([`storage_fs::DirEntry`], [`storage_fs::DirEntryType`],
 //!   [`storage_fs::DirEnumerationLimits`], [`storage_fs::FsDirError`]), and single-file
 //!   metadata inspection ([`storage_fs::FsFileMetadata`]).
-//! - `registry-rust`: CAS namespace layout (`blobs/sha256/<2-char-prefix>/<64-char-hex>`),
+//! - `naust`: CAS namespace layout (`blobs/sha256/<2-char-prefix>/<64-char-hex>`),
 //!   digest validation and normalization, lexical cursor comparisons, page-limit clamping [1, 1000],
 //!   exact-full-page next-cursor calculation, error taxonomy translation ([`StorageError`]),
 //!   and candidate metadata/version conversion ([`GcBlobCandidate`]).

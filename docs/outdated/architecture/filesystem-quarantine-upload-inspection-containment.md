@@ -4,8 +4,8 @@
 
 - **Document:** `docs/architecture/filesystem-quarantine-upload-inspection-containment.md`
 - **Status:** Historical implementation record (working tree at `0cd6a73`; subsequently committed and superseded for the reaper)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `0cd6a734475555ffe315ba6db8775031b248ee36` (`master`), changes applied in the working tree only.
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — the required capability, including nanosecond mtime via `inspect_file_metadata`, exists; no gap).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `0cd6a734475555ffe315ba6db8775031b248ee36` (`master`), changes applied in the working tree only.
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — the required capability, including nanosecond mtime via `inspect_file_metadata`, exists; no gap).
 - **Scope:** Gap items R-13–R-15. This batch contains the three standalone
   inspection **point reads** (`quarantined_blob_version`,
   `read_quarantine_timestamp`, `get_finalized_receipt`) and applies a narrow

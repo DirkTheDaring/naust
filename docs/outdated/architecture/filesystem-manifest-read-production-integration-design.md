@@ -547,7 +547,7 @@ Under `storage_fs::FsMetadataReader::open_payload`:
 
 ## 7. Section 5: Exact Error Mapping Taxonomy
 
-The authoritative source of error translation is [`super::read_adapter::translate_payload_read_error`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/read_adapter.rs#L176-L178), which delegates to `translate_read_error(err, ReadOp::Payload)` (`src/storage/fs/read_adapter.rs:93-168`).
+The authoritative source of error translation is [`super::read_adapter::translate_payload_read_error`](src/storage/fs/read_adapter.rs#L176-L178), which delegates to `translate_read_error(err, ReadOp::Payload)` (`src/storage/fs/read_adapter.rs:93-168`).
 
 The table below contrasts legacy error behavior against the proposed production cutover:
 

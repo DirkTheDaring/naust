@@ -24,9 +24,9 @@ if [[ -n "$CONFIG_PATH" ]]; then
 fi
 
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-BIN="./$CARGO_TARGET_DIR/debug/registry-rust"
-if [[ -f "./$CARGO_TARGET_DIR/release/registry-rust" ]]; then
-  BIN="./$CARGO_TARGET_DIR/release/registry-rust"
+BIN="./$CARGO_TARGET_DIR/debug/naust"
+if [[ -f "./$CARGO_TARGET_DIR/release/naust" ]]; then
+  BIN="./$CARGO_TARGET_DIR/release/naust"
 fi
 
 export REGISTRY_USERNAME="$USER"
@@ -46,7 +46,7 @@ if [[ $USE_TOML -eq 0 ]]; then
 fi
 
 log "Starting registry on $ADDR (repo=$REPO tag=$TAG)"
-RUST_LOG=warn "$BIN" server >/tmp/registry-rust.log 2>&1 &
+RUST_LOG=warn "$BIN" server >/tmp/naust.log 2>&1 &
 PID=$!
 cleanup() {
   kill "$PID" >/dev/null 2>&1 || true

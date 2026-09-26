@@ -10,7 +10,7 @@
 - `registry-rust` baseline commit: `3bbe006148c83add6acfb2f7e0c5df9a21d38b7e`
 - `storage-layer-rust` baseline commit: `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`
 - Reviewed Design Archive:
-  `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-0210/filesystem-gc-manifest-reference-seam-design.tar.gz`
+  `~/devel/rust/manifest-read-review-evidence/session-20260912-0210/filesystem-gc-manifest-reference-seam-design.tar.gz`
   Size: 16886 bytes
   SHA-256: `f5ded1aade189f726c7c9d9047ccaeaee69f756ada0b959c767823e943fd90d4`
 

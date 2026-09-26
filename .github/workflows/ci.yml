@@ -26,8 +26,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Core boundary gate (ADR-010)
         run: make core-boundary
-      - name: Workspace tests
-        run: cargo test --workspace --locked
+      - name: Workspace tests (live-S3 suite runs in its own job)
+        run: cargo test --workspace --locked --no-fail-fast -- --skip test_live_s3
       - name: Conformance (fs, basic, token)
         run: tests/compliance/run.sh fs basic token
 

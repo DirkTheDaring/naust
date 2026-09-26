@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 #set -ex
-URL=https://registry.trantor.kaupon.de:10443
-URL=https://registry.synology.kaupon.de
+URL=https://registry.reg2.example.invalid:10443
+URL=https://registry.example.invalid
 # All repos single call
 curl -sS "$URL/_meta/catalog?include_tags=1" | jq
 exit 0

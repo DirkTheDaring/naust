@@ -88,7 +88,7 @@ run_matrix() {
       STORAGE_FS_ROOT="${data_dir}" \
       ALLOW_TAG_OVERWRITE=1 \
       RUST_LOG=debug \
-      ./target/debug/registry-rust server > "${reg_log}" 2>&1 &
+      ./target/debug/naust server > "${reg_log}" 2>&1 &
     reg_pid=$!
   else
     prefix="conformance-${matrix_name}-s3-$(date +%s)"
@@ -109,7 +109,7 @@ run_matrix() {
       AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}" \
       ALLOW_TAG_OVERWRITE=1 \
       RUST_LOG=debug \
-      ./target/debug/registry-rust server > "${reg_log}" 2>&1 &
+      ./target/debug/naust server > "${reg_log}" 2>&1 &
     reg_pid=$!
   fi
 

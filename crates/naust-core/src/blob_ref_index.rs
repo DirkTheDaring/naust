@@ -1836,10 +1836,7 @@ mod tests {
     crate::impl_cache_eviction_port!(MockStorage);
 
     fn temp_index_path() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "registry-rust-ref-index-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let p = std::env::temp_dir().join(format!("naust-ref-index-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("create temp dir");
         p
     }

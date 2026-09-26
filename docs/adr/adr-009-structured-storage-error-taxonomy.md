@@ -115,20 +115,20 @@ Every single constructor and match site across the repository was classified:
 
 | File | Scope & Classifications |
 | :--- | :--- |
-| [`src/storage/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs) | `StorageErrorKind` taxonomy definition, constructor helpers, configuration & I/O errors |
-| [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs) | 119 call sites classified into `Io`, `CorruptData`, `Serialization`, `InternalInvariant`, `PermissionDenied` |
-| [`src/storage/s3.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/s3.rs) | 65 call sites classified into `Backend`, `PermissionDenied`, `Configuration`, `Serialization`, `CorruptData`, `Conflict` |
-| [`src/storage/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/tests.rs) | Dedicated unit test suite verifying taxonomy display, serde, accessors, and variant stability |
-| [`src/storage/fs/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs) | Typed pattern assertions on `StorageErrorKind::CorruptData` and `StorageErrorKind::Io` |
-| [`src/storage/s3/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/s3/tests.rs) | Typed error injections for `Backend`, `PermissionDenied`, `Conflict`, `InternalInvariant` |
-| [`src/blob_delete_safety.rs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_delete_safety.rs) | Unparseable manifest handling mapped to `CorruptData`, ledger invariants |
-| [`src/membership_migration.rs`](file:///home/dietmar/devel/rust/registry-rust/src/membership_migration.rs) | Corrupt manifest mapped to `CorruptData`, concurrent migrator lease conflict mapped to `Conflict` |
-| [`src/storage/mutation_authority.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mutation_authority.rs) | Invalid confirmation tokens mapped to `PermissionDenied` |
-| [`src/runtime.rs`](file:///home/dietmar/devel/rust/registry-rust/src/runtime.rs) | Unwind release failure mapped to `Backend` |
-| [`src/upload_coordinator.rs`](file:///home/dietmar/devel/rust/registry-rust/src/upload_coordinator.rs) | Pin acquisition/renewal I/O mapped to `Io`, missing CAS blobs mapped to `CorruptData` |
-| [`tests/application_read_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/application_read_tests.rs) | Mock upload transitions mapped to `Io` and `Backend` |
-| [`tests/supervisor_and_command_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/supervisor_and_command_tests.rs) | Teardown release failures mapped to `Backend` |
-| [`tests/support/s3_mock.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/support/s3_mock.rs) | Missing part invariant mapped to `InternalInvariant` |
+| [`src/storage/mod.rs`](src/storage/mod.rs) | `StorageErrorKind` taxonomy definition, constructor helpers, configuration & I/O errors |
+| [`src/storage/fs.rs`](src/storage/fs.rs) | 119 call sites classified into `Io`, `CorruptData`, `Serialization`, `InternalInvariant`, `PermissionDenied` |
+| [`src/storage/s3.rs`](src/storage/s3.rs) | 65 call sites classified into `Backend`, `PermissionDenied`, `Configuration`, `Serialization`, `CorruptData`, `Conflict` |
+| [`src/storage/tests.rs`](src/storage/tests.rs) | Dedicated unit test suite verifying taxonomy display, serde, accessors, and variant stability |
+| [`src/storage/fs/tests.rs`](src/storage/fs/tests.rs) | Typed pattern assertions on `StorageErrorKind::CorruptData` and `StorageErrorKind::Io` |
+| [`src/storage/s3/tests.rs`](src/storage/s3/tests.rs) | Typed error injections for `Backend`, `PermissionDenied`, `Conflict`, `InternalInvariant` |
+| [`src/blob_delete_safety.rs`](src/blob_delete_safety.rs) | Unparseable manifest handling mapped to `CorruptData`, ledger invariants |
+| [`src/membership_migration.rs`](src/membership_migration.rs) | Corrupt manifest mapped to `CorruptData`, concurrent migrator lease conflict mapped to `Conflict` |
+| [`src/storage/mutation_authority.rs`](src/storage/mutation_authority.rs) | Invalid confirmation tokens mapped to `PermissionDenied` |
+| [`src/runtime.rs`](src/runtime.rs) | Unwind release failure mapped to `Backend` |
+| [`src/upload_coordinator.rs`](src/upload_coordinator.rs) | Pin acquisition/renewal I/O mapped to `Io`, missing CAS blobs mapped to `CorruptData` |
+| [`tests/application_read_tests.rs`](tests/application_read_tests.rs) | Mock upload transitions mapped to `Io` and `Backend` |
+| [`tests/supervisor_and_command_tests.rs`](tests/supervisor_and_command_tests.rs) | Teardown release failures mapped to `Backend` |
+| [`tests/support/s3_mock.rs`](tests/support/s3_mock.rs) | Missing part invariant mapped to `InternalInvariant` |
 
 ---
 

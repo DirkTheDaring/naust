@@ -3,7 +3,7 @@
 //! # Architecture and Scope
 //!
 //! This module implements contained manifest reference collection for filesystem
-//! garbage collection reachability in `registry-rust`. It enumerates terminal directories
+//! garbage collection reachability in `naust`. It enumerates terminal directories
 //! discovered by [`super::repo_discovery::discover_manifest_dirs_impl`], reads manifest payloads
 //! using the pinned root descriptor via [`storage_fs::FsMetadataReader`], and extracts protected digests.
 //!

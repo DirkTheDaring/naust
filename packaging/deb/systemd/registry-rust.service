@@ -1,6 +1,6 @@
 [Unit]
-Description=registry-rust OCI registry
-Documentation=man:registry-rust(1)
+Description=naust OCI registry
+Documentation=man:naust(1)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,13 +9,13 @@ Type=simple
 User=registry
 Group=registry
 
-EnvironmentFile=-/etc/default/registry-rust
+EnvironmentFile=-/etc/default/naust
 
 # Allow admins to pass extra args/config overlays.
-ExecStart=/usr/bin/registry-rust --config /etc/registry-rust/registry.core.toml --config /etc/registry-rust/registry.auth.toml $REGISTRY_RUST_ARGS server
+ExecStart=/usr/bin/naust --config /etc/naust/registry.core.toml --config /etc/naust/registry.auth.toml $REGISTRY_RUST_ARGS server
 
-WorkingDirectory=/var/lib/registry-rust
-StateDirectory=registry-rust
+WorkingDirectory=/var/lib/naust
+StateDirectory=naust
 StateDirectoryMode=0750
 
 Restart=on-failure
@@ -29,8 +29,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/registry-rust
-ReadOnlyPaths=/etc/registry-rust
+ReadWritePaths=/var/lib/naust
+ReadOnlyPaths=/etc/naust
 
 [Install]
 WantedBy=multi-user.target

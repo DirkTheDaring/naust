@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-service_name="registry-rust.service"
+service_name="naust.service"
 
 case "${1:-}" in
   configure)
@@ -13,7 +13,7 @@ case "${1:-}" in
       adduser \
         --system \
         --ingroup registry \
-        --home /var/lib/registry-rust \
+        --home /var/lib/naust \
         --no-create-home \
         --shell /usr/sbin/nologin \
         --disabled-login \
@@ -21,7 +21,7 @@ case "${1:-}" in
         registry >/dev/null || true
     fi
 
-    install -d -o registry -g registry -m 0750 /var/lib/registry-rust || true
+    install -d -o registry -g registry -m 0750 /var/lib/naust || true
 
     if command -v deb-systemd-helper >/dev/null 2>&1; then
       deb-systemd-helper unmask "$service_name" >/dev/null || true

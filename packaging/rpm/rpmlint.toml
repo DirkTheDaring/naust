@@ -4,8 +4,8 @@
 # in this project context (static `registry` user/group and proprietary license).
 
 Filters = [
-  '^registry-rust\..*: W: non-standard-uid\b',
-  '^registry-rust\..*: W: non-standard-gid\b',
-  '^registry-rust\.spec: W: no-%check-section\b',
-  '^registry-rust\..*: W: invalid-license\b',
+  '^naust\..*: W: non-standard-uid\b',
+  '^naust\..*: W: non-standard-gid\b',
+  '^naust\.spec: W: no-%check-section\b',
+  '^naust\..*: W: invalid-license\b',
 ]

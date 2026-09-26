@@ -51,7 +51,7 @@ if [[ "${engine}" == "podman" && "${rootful}" -eq 1 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-image="registry-rust-rpmbuild:${fedora_version}"
+image="naust-rpmbuild:${fedora_version}"
 
 # Optional local path dependency used by this workspace:
 #   acmecert-core = { path = "../acmecert/crates/acmecert-core" }

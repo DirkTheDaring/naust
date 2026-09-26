@@ -3,7 +3,7 @@
 //! mechanism the supervisor uses, swaps certificates through the TlsWatcher
 //! tick, and verifies the handshake-visible certificate changed.
 
-use registry_rust::tls_manager::TlsWatcher;
+use naust::tls_manager::TlsWatcher;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -90,7 +90,7 @@ fn handshake_peer_cert(addr: std::net::SocketAddr, server_name: &str) -> Vec<u8>
 
 #[tokio::test]
 async fn renewed_certificate_is_served_without_restart() {
-    registry_rust::install_rustls_crypto_provider();
+    naust::install_rustls_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let der_a = write_cert(dir.path(), "reg.example.com");
 

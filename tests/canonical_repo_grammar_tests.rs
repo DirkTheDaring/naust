@@ -1,14 +1,12 @@
 use axum::http::StatusCode;
 use base64::Engine;
 use bytes::Bytes;
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::manifest_lifecycle::{ManifestLifecycleService, PublishManifestRequest};
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::repo_membership::{
-    RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
-};
+use naust::blob_ref_index::BlobRefIndex;
+use naust::manifest_lifecycle::{ManifestLifecycleService, PublishManifestRequest};
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::repo_membership::{RepoBlobMembershipRecord, RepositoryBlobMembershipStorage};
 use reqwest::header;
 use serde_json::json;
 use sha2::Digest as _;
@@ -34,10 +32,10 @@ fn pick_unused_port() -> u16 {
 }
 
 fn bin_path() -> String {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry-rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry_rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
 
@@ -45,11 +43,7 @@ fn bin_path() -> String {
     let deps_dir = exe.parent().expect("exe parent");
     let profile_dir = deps_dir.parent().expect("deps parent");
 
-    let bin_name = if cfg!(windows) {
-        "registry-rust.exe"
-    } else {
-        "registry-rust"
-    };
+    let bin_name = if cfg!(windows) { "naust.exe" } else { "naust" };
 
     profile_dir.join(bin_name).to_string_lossy().to_string()
 }
@@ -874,7 +868,7 @@ async fn test_10_lifecycle_journal_recovery() {
     let storage = Arc::new(FsStorage::new(fs_root.clone(), 10 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let svc = ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
 
     let repo = "team/image__cache--production";
@@ -1014,7 +1008,7 @@ fn test_13_filesystem_path_traversal_protection() {
     let base_root = Path::new("/var/data/registry");
 
     let repo = CanonicalRepoName::parse("team/image__cache/sub").unwrap();
-    let fs_path = registry_rust::test_support::fs_repo_dir(base_root, &repo).unwrap();
+    let fs_path = naust::test_support::fs_repo_dir(base_root, &repo).unwrap();
 
     assert!(fs_path.starts_with(base_root));
     assert_eq!(
@@ -1039,7 +1033,7 @@ fn test_14_s3_prefix_isolation() {
     let root_prefix = "live-test-uuid-12345/root";
     let repo = CanonicalRepoName::parse("team/image__cache/sub--service").unwrap();
 
-    let prefix = registry_rust::test_support::s3_repo_prefix(root_prefix, &repo);
+    let prefix = naust::test_support::s3_repo_prefix(root_prefix, &repo);
     assert_eq!(
         prefix,
         "live-test-uuid-12345/root/repos/team/image__cache/sub--service/"
@@ -1062,9 +1056,9 @@ fn test_15_collision_isolation_across_key_families() {
 
     for name in repo_variants {
         let repo = CanonicalRepoName::parse(name).unwrap();
-        let encoded_key = registry_rust::test_support::encode_canonical_repo_key(&repo);
-        let fs_path = registry_rust::test_support::fs_repo_dir(base_root, &repo).unwrap();
-        let _s3_prefix = registry_rust::test_support::s3_repo_prefix("root", &repo);
+        let encoded_key = naust::test_support::encode_canonical_repo_key(&repo);
+        let fs_path = naust::test_support::fs_repo_dir(base_root, &repo).unwrap();
+        let _s3_prefix = naust::test_support::s3_repo_prefix("root", &repo);
 
         assert!(
             keys.insert(encoded_key.clone()),
@@ -1076,7 +1070,7 @@ fn test_15_collision_isolation_across_key_families() {
         );
 
         // Decode roundtrip
-        let decoded = registry_rust::test_support::decode_canonical_repo_key(&encoded_key).unwrap();
+        let decoded = naust::test_support::decode_canonical_repo_key(&encoded_key).unwrap();
         assert_eq!(decoded.as_str(), name);
     }
 }

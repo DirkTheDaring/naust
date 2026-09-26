@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary & Purpose
 
-This implementation slice hardens supervisor tag-listing error handling in [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs) before any production promotion of contained filesystem tag listing (`contained_list_tags_seam`).
+This implementation slice hardens supervisor tag-listing error handling in [`src/supervisor.rs`](src/supervisor.rs) before any production promotion of contained filesystem tag listing (`contained_list_tags_seam`).
 
 Previously, within `compute_protected_blobs` under the `KeepLatestCachedSemver` eviction policy, wildcard error suppression (`if let Ok(tags) = storage.list_tags(&repo).await`) silently swallowed all tag listing errors. Any transient I/O failure, permission fault, or contained directory-entry limit exceedance silently produced zero pinned tags for that repository.
 
@@ -33,7 +33,7 @@ failed to list tags for repository '{repo}' during proxy gc: {e}
 ```
 
 ### 2.3 Exact Production Code Modification
-In [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L936-L953), lines 936–953:
+In [`src/supervisor.rs`](src/supervisor.rs#L936-L953), lines 936–953:
 
 ```rust
                 crate::config::EvictionPolicy::KeepLatestCachedSemver {
@@ -59,7 +59,7 @@ In [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rust/src/super
 
 ### 2.4 Function Signature and Outer Error Propagation
 - **Signature Preserved:** `pub async fn compute_protected_blobs(storage: &(impl storage::BlobIndexStoragePort + ?Sized), repo_rules: &[crate::config::ProxyRepoRule], proxy: &crate::proxy::Proxy) -> Result<HashSet<String>, String>` is preserved unchanged.
-- **Outer Caller (`proxy_gc_once`):** In `proxy_gc_once` ([`src/supervisor.rs:830`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L830)), `compute_protected_blobs(storage, repo_rules, proxy).await?` propagates the error immediately via `?`.
+- **Outer Caller (`proxy_gc_once`):** In `proxy_gc_once` ([`src/supervisor.rs:830`](src/supervisor.rs#L830)), `compute_protected_blobs(storage, repo_rules, proxy).await?` propagates the error immediately via `?`.
 - **Pre-Scan Abort:** Because `proxy_gc_once` aborts at line 830, candidate scanning over `fs_root/blobs/sha256`, candidate sorting, and `tracing::info!` logging are entirely skipped.
 - **Supervisor Task Loop:** `spawn_proxy_gc` maps the error to `proxy gc failed: {e}`, and `TaskSupervisor::spawn_loop` logs the periodic iteration error at `warn` level before the next interval tick.
 
@@ -88,7 +88,7 @@ The following subsystems and configurations remain completely unmodified:
 ## 3. Test Verification & Coverage
 
 ### 3.1 Focused Test Suite
-Six focused test cases were added to `mod tests` in [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs):
+Six focused test cases were added to `mod tests` in [`src/supervisor.rs`](src/supervisor.rs):
 
 1. **`test_compute_protected_blobs_propagates_representative_listing_errors`:**
    Injects representative `StorageErrorKind::Io`, `StorageErrorKind::Backend` (the contained directory limit mapping), and `StorageErrorKind::PermissionDenied` failures on `list_tags`. Verifies that `compute_protected_blobs` returns `Err(msg)` containing the repository context and exact error details.

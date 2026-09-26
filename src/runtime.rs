@@ -35,7 +35,7 @@ pub(crate) enum RuntimeBuildError {
     #[error(
         "FATAL: Storage contains existing data (repositories, blobs, uploads, or legacy markers) but repository-scoped blob membership is not initialized.\n\
          Silent fallback to global visibility is disabled for security and tenant isolation.\n\
-         Please run: `registry-rust migrate-membership apply` to backfill membership records before starting the server."
+         Please run: `naust migrate-membership apply` to backfill membership records before starting the server."
     )]
     MembershipBackfillRequired,
 
@@ -102,7 +102,7 @@ pub(crate) fn assemble_application_services(
             .token_signing_keys
             .first()
             .map(|k| k.key.as_bytes().to_vec())
-            .unwrap_or_else(|| b"registry-rust-state-secret".to_vec()),
+            .unwrap_or_else(|| b"naust-state-secret".to_vec()),
         max_upload_bytes: config.max_upload_bytes,
         abort_on_digest_mismatch: config.upload_policy.abort_on_digest_mismatch,
         disallow_monolithic_uploads: config.disallow_monolithic_uploads,

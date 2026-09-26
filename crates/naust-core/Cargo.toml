@@ -1,7 +1,9 @@
 [package]
-name = "registry-core"
+name = "naust-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/DirkTheDaring/naust"
 description = "Registry-object primitives: blobs, manifests, tags, referrers, uploads, membership, GC, consistency. Transport-, auth-, and config-free (ADR-010)."
 
 # Explicitly unstable (0.x) until a second consumer exists — see ADR-010 §2.6.

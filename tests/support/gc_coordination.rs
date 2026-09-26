@@ -2,12 +2,12 @@
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
-use registry_rust::config::*;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::mutation_authority::GcMutationPermit;
-use registry_rust::storage::repo_membership::*;
-use registry_rust::storage::upload_session::*;
-use registry_rust::storage::*;
+use naust::config::*;
+use naust::registry::digest::Digest;
+use naust::storage::mutation_authority::GcMutationPermit;
+use naust::storage::repo_membership::*;
+use naust::storage::upload_session::*;
+use naust::storage::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -536,11 +536,11 @@ impl Storage for HookedStorage {
     }
 }
 
-registry_rust::impl_storage_ports!(HookedStorage);
-registry_rust::impl_gc_storage_port!(HookedStorage);
-registry_rust::impl_cache_eviction_port!(HookedStorage);
+naust::impl_storage_ports!(HookedStorage);
+naust::impl_gc_storage_port!(HookedStorage);
+naust::impl_cache_eviction_port!(HookedStorage);
 
-use registry_rust::storage::fs::FsStorage;
+use naust::storage::fs::FsStorage;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1117,13 +1117,13 @@ impl Storage for LifecycleFaultStorage {
     }
 }
 
-registry_rust::impl_storage_ports!(LifecycleFaultStorage);
-registry_rust::impl_gc_storage_port!(LifecycleFaultStorage);
-registry_rust::impl_cache_eviction_port!(LifecycleFaultStorage);
+naust::impl_storage_ports!(LifecycleFaultStorage);
+naust::impl_gc_storage_port!(LifecycleFaultStorage);
+naust::impl_cache_eviction_port!(LifecycleFaultStorage);
 
 #[allow(dead_code)]
 pub fn tmp_dir(prefix: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("registry-rust-{prefix}-{}", uuid::Uuid::new_v4()));
+    let p = std::env::temp_dir().join(format!("naust-{prefix}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&p).expect("create temp dir");
     p
 }
@@ -1142,7 +1142,7 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         push_implies_delete: false,
         auth_strategy: AuthStrategy::Token,
         anonymous_pull: true,
-        private_name_prefixes: registry_rust::config::default_private_name_prefixes(),
+        private_name_prefixes: naust::config::default_private_name_prefixes(),
         star_grants_catalog: true,
         storage_backend: StorageBackend::Filesystem,
         fs_root,
@@ -1231,9 +1231,9 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         },
         catalog_requires_auth: false,
         public_url: None,
-        token_service: "registry-rust".to_string(),
+        token_service: "naust".to_string(),
         token_signing_key: "test".to_string(),
-        token_signing_keys: vec![registry_rust::security::TokenSigningKey {
+        token_signing_keys: vec![naust::security::TokenSigningKey {
             kid: "default".to_string(),
             key: "test".to_string(),
         }],
@@ -1286,7 +1286,7 @@ pub async fn write_live_blob(fs_root: &std::path::Path, digest: &Digest, bytes: 
 pub fn live_blob_candidate_version(
     fs_root: &std::path::Path,
     digest: &Digest,
-) -> registry_rust::storage::BlobObjectVersion {
+) -> naust::storage::BlobObjectVersion {
     let path = fs_root
         .join("blobs")
         .join("sha256")
@@ -1299,5 +1299,5 @@ pub fn live_blob_candidate_version(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    registry_rust::storage::BlobObjectVersion(format!("{secs}:{}", meta.len()))
+    naust::storage::BlobObjectVersion(format!("{secs}:{}", meta.len()))
 }

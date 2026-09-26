@@ -1,4 +1,4 @@
-//! Consolidated filesystem CAS blob read adapter for `registry-rust`.
+//! Consolidated filesystem CAS blob read adapter for `naust`.
 //!
 //! Provides a unified [`BlobCasReader`] implementation wrapping extracted
 //! storage-layer readers ([`storage_core::ObjectMetadataReader`] and

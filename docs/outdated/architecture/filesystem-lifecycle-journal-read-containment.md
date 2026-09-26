@@ -6,8 +6,8 @@
 
 - **Document:** `docs/architecture/filesystem-lifecycle-journal-read-containment.md`
 - **Status:** Implementation & Compatibility Record with Write/Delete Audit (working tree, not committed)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `ef50360da7ac7640a628e2f808c242d914ca4c14` (`master`), changes applied in the working tree only.
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `ef50360da7ac7640a628e2f808c242d914ca4c14` (`master`), changes applied in the working tree only.
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged).
 - **Scope:** Gap item R-12 (`read_lifecycle_journal`) read containment, narrow recovery-boundary caller corrections, and an audit (documentation only) of the associated journal write/delete ordering.
 
 ---

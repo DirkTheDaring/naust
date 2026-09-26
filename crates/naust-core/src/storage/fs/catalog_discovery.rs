@@ -1,4 +1,4 @@
-//! Contained filesystem repository-catalog discovery for `registry-rust`.
+//! Contained filesystem repository-catalog discovery for `naust`.
 //!
 //! # Architecture and Scope
 //!

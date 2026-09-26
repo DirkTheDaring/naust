@@ -21,9 +21,9 @@ The repository is preparing for the production promotion of descriptor-relative 
 ### 1.1 Context & Preceding Hardening Slices
 Caller-side error handling was previously hardened in two subsystems before storage cutover:
 1. **Lifecycle Hardening (Commit `96c0729bcd02c5f44fbfa13c5b0d4ea77bff6a86`):**
-   Hardened three call sites in [`src/manifest_lifecycle.rs`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs) (`DeleteManifest` recovery, `ProxyEvict` recovery, and active proxy eviction). Wildcard error suppression (`Err(_) => (Vec::new(), None)`) was replaced: `StorageError::NotFound` returns an empty page, while any other error propagates immediately via `ManifestLifecycleError::Storage(e)`, preventing destructive manifest deletion or membership unlinking.
+   Hardened three call sites in [`src/manifest_lifecycle.rs`](src/manifest_lifecycle.rs) (`DeleteManifest` recovery, `ProxyEvict` recovery, and active proxy eviction). Wildcard error suppression (`Err(_) => (Vec::new(), None)`) was replaced: `StorageError::NotFound` returns an empty page, while any other error propagates immediately via `ManifestLifecycleError::Storage(e)`, preventing destructive manifest deletion or membership unlinking.
 2. **Membership-Migration Hardening (Commit `5779f7f97f1109bcbb15bb6ad47e845bd4686bbf`):**
-   Hardened planning, application, and verification in [`src/membership_migration.rs`](file:///home/dietmar/devel/rust/registry-rust/src/membership_migration.rs). Wildcard error suppression (`unwrap_or_default()`) was replaced:
+   Hardened planning, application, and verification in [`src/membership_migration.rs`](src/membership_migration.rs). Wildcard error suppression (`unwrap_or_default()`) was replaced:
    - In planning (`plan_membership_migration`), `StorageError::NotFound` returns empty tags, and non-`NotFound` errors return `Err(e)` with zero checkpoint writes.
    - In application (`apply_membership_migration`), `StorageError::NotFound` returns empty tags; non-`NotFound` errors set `checkpoint.phase = MigrationPhase::Failed`, preserve continuation cursors, record bounded UTF-8 diagnostics, await checkpoint persistence (handling secondary save errors), and return `Err(e)`.
    - In verification (`verify_membership_migration`, `src/membership_migration.rs:243`), `StorageError::NotFound` returns empty tags; non-`NotFound` errors return `Err(e)`. When called from application after the Verifying checkpoint save, verification failure leaves that checkpoint in place. Direct verification does not itself create or transition a checkpoint.
@@ -32,13 +32,13 @@ Caller-side error handling was previously hardened in two subsystems before stor
 Production filesystem tag-listing routing currently remains legacy (`FsStorage::list_tags` and `FsStorage::list_tags_page`).
 Crucially, **neither the lifecycle nor migration hardening decisions established supervisor or background garbage collection policy**.
 
-Inspection of [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs) and supervisor-invoked maintenance loops reveals critical architectural boundaries:
+Inspection of [`src/supervisor.rs`](src/supervisor.rs) and supervisor-invoked maintenance loops reveals critical architectural boundaries:
 1. **Separation of Name-Only Listing from Paginated Listing:**
    Supervisor callers (`compute_protected_blobs` and `find_repo_blob_reference`) invoke name-only `storage.list_tags(&repo).await`, **not** paginated `list_tags_page`. Name-only listing inspects directory entries without opening tag payloads. A corrupted or unreadable tag payload does **not** cause name-only listing to fail. Subsequent tag resolution (`storage.resolve_tag`) and manifest reading occur on distinct branches with their own separate error handling.
 2. **`proxy_gc_once` Executes Zero Storage Mutations:**
-   In [`src/supervisor.rs:823-907`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L823-L907), `proxy_gc_once` scans candidate blob files in `fs_root`, filters out those present in `protected_blobs`, tallies a local `evicted_records` counter, and logs an informational message. It executes **zero storage mutations, zero file deletions, and zero CAS unlinks**. Physical CAS reclamation is managed exclusively by `BlobGcService`. However, in `compute_protected_blobs`, `if let Ok(tags) = storage.list_tags(&repo).await` silently swallows listing errors, and `if let Ok(digest) = storage.resolve_tag(&repo, &tag).await` separately swallows resolution errors, resulting in incomplete `protected_blobs` calculations.
+   In [`src/supervisor.rs:823-907`](src/supervisor.rs#L823-L907), `proxy_gc_once` scans candidate blob files in `fs_root`, filters out those present in `protected_blobs`, tallies a local `evicted_records` counter, and logs an informational message. It executes **zero storage mutations, zero file deletions, and zero CAS unlinks**. Physical CAS reclamation is managed exclusively by `BlobGcService`. However, in `compute_protected_blobs`, `if let Ok(tags) = storage.list_tags(&repo).await` silently swallows listing errors, and `if let Ok(digest) = storage.resolve_tag(&repo, &tag).await` separately swallows resolution errors, resulting in incomplete `protected_blobs` calculations.
 3. **Dual Membership Reference-Check Sites in GC Sweep:**
-   In [`src/gc_service.rs:590-680`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L590-L680) (`sweep_repository_memberships_with_guard`), `find_repo_blob_reference` is invoked at two distinct sites:
+   In [`src/gc_service.rs:590-680`](src/gc_service.rs#L590-L680) (`sweep_repository_memberships_with_guard`), `find_repo_blob_reference` is invoked at two distinct sites:
    - *Site 1 (Initial Reference Check, line 611):* Any error returned by `find_repo_blob_reference` propagates through `?`, **aborting the entire membership sweep immediately**. Mutations committed on earlier records ($1 \dots k-1$) remain in storage, but downstream CAS deletion (`blob_gc_delete`) is bypassed for this scheduled tick.
    - *Site 2 (Pre-Unlink Revalidation, line 654):* Handled via `Err(_) => true`. An error during revalidation treats the blob as still referenced, skips `ledger.unlink`, increments `stats.skipped`, and **continues sweeping subsequent records**.
 4. **Index Mutation Boundaries:**
@@ -48,7 +48,7 @@ Inspection of [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rus
 
 ## 2. Trace of Actual Production Callers
 
-Starting with [`src/supervisor.rs`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs), direct and indirect invocations of `list_tags` and `list_tags_page` were traced across supervisor-spawned maintenance tasks, startup validation, and background services.
+Starting with [`src/supervisor.rs`](src/supervisor.rs), direct and indirect invocations of `list_tags` and `list_tags_page` were traced across supervisor-spawned maintenance tasks, startup validation, and background services.
 
 ```
 run_server_supervisor (src/supervisor.rs:309)
@@ -66,10 +66,10 @@ run_server_supervisor (src/supervisor.rs:309)
 ### 2.1 Path 1: `proxy_gc` (Direct Supervisor Worker)
 
 - **Source Locations:**
-  - Invocation Loop: [`src/supervisor.rs:527-621`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L527-L621) (`spawn_proxy_gc`)
-  - Once Execution: [`src/supervisor.rs:823-907`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L823-L907) (`proxy_gc_once`)
-  - Tag Listing Call Site: [`src/supervisor.rs:909-968`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L909-L968) (`compute_protected_blobs`, line 940)
-  - Helper Functions: [`pick_latest_semver_tag`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L1012-L1038) (lines 1012–1038), [`collect_protected_blobs_for_manifest`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L970-L1010) (lines 970–1010).
+  - Invocation Loop: [`src/supervisor.rs:527-621`](src/supervisor.rs#L527-L621) (`spawn_proxy_gc`)
+  - Once Execution: [`src/supervisor.rs:823-907`](src/supervisor.rs#L823-L907) (`proxy_gc_once`)
+  - Tag Listing Call Site: [`src/supervisor.rs:909-968`](src/supervisor.rs#L909-L968) (`compute_protected_blobs`, line 940)
+  - Helper Functions: [`pick_latest_semver_tag`](src/supervisor.rs#L1012-L1038) (lines 1012–1038), [`collect_protected_blobs_for_manifest`](src/supervisor.rs#L970-L1010) (lines 970–1010).
 - **Scheduling & Entry Point:**
   Spawned inside `run_server_supervisor` at line 367 via `spawn_proxy_gc(&supervisor, state.clone()).await;`.
   Requires `state.config.proxy.enabled == true`.
@@ -131,10 +131,10 @@ run_server_supervisor (src/supervisor.rs:309)
 ### 2.2 Path 2: `blob_gc_scheduler` (Scheduled Background Blob GC & Membership Sweep)
 
 - **Source Locations:**
-  - Scheduler Loop: [`src/supervisor.rs:1300-1370`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L1300-L1370) (`spawn_blob_gc_scheduler`)
-  - Once Execution: [`src/gc_service.rs:693-800`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L693-L800) (`scheduled_cleanup_once`)
-  - Membership Sweep: [`src/gc_service.rs:590-680`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L590-L680) (`sweep_repository_memberships_with_guard`)
-  - Reference Safety Check: [`src/blob_delete_safety.rs:127-158`](file:///home/dietmar/devel/rust/registry-rust/src/blob_delete_safety.rs#L127-L158) (`find_repo_blob_reference`)
+  - Scheduler Loop: [`src/supervisor.rs:1300-1370`](src/supervisor.rs#L1300-L1370) (`spawn_blob_gc_scheduler`)
+  - Once Execution: [`src/gc_service.rs:693-800`](src/gc_service.rs#L693-L800) (`scheduled_cleanup_once`)
+  - Membership Sweep: [`src/gc_service.rs:590-680`](src/gc_service.rs#L590-L680) (`sweep_repository_memberships_with_guard`)
+  - Reference Safety Check: [`src/blob_delete_safety.rs:127-158`](src/blob_delete_safety.rs#L127-L158) (`find_repo_blob_reference`)
 - **Scheduling & Locks:**
   Spawned at line 366 of `src/supervisor.rs`. Requires `config.blob_gc_schedule_enabled == true`.
   Guarded by `self.run_lock.try_lock()` (in-process concurrency control), `self.try_acquire_fs_gc_lock()` (`quarantine/gc.lock` on filesystem backend), and validates active `mutation_authority`.
@@ -142,7 +142,7 @@ run_server_supervisor (src/supervisor.rs:309)
   - `sweep_repository_memberships_with_guard` paginates memberships via `self.storage.list_all_repo_blob_memberships_page(continuation, 256)`.
   - For each `RepoBlobMembershipRecord` (`rec`), it queries `find_repo_blob_reference(self.storage.as_ref(), rec.repo.as_str(), &rec.digest)`.
 - **Internal Stages of `find_repo_blob_reference`:**
-  In [`src/blob_delete_safety.rs:132-158`](file:///home/dietmar/devel/rust/registry-rust/src/blob_delete_safety.rs#L132-L158):
+  In [`src/blob_delete_safety.rs:132-158`](src/blob_delete_safety.rs#L132-L158):
   1. *Tag Listing (Name-Only):*
      ```rust
      let tags = match storage.list_tags(repo).await {
@@ -168,7 +168,7 @@ run_server_supervisor (src/supervisor.rs:309)
      `scan_repo_for_blob` fetches and parses manifests for each root, propagating errors via `?`.
   Therefore, errors from `find_repo_blob_reference` can originate from listing, tag resolution, or manifest reading.
 - **The Two Distinct Reference-Check Sites in `sweep_repository_memberships_with_guard`:**
-  - **Site 1: Initial Reference Check ([`src/gc_service.rs:606-612`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L606-L612)):**
+  - **Site 1: Initial Reference Check ([`src/gc_service.rs:606-612`](src/gc_service.rs#L606-L612)):**
     ```rust
     let is_referenced = crate::blob_delete_safety::find_repo_blob_reference(
         self.storage.as_ref(),
@@ -182,7 +182,7 @@ run_server_supervisor (src/supervisor.rs:309)
     - Mutations performed on earlier records ($1 \dots k-1$) via `RepositoryMembershipLedger` remain in storage.
     - Subsequent records are not evaluated.
     - `scheduled_cleanup_once` halts before reaching Phase 2 (`blob_gc_delete`), so no blobs are deleted from CAS during this run.
-  - **Site 2: Pre-Unlink Revalidation ([`src/gc_service.rs:645-655`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L645-L655)):**
+  - **Site 2: Pre-Unlink Revalidation ([`src/gc_service.rs:645-655`](src/gc_service.rs#L645-L655)):**
     ```rust
     let still_referenced =
         match crate::blob_delete_safety::find_repo_blob_reference(
@@ -207,7 +207,7 @@ run_server_supervisor (src/supervisor.rs:309)
     - The candidate record is preserved.
     - The loop increments `stats.skipped` and **continues to subsequent records**.
 - **`RepositoryMembershipLedger` Delegation and Reverse-Index Updates:**
-  Authoritative membership state is persisted directly in `self.storage` (`RepositoryBlobMembershipStorage`), **not** in Sled. When the ledger runs in `LedgerIndexMode::Indexed`, the secondary reverse index (`BlobRefIndex`, Sled) is updated at three points in [`src/repository_membership_ledger.rs`](file:///home/dietmar/devel/rust/registry-rust/src/repository_membership_ledger.rs):
+  Authoritative membership state is persisted directly in `self.storage` (`RepositoryBlobMembershipStorage`), **not** in Sled. When the ledger runs in `LedgerIndexMode::Indexed`, the secondary reverse index (`BlobRefIndex`, Sled) is updated at three points in [`src/repository_membership_ledger.rs`](src/repository_membership_ledger.rs):
   - `link_with_guard` (lines 103–127): `mark_dirty`, storage `link_repo_blob`, then `record_membership`, `flush`, `mark_ready`.
   - `unlink_with_guard` (lines 136–163): `mark_dirty`, storage `unlink_repo_blob`, then `remove_membership` (only if the storage marker was removed), `flush`, `mark_ready`.
   - `reactivate_with_guard` (lines 200–215): storage `clear_membership_candidate`; when it reports a state change, `idx.record_membership(digest, repo)` is called with its result discarded (`let _ =`), without `mark_dirty`/`flush`/`mark_ready`.
@@ -218,11 +218,11 @@ run_server_supervisor (src/supervisor.rs:309)
 ### 2.3 Path 3: Ref-Index Rebuild & Sync (`BlobRefIndex`)
 
 - **Source Locations:**
-  - Startup Invocation: [`src/runtime.rs:411-430`](file:///home/dietmar/devel/rust/registry-rust/src/runtime.rs#L411-L430)
-  - Preflight Invocation: [`src/gc_service.rs:715`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L715) (`ensure_ref_index_ready`)
-  - Rebuild Loop: [`src/blob_ref_index.rs:708-746`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L708-L746) (`rebuild`)
-  - Sync Function: [`src/blob_ref_index.rs:493-531`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L493-L531) (`sync_repo_manifests_and_tags`)
-  - Paginated Call Site: [`src/blob_ref_index.rs:628-656`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L628-L656) (`discover_repo_manifests_and_tags`, line 634)
+  - Startup Invocation: [`src/runtime.rs:411-430`](src/runtime.rs#L411-L430)
+  - Preflight Invocation: [`src/gc_service.rs:715`](src/gc_service.rs#L715) (`ensure_ref_index_ready`)
+  - Rebuild Loop: [`src/blob_ref_index.rs:708-746`](src/blob_ref_index.rs#L708-L746) (`rebuild`)
+  - Sync Function: [`src/blob_ref_index.rs:493-531`](src/blob_ref_index.rs#L493-L531) (`sync_repo_manifests_and_tags`)
+  - Paginated Call Site: [`src/blob_ref_index.rs:628-656`](src/blob_ref_index.rs#L628-L656) (`discover_repo_manifests_and_tags`, line 634)
 - **Staging vs Global Rebuild Boundaries:**
   - In `sync_repo_manifests_and_tags`: Discovery errors prevent application-phase index writes within that sync call. The subsequent application phase is not established as transactional or atomic. Zero index writes occur if discovery fails.
   - However, `rebuild` is **not globally mutation-free**:
@@ -237,7 +237,7 @@ run_server_supervisor (src/supervisor.rs:309)
 
 ### 2.4 Path 4: Tag-Rooted GC Refresh (`refresh_tag_rooted_conservative`)
 
-- **Source Locations:** [`src/gc_service.rs:172-198`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs#L172-L198) -> [`src/blob_ref_index.rs:758-800`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L758-L800).
+- **Source Locations:** [`src/gc_service.rs:172-198`](src/gc_service.rs#L172-L198) -> [`src/blob_ref_index.rs:758-800`](src/blob_ref_index.rs#L758-L800).
 - **Listing Type:** Unpaginated `storage.list_tags(&repo).await` (line 768).
 - **Execution Dynamic:**
   Iterates over repositories and tags.

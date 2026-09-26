@@ -3,14 +3,14 @@ use sha2::Digest as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use registry_rust::application::{
+use naust::application::{
     BlobMutationError, BlobMutationService, ManifestMutationError, ManifestMutationService,
 };
-use registry_rust::consistency::ConsistencyCoordinator;
-use registry_rust::manifest_lifecycle::{ProxyPublicationEvidence, PublishManifestRequest};
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::upload_coordinator::BlobUploadCoordinatorConfig;
+use naust::consistency::ConsistencyCoordinator;
+use naust::manifest_lifecycle::{ProxyPublicationEvidence, PublishManifestRequest};
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::upload_coordinator::BlobUploadCoordinatorConfig;
 
 fn sha256_digest(bytes: &[u8]) -> Digest {
     let mut hasher = sha2::Sha256::new();
@@ -75,7 +75,7 @@ async fn test_blob_mutation_service_chunked_upload_lifecycle() {
 
     // 3. Append chunk 1: "hello "
     let chunk1 = Bytes::from_static(b"hello ");
-    let stream1: registry_rust::storage::upload_session::UploadByteStream =
+    let stream1: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(chunk1) }));
     let append1 = blob_service
         .append_chunk(
@@ -92,7 +92,7 @@ async fn test_blob_mutation_service_chunked_upload_lifecycle() {
 
     // 4. Append chunk 2: "world"
     let chunk2 = Bytes::from_static(b"world");
-    let stream2: registry_rust::storage::upload_session::UploadByteStream =
+    let stream2: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(chunk2) }));
     let append2 = blob_service
         .append_chunk(
@@ -152,7 +152,7 @@ async fn test_blob_mutation_service_monolithic_upload() {
     let data = Bytes::from_static(b"monolithic content payload");
     let digest = sha256_digest(&data);
 
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(data) }));
 
     let res = blob_service
@@ -161,7 +161,7 @@ async fn test_blob_mutation_service_monolithic_upload() {
         .unwrap();
 
     match res {
-        registry_rust::upload_coordinator::MonolithicUploadResult::Created(fin) => {
+        naust::upload_coordinator::MonolithicUploadResult::Created(fin) => {
             assert_eq!(fin.digest, digest);
             assert_eq!(fin.size, 26);
         }
@@ -179,7 +179,7 @@ async fn test_blob_mutation_service_cross_mount() {
     let data = Bytes::from_static(b"cross mountable blob");
     let digest = sha256_digest(&data);
 
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(data) }));
     blob_service
         .monolithic_upload(src_repo, &digest, Some(stream))
@@ -193,7 +193,7 @@ async fn test_blob_mutation_service_cross_mount() {
         .unwrap();
 
     match mount_res {
-        registry_rust::upload_coordinator::CrossMountResult::Mounted(fin) => {
+        naust::upload_coordinator::CrossMountResult::Mounted(fin) => {
             assert_eq!(fin.digest, digest);
         }
         _ => panic!("expected Mounted result"),
@@ -207,7 +207,7 @@ async fn test_blob_mutation_service_delete_repo_blob() {
     let data = Bytes::from_static(b"delete me please");
     let digest = sha256_digest(&data);
 
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(data) }));
     blob_service
         .monolithic_upload(repo, &digest, Some(stream))
@@ -218,14 +218,14 @@ async fn test_blob_mutation_service_delete_repo_blob() {
     let del_res = blob_service.delete_repo_blob(repo, &digest).await.unwrap();
     assert_eq!(
         del_res,
-        registry_rust::blob_delete_safety::BlobDeleteResult::Success
+        naust::blob_delete_safety::BlobDeleteResult::Success
     );
 
     // Subsequent delete returns NotFound
     let del_res2 = blob_service.delete_repo_blob(repo, &digest).await.unwrap();
     assert_eq!(
         del_res2,
-        registry_rust::blob_delete_safety::BlobDeleteResult::NotFound
+        naust::blob_delete_safety::BlobDeleteResult::NotFound
     );
 }
 
@@ -237,7 +237,7 @@ async fn test_manifest_mutation_service_lifecycle() {
     // 1. Upload config blob
     let config_bytes = Bytes::from_static(b"{}");
     let config_digest = sha256_digest(&config_bytes);
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(config_bytes) }));
     blob_service
         .monolithic_upload(repo, &config_digest, Some(stream))
@@ -247,7 +247,7 @@ async fn test_manifest_mutation_service_lifecycle() {
     // 2. Upload layer blob
     let layer_bytes = Bytes::from_static(b"layer-payload-content");
     let layer_digest = sha256_digest(&layer_bytes);
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move { Ok(layer_bytes) }));
     blob_service
         .monolithic_upload(repo, &layer_digest, Some(stream))
@@ -367,15 +367,15 @@ async fn test_blob_mutation_error_invalid_repo_name_preserves_typed_source() {
             assert_eq!(name, "invalid//repo");
             assert_eq!(
                 *source,
-                registry_rust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
+                naust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
             );
             let src = err.source().expect("source error must exist");
             let downcasted = src
-                .downcast_ref::<registry_rust::registry::canonical_name::RepoNameError>()
+                .downcast_ref::<naust::registry::canonical_name::RepoNameError>()
                 .expect("source error must downcast to RepoNameError");
             assert_eq!(
                 *downcasted,
-                registry_rust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
+                naust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
             );
         }
         _ => panic!("expected InvalidRepoName error with typed source"),
@@ -399,15 +399,15 @@ async fn test_manifest_mutation_error_typed_variants_and_sources() {
             assert_eq!(name, "bad//repo");
             assert_eq!(
                 *source,
-                registry_rust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
+                naust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
             );
             let src = err.source().expect("source error must exist");
             let downcasted = src
-                .downcast_ref::<registry_rust::registry::canonical_name::RepoNameError>()
+                .downcast_ref::<naust::registry::canonical_name::RepoNameError>()
                 .expect("source error must downcast to RepoNameError");
             assert_eq!(
                 *downcasted,
-                registry_rust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
+                naust::registry::canonical_name::RepoNameError::ConsecutiveSlashes
             );
         }
         _ => panic!("expected InvalidRepoName error with typed source"),
@@ -442,7 +442,7 @@ async fn test_manifest_mutation_error_typed_variants_and_sources() {
         .unwrap_err();
     match &err_bad_json {
         ManifestMutationError::InvalidManifest(parse_err) => match parse_err {
-            registry_rust::manifest_refs::ManifestParseError::InvalidJson(json_err) => {
+            naust::manifest_refs::ManifestParseError::InvalidJson(json_err) => {
                 let src = parse_err.source().expect("parse error must have source");
                 let downcasted = src
                     .downcast_ref::<serde_json::Error>()
@@ -470,19 +470,18 @@ async fn test_manifest_mutation_error_typed_variants_and_sources() {
         ManifestMutationError::Unverified(reason) => {
             assert_eq!(
                 reason,
-                registry_rust::manifest_lifecycle::UnverifiedReason::SignatureVerificationFailed
+                naust::manifest_lifecycle::UnverifiedReason::SignatureVerificationFailed
             );
         }
         _ => panic!("expected Unverified variant"),
     }
 
     // 6. Direct Lifecycle error conversion preservation
-    let lifecycle_err =
-        registry_rust::manifest_lifecycle::ManifestLifecycleError::CoordinationLeaseHeld;
+    let lifecycle_err = naust::manifest_lifecycle::ManifestLifecycleError::CoordinationLeaseHeld;
     let converted: ManifestMutationError = lifecycle_err.into();
     match converted {
         ManifestMutationError::Lifecycle(
-            registry_rust::manifest_lifecycle::ManifestLifecycleError::CoordinationLeaseHeld,
+            naust::manifest_lifecycle::ManifestLifecycleError::CoordinationLeaseHeld,
         ) => {}
         _ => panic!("expected Lifecycle(CoordinationLeaseHeld)"),
     }

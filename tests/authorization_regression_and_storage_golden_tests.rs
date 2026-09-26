@@ -10,14 +10,14 @@
 
 use std::path::Path;
 
-use registry_rust::config::{Config, ConfigError};
-use registry_rust::proxy::{ProxyAllowedPrefix, ProxyHostPattern, ProxyRepoPattern};
-use registry_rust::rbac::{Grant, RbacRepoPattern};
-use registry_rust::registry::access_pattern::RepositoryAccessPattern;
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::repo_membership::RepoKeyDecodeError;
-use registry_rust::test_support::{
+use naust::config::{Config, ConfigError};
+use naust::proxy::{ProxyAllowedPrefix, ProxyHostPattern, ProxyRepoPattern};
+use naust::rbac::{Grant, RbacRepoPattern};
+use naust::registry::access_pattern::RepositoryAccessPattern;
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::storage::repo_membership::RepoKeyDecodeError;
+use naust::test_support::{
     canonical_all_memberships_prefix, canonical_repo_membership_prefix,
     canonical_repo_membership_relpath, decode_canonical_repo_key, encode_canonical_repo_key,
     fs_repo_dir, push_repository_allowed, s3_repo_prefix,

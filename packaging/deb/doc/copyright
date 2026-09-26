@@ -1,9 +1,9 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: registry-rust
+Upstream-Name: naust
 Source: (not published)
 
 Files: *
-Copyright: 2026 registry-rust authors
+Copyright: 2026 naust authors
 License: Proprietary
  This software is proprietary. Redistribution and modification are not
  permitted without explicit permission from the copyright holders.

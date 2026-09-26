@@ -1,10 +1,10 @@
-# Example configuration file for registry-rust
+# Example configuration file for naust
 # Usage:
-#   ./registry-rust server --config /etc/registry/registry.toml
-#   # (equivalently: CONFIG_PATH=/etc/registry/registry.toml ./registry-rust server)
+#   ./naust server --config /etc/registry/registry.toml
+#   # (equivalently: CONFIG_PATH=/etc/registry/registry.toml ./naust server)
 #
 # Layered configs (repeatable --config; later files override earlier ones; lists replaced wholesale):
-#   ./registry-rust server \
+#   ./naust server \
 #     --config /etc/registry/registry.core.toml \
 #     --config /etc/registry/registry.auth.toml
 # Precedence:
@@ -111,7 +111,7 @@ allow_repos = ["*"]
 # ]
 
 [token]
-service = "registry-rust"
+service = "naust"
 # Token TTL in seconds.
 ttl_secs = 600
 # Set a stable secret in production.

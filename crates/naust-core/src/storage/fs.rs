@@ -933,7 +933,7 @@ impl FsStorage {
             let mib = observed_len as f64 / (1024.0 * 1024.0);
             let mib_s = mib / elapsed.as_secs_f64().max(0.000_001);
             tracing::debug!(
-                target: "registry_core::storage::fs",
+                target: "naust_core::storage::fs",
                 event = "upload_hash_resume_rebuild",
                 uuid,
                 size_bytes = observed_len,
@@ -1517,7 +1517,7 @@ impl Storage for FsStorage {
             let secs = elapsed.as_secs_f64().max(0.000_001);
             let mib_s = mib / secs;
             tracing::debug!(
-                target: "registry_core::storage::fs",
+                target: "naust_core::storage::fs",
                 event = "upload_append",
                 uuid,
                 chunk_bytes = chunk.len(),
@@ -1668,7 +1668,7 @@ impl Storage for FsStorage {
         let hash_mib_s = (hash_ms_u64 >= 1).then(|| size_mib / (hash_ms_u64 as f64 / 1000.0));
         let total_mib_s = (total_ms_u64 >= 1).then(|| size_mib / (total_ms_u64 as f64 / 1000.0));
         tracing::info!(
-            target: "registry_core::storage::fs",
+            target: "naust_core::storage::fs",
             event = "upload_finalize",
             uuid,
             digest = %digest.as_str(),

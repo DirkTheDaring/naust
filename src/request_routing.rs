@@ -158,7 +158,7 @@ mod tests {
             block_private_networks: true,
             redirect_policy: RedirectPolicy::AnyPublic,
             max_concurrent_upstream: 1,
-            index_path: PathBuf::from("/tmp/registry-rust-test-proxy-index"),
+            index_path: PathBuf::from("/tmp/naust-test-proxy-index"),
             cache_fs_root: None,
             cache_s3_prefix: None,
             gc_interval_secs: 3600,

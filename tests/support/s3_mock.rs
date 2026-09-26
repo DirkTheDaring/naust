@@ -2,11 +2,11 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use registry_rust::storage::s3::{
+use naust::storage::s3::{
     S3BucketVersioningState, S3Driver, S3MultipartListResult, S3MultipartUploadSummary,
     S3ObjectSummary, S3ObjectsPage, S3Storage,
 };
-use registry_rust::storage::{ConditionalDeleteResult, StorageError};
+use naust::storage::{ConditionalDeleteResult, StorageError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -631,7 +631,7 @@ impl MockDriverTagClient {
         {
             let msg = err.message().unwrap_or("injected fault").to_string();
             return Err(match err.internal_kind() {
-                Some(registry_rust::storage::StorageErrorKind::PermissionDenied) => {
+                Some(naust::storage::StorageErrorKind::PermissionDenied) => {
                     storage_s3::S3ApiError::new(Some(403), Some("AccessDenied"), msg)
                 }
                 _ => storage_s3::S3ApiError::new(Some(500), Some("InternalError"), msg),

@@ -1,6 +1,6 @@
 # Multi-upstream pull-through cache example (single process)
 #
-# This runs ONE registry-rust instance that proxies multiple upstream registries.
+# This runs ONE naust instance that proxies multiple upstream registries.
 # Requests are routed by Host header to select the upstream and its isolated cache.
 #
 # Example routing (reverse proxy / DNS):
@@ -35,7 +35,7 @@ password = "demo"
 allow_repos = ["myrepo"]
 
 [token]
-service = "registry-rust"
+service = "naust"
 signing_key = "change-me"
 ttl_secs = 600
 

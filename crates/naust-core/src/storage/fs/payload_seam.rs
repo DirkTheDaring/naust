@@ -1,12 +1,12 @@
 //! Registry payload integration seam for evaluating `storage-fs` and `storage-core`
-//! payload streaming against `registry-rust` CAS semantics and quarantine orchestration.
+//! payload streaming against `naust` CAS semantics and quarantine orchestration.
 //!
 //! # Architectural Ownership Boundaries
 //! - `storage-core`: Defines domain-neutral contracts ([`storage_core::ObjectPayloadReader`],
 //!   [`storage_core::ObjectPayload`], [`storage_core::ObjectStream`], [`storage_core::ReadError`]).
 //! - `storage-fs`: Implements Linux descriptor-relative containment (`openat2` + `O_PATH`),
 //!   type validation (`S_IFREG`), and Phase 2 readable reopening via `/proc/self/fd/N`.
-//! - `registry-rust`: Owns CAS digest layout rules (`blobs/` vs `quarantine/blobs/`),
+//! - `naust`: Owns CAS digest layout rules (`blobs/` vs `quarantine/blobs/`),
 //!   quarantine fallback orchestration, and legacy [`StorageError`] translation.
 //!
 //! # Explicit Procfs Trust Assumption
@@ -18,7 +18,7 @@
 //! # Error Taxonomy Mapping
 //! In `storage-core`, any failure other than [`storage_core::ReadError::NotFound`] or
 //! [`storage_core::ReadError::PermissionDenied`] is classified generically as [`storage_core::ReadError::Backend`].
-//! In `registry-rust`:
+//! In `naust`:
 //! - Local operating system syscall and descriptor failures ([`storage_fs::FsMetadataError::StatFailed`],
 //!   [`storage_fs::FsMetadataError::ProcfsReopenFailed`], [`storage_fs::FsMetadataError::IdentityMismatch`],
 //!   [`storage_fs::FsMetadataError::ResolutionRejected`], [`storage_fs::FsMetadataError::UnsupportedObjectType`],

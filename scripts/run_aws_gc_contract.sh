@@ -8,7 +8,7 @@ fi
 
 EXPECTED_ACCOUNT="$EXPECTED_AWS_ACCOUNT_ID"
 EXPECTED_REGION="${AWS_REGION:-us-east-1}"
-SAFE_PREFIX="registry-rust-gc-contract-"
+SAFE_PREFIX="naust-gc-contract-"
 
 echo "=== 1. Verifying AWS STS Caller Identity ==="
 CALLER_JSON="$(aws sts get-caller-identity --output json)"

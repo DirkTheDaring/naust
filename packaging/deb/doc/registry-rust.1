@@ -1,32 +1,32 @@
-.TH REGISTRY-RUST 1 "January 2026" "registry-rust" "User Commands"
+.TH REGISTRY-RUST 1 "January 2026" "naust" "User Commands"
 .SH NAME
-registry-rust \- OCI/Docker registry server
+naust \- OCI/Docker registry server
 .SH SYNOPSIS
-.B registry-rust
+.B naust
 .RI [OPTIONS] " server"
 .br
-.B registry-rust
+.B naust
 .RI [OPTIONS] " check-config"
 .br
-.B registry-rust
+.B naust
 .RI [OPTIONS] " ref-index " "check|ensure|rebuild"
 .br
-.B registry-rust
+.B naust
 .RI [OPTIONS] " blob-gc " "plan|quarantine|delete" " [--policy ...]"
 .SH DESCRIPTION
-.B registry-rust
+.B naust
 is a lightweight OCI/Docker registry implementation in Rust.
 .PP
 For the full CLI and configuration options, run:
 .PP
-.B registry-rust --help
+.B naust --help
 .PP
 Maintenance commands:
 .TP
-.B registry-rust ref-index check|ensure|rebuild
+.B naust ref-index check|ensure|rebuild
 Inspect/rebuild the persistent blob reference index.
 .TP
-.B registry-rust blob-gc plan|quarantine|delete
+.B naust blob-gc plan|quarantine|delete
 Reclaim disk space by quarantining/deleting unreferenced blobs (filesystem backend only).
 
 .PP
@@ -34,13 +34,13 @@ Note: for safety, these maintenance commands refuse to run while a live
 registry server is active on the same filesystem root.
 .SH FILES
 .TP
-.I /etc/registry-rust/registry.core.toml
+.I /etc/naust/registry.core.toml
 Core configuration.
 .TP
-.I /etc/registry-rust/registry.auth.toml
+.I /etc/naust/registry.auth.toml
 Authentication/authorization configuration.
 .TP
-.I /etc/default/registry-rust
+.I /etc/default/naust
 Environment overrides for the systemd service.
 .SH SEE ALSO
 systemd(1)

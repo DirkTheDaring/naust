@@ -4,8 +4,8 @@
 
 - **Document:** `docs/architecture/filesystem-read-containment-post-catalog-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the catalog rows of `filesystem-read-containment-post-referrers-assessment.md`)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `906ef891baab47780856132df6e25492f3cd3499` (`master`), with the contained catalog-discovery cutover applied in the working tree (uncommitted).
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `906ef891baab47780856132df6e25492f3cd3499` (`master`), with the contained catalog-discovery cutover applied in the working tree (uncommitted).
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
 - **Cutover Record:** `docs/architecture/filesystem-catalog-discovery-production-cutover.md`
 
 This delta updates the inventory carried by the post-tag-listing assessment (R-1…R-18) and the

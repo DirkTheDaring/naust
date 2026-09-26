@@ -1,10 +1,10 @@
-# /etc/sysconfig/registry-rust
+# /etc/sysconfig/naust
 #
 # This file is sourced by the systemd unit as an EnvironmentFile.
 # Use it to set environment variables and optional extra CLI args.
 #
 # Example: add an optional local override config file (not shipped by the RPM):
-# REGISTRY_RUST_ARGS="--config /etc/registry-rust/registry.local.toml"
+# REGISTRY_RUST_ARGS="--config /etc/naust/registry.local.toml"
 #
 # Example: enable verbose logging:
 # RUST_LOG=debug

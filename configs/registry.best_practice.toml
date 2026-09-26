@@ -36,7 +36,7 @@ password = "demo"
 # allow_repos = ["org/*"]
 
 [token]
-service = "registry-rust"
+service = "naust"
 # MUST be set to a long random secret for real deployments.
 signing_key = "REPLACE_ME_WITH_LONG_RANDOM_SECRET"
 ttl_secs = 600

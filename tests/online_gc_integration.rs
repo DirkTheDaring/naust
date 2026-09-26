@@ -71,10 +71,10 @@ fn write_repo_blob_membership(fs_root: &Path, repo: &str, digest: &str) {
 fn bin_path() -> String {
     // Prefer Cargo-provided env var when available, otherwise derive the path from the
     // integration test executable location (target/<profile>/deps/...).
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry-rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry_rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
 
@@ -82,11 +82,7 @@ fn bin_path() -> String {
     let deps_dir = exe.parent().expect("exe parent");
     let profile_dir = deps_dir.parent().expect("deps parent");
 
-    let bin_name = if cfg!(windows) {
-        "registry-rust.exe"
-    } else {
-        "registry-rust"
-    };
+    let bin_name = if cfg!(windows) { "naust.exe" } else { "naust" };
 
     profile_dir.join(bin_name).to_string_lossy().to_string()
 }
@@ -147,7 +143,7 @@ allow_repos = ["*"]
 actions = ["pull", "push", "delete"]
 
 [token]
-service = "registry-rust"
+service = "naust"
 ttl_secs = 600
 [[token.signing_keys]]
 kid = "k1"
@@ -263,7 +259,7 @@ async fn get_token(base: &str, scope: &str) -> String {
 
     let resp = client
         .get(format!("{base}/token"))
-        .query(&[("service", "registry-rust"), ("scope", scope)])
+        .query(&[("service", "naust"), ("scope", scope)])
         .basic_auth("demo", Some("demo"))
         .send()
         .await

@@ -4,8 +4,8 @@
 
 - **Document:** `docs/architecture/filesystem-read-containment-post-referrers-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the referrers rows of `filesystem-read-containment-post-tag-listing-assessment.md`)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `2419d46e89d88151c18972210ba79826bf776b59` (`master`), with the contained referrers read cutover applied in the working tree (uncommitted).
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `2419d46e89d88151c18972210ba79826bf776b59` (`master`), with the contained referrers read cutover applied in the working tree (uncommitted).
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
 - **Cutover Record:** `docs/architecture/filesystem-referrers-read-production-cutover.md`
 
 This document updates the inventory of `filesystem-read-containment-post-tag-listing-assessment.md`

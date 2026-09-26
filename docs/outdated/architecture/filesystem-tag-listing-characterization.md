@@ -26,15 +26,15 @@
 ## 1. Executive Summary & Review Baseline
 
 This assessment characterizes the current production implementation and behavior of filesystem tag listing in `registry-rust`, specifically evaluating:
-1. [`FsStorage::list_tags`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L950-L984) (`TagReader::list_tags` port).
-2. [`FsStorage::list_tags_page`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1169-L1214) (`TagReader::list_tags_page` port).
-3. The internal traversal helper [`FsStorage::list_tag_files`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L646-L669).
-4. Interactions with the contained tag-read operations ([`FsStorage::resolve_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L939-L948) and [`FsStorage::get_tag_with_version`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1250-L1262)) cut over in commit `5a0b4246e4c24e8db56d84f047eadae5387e7330`.
+1. [`FsStorage::list_tags`](src/storage/fs.rs#L950-L984) (`TagReader::list_tags` port).
+2. [`FsStorage::list_tags_page`](src/storage/fs.rs#L1169-L1214) (`TagReader::list_tags_page` port).
+3. The internal traversal helper [`FsStorage::list_tag_files`](src/storage/fs.rs#L646-L669).
+4. Interactions with the contained tag-read operations ([`FsStorage::resolve_tag`](src/storage/fs.rs#L939-L948) and [`FsStorage::get_tag_with_version`](src/storage/fs.rs#L1250-L1262)) cut over in commit `5a0b4246e4c24e8db56d84f047eadae5387e7330`.
 
 ### 1.1 Core Invariants & Key Findings
 
 1. **Independent Implementations & Zero Delegation**:
-   Neither `list_tags` nor `list_tags_page` delegates to the other, nor does either delegate to `resolve_tag` or `get_tag_with_version`. They are independent implementations in [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs).
+   Neither `list_tags` nor `list_tags_page` delegates to the other, nor does either delegate to `resolve_tag` or `get_tag_with_version`. They are independent implementations in [`src/storage/fs.rs`](src/storage/fs.rs).
 2. **Complete Bypass of Contained Reader**:
    Both `list_tags` and `list_tags_page` bypass the shared `Arc<storage_fs::FsMetadataReader>` (`self.reader`) and its pinned `root_fd`. Both execute raw ambient pathname operations anchored to `self.root: PathBuf` (`tokio::fs::metadata`, `tokio::fs::read_dir`, and `tokio::fs::read_to_string`).
 3. **Contrasting Directory & Error Contracts**:
@@ -118,7 +118,7 @@ This assessment characterizes the current production implementation and behavior
 
 ## 3. Behavior Comparison: `list_tags` vs `list_tags_page`
 
-The table below contrasts the observable behaviors of `list_tags` and `list_tags_page` across diverse input and filesystem conditions, verified by characterization tests in [`src/storage/fs/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs#L7094-L8048).
+The table below contrasts the observable behaviors of `list_tags` and `list_tags_page` across diverse input and filesystem conditions, verified by characterization tests in [`src/storage/fs/tests.rs`](src/storage/fs/tests.rs#L7094-L8048).
 
 | Scenario | `FsStorage::list_tags` Behavior | `FsStorage::list_tags_page` Behavior | Supporting Test Name |
 | :--- | :--- | :--- | :--- |

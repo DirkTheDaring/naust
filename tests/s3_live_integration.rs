@@ -7,34 +7,32 @@ use tokio::sync::{Barrier, Mutex, oneshot};
 use url::Url;
 use uuid::Uuid;
 
-use registry_rust::blob_gc::{BlobGcPolicy, CasBlobTraverser};
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::config::Config;
-use registry_rust::consistency::ConsistencyCoordinator;
-use registry_rust::gc_service::{GcBudgets, GcService, GcServiceError};
-use registry_rust::manifest_lifecycle::{
+use naust::blob_gc::{BlobGcPolicy, CasBlobTraverser};
+use naust::blob_ref_index::BlobRefIndex;
+use naust::config::Config;
+use naust::consistency::ConsistencyCoordinator;
+use naust::gc_service::{GcBudgets, GcService, GcServiceError};
+use naust::manifest_lifecycle::{
     LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase, ManifestLifecycleService,
     PublishManifestRequest,
 };
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::mutation_authority::{
+use naust::registry::digest::Digest;
+use naust::storage::mutation_authority::{
     RuntimeMutationAuthority, admin_clear_abandoned_deployment_writer_lock,
     inspect_deployment_writer_lock,
 };
-use registry_rust::storage::repo_membership::{
-    RepoBlobMembershipRecord, RepositoryBlobMembershipStorage,
-};
-use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::upload_session::{
+use naust::storage::repo_membership::{RepoBlobMembershipRecord, RepositoryBlobMembershipStorage};
+use naust::storage::s3::S3Storage;
+use naust::storage::upload_session::{
     FinalizeOutcome, UploadAppendResult, UploadOffsetPrecondition, UploadSessionState,
     UploadSessionStorage,
 };
-use registry_rust::storage::{
+use naust::storage::{
     ConditionalDeleteResult, GcDeleteResult, GcStorage, ReferrerDescriptor, Storage, StorageError,
     TagMutation, TagMutationPolicy,
 };
-use registry_rust::supervisor::{SupervisorOptions, run_server_supervisor};
-use registry_rust::upload_coordinator::{
+use naust::supervisor::{SupervisorOptions, run_server_supervisor};
+use naust::upload_coordinator::{
     BlobUploadCoordinator, BlobUploadCoordinatorConfig, CrossMountResult,
 };
 
@@ -401,8 +399,7 @@ async fn write_test_blob(storage: &(impl Storage + ?Sized), repo: &str, content:
         .finalize_upload(&upload.uuid, &digest)
         .await
         .unwrap();
-    let canonical_repo =
-        registry_rust::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+    let canonical_repo = naust::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
     let rec =
         RepoBlobMembershipRecord::new_upload(canonical_repo, digest.clone(), Some(upload.uuid));
     storage.link_repo_blob(&rec).await.unwrap();
@@ -820,7 +817,7 @@ async fn test_live_s3_pagination_under_mutation() {
 // 6. UPLOAD-SESSION CONTRACT (STORAGE API + COORDINATOR STORAGE)
 // ================================================================================================
 
-fn make_upload_stream(bytes: Bytes) -> registry_rust::storage::upload_session::UploadByteStream {
+fn make_upload_stream(bytes: Bytes) -> naust::storage::upload_session::UploadByteStream {
     let stream = futures_util::stream::once(async move { Ok(bytes) });
     Box::pin(stream)
 }
@@ -1065,7 +1062,7 @@ async fn test_live_s3_membership_contract() {
     let blob_content = b"shared base layer content";
     let shared_digest = write_test_blob(&storage, repo1, blob_content).await;
     let rec2 = RepoBlobMembershipRecord::new_upload(
-        registry_rust::registry::canonical_name::CanonicalRepoName::parse(repo2).unwrap(),
+        naust::registry::canonical_name::CanonicalRepoName::parse(repo2).unwrap(),
         shared_digest.clone(),
         None,
     );
@@ -1250,7 +1247,7 @@ async fn test_live_s3_gc_scheduler_dispatches_cleanly() {
         .unwrap();
 
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1290,7 +1287,7 @@ async fn test_live_s3_gc_admin_plan_succeeds() {
         .unwrap();
 
     let service = GcService::new(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1341,7 +1338,7 @@ async fn test_live_s3_gc_admin_delete_removes_unreferenced_object() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1390,7 +1387,7 @@ async fn test_live_s3_gc_quarantine_returns_unsupported_strategy() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1441,7 +1438,7 @@ async fn test_live_s3_gc_repository_membership_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1522,7 +1519,7 @@ async fn test_live_s3_gc_manifest_reachability_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1584,7 +1581,7 @@ async fn test_live_s3_gc_upload_pin_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1635,7 +1632,7 @@ async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
         .unwrap();
 
     let canonical_repo =
-        registry_rust::registry::canonical_name::CanonicalRepoName::parse("journal-repo").unwrap();
+        naust::registry::canonical_name::CanonicalRepoName::parse("journal-repo").unwrap();
     let journal = LifecycleJournalRecord {
         op_id: "op-test-123".to_string(),
         repo: canonical_repo,
@@ -1664,7 +1661,7 @@ async fn test_live_s3_gc_active_lifecycle_journal_protects_blob() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1715,8 +1712,7 @@ async fn test_live_s3_gc_changed_etag_produces_precondition_failed_and_preserves
     let current_version = cand.version.clone();
 
     // Conditional delete with stale ETag version
-    let stale_version =
-        registry_rust::storage::BlobObjectVersion("\"mismatched-etag-value\"".to_string());
+    let stale_version = naust::storage::BlobObjectVersion("\"mismatched-etag-value\"".to_string());
     let del_res = storage
         .delete_blob_conditional(&permit, &digest, Some(&stale_version))
         .await
@@ -1791,7 +1787,7 @@ async fn test_live_s3_gc_multi_page_enumeration_processed_exactly_once() {
         .await
         .unwrap();
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -1860,7 +1856,7 @@ async fn test_live_s3_gc_concurrent_lifecycle_mutation_serialized_only_for_bound
         .await
         .unwrap();
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator,
@@ -1971,9 +1967,10 @@ async fn test_r6_live_s3_streaming_open_blob_equivalence() {
     let s3 = harness.create_storage();
 
     let fs_dir = TempDir::new().unwrap();
-    let fs: Arc<registry_rust::storage::fs::FsStorage> = Arc::new(
-        registry_rust::storage::fs::FsStorage::new(fs_dir.path().to_path_buf(), 64 * 1024 * 1024),
-    );
+    let fs: Arc<naust::storage::fs::FsStorage> = Arc::new(naust::storage::fs::FsStorage::new(
+        fs_dir.path().to_path_buf(),
+        64 * 1024 * 1024,
+    ));
 
     // Empty object, single byte, small blob, 1 MiB, and a 5 MiB+7 blob that
     // crosses typical read-buffer chunking.
@@ -2326,7 +2323,7 @@ async fn test_r6_live_s3_cross_mount() {
 #[tokio::test]
 #[ignore = "R6 live AccessDenied: requires a scoped denied identity (R6_ACCESSDENIED_SCOPED_AK/SK) and mutates process-global AWS credentials; run alone with --ignored --test-threads=1"]
 async fn test_r6_live_s3_access_denied_not_masked_as_notfound() {
-    use registry_rust::storage::StorageErrorKind;
+    use naust::storage::StorageErrorKind;
 
     let (scoped_ak, scoped_sk) = match (
         std::env::var("R6_ACCESSDENIED_SCOPED_AK"),
@@ -2417,8 +2414,8 @@ async fn test_r6_live_s3_access_denied_not_masked_as_notfound() {
 /// bounded cache results once matching versions are applied.
 #[tokio::test]
 async fn test_live_s3_cache_eviction_port_conditional_and_bounding() {
-    use registry_rust::storage::GcDeleteResult;
-    use registry_rust::storage::ports::CacheEvictionPort;
+    use naust::storage::GcDeleteResult;
+    use naust::storage::ports::CacheEvictionPort;
     use sha2::Digest as ShaDigest;
 
     let harness = LiveS3Harness::new().await.unwrap();
@@ -2493,7 +2490,7 @@ async fn test_live_s3_cache_eviction_port_conditional_and_bounding() {
     );
 
     // Stale version is refused on live S3.
-    let stale = registry_rust::storage::BlobObjectVersion("\"deadbeef\"".to_string());
+    let stale = naust::storage::BlobObjectVersion("\"deadbeef\"".to_string());
     let refused = storage
         .evict_cache_blob(&items[0].digest, Some(&stale))
         .await

@@ -4,8 +4,8 @@
 
 - **Document:** `docs/architecture/filesystem-read-containment-post-membership-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the R-7–R-11 rows of `filesystem-read-containment-post-timestamps-assessment.md`; earlier assessments preserved unchanged as historical records)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `634da23b1f4f015fb38fa0dd9baea95236583a62` (`master`), with the membership read-containment batch applied in the working tree (uncommitted).
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `634da23b1f4f015fb38fa0dd9baea95236583a62` (`master`), with the membership read-containment batch applied in the working tree (uncommitted).
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
 - **Implementation Record:** `docs/architecture/filesystem-membership-read-containment.md`
 
 ## 1. Resolved / Changed Items

@@ -22,7 +22,7 @@ export TOKEN_SIGNING_KEY="${TOKEN_SIGNING_KEY:-smoke-signing-key-please-change}"
 echo "[config-smoke] Using CONFIG_PATH=$CONFIG_PATH"
 
 # Run a throwaway registry instance.
-BIN="${BIN:-$ROOT_DIR/target2/debug/registry-rust}"
+BIN="${BIN:-$ROOT_DIR/target2/debug/naust}"
 if [[ ! -x "$BIN" ]]; then
   echo "[config-smoke] building (debug) into target2 ..."
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target2 cargo build -q)

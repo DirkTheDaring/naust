@@ -1,13 +1,13 @@
 [Unit]
-Description=registry-rust OCI/Docker registry
+Description=naust OCI/Docker registry
 Documentation=https://docs.docker.com/registry/spec/api/
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/sysconfig/registry-rust
-ExecStart=/usr/bin/registry-rust --config /etc/registry-rust/registry.core.toml --config /etc/registry-rust/registry.auth.toml $REGISTRY_RUST_ARGS server
+EnvironmentFile=-/etc/sysconfig/naust
+ExecStart=/usr/bin/naust --config /etc/naust/registry.core.toml --config /etc/naust/registry.auth.toml $REGISTRY_RUST_ARGS server
 Restart=on-failure
 RestartSec=2s
 
@@ -20,9 +20,9 @@ User=registry
 Group=registry
 
 # Create and manage the writable state directory.
-StateDirectory=registry-rust
+StateDirectory=naust
 StateDirectoryMode=0750
-WorkingDirectory=/var/lib/registry-rust
+WorkingDirectory=/var/lib/naust
 
 # Basic hardening.
 NoNewPrivileges=yes
@@ -31,8 +31,8 @@ ProtectSystem=strict
 ProtectHome=yes
 
 # Allow reading config, writing state.
-ReadOnlyPaths=/etc/registry-rust
-ReadWritePaths=/var/lib/registry-rust
+ReadOnlyPaths=/etc/naust
+ReadWritePaths=/var/lib/naust
 
 [Install]
 WantedBy=multi-user.target

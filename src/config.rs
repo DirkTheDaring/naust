@@ -2341,7 +2341,7 @@ impl Config {
             .or_else(|| file_cfg.token.service.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "registry-rust".to_string());
+            .unwrap_or_else(|| "naust".to_string());
 
         let env_token_signing_key =
             env_str_opt(&["REGISTRY__TOKEN__SIGNING_KEY", "TOKEN_SIGNING_KEY"])

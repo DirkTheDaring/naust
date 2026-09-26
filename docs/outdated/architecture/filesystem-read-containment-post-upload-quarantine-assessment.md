@@ -4,8 +4,8 @@
 
 - **Document:** `docs/architecture/filesystem-read-containment-post-upload-quarantine-assessment.md`
 - **Status:** Historical gap delta (superseded as current inventory by `current-state.md`). Originally superseded the R-13–R-15 rows of `filesystem-read-containment-post-journal-assessment.md`.
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `0cd6a734475555ffe315ba6db8775031b248ee36` (`master`), with the quarantine/upload inspection point-read batch applied in the working tree (uncommitted).
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `0cd6a734475555ffe315ba6db8775031b248ee36` (`master`), with the quarantine/upload inspection point-read batch applied in the working tree (uncommitted).
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
 - **Implementation Record:** `docs/architecture/filesystem-quarantine-upload-inspection-containment.md`
 
 ## 1. Resolved / Changed Items

@@ -1,5 +1,7 @@
 # Plan: extract `registry-core` — a registry-primitives crate
 
+> **Naming note (2026-09-26, ADR-012):** after this plan closed, the product was renamed `registry-rust`→`naust` and `registry-core`→`naust-core`. Names and paths below are historical.
+
 - **Status:** **COMPLETE (2026-09-26)** — all phases executed; progress log at end of file
 - **Date:** 2026-09-26
 - **Analyzed code revision:** `master` @ `be40792`

@@ -17,10 +17,10 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 fn bin_path() -> String {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry-rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry_rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
 
@@ -28,11 +28,7 @@ fn bin_path() -> String {
     let deps_dir = exe.parent().expect("exe parent");
     let profile_dir = deps_dir.parent().expect("deps parent");
 
-    let bin_name = if cfg!(windows) {
-        "registry-rust.exe"
-    } else {
-        "registry-rust"
-    };
+    let bin_name = if cfg!(windows) { "naust.exe" } else { "naust" };
 
     profile_dir.join(bin_name).to_string_lossy().to_string()
 }
@@ -165,7 +161,7 @@ async fn test_upload_status_get_preserves_state_token_for_resumption() {
     // 1. Authenticate to get token
     let token_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/repo:pull,push,delete"
+            "{base_url}/token?service=naust&scope=repository:test/repo:pull,push,delete"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -282,7 +278,7 @@ async fn test_cross_mount_fallback_non_disclosure_matrix() {
     // Setup target token
     let token_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/target:pull,push"
+            "{base_url}/token?service=naust&scope=repository:test/target:pull,push"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -295,7 +291,7 @@ async fn test_cross_mount_fallback_non_disclosure_matrix() {
     // (First upload blob to real source repo using full admin token)
     let admin_token_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:secret/source:pull,push,delete"
+            "{base_url}/token?service=naust&scope=repository:secret/source:pull,push,delete"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -508,7 +504,7 @@ async fn test_least_privilege_challenges_and_action_separation() {
     // 4. Token endpoint never grants unrequested actions
     let token_pull_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/repo:pull"
+            "{base_url}/token?service=naust&scope=repository:test/repo:pull"
         ))
         .basic_auth("pushuser", Some("pushpass"))
         .send()
@@ -522,7 +518,7 @@ async fn test_least_privilege_challenges_and_action_separation() {
     // 5. Token endpoint never grants unpermitted actions (pushuser has only pull,push)
     let token_del_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/repo:delete"
+            "{base_url}/token?service=naust&scope=repository:test/repo:delete"
         ))
         .basic_auth("pushuser", Some("pushpass"))
         .send()
@@ -537,7 +533,7 @@ async fn test_least_privilege_challenges_and_action_separation() {
     // 6. Push-only token cannot delete
     let token_push_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/repo:pull,push"
+            "{base_url}/token?service=naust&scope=repository:test/repo:pull,push"
         ))
         .basic_auth("pushuser", Some("pushpass"))
         .send()
@@ -598,7 +594,7 @@ async fn test_delete_only_and_pull_only_identities() {
     // 1. Delete-only identity cannot upload / push
     let token_push_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/repo:push"
+            "{base_url}/token?service=naust&scope=repository:test/repo:push"
         ))
         .basic_auth("deluser", Some("delpass"))
         .send()
@@ -622,7 +618,7 @@ async fn test_delete_only_and_pull_only_identities() {
     // 2. Delete-only identity CAN obtain delete token and delete
     let token_del_res = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:test/repo:delete"
+            "{base_url}/token?service=naust&scope=repository:test/repo:delete"
         ))
         .basic_auth("deluser", Some("delpass"))
         .send()

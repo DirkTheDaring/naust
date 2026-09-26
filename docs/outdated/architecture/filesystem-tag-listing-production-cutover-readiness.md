@@ -360,7 +360,7 @@ if buffer.len() as u64 > limit {
    - Store configured `tag_listing_limits: TagListingLimits` in `FsStorage`.
    - Route `FsStorage::list_tags` and `FsStorage::list_tags_page` to the contained seam functions.
    - **MANDATORY RETENTION: `list_tag_files`**:
-     [`FsStorage::list_tag_files`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L646) must **NOT** be deleted or altered. It is actively called by [`FsStorage::delete_manifest`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1796) on the manifest deletion mutation path.
+     [`FsStorage::list_tag_files`](src/storage/fs.rs#L646) must **NOT** be deleted or altered. It is actively called by [`FsStorage::delete_manifest`](src/storage/fs.rs#L1796) on the manifest deletion mutation path.
 3. **`src/config.rs`**:
    - Add tag listing configuration fields, default constants, env parsing, and startup validation.
    - Update `Config::load_with_overrides`.

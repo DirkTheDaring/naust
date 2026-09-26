@@ -65,10 +65,10 @@ printf 'hello registry\n' >"$TMP_DIR/hello.txt"
 cat >"$TMP_DIR/Dockerfile" <<'EOF'
 FROM scratch
 ADD hello.txt /hello.txt
-LABEL org.opencontainers.image.title="registry-rust-podman-smoke"
+LABEL org.opencontainers.image.title="naust-podman-smoke"
 EOF
 
-LOCAL_IMG="registry-rust-smoke:local"
+LOCAL_IMG="naust-smoke:local"
 log "Building local test image ($LOCAL_IMG)"
 podman build -t "$LOCAL_IMG" "$TMP_DIR" >/dev/null
 
@@ -85,7 +85,7 @@ export TLS_CERT_PATH="$CERT_PATH"
 export TLS_KEY_PATH="$KEY_PATH"
 
 log "Starting registry on $ADDR (TLS enabled)"
-RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/registry-rust" server >/tmp/registry-rust-podman.log 2>&1 &
+RUST_LOG=warn "./$CARGO_TARGET_DIR/debug/naust" server >/tmp/naust-podman.log 2>&1 &
 PID=$!
 cleanup() {
   kill "$PID" >/dev/null 2>&1 || true

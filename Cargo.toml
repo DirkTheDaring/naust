@@ -1,10 +1,13 @@
 [workspace]
-members = ["crates/registry-core"]
+members = ["crates/naust-core"]
 
 [package]
-name = "registry-rust"
+name = "naust"
 version = "0.9.0"
 edition = "2024"
+description = "Naust — a self-hostable OCI/Docker container registry (Old Norse: the boathouse where vessels are stored)"
+license = "MIT"
+repository = "https://github.com/DirkTheDaring/naust"
 
 [dependencies]
 argon2 = "0.5"
@@ -46,14 +49,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 acmecert-core = { path = "../acmecert/crates/acmecert-core" }
-registry-core = { path = "crates/registry-core" }
+naust-core = { path = "crates/naust-core" }
 storage-core = { path = "../storage-layer-rust/crates/storage-core" }
 storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
 storage-s3 = { path = "../storage-layer-rust/crates/storage-s3" }
 x509-parser = "0.18.1"
 
 [dev-dependencies]
-registry-core = { path = "crates/registry-core", features = ["test-mocks"] }
+naust-core = { path = "crates/naust-core", features = ["test-mocks"] }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }

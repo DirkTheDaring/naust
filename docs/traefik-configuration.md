@@ -1,6 +1,6 @@
 > *Ops guide. Last reviewed 2026-09-19 (documentation reconciliation at `master` `2718bc16`); no architectural claims — content not re-validated against a live deployment.*
 
-# Traefik configuration for registry-rust
+# Traefik configuration for naust
 
 This document captures Traefik settings that are commonly required for reliable Docker/OCI pushes (especially large blobs) through Traefik.
 
@@ -26,7 +26,7 @@ There are two separate connections to consider:
    - If the entryPoint read timeout is too low, Traefik may close the connection while the client is still uploading the request body.
    - Result: client sees a reset; the registry sees request-body read failures.
 
-2. **Traefik → registry-rust** (backend)
+2. **Traefik → naust** (backend)
    - Controlled by **serversTransport** (can be configured per-service in dynamic config).
    - If backend forwarding timeouts are too low, Traefik may return 502/504 while waiting for response headers or keeping backend connections.
 

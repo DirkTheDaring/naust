@@ -15,7 +15,7 @@ use crate::config::{Config, StorageBackend};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "registry-rust",
+    name = "naust",
     about = "OCI/Docker Distribution Registry in Rust",
     version
 )]

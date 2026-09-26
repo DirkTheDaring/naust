@@ -1,4 +1,4 @@
-Package: registry-rust
+Package: naust
 Version: @VERSION@
 Section: net
 Priority: optional
@@ -12,5 +12,5 @@ Description: OCI Distribution Registry (Rust)
  It supports basic push/pull workflows and is suitable for local or
  on-prem deployments.
  .
- The same `registry-rust` binary also includes maintenance subcommands
+ The same `naust` binary also includes maintenance subcommands
  such as `ref-index` and `blob-gc`.

@@ -3,7 +3,7 @@
 //! # Architecture and Scope
 //!
 //! This module implements bounded breadth-first manifest-directory discovery for
-//! filesystem garbage collection reachability in `registry-rust`. Traversal executes
+//! filesystem garbage collection reachability in `naust`. Traversal executes
 //! beneath the pinned storage root descriptor via [`storage_fs::FsMetadataReader`].
 //!
 //! # Discovery Contract

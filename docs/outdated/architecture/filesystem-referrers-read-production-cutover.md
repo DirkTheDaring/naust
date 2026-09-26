@@ -6,8 +6,8 @@
 
 - **Document:** `docs/architecture/filesystem-referrers-read-production-cutover.md`
 - **Status:** Implementation & Compatibility Record (working tree, not committed)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `2419d46e89d88151c18972210ba79826bf776b59` (`master`), changes applied in the working tree only.
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `2419d46e89d88151c18972210ba79826bf776b59` (`master`), changes applied in the working tree only.
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged).
 - **Predecessor Records:**
   - Characterization: `docs/architecture/filesystem-referrers-read-characterization.md` (committed in `2419d46`).
   - Integration design: `docs/architecture/filesystem-referrers-read-contained-integration-design.md` (untracked; errata corrected alongside this cutover).

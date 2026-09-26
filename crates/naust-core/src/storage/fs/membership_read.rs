@@ -1,5 +1,5 @@
 //! Contained filesystem repository-blob membership, readiness, and migration
-//! checkpoint reads for `registry-rust` (gap items R-7–R-11).
+//! checkpoint reads for `naust` (gap items R-7–R-11).
 //!
 //! # Architecture and Scope
 //!

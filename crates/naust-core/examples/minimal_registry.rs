@@ -1,7 +1,7 @@
-//! A complete, working registry composed from `registry-core` alone — no HTTP,
+//! A complete, working registry composed from `naust-core` alone — no HTTP,
 //! no auth, no server configuration (the proof of ADR-010's purpose).
 //!
-//! Run with: `cargo run -p registry-core --example minimal_registry`
+//! Run with: `cargo run -p naust-core --example minimal_registry`
 //!
 //! The composition mirrors what any transport (HTTP server, gRPC front-end,
 //! embedded library) must do:
@@ -12,9 +12,9 @@
 //!   5. assemble the application services,
 //! then drive pushes/pulls exclusively through those services.
 
-use registry_core::prelude::*;
-use registry_core::storage::fs::FsStorage;
-use registry_core::storage::upload_session::{UploadByteStream, UploadStreamError};
+use naust_core::prelude::*;
+use naust_core::storage::fs::FsStorage;
+use naust_core::storage::upload_session::{UploadByteStream, UploadStreamError};
 use std::sync::Arc;
 
 fn byte_stream(data: &'static [u8]) -> UploadByteStream {

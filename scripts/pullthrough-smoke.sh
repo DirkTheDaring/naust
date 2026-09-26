@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Pull-through cache smoke test (offline).
 #
-# Starts two local registry-rust instances:
+# Starts two local naust instances:
 #  1) Upstream registry (no proxy) on UPSTREAM_ADDR
 #  2) Proxy registry (proxy enabled) on PROXY_ADDR pointing at the upstream
 #
@@ -23,7 +23,7 @@ USER="${REGISTRY_USERNAME:-demo}"
 PASS="${REGISTRY_PASSWORD:-demo}"
 
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target2}"
-BIN="./$CARGO_TARGET_DIR/debug/registry-rust"
+BIN="./$CARGO_TARGET_DIR/debug/naust"
 
 DATA_ROOT="${DATA_ROOT:-$PWD/data}"
 PRIMARY_ROOT="${PRIMARY_ROOT:-$DATA_ROOT/primary}"
@@ -131,7 +131,7 @@ EOF
 unset TLS_CERT_PATH TLS_KEY_PATH
 
 log "Starting upstream registry ($UPSTREAM_ADDR)"
-CONFIG_PATH="$TMP_UP" RUST_LOG=warn "$BIN" server >/tmp/registry-rust-upstream.log 2>&1 &
+CONFIG_PATH="$TMP_UP" RUST_LOG=warn "$BIN" server >/tmp/naust-upstream.log 2>&1 &
 PID_UP=$!
 sleep 0.5
 
@@ -165,7 +165,7 @@ _=$(curl -fsS -u "$USER:$PASS" -X PUT -H 'Content-Type: application/vnd.oci.imag
   "http://$UPSTREAM_ADDR/v2/$REPO/manifests/$TAG")
 
 log "Starting proxy registry ($PROXY_ADDR)"
-CONFIG_PATH="$TMP_PROXY" RUST_LOG=warn "$BIN" server >/tmp/registry-rust-proxy.log 2>&1 &
+CONFIG_PATH="$TMP_PROXY" RUST_LOG=warn "$BIN" server >/tmp/naust-proxy.log 2>&1 &
 PID_PROXY=$!
 sleep 0.6
 
@@ -182,15 +182,15 @@ if [[ "$http_code" != "200" ]]; then
   cat "$tmp_headers" || true
   head -c 1000 "$tmp_manifest" || true
   echo
-  tail -n 160 /tmp/registry-rust-proxy.log || true
-  tail -n 160 /tmp/registry-rust-upstream.log || true
+  tail -n 160 /tmp/naust-proxy.log || true
+  tail -n 160 /tmp/naust-upstream.log || true
   die "manifest fetch failed"
 fi
 if [[ ! -s "$tmp_manifest" ]]; then
   log "Empty manifest body; showing response and logs"
   cat "$tmp_headers" || true
-  tail -n 160 /tmp/registry-rust-proxy.log || true
-  tail -n 160 /tmp/registry-rust-upstream.log || true
+  tail -n 160 /tmp/naust-proxy.log || true
+  tail -n 160 /tmp/naust-upstream.log || true
   die "empty manifest body"
 fi
 if ! python3 - "$tmp_manifest" >/dev/null 2>&1 <<'PY'; then
@@ -202,8 +202,8 @@ PY
   cat "$tmp_headers" || true
   head -c 1000 "$tmp_manifest" || true
   echo
-  tail -n 160 /tmp/registry-rust-proxy.log || true
-  tail -n 160 /tmp/registry-rust-upstream.log || true
+  tail -n 160 /tmp/naust-proxy.log || true
+  tail -n 160 /tmp/naust-upstream.log || true
   die "invalid manifest JSON"
 fi
 

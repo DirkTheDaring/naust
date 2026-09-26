@@ -6,9 +6,9 @@
 
 - **Document:** `docs/architecture/filesystem-read-containment-post-tag-listing-assessment.md`
 - **Status:** Read-Only Architectural Gap Assessment & Next Slice Proposal (Corrected Record)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD [`f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe`](file:///home/dietmar/devel/rust/registry-rust) (`master`)
-- **Dependency Repository Baseline:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD [`0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`](file:///home/dietmar/devel/rust/storage-layer-rust) (`main`, strictly read-only)
-- **Latest Reviewed Cutover Package:** `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-2300/filesystem-tag-listing-production-cutover.tar.gz` (Size: 197,747 bytes; SHA-256: `521ece9d608ae555d4e53a5ff1fc640fa8ba40cbff75b2f3672cd949b5eef8af`)
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD [`f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe`](registry-rust) (`master`)
+- **Dependency Repository Baseline:** `~/devel/rust/storage-layer-rust` at HEAD [`0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`](storage-layer-rust) (`main`, strictly read-only)
+- **Latest Reviewed Cutover Package:** `~/devel/rust/manifest-read-review-evidence/session-20260912-2300/filesystem-tag-listing-production-cutover.tar.gz` (Size: 197,747 bytes; SHA-256: `521ece9d608ae555d4e53a5ff1fc640fa8ba40cbff75b2f3672cd949b5eef8af`)
 - **Recorded Cutover Verification:** 122 passing unit/integration tests and 3 ignored tests (unprivileged permissions tests).
 - **Canonical Quality Gates:** `O-03`, `O-04`, `O-05`, `O-06`, `O-13`, `O-15`, `O-16`, and `D-06` remain explicitly **OPEN**.
 
@@ -16,15 +16,15 @@
 
 ## 1. Executive Summary & Assessment Scope
 
-Following the local commit of bounded filesystem tag-listing production cutover in commit [`f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe`](file:///home/dietmar/devel/rust/registry-rust), both `FsStorage::list_tags` and `FsStorage::list_tags_page` operate through contained descriptor-relative enumeration beneath a pinned storage root descriptor via [`storage_fs::FsMetadataReader`](file:///home/dietmar/devel/rust/storage-layer-rust/crates/storage-fs/src/reader.rs).
+Following the local commit of bounded filesystem tag-listing production cutover in commit [`f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe`](registry-rust), both `FsStorage::list_tags` and `FsStorage::list_tags_page` operate through contained descriptor-relative enumeration beneath a pinned storage root descriptor via [`storage_fs::FsMetadataReader`](storage-layer-rust/crates/storage-fs/src/reader.rs).
 
 Promoting contained tag listing into production fulfills the tag-listing milestones characterized in commit `6d13cd9`, validated in seam commit `8dd1799`, and hardened across callers in lifecycle commit `96c0729`, migration commit `5779f7f`, and supervisor commit `02cfa07`.
 
-However, completing this cutover does **not** close canonical Quality Gate **O-05 (Broader filesystem read containment)**. Multiple production filesystem read paths in [`FsStorage`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs) remain uncontained, continuing to execute ambient path-based operations via `tokio::fs` or `std::fs`.
+However, completing this cutover does **not** close canonical Quality Gate **O-05 (Broader filesystem read containment)**. Multiple production filesystem read paths in [`FsStorage`](src/storage/fs.rs) remain uncontained, continuing to execute ambient path-based operations via `tokio::fs` or `std::fs`.
 
 This document provides a refreshed, comprehensive gap assessment against current production source:
 1. Reconciles prior assessments (`filesystem-read-containment-remaining-gaps.md`, baseline `2fc21aa`) with active source, removing obsolete labels and recording the exact operational contracts of committed cutovers.
-2. Delivers an exhaustive mechanical inventory of all remaining uncontained filesystem read paths in [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs) and surrounding modules, specifying symbols, line references, callers, operation types, root ownership, containment mechanisms, resource bounds, error handling, and mutation relationships.
+2. Delivers an exhaustive mechanical inventory of all remaining uncontained filesystem read paths in [`src/storage/fs.rs`](src/storage/fs.rs) and surrounding modules, specifying symbols, line references, callers, operation types, root ownership, containment mechanisms, resource bounds, error handling, and mutation relationships.
 3. Traces caller consequences precisely for remaining high-priority gaps. In particular, it separates direct-read reachability (`list_referrers`) from paged error suppression (`list_referrers_page`), tracing actual reference sites and establishing that `list_referrers_page` has no active production caller.
 4. Corrects validation terminology, distinguishing structural path validation from canonical repository grammar.
 5. Accurately classifies read-modify-write operations (such as `clear_membership_candidate`) as ambient reads embedded in mutation workflows rather than standalone observation reads.
@@ -40,7 +40,7 @@ The baselines and working tree states were inspected prior to analysis:
 
 | Property | Primary Repository (`registry-rust`) | Dependency Repository (`storage-layer-rust`) |
 | :--- | :--- | :--- |
-| **Path** | `/home/dietmar/devel/rust/registry-rust` | `/home/dietmar/devel/rust/storage-layer-rust` |
+| **Path** | `~/devel/rust/registry-rust` | `~/devel/rust/storage-layer-rust` |
 | **Branch** | `master` | `main` |
 | **HEAD Commit** | `f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe` | `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` |
 | **Latest Commit Message** | `fix(storage): use contained filesystem tag listing in production` | `chore: sync documentation and architecture records` |
@@ -53,7 +53,7 @@ The baselines and working tree states were inspected prior to analysis:
 ### 2.2 Latest Cutover Package Verification
 
 The reviewed cutover package for the preceding milestone was verified:
-- **Archive Path:** `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-2300/filesystem-tag-listing-production-cutover.tar.gz`
+- **Archive Path:** `~/devel/rust/manifest-read-review-evidence/session-20260912-2300/filesystem-tag-listing-production-cutover.tar.gz`
 - **Verified Size:** 197,747 bytes
 - **Verified SHA-256:** `521ece9d608ae555d4e53a5ff1fc640fa8ba40cbff75b2f3672cd949b5eef8af`
 - **Verification Records:** Contains 42 payload files plus `MANIFEST.sha256`. Recorded verification includes 122 passing tests and 3 ignored tests. None of these tests were re-executed during this read-only assessment.
@@ -61,7 +61,7 @@ The reviewed cutover package for the preceding milestone was verified:
 ### 2.3 Committed Tag-Listing Cutover Contract
 
 The cutover committed in `f1d6d9c` established the following production contracts:
-- **Active Production Routing:** Both `FsStorage::list_tags` ([`src/storage/fs.rs:1020-1028`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1020-L1028)) and `FsStorage::list_tags_page` ([`src/storage/fs.rs:1213-1230`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1213-L1230)) route through contained seam functions (`tag_listing::contained_list_tags_seam` and `tag_listing::contained_list_tags_page_seam`) using `self.reader: Arc<FsMetadataReader>`.
+- **Active Production Routing:** Both `FsStorage::list_tags` ([`src/storage/fs.rs:1020-1028`](src/storage/fs.rs#L1020-L1028)) and `FsStorage::list_tags_page` ([`src/storage/fs.rs:1213-1230`](src/storage/fs.rs#L1213-L1230)) route through contained seam functions (`tag_listing::contained_list_tags_seam` and `tag_listing::contained_list_tags_page_seam`) using `self.reader: Arc<FsMetadataReader>`.
 - **Approved Operational Limits:**
   - `tag_listing_max_entries`: 10,000 (minimum 1, maximum `usize::MAX`).
   - `tag_listing_max_name_bytes`: 1,500,000 (minimum 128, maximum `usize::MAX`).
@@ -69,8 +69,8 @@ The cutover committed in `f1d6d9c` established the following production contract
   - `tag_listing_repo_probe_max_name_bytes`: 4,096 (minimum 64, maximum `usize::MAX`).
   - `tag_listing_max_payload_bytes`: 1,024 (minimum 256, strictly `< u64::MAX`).
 - **Preserved Boundaries & Invariants:**
-  1. `resolve_tag` ([`src/storage/fs.rs:1010-1018`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1010-L1018)) and `get_tag_with_version` ([`src/storage/fs.rs:1263-1275`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1263-L1275)) retain their default `TagReadLimits` (`max_payload_bytes: None`), unconstrained by listing payload limits.
-  2. `list_tag_files` ([`src/storage/fs.rs:716-739`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L716-L739)) remains preserved byte-for-byte and retains its active use by `delete_manifest` ([`src/storage/fs.rs:1812`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1812)) for referencing tag removal.
+  1. `resolve_tag` ([`src/storage/fs.rs:1010-1018`](src/storage/fs.rs#L1010-L1018)) and `get_tag_with_version` ([`src/storage/fs.rs:1263-1275`](src/storage/fs.rs#L1263-L1275)) retain their default `TagReadLimits` (`max_payload_bytes: None`), unconstrained by listing payload limits.
+  2. `list_tag_files` ([`src/storage/fs.rs:716-739`](src/storage/fs.rs#L716-L739)) remains preserved byte-for-byte and retains its active use by `delete_manifest` ([`src/storage/fs.rs:1812`](src/storage/fs.rs#L1812)) for referencing tag removal.
   3. Caller error policies were not altered by listing promotion; caller hardening was committed prior to cutover in commits `96c0729`, `5779f7f`, and `02cfa07`.
   4. Nonzero pages process all retained candidates in the directory before sorting and slicing; successive pages repeat directory enumeration and candidate payload reads.
   5. No snapshot isolation or global concurrency/memory budget was established.
@@ -99,26 +99,26 @@ To eliminate obsolete "test-only" or "legacy production" labels, all operations 
 
 | Component / Path | Prior Label (`2fc21aa`) | Current State (`f1d6d9c`) | Architectural Category | Source Evidence |
 | :--- | :--- | :--- | :--- | :--- |
-| **CAS Blob Reads** (`head_blob`, `open_blob`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:997-1008`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L997-L1008) |
-| **CAS Blob Listing** (`list_cas_blobs_page`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:3467-3479`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3467-L3479) |
-| **Manifest Reads** (`head_manifest`, `get_manifest`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:1030-1044`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1030-L1044) |
-| **Manifest Listing** (`list_manifest_digests_page`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:1197-1211`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1197-L1211) |
-| **GC Manifest Ref Discovery** (`discover_manifest_references`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:3672-3682`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3672-L3682) |
-| **Tag Direct Reads** (`resolve_tag`, `get_tag_with_version`) | Uncontained Gap | Contained (Cutover in `5a0b424`) | **Active Production Behavior** | [`src/storage/fs.rs:1010-1018`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1010-L1018), [`1263-1275`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1263-L1275) |
-| **Tag Listing** (`list_tags`, `list_tags_page`) | Uncontained Gap | Contained (Cutover in `f1d6d9c`) | **Active Production Behavior** | [`src/storage/fs.rs:1020-1028`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1020-L1028), [`1213-1230`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1213-L1230) |
-| **Metadata / Payload Seams** (`contained_metadata`, `metadata_seam`, `payload_seam`) | Test-Only Seams | Test-Only Seams | **Helpers / Seams Still Test-Only** | [`src/storage/fs.rs:3689-3703`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3689-L3703) |
+| **CAS Blob Reads** (`head_blob`, `open_blob`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:997-1008`](src/storage/fs.rs#L997-L1008) |
+| **CAS Blob Listing** (`list_cas_blobs_page`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:3467-3479`](src/storage/fs.rs#L3467-L3479) |
+| **Manifest Reads** (`head_manifest`, `get_manifest`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:1030-1044`](src/storage/fs.rs#L1030-L1044) |
+| **Manifest Listing** (`list_manifest_digests_page`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:1197-1211`](src/storage/fs.rs#L1197-L1211) |
+| **GC Manifest Ref Discovery** (`discover_manifest_references`) | Contained | Contained | **Active Production Behavior** | [`src/storage/fs.rs:3672-3682`](src/storage/fs.rs#L3672-L3682) |
+| **Tag Direct Reads** (`resolve_tag`, `get_tag_with_version`) | Uncontained Gap | Contained (Cutover in `5a0b424`) | **Active Production Behavior** | [`src/storage/fs.rs:1010-1018`](src/storage/fs.rs#L1010-L1018), [`1263-1275`](src/storage/fs.rs#L1263-L1275) |
+| **Tag Listing** (`list_tags`, `list_tags_page`) | Uncontained Gap | Contained (Cutover in `f1d6d9c`) | **Active Production Behavior** | [`src/storage/fs.rs:1020-1028`](src/storage/fs.rs#L1020-L1028), [`1213-1230`](src/storage/fs.rs#L1213-L1230) |
+| **Metadata / Payload Seams** (`contained_metadata`, `metadata_seam`, `payload_seam`) | Test-Only Seams | Test-Only Seams | **Helpers / Seams Still Test-Only** | [`src/storage/fs.rs:3689-3703`](src/storage/fs.rs#L3689-L3703) |
 | **Contained Referrer Reads** | Unimplemented | Unimplemented | **Proposed Work Not Implemented** | Does not exist; uses ambient `tokio::fs::read` |
 | **Contained Catalog Discovery** | Unimplemented | Unimplemented | **Proposed Work Not Implemented** | Does not exist; uses ambient `tokio::fs::read_dir` |
 | **Contained Membership Reads** | Unimplemented | Unimplemented | **Proposed Work Not Implemented** | Does not exist; uses ambient `tokio::fs::read` |
-| **Supervisor `resolve_tag` Swallowing** | Deferred Risk | Deferred Risk | **Residual Risk Intentionally Deferred** | [`src/supervisor.rs:958`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L958) swallows non-fatal resolve errors |
-| **Ref-Index Rebuild Partial State** | Deferred Risk | Deferred Risk | **Residual Risk Intentionally Deferred** | [`src/blob_ref_index.rs:724`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L724) leaves `Building` state on abort |
-| **Nonzero Page Candidate Repetition** | Deferred Risk | Deferred Risk | **Residual Risk Intentionally Deferred** | [`src/storage/fs/tag_listing.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tag_listing.rs) re-scans all retained candidates |
+| **Supervisor `resolve_tag` Swallowing** | Deferred Risk | Deferred Risk | **Residual Risk Intentionally Deferred** | [`src/supervisor.rs:958`](src/supervisor.rs#L958) swallows non-fatal resolve errors |
+| **Ref-Index Rebuild Partial State** | Deferred Risk | Deferred Risk | **Residual Risk Intentionally Deferred** | [`src/blob_ref_index.rs:724`](src/blob_ref_index.rs#L724) leaves `Building` state on abort |
+| **Nonzero Page Candidate Repetition** | Deferred Risk | Deferred Risk | **Residual Risk Intentionally Deferred** | [`src/storage/fs/tag_listing.rs`](src/storage/fs/tag_listing.rs) re-scans all retained candidates |
 
 ---
 
 ## 4. Comprehensive Inventory of Remaining Filesystem Read Paths
 
-This section traces all remaining production-reachable filesystem read paths in [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs) and callers.
+This section traces all remaining production-reachable filesystem read paths in [`src/storage/fs.rs`](src/storage/fs.rs) and callers.
 
 ### 4.1 Master Inventory Table
 
@@ -126,24 +126,24 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 | Index | Area / Feature | Exact Source Symbol | Line Range | Operation Type | Root Ownership | Containment Status | Resource Limits | Mutation / Caller Impact |
 |---|---|---|---|---|---|---|---|---|
-| **R-1** | OCI Referrers Direct | `Storage::list_referrers` | [`fs.rs:1722-1735`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1722-L1735) | Payload read & JSON parse | Ambient pathname | **Uncontained** | None (unbounded `Vec<u8>`) | Production public route & mutation helper |
-| **R-2** | OCI Referrers Paged | `Storage::list_referrers_page` | [`fs.rs:1232-1261`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1232-L1261) | In-memory sort & page slice | Ambient pathname | **Uncontained** | None (`unwrap_or_default`) | **No active production caller** |
-| **R-3** | Catalog Discovery | `Storage::list_repositories` / `list_repo_names` | [`fs.rs:741-816`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L741-L816), [`948-950`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L948-L950) | Iterative dir walk + 4x stat | Ambient pathname | **Uncontained** | None (unbounded stack/RAM) | Observation input to GC/Safety |
-| **R-4** | Catalog Timestamps | `Storage::repo_timestamps` / `max_mtime_in_dir` | [`fs.rs:818-844`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L818-L844), [`952-972`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L952-L972) | Dir enumeration & mtime | Ambient pathname | **Uncontained** | None | Pure observation |
-| **R-5** | Storage Emptiness | `Storage::is_storage_empty` / `fs_dir_has_any_entry` | [`fs.rs:905-930`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L905-L930), [`974-995`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L974-L995) | Recursive dir entry probe | Ambient pathname | **Uncontained** | None | Startup & test readiness |
-| **R-6** | Manifest Delete Discovery | `FsStorage::list_tag_files` | [`fs.rs:716-739`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L716-L739), [`1812`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1812) | Dir enumeration & string read | Ambient pathname | **Uncontained** | None (reads all tag files) | **Embedded in Mutation** (`delete_manifest`) |
-| **R-7** | Repo-Blob Membership | `get_repo_blob_membership` | [`fs.rs:2873-2898`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2873-L2898) | JSON payload read | Ambient pathname | **Uncontained** | None | Observation & verification |
-| **R-8** | Repo-Blob Membership | `list_repo_blob_memberships_page` | [`fs.rs:2983-3109`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2983-L3109) | Dir walk & JSON reads | Ambient pathname | **Uncontained** | Max limit 1000 in heap | Observation input to sweep |
-| **R-9** | Repo-Blob Membership | `list_all_repo_blob_memberships_page` | [`fs.rs:3111-3263`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3111-L3263) | 3-level dir walk & JSON reads | Ambient pathname | **Uncontained** | Max limit 1000 in heap | Observation input to sweep |
-| **R-10** | Repo-Blob Membership | `count_repo_blob_memberships` | [`fs.rs:3265-3284`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3265-L3284) | Dir enumeration & metadata | Ambient pathname | **Uncontained** | None | Read-only count check |
-| **R-11** | Repo-Blob Membership | `is_membership_ready` / `get_migration_checkpoint` | [`fs.rs:3286-3297`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3286-L3297), [`3343-3361`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3343-L3361) | Metadata probe & JSON read | Ambient pathname | **Uncontained** | None | Readiness gating |
-| **R-12** | Lifecycle Recovery | `Storage::read_lifecycle_journal` | [`fs.rs:1343-1354`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1343-L1354) | JSON payload read | Ambient pathname | **Uncontained** | None | Mutation recovery check |
-| **R-13** | Quarantine Inspection | `quarantined_blob_version` / `compute_fs_blob_version` | [`fs.rs:3437-3463`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3437-L3463), [`3597-3612`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3597-L3612) | Stat & streaming payload hash | Ambient pathname | **Uncontained** | 64 KB buffer; unbounded file | Precondition for GC delete |
-| **R-14** | Quarantine Inspection | `read_quarantine_timestamp` | [`fs.rs:3402-3422`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3402-L3422) | Text payload read | Ambient pathname | **Uncontained** | None | GC age evaluation |
-| **R-15** | Upload Inspection | `get_finalized_receipt` / `reap_expired_sessions` | [`fs.rs:2783-2801`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2783-L2801), [`2803-2868`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2803-L2868) | Dir enumeration & JSON reads | Ambient pathname | **Uncontained** | None | Upload cleanup & recovery |
-| **R-16** | Membership Candidate Clear | `clear_membership_candidate` | [`fs.rs:2942-2970`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2942-L2970) | Read-modify-write | Ambient pathname | **Uncontained** | None | **Embedded in Mutation** (atomic write) |
-| **R-17** | Tag Mutation Reads | `mutate_tag` / `delete_tag_conditional` | [`fs.rs:1101`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1101), [`1310`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1310) | Sync file read under lock | Ambient pathname | **Uncontained** | None | **Embedded in Mutation** |
-| **R-18** | Manifest Delete Subject Read | `delete_manifest` (subject extract) | [`fs.rs:1788`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1788) | Async manifest payload read | Ambient pathname | **Uncontained** | None | **Embedded in Mutation** |
+| **R-1** | OCI Referrers Direct | `Storage::list_referrers` | [`fs.rs:1722-1735`](src/storage/fs.rs#L1722-L1735) | Payload read & JSON parse | Ambient pathname | **Uncontained** | None (unbounded `Vec<u8>`) | Production public route & mutation helper |
+| **R-2** | OCI Referrers Paged | `Storage::list_referrers_page` | [`fs.rs:1232-1261`](src/storage/fs.rs#L1232-L1261) | In-memory sort & page slice | Ambient pathname | **Uncontained** | None (`unwrap_or_default`) | **No active production caller** |
+| **R-3** | Catalog Discovery | `Storage::list_repositories` / `list_repo_names` | [`fs.rs:741-816`](src/storage/fs.rs#L741-L816), [`948-950`](src/storage/fs.rs#L948-L950) | Iterative dir walk + 4x stat | Ambient pathname | **Uncontained** | None (unbounded stack/RAM) | Observation input to GC/Safety |
+| **R-4** | Catalog Timestamps | `Storage::repo_timestamps` / `max_mtime_in_dir` | [`fs.rs:818-844`](src/storage/fs.rs#L818-L844), [`952-972`](src/storage/fs.rs#L952-L972) | Dir enumeration & mtime | Ambient pathname | **Uncontained** | None | Pure observation |
+| **R-5** | Storage Emptiness | `Storage::is_storage_empty` / `fs_dir_has_any_entry` | [`fs.rs:905-930`](src/storage/fs.rs#L905-L930), [`974-995`](src/storage/fs.rs#L974-L995) | Recursive dir entry probe | Ambient pathname | **Uncontained** | None | Startup & test readiness |
+| **R-6** | Manifest Delete Discovery | `FsStorage::list_tag_files` | [`fs.rs:716-739`](src/storage/fs.rs#L716-L739), [`1812`](src/storage/fs.rs#L1812) | Dir enumeration & string read | Ambient pathname | **Uncontained** | None (reads all tag files) | **Embedded in Mutation** (`delete_manifest`) |
+| **R-7** | Repo-Blob Membership | `get_repo_blob_membership` | [`fs.rs:2873-2898`](src/storage/fs.rs#L2873-L2898) | JSON payload read | Ambient pathname | **Uncontained** | None | Observation & verification |
+| **R-8** | Repo-Blob Membership | `list_repo_blob_memberships_page` | [`fs.rs:2983-3109`](src/storage/fs.rs#L2983-L3109) | Dir walk & JSON reads | Ambient pathname | **Uncontained** | Max limit 1000 in heap | Observation input to sweep |
+| **R-9** | Repo-Blob Membership | `list_all_repo_blob_memberships_page` | [`fs.rs:3111-3263`](src/storage/fs.rs#L3111-L3263) | 3-level dir walk & JSON reads | Ambient pathname | **Uncontained** | Max limit 1000 in heap | Observation input to sweep |
+| **R-10** | Repo-Blob Membership | `count_repo_blob_memberships` | [`fs.rs:3265-3284`](src/storage/fs.rs#L3265-L3284) | Dir enumeration & metadata | Ambient pathname | **Uncontained** | None | Read-only count check |
+| **R-11** | Repo-Blob Membership | `is_membership_ready` / `get_migration_checkpoint` | [`fs.rs:3286-3297`](src/storage/fs.rs#L3286-L3297), [`3343-3361`](src/storage/fs.rs#L3343-L3361) | Metadata probe & JSON read | Ambient pathname | **Uncontained** | None | Readiness gating |
+| **R-12** | Lifecycle Recovery | `Storage::read_lifecycle_journal` | [`fs.rs:1343-1354`](src/storage/fs.rs#L1343-L1354) | JSON payload read | Ambient pathname | **Uncontained** | None | Mutation recovery check |
+| **R-13** | Quarantine Inspection | `quarantined_blob_version` / `compute_fs_blob_version` | [`fs.rs:3437-3463`](src/storage/fs.rs#L3437-L3463), [`3597-3612`](src/storage/fs.rs#L3597-L3612) | Stat & streaming payload hash | Ambient pathname | **Uncontained** | 64 KB buffer; unbounded file | Precondition for GC delete |
+| **R-14** | Quarantine Inspection | `read_quarantine_timestamp` | [`fs.rs:3402-3422`](src/storage/fs.rs#L3402-L3422) | Text payload read | Ambient pathname | **Uncontained** | None | GC age evaluation |
+| **R-15** | Upload Inspection | `get_finalized_receipt` / `reap_expired_sessions` | [`fs.rs:2783-2801`](src/storage/fs.rs#L2783-L2801), [`2803-2868`](src/storage/fs.rs#L2803-L2868) | Dir enumeration & JSON reads | Ambient pathname | **Uncontained** | None | Upload cleanup & recovery |
+| **R-16** | Membership Candidate Clear | `clear_membership_candidate` | [`fs.rs:2942-2970`](src/storage/fs.rs#L2942-L2970) | Read-modify-write | Ambient pathname | **Uncontained** | None | **Embedded in Mutation** (atomic write) |
+| **R-17** | Tag Mutation Reads | `mutate_tag` / `delete_tag_conditional` | [`fs.rs:1101`](src/storage/fs.rs#L1101), [`1310`](src/storage/fs.rs#L1310) | Sync file read under lock | Ambient pathname | **Uncontained** | None | **Embedded in Mutation** |
+| **R-18** | Manifest Delete Subject Read | `delete_manifest` (subject extract) | [`fs.rs:1788`](src/storage/fs.rs#L1788) | Async manifest payload read | Ambient pathname | **Uncontained** | None | **Embedded in Mutation** |
 
 ---
 
@@ -151,17 +151,17 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 1: OCI Referrer Reads and Listing (`list_referrers`, `list_referrers_page`)
 - **Source Files & Symbols:**
-  - `Storage::list_referrers` ([`src/storage/fs.rs:1722-1735`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1722-L1735))
-  - `Storage::list_referrers_page` ([`src/storage/fs.rs:1232-1261`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1232-L1261))
-  - Private helper `referrers_path` ([`src/storage/fs.rs:671-678`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L671-L678))
+  - `Storage::list_referrers` ([`src/storage/fs.rs:1722-1735`](src/storage/fs.rs#L1722-L1735))
+  - `Storage::list_referrers_page` ([`src/storage/fs.rs:1232-1261`](src/storage/fs.rs#L1232-L1261))
+  - Private helper `referrers_path` ([`src/storage/fs.rs:671-678`](src/storage/fs.rs#L671-L678))
 - **Production Callers & Real Invocation Sites:**
-  1. `ReferrersQueryService::query_referrers` ([`src/application/referrers.rs:51`](file:///home/dietmar/devel/rust/registry-rust/src/application/referrers.rs#L51)), serving the public OCI HTTP route `GET /v2/<name>/referrers/<digest>` ([`src/http_api/referrers.rs:52`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/referrers.rs#L52)). **Calls `list_referrers` directly**, not `list_referrers_page`.
-  2. `FsStorage::add_referrer` ([`src/storage/fs.rs:1747`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1747)) and `FsStorage::remove_referrer` ([`src/storage/fs.rs:1766`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1766)) during manifest mutations.
-  3. `FsStorage::delete_manifest` ([`src/storage/fs.rs:1825`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1825)) via `remove_referrer`.
-  4. Forwarding adapters: `SupervisorStorageWrapper::list_referrers` ([`src/supervisor.rs:1701`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L1701)), `LifecycleStorageWrapper::list_referrers` ([`src/manifest_lifecycle.rs:1902`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1902)).
+  1. `ReferrersQueryService::query_referrers` ([`src/application/referrers.rs:51`](src/application/referrers.rs#L51)), serving the public OCI HTTP route `GET /v2/<name>/referrers/<digest>` ([`src/http_api/referrers.rs:52`](src/http_api/referrers.rs#L52)). **Calls `list_referrers` directly**, not `list_referrers_page`.
+  2. `FsStorage::add_referrer` ([`src/storage/fs.rs:1747`](src/storage/fs.rs#L1747)) and `FsStorage::remove_referrer` ([`src/storage/fs.rs:1766`](src/storage/fs.rs#L1766)) during manifest mutations.
+  3. `FsStorage::delete_manifest` ([`src/storage/fs.rs:1825`](src/storage/fs.rs#L1825)) via `remove_referrer`.
+  4. Forwarding adapters: `SupervisorStorageWrapper::list_referrers` ([`src/supervisor.rs:1701`](src/supervisor.rs#L1701)), `LifecycleStorageWrapper::list_referrers` ([`src/manifest_lifecycle.rs:1902`](src/manifest_lifecycle.rs#L1902)).
 - **Status of `list_referrers_page`:**
   - Auditing all references across `src/` and `tests/` establishes that **no production caller invokes `list_referrers_page`**.
-  - Trait declarations exist on `ReferrersReader` ([`src/storage/ports/mod.rs:123`](file:///home/dietmar/devel/rust/registry-rust/src/storage/ports/mod.rs#L123)), implementations exist on `FsStorage` and `S3Storage`, and forwarding methods exist in `supervisor.rs:1705` and `manifest_lifecycle.rs:1904`. However, neither supervisor nor lifecycle call `list_referrers_page`.
+  - Trait declarations exist on `ReferrersReader` ([`src/storage/ports/mod.rs:123`](src/storage/ports/mod.rs#L123)), implementations exist on `FsStorage` and `S3Storage`, and forwarding methods exist in `supervisor.rs:1705` and `manifest_lifecycle.rs:1904`. However, neither supervisor nor lifecycle call `list_referrers_page`.
   - All test references are mock storage definitions or live S3 harness calls (`tests/s3_live_integration.rs:1150`).
 - **Operation Type:**
   - `list_referrers`: Payload read and JSON deserialization (`tokio::fs::read(&path)` -> `serde_json::from_slice::<Vec<ReferrerDescriptor>>(&bytes)`).
@@ -179,16 +179,16 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 2: Repository Catalog Discovery (`list_repositories`, `list_repo_names`)
 - **Source Files & Symbols:**
-  - `Storage::list_repositories` ([`src/storage/fs.rs:948-950`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L948-L950))
-  - Private helper `list_repo_names` ([`src/storage/fs.rs:741-816`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L741-L816))
+  - `Storage::list_repositories` ([`src/storage/fs.rs:948-950`](src/storage/fs.rs#L948-L950))
+  - Private helper `list_repo_names` ([`src/storage/fs.rs:741-816`](src/storage/fs.rs#L741-L816))
 - **Production Callers & Entry Points:**
-  1. OCI catalog route `GET /v2/_catalog` ([`src/http_api/catalog.rs:136`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/catalog.rs#L136)).
-  2. `Storage::is_storage_empty` ([`src/storage/fs.rs:975`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L975)).
-  3. `BlobDeleteSafety::check_blob_unreferenced_any_repo` ([`src/blob_delete_safety.rs:93`](file:///home/dietmar/devel/rust/registry-rust/src/blob_delete_safety.rs#L93)).
-  4. `BlobRefIndex::rebuild` ([`src/blob_ref_index.rs:722`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L722)).
-  5. `MembershipMigration::plan_membership_migration` ([`src/membership_migration.rs:15`](file:///home/dietmar/devel/rust/registry-rust/src/membership_migration.rs#L15)).
-  6. `RuntimeSupervisor::check_storage_health` ([`src/supervisor.rs:915`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L915)).
-  7. GC policy fallback in `blob_gc::policy::build_manifest_protected_set` ([`src/blob_gc/policy.rs:355`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L355)).
+  1. OCI catalog route `GET /v2/_catalog` ([`src/http_api/catalog.rs:136`](src/http_api/catalog.rs#L136)).
+  2. `Storage::is_storage_empty` ([`src/storage/fs.rs:975`](src/storage/fs.rs#L975)).
+  3. `BlobDeleteSafety::check_blob_unreferenced_any_repo` ([`src/blob_delete_safety.rs:93`](src/blob_delete_safety.rs#L93)).
+  4. `BlobRefIndex::rebuild` ([`src/blob_ref_index.rs:722`](src/blob_ref_index.rs#L722)).
+  5. `MembershipMigration::plan_membership_migration` ([`src/membership_migration.rs:15`](src/membership_migration.rs#L15)).
+  6. `RuntimeSupervisor::check_storage_health` ([`src/supervisor.rs:915`](src/supervisor.rs#L915)).
+  7. GC policy fallback in `blob_gc::policy::build_manifest_protected_set` ([`src/blob_gc/policy.rs:355`](src/blob_gc/policy.rs#L355)).
 - **Operation Type:** Iterative directory traversal via `tokio::fs::read_dir` on `repos/` with in-memory stack, followed by four ambient `tokio::fs::metadata` stat calls (`tags/`, `manifests/`, `blobs/`, `meta/`) per directory visited.
 - **Root Ownership:** Ambient pathname: `self.root.join("repos")`. Does not use pinned reader.
 - **Containment Mechanism & Fallback:** **Completely Uncontained**. Symlinks in directory ancestors are resolved by ambient OS pathname resolution. Intermediate directory symlinks are skipped via dirent `file_type.is_dir()`, but leaf directory recognition (`tags/`, `manifests/`, etc.) executes ambient `stat()` which follows symlinks.
@@ -201,10 +201,10 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 3: Repository Timestamps and Storage Emptiness
 - **Source Files & Symbols:**
-  - `Storage::repo_timestamps` ([`src/storage/fs.rs:952-972`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L952-L972))
-  - `FsStorage::max_mtime_in_dir` ([`src/storage/fs.rs:818-844`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L818-L844))
-  - `Storage::is_storage_empty` ([`src/storage/fs.rs:974-995`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L974-L995))
-  - Private helper `fs_dir_has_any_entry` ([`src/storage/fs.rs:905-930`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L905-L930))
+  - `Storage::repo_timestamps` ([`src/storage/fs.rs:952-972`](src/storage/fs.rs#L952-L972))
+  - `FsStorage::max_mtime_in_dir` ([`src/storage/fs.rs:818-844`](src/storage/fs.rs#L818-L844))
+  - `Storage::is_storage_empty` ([`src/storage/fs.rs:974-995`](src/storage/fs.rs#L974-L995))
+  - Private helper `fs_dir_has_any_entry` ([`src/storage/fs.rs:905-930`](src/storage/fs.rs#L905-L930))
 - **Production Callers & Entry Points:**
   - `repo_timestamps`: Query handlers, proxy caching freshness evaluation.
   - `is_storage_empty`: Startup bootstrap, readiness probe, test suites.
@@ -217,8 +217,8 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 4: Mutation-Associated Tag File Discovery (`list_tag_files`)
 - **Source Files & Symbols:**
-  - `FsStorage::list_tag_files` ([`src/storage/fs.rs:716-739`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L716-L739))
-  - Call site: `FsStorage::delete_manifest` ([`src/storage/fs.rs:1812-1821`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1812-L1821))
+  - `FsStorage::list_tag_files` ([`src/storage/fs.rs:716-739`](src/storage/fs.rs#L716-L739))
+  - Call site: `FsStorage::delete_manifest` ([`src/storage/fs.rs:1812-1821`](src/storage/fs.rs#L1812-L1821))
 - **Production Callers & Entry Points:**
   - Invoked exclusively inside `FsStorage::delete_manifest` to find and unlink tag files referencing the deleted manifest. Preserved byte-for-byte during tag-listing cutover (`f1d6d9c`).
 - **Operation Type:** Directory enumeration (`tokio::fs::read_dir`) on `repos/<name>/tags` followed by point file read (`tokio::fs::read_to_string(&path)`) for every tag file found.
@@ -231,12 +231,12 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 5: Repository-Blob Membership Reads (`RepositoryBlobMembershipStorage`)
 - **Source Files & Symbols:**
-  - `get_repo_blob_membership` ([`src/storage/fs.rs:2873-2898`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2873-L2898))
-  - `list_repo_blob_memberships_page` ([`src/storage/fs.rs:2983-3109`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2983-L3109))
-  - `list_all_repo_blob_memberships_page` ([`src/storage/fs.rs:3111-3263`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3111-L3263))
-  - `count_repo_blob_memberships` ([`src/storage/fs.rs:3265-3284`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3265-L3284))
-  - `is_membership_ready` ([`src/storage/fs.rs:3286-3297`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3286-L3297))
-  - `get_migration_checkpoint` ([`src/storage/fs.rs:3343-3361`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3343-L3361))
+  - `get_repo_blob_membership` ([`src/storage/fs.rs:2873-2898`](src/storage/fs.rs#L2873-L2898))
+  - `list_repo_blob_memberships_page` ([`src/storage/fs.rs:2983-3109`](src/storage/fs.rs#L2983-L3109))
+  - `list_all_repo_blob_memberships_page` ([`src/storage/fs.rs:3111-3263`](src/storage/fs.rs#L3111-L3263))
+  - `count_repo_blob_memberships` ([`src/storage/fs.rs:3265-3284`](src/storage/fs.rs#L3265-L3284))
+  - `is_membership_ready` ([`src/storage/fs.rs:3286-3297`](src/storage/fs.rs#L3286-L3297))
+  - `get_migration_checkpoint` ([`src/storage/fs.rs:3343-3361`](src/storage/fs.rs#L3343-L3361))
 - **Production Callers & Entry Points:**
   - `src/membership_migration.rs` (planning, application, verification)
   - `src/gc_service.rs` (membership-aware GC sweeps, reference checks, candidate unlinking)
@@ -245,17 +245,17 @@ The inventory explicitly separates standalone observation reads from reads embed
 - **Containment & Limits:** Uncontained ambient path operations. Output page capped to `min(page_limit, 1000)` using in-memory `BinaryHeap`, but directory traversal evaluates all directory entries without enumeration or name byte bounds.
 - **Error Propagation:** Missing directories return empty pages. Malformed JSON records propagate `StorageError::corrupt_data`.
 - **Classification Note on `clear_membership_candidate`:**
-  - [`FsStorage::clear_membership_candidate`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2942-L2970) reads a membership record, updates its state in memory, serializes it, and writes it back via `write_atomic_file`.
+  - [`FsStorage::clear_membership_candidate`](src/storage/fs.rs#L2942-L2970) reads a membership record, updates its state in memory, serializes it, and writes it back via `write_atomic_file`.
   - It is classified under **Area 8 (Mutation-Embedded Reads)** as a read-modify-write operation, not a standalone membership read.
 
 ---
 
 #### Area 6: Durable Lifecycle Journal Reads (`read_lifecycle_journal`)
 - **Source Files & Symbols:**
-  - `Storage::read_lifecycle_journal` ([`src/storage/fs.rs:1343-1354`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1343-L1354))
+  - `Storage::read_lifecycle_journal` ([`src/storage/fs.rs:1343-1354`](src/storage/fs.rs#L1343-L1354))
 - **Production Callers & Entry Points:**
-  - `ManifestLifecycleManager::recover_pending_journal_under_lock` ([`src/manifest_lifecycle.rs:555`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L555))
-  - `ManifestLifecycleManager::check_journal_state` ([`src/manifest_lifecycle.rs:512`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L512))
+  - `ManifestLifecycleManager::recover_pending_journal_under_lock` ([`src/manifest_lifecycle.rs:555`](src/manifest_lifecycle.rs#L555))
+  - `ManifestLifecycleManager::check_journal_state` ([`src/manifest_lifecycle.rs:512`](src/manifest_lifecycle.rs#L512))
 - **Operation Type:** Single-file payload read (`tokio::fs::read(&path)` -> `Bytes`).
 - **Root Ownership:** Ambient pathname: `fs_repo_dir(&self.root, &canonical)?.join("meta").join("lifecycle_journal.json")`.
 - **Containment & Limits:** Uncontained ambient read. No file size bound.
@@ -266,11 +266,11 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 7: Upload Session and Quarantine Inspection
 - **Source Files & Symbols:**
-  - `quarantined_blob_version` ([`src/storage/fs.rs:3597-3612`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3597-L3612))
-  - `compute_fs_blob_version` ([`src/storage/fs.rs:3437-3463`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3437-L3463))
-  - `read_quarantine_timestamp` ([`src/storage/fs.rs:3402-3422`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L3402-L3422))
-  - `get_finalized_receipt` ([`src/storage/fs.rs:2783-2801`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2783-L2801))
-  - `reap_expired_sessions` ([`src/storage/fs.rs:2803-2868`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2803-L2868))
+  - `quarantined_blob_version` ([`src/storage/fs.rs:3597-3612`](src/storage/fs.rs#L3597-L3612))
+  - `compute_fs_blob_version` ([`src/storage/fs.rs:3437-3463`](src/storage/fs.rs#L3437-L3463))
+  - `read_quarantine_timestamp` ([`src/storage/fs.rs:3402-3422`](src/storage/fs.rs#L3402-L3422))
+  - `get_finalized_receipt` ([`src/storage/fs.rs:2783-2801`](src/storage/fs.rs#L2783-L2801))
+  - `reap_expired_sessions` ([`src/storage/fs.rs:2803-2868`](src/storage/fs.rs#L2803-L2868))
 - **Production Callers & Entry Points:**
   - `blob_gc::policy` (evaluating quarantined blobs, computing versions, conditional deletion).
   - `upload_coordinator.rs` (checking finalized receipts, session recovery).
@@ -282,10 +282,10 @@ The inventory explicitly separates standalone observation reads from reads embed
 
 #### Area 8: Mutation-Embedded Reads
 - **Source Files & Symbols:**
-  - `mutate_tag` ([`src/storage/fs.rs:1101`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1101)): Synchronous `std::fs::read(&path)` under `.lock.{tag}` to read existing tag digest before overwriting.
-  - `delete_tag_conditional` ([`src/storage/fs.rs:1310`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1310)): Synchronous `std::fs::read(&path)` under `.lock.{tag}` to hash existing bytes for expected version comparison before unlinking.
-  - `delete_manifest` ([`src/storage/fs.rs:1788`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1788)): Asynchronous `tokio::fs::read(&manifest_path)` to extract subject digest before unlinking manifest.
-  - `clear_membership_candidate` ([`src/storage/fs.rs:2942-2970`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L2942-L2970)): Read-modify-write operation reading record via `tokio::fs::read` and committing modification via `write_atomic_file`.
+  - `mutate_tag` ([`src/storage/fs.rs:1101`](src/storage/fs.rs#L1101)): Synchronous `std::fs::read(&path)` under `.lock.{tag}` to read existing tag digest before overwriting.
+  - `delete_tag_conditional` ([`src/storage/fs.rs:1310`](src/storage/fs.rs#L1310)): Synchronous `std::fs::read(&path)` under `.lock.{tag}` to hash existing bytes for expected version comparison before unlinking.
+  - `delete_manifest` ([`src/storage/fs.rs:1788`](src/storage/fs.rs#L1788)): Asynchronous `tokio::fs::read(&manifest_path)` to extract subject digest before unlinking manifest.
+  - `clear_membership_candidate` ([`src/storage/fs.rs:2942-2970`](src/storage/fs.rs#L2942-L2970)): Read-modify-write operation reading record via `tokio::fs::read` and committing modification via `write_atomic_file`.
 - **Classification:** Standalone read containment slices must **not** modify mutation paths. Write containment, locking, and atomic deletion are governed by Quality Gate **O-04**.
 
 ---
@@ -313,12 +313,12 @@ src/application/referrers.rs:51 (reader.list_referrers(repo, subject))
 
 #### Established Facts on Direct vs. Paged Referrers:
 1. **Public Route Reachability:**
-   - The public HTTP route handler [`referrers_get_or_head`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/referrers.rs#L30-L75) invokes `ReferrersQueryService::query_referrers`.
+   - The public HTTP route handler [`referrers_get_or_head`](src/http_api/referrers.rs#L30-L75) invokes `ReferrersQueryService::query_referrers`.
    - `ReferrersQueryService` invokes `reader.list_referrers(repo, subject).await`. It does **not** call `list_referrers_page`.
    - In `ReferrersQueryService`, any non-`NotFound` storage error from `list_referrers` is propagated as `ReferrersQueryError::Storage(e)`, which the HTTP route handler maps to HTTP 500 (`errors::internal_error()`).
    - Therefore, the public OCI route does **not** swallow errors into empty results; it fails closed with HTTP 500 on I/O or JSON corruption errors.
 2. **Status of `list_referrers_page` in Production:**
-   - `list_referrers_page` ([`src/storage/fs.rs:1232-1261`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1232-L1261)) delegates to `self.list_referrers(repo, subject).await.unwrap_or_default()`, suppressing errors into an empty vector.
+   - `list_referrers_page` ([`src/storage/fs.rs:1232-1261`](src/storage/fs.rs#L1232-L1261)) delegates to `self.list_referrers(repo, subject).await.unwrap_or_default()`, suppressing errors into an empty vector.
    - However, exhaustive codebase inspection demonstrates that **no production caller invokes `list_referrers_page`**.
    - Forwarding implementations in `supervisor.rs:1705` and `manifest_lifecycle.rs:1904` exist only to satisfy trait requirements; neither supervisor nor lifecycle call them.
    - All references to `list_referrers_page` are in test mocks or live S3 test harnesses.
@@ -329,7 +329,7 @@ src/application/referrers.rs:51 (reader.list_referrers(repo, subject))
    - Loads the entire referrers JSON payload into memory via `tokio::fs::read` without a size ceiling.
    - Maps JSON deserialization failures to `StorageError::io` rather than `StorageError::corrupt_data`.
 4. **Manifest Deletion Cleanup (`delete_manifest`):**
-   - In `delete_manifest` ([`src/storage/fs.rs:1825`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1825)), cleanup of referrers uses `let _ = self.remove_referrer(...)`.
+   - In `delete_manifest` ([`src/storage/fs.rs:1825`](src/storage/fs.rs#L1825)), cleanup of referrers uses `let _ = self.remove_referrer(...)`.
    - If `remove_referrer` fails due to unreadable or corrupt JSON, the error is ignored, leaving stale referrers. However, this does not cause premature physical deletion of blobs or manifests.
 
 ---
@@ -417,12 +417,12 @@ This slice must be **characterization and documentation only**, freezing and ver
   - Characterize caller interaction with `ReferrersQueryService::query_referrers` and `delete_manifest`.
 
 ### 7.2 Expected Files and Symbols
-- **Test File:** [`src/storage/fs/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs) (new characterization tests).
+- **Test File:** [`src/storage/fs/tests.rs`](src/storage/fs/tests.rs) (new characterization tests).
 - **Target Symbols Under Characterization:**
-  - `FsStorage::list_referrers` ([`src/storage/fs.rs:1722-1735`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1722-L1735))
-  - `FsStorage::list_referrers_page` ([`src/storage/fs.rs:1232-1261`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1232-L1261))
-  - `FsStorage::referrers_path` ([`src/storage/fs.rs:671-678`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L671-L678))
-  - `ReferrerDescriptor` ([`src/storage/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs))
+  - `FsStorage::list_referrers` ([`src/storage/fs.rs:1722-1735`](src/storage/fs.rs#L1722-L1735))
+  - `FsStorage::list_referrers_page` ([`src/storage/fs.rs:1232-1261`](src/storage/fs.rs#L1232-L1261))
+  - `FsStorage::referrers_path` ([`src/storage/fs.rs:671-678`](src/storage/fs.rs#L671-L678))
+  - `ReferrerDescriptor` ([`src/storage/mod.rs`](src/storage/mod.rs))
 
 ### 7.3 Explicit Exclusions
 - **No Production Code Modifications:** `src/storage/fs.rs`, `src/application/referrers.rs`, and `src/http_api/referrers.rs` remain completely untouched.

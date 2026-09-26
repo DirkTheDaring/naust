@@ -25,20 +25,16 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 fn bin_path() -> String {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry-rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry_rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
     let exe = std::env::current_exe().expect("current_exe");
     let deps_dir = exe.parent().expect("exe parent");
     let profile_dir = deps_dir.parent().expect("deps parent");
-    let bin_name = if cfg!(windows) {
-        "registry-rust.exe"
-    } else {
-        "registry-rust"
-    };
+    let bin_name = if cfg!(windows) { "naust.exe" } else { "naust" };
     profile_dir.join(bin_name).to_string_lossy().to_string()
 }
 
@@ -2642,14 +2638,14 @@ async fn test_indexed_mode_versus_storage_only_mode_configuration() {
 // Bounded Membership-Migration Tag-Listing Error-Hardening Integration Tests
 // ================================================================================================
 
-use registry_rust::membership_migration::{
+use naust::membership_migration::{
     MigrationPhase, apply_membership_migration, plan_membership_migration,
     verify_membership_migration,
 };
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::{RepositoryBlobMembershipStorage, StorageError, StorageErrorKind};
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::{RepositoryBlobMembershipStorage, StorageError, StorageErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use support::gc_coordination::LifecycleFaultStorage;

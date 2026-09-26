@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-service_name="registry-rust.service"
+service_name="naust.service"
 
 case "${1:-}" in
   purge)

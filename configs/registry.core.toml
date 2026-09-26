@@ -1,6 +1,6 @@
-# Core configuration for registry-rust (intended to be stable-ish).
+# Core configuration for naust (intended to be stable-ish).
 # Layer this with an auth file:
-#   ./registry-rust server \
+#   ./naust server \
 #     --config /etc/registry/registry.core.toml \
 #     --config /etc/registry/registry.auth.toml
 # Precedence:
@@ -47,7 +47,7 @@ key_path  = ""
 # exec_path = "/usr/local/bin/acme-dns-hook"
 
 [token]
-service = "registry-rust"
+service = "naust"
 # Token TTL in seconds.
 ttl_secs = 600
 # Set a stable secret in production.
@@ -180,12 +180,12 @@ mode = "any" # "allowlist" or "any"
 # - writes are rejected (405)
 # Patterns support a minimal '*' glob.
 proxy_hosts = [
-	"docker-io.thor.kaupon.de",
-	"ghcr.thor.kaupon.de",
-	"gcr.thor.kaupon.de",
-	"k8s-gcr.thor.kaupon.de",
-	"registry-k8s.thor.kaupon.de",
-	"quay.thor.kaupon.de",
+	"docker-io.reg.example.invalid",
+	"ghcr.reg.example.invalid",
+	"gcr.reg.example.invalid",
+	"k8s-gcr.reg.example.invalid",
+	"registry-k8s.reg.example.invalid",
+	"quay.reg.example.invalid",
 ]
 trust_x_forwarded_host = false
 
@@ -216,9 +216,9 @@ scrub_max_files_per_run = 2000
 # Multiple upstream registries / isolated caches (single process)
 
 [[proxy.upstreams]]
-hosts = ["docker-io.thor.kaupon.de"]
+hosts = ["docker-io.reg.example.invalid"]
 base_url = "https://registry-1.docker.io"
-username = "dietmarkling"
+username = "exampleuser"
 password = "test"
 max_cache_bytes = 10737418240
 
@@ -238,7 +238,7 @@ s3_prefix = ""
 max_cache_bytes = 10737418240
 
 [[proxy.upstreams]]
-hosts = ["ghcr.thor.kaupon.de"]
+hosts = ["ghcr.reg.example.invalid"]
 base_url = "https://ghcr.io"
 max_cache_bytes = 10737418240
 
@@ -255,7 +255,7 @@ s3_prefix = ""
 max_cache_bytes = 10737418240
 
 [[proxy.upstreams]]
-hosts = ["quay.thor.kaupon.de"]
+hosts = ["quay.reg.example.invalid"]
 base_url = "https://quay.io"
 max_cache_bytes = 10737418240
 
@@ -272,7 +272,7 @@ s3_prefix = ""
 max_cache_bytes = 10737418240
 
 [[proxy.upstreams]]
-hosts = ["gcr.thor.kaupon.de"]
+hosts = ["gcr.reg.example.invalid"]
 base_url = "https://gcr.io"
 max_cache_bytes = 10737418240
 
@@ -290,7 +290,7 @@ s3_prefix = ""
 max_cache_bytes = 10737418240
 
 [[proxy.upstreams]]
-hosts = ["k8s-gcr.thor.kaupon.de"]
+hosts = ["k8s-gcr.reg.example.invalid"]
 base_url = "https://k8s.gcr.io"
 max_cache_bytes = 10737418240
 
@@ -307,7 +307,7 @@ s3_prefix = ""
 max_cache_bytes = 10737418240
 
 [[proxy.upstreams]]
-hosts = ["registry-k8s.thor.kaupon.de"]
+hosts = ["registry-k8s.reg.example.invalid"]
 base_url = "https://registry.k8s.io"
 max_cache_bytes = 10737418240
 

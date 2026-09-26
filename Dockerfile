@@ -33,7 +33,7 @@ RUN addgroup -S -g 10001 registry \
   && apk add --no-cache ca-certificates
 
 WORKDIR /srv
-COPY --from=build /app/target/release/registry-rust /usr/local/bin/registry-rust
+COPY --from=build /app/target/release/naust /usr/local/bin/naust
 
 ENV LISTEN_ADDR=0.0.0.0:5000 \
     STORAGE_BACKEND=fs \
@@ -47,5 +47,5 @@ VOLUME ["/data"]
 EXPOSE 5000
 
 USER registry
-ENTRYPOINT ["/usr/local/bin/registry-rust"]
+ENTRYPOINT ["/usr/local/bin/naust"]
 CMD ["server"]

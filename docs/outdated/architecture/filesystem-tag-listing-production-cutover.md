@@ -7,11 +7,11 @@
 This document records the bounded production cutover of contained filesystem tag listing in `registry-rust`, promoting the contained test seam into active production service and routing both `FsStorage::list_tags` and `FsStorage::list_tags_page` through it.
 
 ### 1.1 Baselines and Authorization
-- **Primary Repository:** `/home/dietmar/devel/rust/registry-rust`
+- **Primary Repository:** `~/devel/rust/registry-rust`
   - Baseline HEAD: `02cfa0789e5b3ad274c93632af90b7fadb66c62f`
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust`
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust`
   - Baseline HEAD: `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only)
-- **Approved Assessment:** `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-2215/filesystem-tag-listing-production-cutover-readiness.tar.gz`
+- **Approved Assessment:** `~/devel/rust/manifest-read-review-evidence/session-20260912-2215/filesystem-tag-listing-production-cutover-readiness.tar.gz`
   - Size: 24,644 bytes
   - SHA-256: `6558ccf288b8f471f1fe895c2355ca8e05697d948d7041d64f5641f838cfc9dc`
 
@@ -72,14 +72,14 @@ Configuration validation is enforced at startup when `storage_backend == Storage
 ## 3. Exact Wiring and Modified Paths
 
 ### 3.1 Promoted Seam Module
-- File: [`src/storage/fs/tag_listing.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tag_listing.rs)
+- File: [`src/storage/fs/tag_listing.rs`](src/storage/fs/tag_listing.rs)
   - Removed top-level `#![cfg(test)]`.
   - Introduced `TagListingLimits` container (`#[derive(Clone, Debug, PartialEq, Eq)]`) encapsulating probe limits, tags directory limits, and payload read limits.
   - Preserved internal test suite strictly under `#[cfg(test)] mod tests`.
   - Exported public seam functions: `contained_list_tags_seam` and `contained_list_tags_page_seam`.
 
 ### 3.2 Filesystem Storage Engine
-- File: [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs)
+- File: [`src/storage/fs.rs`](src/storage/fs.rs)
   - Exposed module: `pub(crate) mod tag_listing;`.
   - Stored `tag_listing_limits: tag_listing::TagListingLimits` in `FsStorage`.
   - Implemented `try_new_with_all_limits` constructor enforcing all limits.
@@ -90,19 +90,19 @@ Configuration validation is enforced at startup when `storage_backend == Storage
   - Added crate-visible `tag_listing_limits(&self)` accessor for verification.
 
 ### 3.3 Application Configuration
-- File: [`src/config.rs`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs)
+- File: [`src/config.rs`](src/config.rs)
   - Added `fs_tag_listing_*` fields to `Config` struct.
   - Added `tag_listing_*` fields to `FileStorageFs` TOML parsing struct.
   - Implemented env var parsing and startup limit validation.
   - Updated `Config { ... }` literal in `Config::load_with_overrides`.
 - Updated test `Config` struct literals:
-  - [`src/config.rs`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs) (test helper)
-  - [`src/gc_service.rs`](file:///home/dietmar/devel/rust/registry-rust/src/gc_service.rs) (test helper)
-  - [`src/http_api/handlers/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers/tests.rs) (test helper)
-  - [`tests/support/gc_coordination.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/support/gc_coordination.rs) (test helper)
+  - [`src/config.rs`](src/config.rs) (test helper)
+  - [`src/gc_service.rs`](src/gc_service.rs) (test helper)
+  - [`src/http_api/handlers/tests.rs`](src/http_api/handlers/tests.rs) (test helper)
+  - [`tests/support/gc_coordination.rs`](tests/support/gc_coordination.rs) (test helper)
 
 ### 3.4 Factory Storage Wiring and Blocking Offload
-- File: [`src/storage/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs)
+- File: [`src/storage/mod.rs`](src/storage/mod.rs)
   - Wired configured `TagListingLimits` into primary filesystem storage in `storage_wiring_try_from_config`.
   - Wired configured `TagListingLimits` into proxy-cache filesystem storage in `proxy_cache_storage_try_from_config`.
   - Preserved existing asynchronous factory offload via `tokio::task::spawn_blocking` in `storage_wiring_try_from_config_async_with_factory` and `proxy_cache_storage_try_from_config_async_with_factory`.
@@ -155,7 +155,7 @@ Both public point-read methods remain entirely untouched and unconstrained by ta
 Both methods continue to use `TagReadLimits::default()`, which sets `max_payload_bytes: None`. Valid tag payloads that exceed `tag_listing_max_payload_bytes` (e.g. 1,024 bytes) remain fully readable through `resolve_tag` and `get_tag_with_version`.
 
 ### 5.2 Preservation of `list_tag_files` for Mutations
-[`FsStorage::list_tag_files`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs) is preserved **byte-for-byte** and remains actively used by `FsStorage::delete_manifest`. This ensures manifest deletion reliably unlinks referencing tags without modifying mutation paths.
+[`FsStorage::list_tag_files`](src/storage/fs.rs) is preserved **byte-for-byte** and remains actively used by `FsStorage::delete_manifest`. This ensures manifest deletion reliably unlinks referencing tags without modifying mutation paths.
 
 ### 5.3 Shared Reader Identity
 Both production listing methods continue using `self.reader.as_ref()`. For `list_tags_page`, the same root reader (`self.reader.as_ref()`) is passed for both directory enumeration and `ObjectPayloadReader` access. Pointer identity between `storage.reader()` and `storage.read_adapter().reader()` is verified (`Arc::ptr_eq`), ensuring no duplicate root descriptor opening or redundant adapter allocation is introduced. Asynchronous construction offload via `tokio::task::spawn_blocking` is maintained and tested across both primary and proxy-cache factory paths.

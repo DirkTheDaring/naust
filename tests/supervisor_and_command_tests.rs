@@ -7,21 +7,21 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, oneshot};
 
-use registry_rust::cli::{
+use naust::cli::{
     BlobGcCommand, Cli, CliCommand, CliError, CommandPolicy, MaintenanceRuntime,
     MigrateMembershipCommand, RefIndexCommand, execute_cli, run_cli,
 };
-use registry_rust::config::Config;
-use registry_rust::fs_root_lock::FsRootLock;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::mutation_authority::{
+use naust::config::Config;
+use naust::fs_root_lock::FsRootLock;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::mutation_authority::{
     RuntimeMutationAuthority, admin_clear_abandoned_deployment_writer_lock,
     inspect_deployment_writer_lock,
 };
-use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::{self, RepositoryBlobMembershipStorage, Storage};
-use registry_rust::supervisor::{
+use naust::storage::s3::S3Storage;
+use naust::storage::{self, RepositoryBlobMembershipStorage, Storage};
+use naust::supervisor::{
     StartupPhase, SupervisorFaultInjector, SupervisorOptions, run_server_supervisor,
 };
 use support::s3_mock::MockS3Driver;
@@ -76,7 +76,7 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::from_config(&cfg);
+    let wiring = naust::storage_wiring::from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -84,8 +84,7 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
         .unwrap();
 
     {
-        let idx =
-            registry_rust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
+        let idx = naust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
         idx.rebuild(wiring.blob_ref_index().as_ref()).await.unwrap();
     }
 
@@ -98,7 +97,7 @@ async fn test_read_only_commands_acquire_zero_deployment_authority() {
         },
         CliCommand::BlobGc {
             command: BlobGcCommand::Plan {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 100,
             },
@@ -141,7 +140,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::from_config(&cfg);
+    let wiring = naust::storage_wiring::from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -160,7 +159,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
         },
         CliCommand::BlobGc {
             command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -169,7 +168,7 @@ async fn test_maintenance_commands_acquire_and_release_authority_cleanly() {
         },
         CliCommand::BlobGc {
             command: BlobGcCommand::Delete {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 quarantine_delay_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -376,7 +375,7 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
     for phase in test_phases {
         let temp = TempDir::new().unwrap();
         let cfg = Arc::new(create_test_config(&temp));
-        let wiring = registry_rust::storage_wiring::from_config(cfg.as_ref());
+        let wiring = naust::storage_wiring::from_config(cfg.as_ref());
 
         let injector = Arc::new(FailingFaultInjector { fail_at: phase });
         let options = SupervisorOptions {
@@ -406,7 +405,7 @@ async fn test_partial_startup_failure_unwinds_resources_in_reverse_order() {
 async fn test_supervisor_graceful_shutdown_order() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let wiring = registry_rust::storage_wiring::from_config(cfg.as_ref());
+    let wiring = naust::storage_wiring::from_config(cfg.as_ref());
 
     let injector = Arc::new(RecordingFaultInjector::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -451,7 +450,7 @@ async fn test_supervisor_graceful_shutdown_order() {
 #[tokio::test]
 async fn test_supervisor_worker_panic_or_exit_triggers_global_shutdown() {
     let shutdown_timeout = Duration::from_secs(5);
-    let supervisor = registry_rust::task_supervisor::TaskSupervisor::new(shutdown_timeout);
+    let supervisor = naust::task_supervisor::TaskSupervisor::new(shutdown_timeout);
 
     let task_ran = Arc::new(AtomicBool::new(false));
     let ran_clone = task_ran.clone();
@@ -459,7 +458,7 @@ async fn test_supervisor_worker_panic_or_exit_triggers_global_shutdown() {
     supervisor
         .spawn(
             "failing_public_server",
-            registry_rust::task_supervisor::TaskClassification::PublicServer,
+            naust::task_supervisor::TaskClassification::PublicServer,
             move |_token| async move {
                 ran_clone.store(true, Ordering::SeqCst);
                 panic!("simulated unexpected worker panic");
@@ -483,7 +482,7 @@ async fn test_supervisor_worker_panic_or_exit_triggers_global_shutdown() {
 async fn test_supervisor_mutation_authority_loss_stops_workers_and_fails_closed() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(cfg.as_ref());
+    let wiring = naust::storage_wiring::storage_wiring_from_config(cfg.as_ref());
 
     let authority = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "worker-test")
         .await
@@ -583,7 +582,7 @@ async fn test_server_auto_initializes_membership_on_fresh_empty_storage() {
 async fn test_server_serves_http_requests_and_shuts_down_cleanly() {
     let temp = TempDir::new().unwrap();
     let cfg = Arc::new(create_test_config(&temp));
-    let wiring = registry_rust::storage_wiring::from_config(cfg.as_ref());
+    let wiring = naust::storage_wiring::from_config(cfg.as_ref());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (bound_tx, bound_rx) = oneshot::channel();
@@ -636,7 +635,7 @@ async fn test_server_serves_token_endpoint_and_respects_rate_limiter() {
 
     let client = reqwest::Client::new();
     let url = format!(
-        "http://{}/token?service=registry-rust&scope=repository:sam/test:pull",
+        "http://{}/token?service=naust&scope=repository:sam/test:pull",
         bound_addr
     );
     let resp = client.get(&url).send().await.unwrap();
@@ -751,7 +750,7 @@ async fn test_shutdown_signals_both_ctrl_c_and_sigterm() {
 #[tokio::test]
 async fn test_background_workers_do_not_outlive_supervisor() {
     let shutdown_timeout = Duration::from_secs(5);
-    let supervisor = registry_rust::task_supervisor::TaskSupervisor::new(shutdown_timeout);
+    let supervisor = naust::task_supervisor::TaskSupervisor::new(shutdown_timeout);
 
     let counter = Arc::new(AtomicUsize::new(0));
     let c_clone = counter.clone();
@@ -759,7 +758,7 @@ async fn test_background_workers_do_not_outlive_supervisor() {
     supervisor
         .spawn_loop(
             "test_worker",
-            registry_rust::task_supervisor::TaskClassification::MaintenanceScheduler,
+            naust::task_supervisor::TaskClassification::MaintenanceScheduler,
             Duration::from_millis(50),
             None,
             move || {
@@ -795,7 +794,7 @@ async fn test_background_workers_do_not_outlive_supervisor() {
 #[tokio::test]
 async fn test_flush_hook_executed_before_authority_release() {
     let shutdown_timeout = Duration::from_secs(5);
-    let supervisor = registry_rust::task_supervisor::TaskSupervisor::new(shutdown_timeout);
+    let supervisor = naust::task_supervisor::TaskSupervisor::new(shutdown_timeout);
 
     let flush_executed = Arc::new(AtomicBool::new(false));
     let f_clone = flush_executed.clone();
@@ -847,7 +846,7 @@ async fn test_supervisor_partial_startup_failure_unwinds_and_releases_authority(
     );
 
     // Verify storage lock is released and can be acquired immediately by a new process
-    let storage = registry_rust::storage_wiring::storage_wiring_from_config(&cfg).cluster_lock();
+    let storage = naust::storage_wiring::storage_wiring_from_config(&cfg).cluster_lock();
     let mut auth2 = RuntimeMutationAuthority::acquire(storage, "recovery-after-failed-startup")
         .await
         .expect("must be able to acquire authority after failed startup unwind");
@@ -878,9 +877,8 @@ async fn test_supervisor_graceful_shutdown_releases_authority_exactly_once() {
     let srv_res = srv.await.expect("join");
     assert!(srv_res.is_ok());
 
-    let storage =
-        registry_rust::storage_wiring::storage_wiring_from_config(&create_test_config(&temp))
-            .cluster_lock();
+    let storage = naust::storage_wiring::storage_wiring_from_config(&create_test_config(&temp))
+        .cluster_lock();
     let mut auth = RuntimeMutationAuthority::acquire(storage, "post-shutdown-check")
         .await
         .expect("must acquire authority after clean supervisor shutdown");
@@ -943,7 +941,7 @@ async fn test_supervisor_runtime_composition_and_full_lifecycle_contract() {
     );
 
     // 4. Verify authority released cleanly and can be acquired by another process
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(cfg.as_ref());
+    let wiring = naust::storage_wiring::storage_wiring_from_config(cfg.as_ref());
     let mut auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "post-lifecycle-check")
         .await
         .expect("authority must be free after supervisor shutdown");
@@ -996,7 +994,7 @@ fn test_command_policy_exhaustive_classification_matrix() {
     assert_eq!(
         CliCommand::BlobGc {
             command: BlobGcCommand::Plan {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 100,
                 max_per_run: 10,
             }
@@ -1007,7 +1005,7 @@ fn test_command_policy_exhaustive_classification_matrix() {
     assert_eq!(
         CliCommand::BlobGc {
             command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 100,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -1022,7 +1020,7 @@ fn test_command_policy_exhaustive_classification_matrix() {
     assert_eq!(
         CliCommand::BlobGc {
             command: BlobGcCommand::Delete {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 quarantine_delay_secs: 100,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -1225,7 +1223,7 @@ path = "{}"
 
     // Initialize membership ready marker so preflight passes and index check is tested
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1236,7 +1234,7 @@ path = "{}"
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Plan {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 10,
             },
@@ -1292,7 +1290,7 @@ async fn test_migration_plan_apply_verify_readiness_rules() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
 
     // Initial state: not ready
     assert!(
@@ -1356,7 +1354,7 @@ async fn test_server_versus_cli_lock_contention_s3_and_fs() {
             .unwrap();
 
         let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-        let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+        let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
         wiring
             .membership_reader()
             .mark_membership_ready()
@@ -1399,7 +1397,7 @@ async fn test_membership_backfill_required_blocks_gc_and_ref_index() {
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -1416,7 +1414,7 @@ async fn test_membership_backfill_required_blocks_gc_and_ref_index() {
 
     // Verify authority is free
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     let mut auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "reacquire-check")
         .await
         .expect("authority must be released after MembershipBackfillRequired failure");
@@ -1432,7 +1430,7 @@ async fn test_blob_gc_quarantine_failure_unwinds_and_releases_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1441,8 +1439,7 @@ async fn test_blob_gc_quarantine_failure_unwinds_and_releases_authority() {
 
     // Rebuild index first
     {
-        let idx =
-            registry_rust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
+        let idx = naust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
         idx.rebuild(wiring.blob_ref_index().as_ref()).await.unwrap();
     }
 
@@ -1451,7 +1448,7 @@ async fn test_blob_gc_quarantine_failure_unwinds_and_releases_authority() {
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -1480,7 +1477,7 @@ async fn test_blob_gc_delete_failure_unwinds_and_releases_authority() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1489,8 +1486,7 @@ async fn test_blob_gc_delete_failure_unwinds_and_releases_authority() {
 
     // Rebuild index first
     {
-        let idx =
-            registry_rust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
+        let idx = naust::blob_ref_index::BlobRefIndex::open(cfg.ref_index.path.clone()).unwrap();
         idx.rebuild(wiring.blob_ref_index().as_ref()).await.unwrap();
     }
 
@@ -1498,7 +1494,7 @@ async fn test_blob_gc_delete_failure_unwinds_and_releases_authority() {
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Delete {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 quarantine_delay_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -1527,7 +1523,7 @@ async fn test_two_simultaneous_maintenance_commands_contention() {
         .unwrap();
 
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1589,7 +1585,7 @@ async fn test_teardown_preflight_failure_plus_release_failure() {
     // 1. Normal preflight failure on unmigrated store returns MembershipBackfillRequired
     let runtime_res = MaintenanceRuntime::acquire(
         cfg,
-        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+        naust::cli::CommandPolicy::ExclusiveMutation {
             lock_suffix: "test-preflight-fail",
         },
     )
@@ -1620,7 +1616,7 @@ async fn test_teardown_command_failure_plus_release_failure() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1629,7 +1625,7 @@ async fn test_teardown_command_failure_plus_release_failure() {
 
     let runtime = MaintenanceRuntime::acquire(
         cfg,
-        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+        naust::cli::CommandPolicy::ExclusiveMutation {
             lock_suffix: "test-cmd-fail",
         },
     )
@@ -1673,7 +1669,7 @@ async fn test_teardown_early_validation_failure_plus_release_failure() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1682,7 +1678,7 @@ async fn test_teardown_early_validation_failure_plus_release_failure() {
 
     let runtime = MaintenanceRuntime::acquire(
         cfg,
-        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+        naust::cli::CommandPolicy::ExclusiveMutation {
             lock_suffix: "test-early-fail",
         },
     )
@@ -1732,7 +1728,7 @@ async fn test_teardown_success_plus_release_failure() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1741,7 +1737,7 @@ async fn test_teardown_success_plus_release_failure() {
 
     let runtime = MaintenanceRuntime::acquire(
         cfg,
-        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+        naust::cli::CommandPolicy::ExclusiveMutation {
             lock_suffix: "test-success-release",
         },
     )
@@ -1772,7 +1768,7 @@ async fn test_ordinary_success_releases_authority_exactly_once() {
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1781,7 +1777,7 @@ async fn test_ordinary_success_releases_authority_exactly_once() {
 
     let mut runtime = MaintenanceRuntime::acquire(
         cfg,
-        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+        naust::cli::CommandPolicy::ExclusiveMutation {
             lock_suffix: "test-idempotent-release",
         },
     )
@@ -1806,7 +1802,7 @@ async fn test_local_filesystem_exclusion_reacquirable_after_distributed_release_
         .unwrap();
 
     let cfg = Arc::new(Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap());
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -1815,7 +1811,7 @@ async fn test_local_filesystem_exclusion_reacquirable_after_distributed_release_
 
     let mut runtime = MaintenanceRuntime::acquire(
         cfg.clone(),
-        registry_rust::cli::CommandPolicy::ExclusiveMutation {
+        naust::cli::CommandPolicy::ExclusiveMutation {
             lock_suffix: "test-fs-reacquire",
         },
     )
@@ -2005,7 +2001,7 @@ path = "{}"
 
     // 3. S3 server-versus-CLI contention: simulate active server holding writer lock on S3
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     let mut server_auth = RuntimeMutationAuthority::acquire(wiring.cluster_lock(), "server")
         .await
         .expect("server authority acquire on S3");
@@ -2047,7 +2043,7 @@ path = "{}"
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -2145,7 +2141,7 @@ signing_key = "test-secret-key-12345678901234567890"
     tokio::fs::write(&cfg_path, toml).await.unwrap();
     let cfg = Config::from_env_with_files(std::slice::from_ref(&cfg_path)).unwrap();
     assert!(!cfg.blob_gc_enabled, "default must be disabled");
-    let wiring = registry_rust::storage_wiring::storage_wiring_from_config(&cfg);
+    let wiring = naust::storage_wiring::storage_wiring_from_config(&cfg);
     wiring
         .membership_reader()
         .mark_membership_ready()
@@ -2156,7 +2152,7 @@ signing_key = "test-secret-key-12345678901234567890"
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 min_age_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,
@@ -2175,7 +2171,7 @@ signing_key = "test-secret-key-12345678901234567890"
         config: vec![cfg_path.clone()],
         command: Some(CliCommand::BlobGc {
             command: BlobGcCommand::Delete {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
+                policy: naust::blob_gc::BlobGcPolicy::ManifestRooted,
                 quarantine_delay_secs: 0,
                 max_per_run: 10,
                 confirm_all_writers_stopped: true,

@@ -46,7 +46,7 @@ if [[ "${engine}" == "podman" && "${rootful}" -eq 1 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-image="registry-rust-debbuild:${debian_suite}"
+image="naust-debbuild:${debian_suite}"
 
 build_args=()
 if [[ "${engine}" == "podman" ]]; then

@@ -13,7 +13,7 @@ impl FsRootLock {
         std::fs::create_dir_all(&locks_dir)
             .map_err(|e| format!("failed to create {}: {e}", locks_dir.display()))?;
 
-        let lock_path = locks_dir.join("registry-rust.lock");
+        let lock_path = locks_dir.join("naust.lock");
         let file = OpenOptions::new()
             .create(true)
             .read(true)

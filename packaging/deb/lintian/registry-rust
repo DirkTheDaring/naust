@@ -1,2 +1,2 @@
 # This package is intended for local/internal deployment, not Debian archive upload.
-registry-rust: initial-upload-closes-no-bugs
+naust: initial-upload-closes-no-bugs

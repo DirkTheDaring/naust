@@ -297,7 +297,7 @@ pub fn issue_bearer_token(
     let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&header_bytes);
 
     let claims = TokenClaims {
-        iss: Some("registry-rust".to_string()),
+        iss: Some("naust".to_string()),
         sub: subject.map(|s| s.to_string()),
         iat: Some(iat),
         exp,
@@ -337,7 +337,7 @@ pub fn issue_bearer_token_with_key(
     let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&header_bytes);
 
     let claims = TokenClaims {
-        iss: Some("registry-rust".to_string()),
+        iss: Some("naust".to_string()),
         sub: subject.map(|s| s.to_string()),
         iat: Some(iat),
         exp,
@@ -429,7 +429,7 @@ mod tests {
         let claims =
             verify_bearer_token_bound(signing_key, &token, aud, 3600).expect("verify token");
 
-        assert_eq!(claims.iss.as_deref(), Some("registry-rust"));
+        assert_eq!(claims.iss.as_deref(), Some("naust"));
         assert_eq!(claims.sub.as_deref(), Some("user"));
         assert_eq!(claims.aud.as_deref(), Some(aud));
         assert!(claims.jti.as_deref().is_some_and(|s| !s.is_empty()));

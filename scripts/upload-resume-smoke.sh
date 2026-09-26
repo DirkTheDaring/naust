@@ -61,7 +61,7 @@ start_registry() {
   REQUEST_TIMEOUT_SECS="${REQUEST_TIMEOUT_SECS:-30}" \
   UPLOAD_REQUEST_TIMEOUT_SECS="${UPLOAD_REQUEST_TIMEOUT_SECS:-300}" \
   RUST_LOG="${RUST_LOG:-info}" \
-  "$ROOT_DIR/target/debug/registry-rust" server >>"$REG_LOG" 2>&1 &
+  "$ROOT_DIR/target/debug/naust" server >>"$REG_LOG" 2>&1 &
   REG_PID=$!
 
   # wait until ready

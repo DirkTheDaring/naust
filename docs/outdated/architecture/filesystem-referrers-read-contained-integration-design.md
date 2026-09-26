@@ -2,7 +2,7 @@
 
 ## Executive Summary & Baseline
 
-This document presents the corrected architectural design for a bounded, contained filesystem referrers-read integration in `registry-rust`. Following the empirical characterization established in [filesystem-referrers-read-characterization.md](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-referrers-read-characterization.md) (committed at `2419d46e89d88151c18972210ba79826bf776b59`), this design specifies the integration of Linux descriptor-relative containment (`openat2`) using existing `storage-core` and `storage-fs` abstractions, evaluates compatibility trade-offs across storage, application, and mutation boundaries, and defines a strictly bounded test-only seam as the recommended immediate implementation slice.
+This document presents the corrected architectural design for a bounded, contained filesystem referrers-read integration in `registry-rust`. Following the empirical characterization established in [filesystem-referrers-read-characterization.md](docs/architecture/filesystem-referrers-read-characterization.md) (committed at `2419d46e89d88151c18972210ba79826bf776b59`), this design specifies the integration of Linux descriptor-relative containment (`openat2`) using existing `storage-core` and `storage-fs` abstractions, evaluates compatibility trade-offs across storage, application, and mutation boundaries, and defines a strictly bounded test-only seam as the recommended immediate implementation slice.
 
 This task is **analysis and documentation only**. Production code, storage traits, mutation workflows, HTTP routing, and configuration remain 100% byte-for-byte unchanged.
 
@@ -17,23 +17,23 @@ This task is **analysis and documentation only**. Production code, storage trait
 
 ### Verified Repository Baselines
 
-- **Primary Repository**: `/home/dietmar/devel/rust/registry-rust`
+- **Primary Repository**: `~/devel/rust/registry-rust`
   - Current HEAD: `2419d46e89d88151c18972210ba79826bf776b59`
   - Latest Commit: `test(storage): characterize filesystem referrers read semantics`
   - Active Branch: `master`
   - Index & Worktree Status: Clean
-- **Dependency Repository**: `/home/dietmar/devel/rust/storage-layer-rust`
+- **Dependency Repository**: `~/devel/rust/storage-layer-rust`
   - Current HEAD: `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`
   - Active Branch: `main`
   - Read-Only Status: Preserved strictly read-only throughout.
 - **Authoritative Characterization Evidence**:
-  - Archive: `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260913-0005/filesystem-referrers-read-characterization.tar.gz`
+  - Archive: `~/devel/rust/manifest-read-review-evidence/session-20260913-0005/filesystem-referrers-read-characterization.tar.gz`
   - Archive Size: 89,087 bytes | SHA-256: `97ad50ac6200b5e2c7d26b85a2afaf69f2604eb3e86325e6aef49e6af3ca5d39`
   - Committed Sources:
-    - [src/storage/fs/tests.rs](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs): `02156e6eb7648719ced2f61d3d143de8387676ece9c670584f0a66a510034763`
-    - [docs/architecture/filesystem-referrers-read-characterization.md](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-referrers-read-characterization.md): `76d06bc1810f8448134a14320aa5b395e8ade89523bb65ee6272ed5d0db314ea`
+    - [src/storage/fs/tests.rs](src/storage/fs/tests.rs): `02156e6eb7648719ced2f61d3d143de8387676ece9c670584f0a66a510034763`
+    - [docs/architecture/filesystem-referrers-read-characterization.md](docs/architecture/filesystem-referrers-read-characterization.md): `76d06bc1810f8448134a14320aa5b395e8ade89523bb65ee6272ed5d0db314ea`
 - **Related Prior Assessment**:
-  - Archive: `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-2345/filesystem-read-containment-post-tag-listing-assessment.tar.gz`
+  - Archive: `~/devel/rust/manifest-read-review-evidence/session-20260912-2345/filesystem-read-containment-post-tag-listing-assessment.tar.gz`
   - Archive Size: 39,799 bytes | SHA-256: `d99b526451e8b8c8c7cbfc37dfaa16afdcc68ce983262da1e3bde1d5b63dda05`
 
 ---
@@ -78,8 +78,8 @@ The public OCI route for referrers is defined by the OCI Image Specification (`G
 ```
 
 Authoritative Source References:
-- Handler: [src/http_api/referrers.rs:25-162](file:///home/dietmar/devel/rust/registry-rust/src/http_api/referrers.rs#L25-L162)
-- Service: [src/application/referrers.rs:36-95](file:///home/dietmar/devel/rust/registry-rust/src/application/referrers.rs#L36-L95)
+- Handler: [src/http_api/referrers.rs:25-162](src/http_api/referrers.rs#L25-L162)
+- Service: [src/application/referrers.rs:36-95](src/application/referrers.rs#L36-L95)
 
 Key Findings:
 1. **Public Query Service Calls `list_referrers` Directly**: The application service delegates directly to `reader.list_referrers(repo, subject)`. It does **not** call `list_referrers_page`.
@@ -131,7 +131,7 @@ Key Findings from Audit and Characterization:
 2. **Arithmetic & Slicing Panics**: Slicing arithmetic `end_idx = (start_idx + page_limit).min(refs.len())` performs unchecked addition. When `start_idx > 0` and `page_limit == usize::MAX`, it panics with an overflow panic under the standard `test` build profile (`overflow-checks = true`), and wraps to `0` with a subsequent slice bounds panic (`&refs[start_idx..0]`) under release profiles without overflow checks.
 3. **Duplicate Digest Advancement**: Rust's standard library `binary_search_by` makes an unspecified choice among equal elements. In `list_referrers_page`, duplicate digests cause non-deterministic token advancement.
 4. **Zero Active Production Callers**: An exhaustive audit of the codebase confirms:
-   - Trait declarations on `Storage` ([src/storage/mod.rs:431](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L431)) and `ReferrersReader` ([src/storage/ports/mod.rs:123](file:///home/dietmar/devel/rust/registry-rust/src/storage/ports/mod.rs#L123)).
+   - Trait declarations on `Storage` ([src/storage/mod.rs:431](src/storage/mod.rs#L431)) and `ReferrersReader` ([src/storage/ports/mod.rs:123](src/storage/ports/mod.rs#L123)).
    - Forwarding adapter implementations in `Arc<dyn Storage>`, `Arc<dyn ReferrersReader>`, and macro `impl_referrers_reader!`.
    - Dead forwarding methods in `supervisor.rs:1705`, `manifest_lifecycle.rs:1904`, and `blob_ref_index.rs:1268` have **zero call sites**.
    - The method is only exercised in test mock harnesses and live S3 integration tests.
@@ -143,7 +143,7 @@ Key Findings from Audit and Characterization:
 
 Referrers reads are also consumed internally during write and deletion workflows. The exact sequence of operations and failure boundaries must be traced precisely without assuming atomic rollback or untouched filesystems.
 
-#### A. `FsStorage::add_referrer` ([src/storage/fs.rs:1736-1755](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1736-L1755))
+#### A. `FsStorage::add_referrer` ([src/storage/fs.rs:1736-1755](src/storage/fs.rs#L1736-L1755))
 ```rust
 async fn add_referrer(
     &self,
@@ -187,7 +187,7 @@ Exact Operation Ordering & Failure Boundaries:
    - If `list_referrers` fails: `repos/<name>/referrers/` directory hierarchy remains on disk; target referrers file was not created or modified.
    - If serialization or `atomic_write_file` fails: directories remain created; temporary files may be removed or left behind depending on atomic write error state; target file remains unchanged.
 
-#### B. `FsStorage::remove_referrer` ([src/storage/fs.rs:1757-1785](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1757-L1785))
+#### B. `FsStorage::remove_referrer` ([src/storage/fs.rs:1757-1785](src/storage/fs.rs#L1757-L1785))
 ```rust
 async fn remove_referrer(
     &self,
@@ -234,7 +234,7 @@ Exact Operation Ordering & Failure Boundaries:
    - If `remove_file` fails: error suppressed; returns `Ok(())` even though the file still exists on disk.
    - If `atomic_write_file` fails: returns error; referrers file remains in pre-removal state.
 
-#### C. `FsStorage::delete_manifest` ([src/storage/fs.rs:1787-1830](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1787-L1830))
+#### C. `FsStorage::delete_manifest` ([src/storage/fs.rs:1787-1830](src/storage/fs.rs#L1787-L1830))
 ```rust
 async fn delete_manifest(&self, name: &str, digest: &Digest) -> Result<(), StorageError> {
     let manifest_path = self.manifest_path(name, digest);
@@ -303,7 +303,7 @@ Exact Operation Ordering & Failure Boundaries:
 
 ### 1. Reuse of Shared Storage Reader Instance
 
-In production `FsStorage` ([src/storage/fs.rs:190-202](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L190-L202)), the instance holds:
+In production `FsStorage` ([src/storage/fs.rs:190-202](src/storage/fs.rs#L190-L202)), the instance holds:
 ```rust
 pub struct FsStorage {
     root: PathBuf,

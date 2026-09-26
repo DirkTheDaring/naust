@@ -6,8 +6,8 @@
 
 - **Document:** `docs/architecture/filesystem-membership-read-containment.md`
 - **Status:** Implementation & Compatibility Record (working tree, not committed)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `634da23b1f4f015fb38fa0dd9baea95236583a62` (`master`), changes applied in the working tree only.
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — all required primitives existed: `enumerate_dir`, `open_payload`, `inspect_file_metadata`).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `634da23b1f4f015fb38fa0dd9baea95236583a62` (`master`), changes applied in the working tree only.
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — all required primitives existed: `enumerate_dir`, `open_payload`, `inspect_file_metadata`).
 - **Scope:** Gap items R-7–R-11: `get_repo_blob_membership` (R-7), `list_repo_blob_memberships_page` (R-8), `list_all_repo_blob_memberships_page` (R-9), `count_repo_blob_memberships` (R-10), `is_membership_ready` + `get_migration_checkpoint` (R-11).
 
 ---

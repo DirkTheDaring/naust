@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin_path() -> String {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry-rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry_rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
 
@@ -13,11 +13,7 @@ fn bin_path() -> String {
     let deps_dir = exe.parent().expect("exe parent");
     let profile_dir = deps_dir.parent().expect("deps parent");
 
-    let bin_name = if cfg!(windows) {
-        "registry-rust.exe"
-    } else {
-        "registry-rust"
-    };
+    let bin_name = if cfg!(windows) { "naust.exe" } else { "naust" };
 
     profile_dir.join(bin_name).to_string_lossy().to_string()
 }

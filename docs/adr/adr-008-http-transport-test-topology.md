@@ -10,7 +10,7 @@
 
 ## 1. Context & Problem Statement
 
-Following the thinning of HTTP handlers (ADR-002) and read service encapsulation (ADR-004), [`src/http_api/handlers.rs`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers.rs) contained an inline test block (`mod tests { ... }` at lines 596–2110, totaling 1,515 lines) containing 46 unit test functions and extensive mock fixtures, embedded in the middle of production handler functions (which continued after line 2110).
+Following the thinning of HTTP handlers (ADR-002) and read service encapsulation (ADR-004), [`src/http_api/handlers.rs`](src/http_api/handlers.rs) contained an inline test block (`mod tests { ... }` at lines 596–2110, totaling 1,515 lines) containing 46 unit test functions and extensive mock fixtures, embedded in the middle of production handler functions (which continued after line 2110).
 
 When addressing technical debt item **D-04 ("In-Source Test Footprint Bloat")**, a critical architectural choice arises:
 1. **The Anti-Pattern (External Integration Migration):** Blindly moving all inline tests to an external integration binary under `tests/` (e.g. `tests/http_transport_tests.rs`). Because downstream integration binaries compile the crate as an external dependency, white-box tests that exercise internal helper methods (token scope parsing, HMAC upload state tokens, repo validation) or construct test states (`AppState::new_test`) would require **widening production visibility** (changing `private` or `pub(crate)` items to `pub`, or leaking `#[cfg(test)]` constructors into release builds).
@@ -55,7 +55,7 @@ The monolithic inline `mod tests { ... }` block (lines 596–2110) in `src/http_
 mod tests;
 ```
 
-The 46 unit tests and their supporting fixtures (`with_admin_creds`, `admin_headers_ok`, `test_app_state`, etc.) are placed in [`src/http_api/handlers/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers/tests.rs) (1,495 lines). Production handlers continue uninterrupted from line 599 through line 1538 in [`src/http_api/handlers.rs`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers.rs).
+The 46 unit tests and their supporting fixtures (`with_admin_creds`, `admin_headers_ok`, `test_app_state`, etc.) are placed in [`src/http_api/handlers/tests.rs`](src/http_api/handlers/tests.rs) (1,495 lines). Production handlers continue uninterrupted from line 599 through line 1538 in [`src/http_api/handlers.rs`](src/http_api/handlers.rs).
 
 Because `src/http_api/handlers/tests.rs` is declared as `mod tests` within `http_api::handlers`, the compiled test namespace remains completely identical:
 ```text

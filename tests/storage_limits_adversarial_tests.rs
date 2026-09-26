@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::{
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::{
     GcCursor, GcStorage, Storage, StorageError, StorageErrorKind, UploadSessionStorage,
 };
 

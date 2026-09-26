@@ -6,8 +6,8 @@
 
 - **Document:** `docs/architecture/filesystem-catalog-discovery-production-cutover.md`
 - **Status:** Implementation & Compatibility Record (working tree, not committed)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `906ef891baab47780856132df6e25492f3cd3499` (`master`), changes applied in the working tree only.
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — all required primitives already existed).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `906ef891baab47780856132df6e25492f3cd3499` (`master`), changes applied in the working tree only.
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — all required primitives already existed).
 - **Predecessor Records:**
   - `docs/architecture/filesystem-gc-repository-discovery-decisions.md` (GC-vs-catalog semantic separation; committed).
   - `docs/architecture/filesystem-read-containment-post-referrers-assessment.md` (gap inventory; committed in `906ef89`).

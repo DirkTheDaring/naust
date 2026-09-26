@@ -1,18 +1,18 @@
 mod support;
 use bytes::Bytes;
-use registry_rust::blob_gc::BlobGcPolicy;
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::config::Config;
-use registry_rust::consistency::ConsistencyCoordinator;
-use registry_rust::gc_service::{GcBudgets, GcService};
-use registry_rust::manifest_lifecycle::{LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase};
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::mutation_authority::RuntimeMutationAuthority;
-use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
-use registry_rust::storage::repo_membership::RepositoryBlobMembershipStorage;
-use registry_rust::storage::{GcDeleteResult, GcQuarantineResult, GcStorage, Storage};
+use naust::blob_gc::BlobGcPolicy;
+use naust::blob_ref_index::BlobRefIndex;
+use naust::config::Config;
+use naust::consistency::ConsistencyCoordinator;
+use naust::gc_service::{GcBudgets, GcService};
+use naust::manifest_lifecycle::{LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase};
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::mutation_authority::RuntimeMutationAuthority;
+use naust::storage::repo_membership::RepoBlobMembershipRecord;
+use naust::storage::repo_membership::RepositoryBlobMembershipStorage;
+use naust::storage::{GcDeleteResult, GcQuarantineResult, GcStorage, Storage};
 use sha2::Digest as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ async fn test_manifest_publication_acquires_gate_first_gc_revalidates_and_preser
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -180,7 +180,7 @@ async fn test_gc_acquires_gate_first_publication_blocked_until_gc_finishes() {
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -272,7 +272,7 @@ async fn test_repo_membership_created_before_final_deletion_causes_candidate_ski
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -350,7 +350,7 @@ async fn test_pin_finalizing_upload_state_causes_candidate_skipped() {
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -428,7 +428,7 @@ async fn test_lifecycle_journal_appearing_before_validation_causes_candidate_ski
         .expect("authority");
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -589,7 +589,7 @@ async fn test_admin_and_scheduler_have_no_permit_access() {
         .expect("authority");
 
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -648,7 +648,7 @@ async fn test_cli_acquires_authority_once_and_routes_through_service() {
         .expect("cli authority");
 
     let service = GcService::with_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         storage.clone(),
         idx.clone(),
         ConsistencyCoordinator::new(),
@@ -747,7 +747,7 @@ async fn test_concurrent_lifecycle_mutation_progresses_between_gc_candidates() {
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(cfg.as_ref())),
+        Arc::new(naust::policy::GcPolicy::from(cfg.as_ref())),
         hooked_storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -794,8 +794,7 @@ async fn test_concurrent_lifecycle_mutation_progresses_between_gc_candidates() {
 
         // Mutate lifecycle under the gate: link remaining blob to repository membership
         let canonical_repo =
-            registry_rust::registry::canonical_name::CanonicalRepoName::parse("saved-repo")
-                .unwrap();
+            naust::registry::canonical_name::CanonicalRepoName::parse("saved-repo").unwrap();
         let record = RepoBlobMembershipRecord::new_upload(
             canonical_repo,
             remaining_digest,
@@ -867,7 +866,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
         .unwrap();
     let authority_arc = Arc::new(Mutex::new(Some(authority)));
 
-    let upload_coord_config = registry_rust::upload_coordinator::BlobUploadCoordinatorConfig {
+    let upload_coord_config = naust::upload_coordinator::BlobUploadCoordinatorConfig {
         signing_key: b"secret".to_vec(),
         max_upload_bytes: 0,
         abort_on_digest_mismatch: true,
@@ -876,7 +875,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
         gc_pin_duration_secs: 300,
         finalize_grace_secs: 0,
     };
-    let upload_coordinator = registry_rust::upload_coordinator::BlobUploadCoordinator::new(
+    let upload_coordinator = naust::upload_coordinator::BlobUploadCoordinator::new(
         storage.clone(),
         Some(idx.clone()),
         coordinator.clone(),
@@ -884,7 +883,7 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
     );
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         storage.clone(),
         idx.clone(),
         coordinator.clone(),
@@ -930,11 +929,11 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
     idx.unpin_blob(&digest, "default").unwrap();
 
     // 3. Now execute full publication via publish_proxy_blob
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move {
-            Ok::<_, registry_rust::storage::upload_session::UploadStreamError>(
-                bytes::Bytes::from_static(proxy_bytes),
-            )
+            Ok::<_, naust::storage::upload_session::UploadStreamError>(bytes::Bytes::from_static(
+                proxy_bytes,
+            ))
         }));
     upload_coordinator
         .publish_proxy_blob(&canonical_repo, &digest, stream)
@@ -951,11 +950,11 @@ async fn test_proxy_blob_publication_vs_gc_race_barrier_and_idempotency() {
     assert!(!idx.is_blob_pinned(&digest, SystemTime::now()).unwrap());
 
     // 5. Verify duplicate publication is idempotent
-    let stream2: registry_rust::storage::upload_session::UploadByteStream =
+    let stream2: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(async move {
-            Ok::<_, registry_rust::storage::upload_session::UploadStreamError>(
-                bytes::Bytes::from_static(proxy_bytes),
-            )
+            Ok::<_, naust::storage::upload_session::UploadStreamError>(bytes::Bytes::from_static(
+                proxy_bytes,
+            ))
         }));
     upload_coordinator
         .publish_proxy_blob(&canonical_repo, &digest, stream2)
@@ -991,7 +990,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     let coordinator = ConsistencyCoordinator::new();
 
     let service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         storage.clone(),
         idx.clone(),
         coordinator,
@@ -1005,8 +1004,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     };
 
     // State 1: Enabled -> StrategyUnsupported error, delete driver never called
-    *driver.versioning_state.lock().unwrap() =
-        registry_rust::storage::s3::S3BucketVersioningState::Enabled;
+    *driver.versioning_state.lock().unwrap() = naust::storage::s3::S3BucketVersioningState::Enabled;
     let err1 = service
         .delete(
             BlobGcPolicy::ManifestRooted,
@@ -1018,7 +1016,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     assert!(
         matches!(
             err1,
-            registry_rust::gc_service::GcServiceError::StrategyUnsupported { .. }
+            naust::gc_service::GcServiceError::StrategyUnsupported { .. }
         ),
         "expected StrategyUnsupported for Enabled, got: {:?}",
         err1
@@ -1026,7 +1024,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
 
     // State 2: Suspended -> StrategyUnsupported error, delete driver never called
     *driver.versioning_state.lock().unwrap() =
-        registry_rust::storage::s3::S3BucketVersioningState::Suspended;
+        naust::storage::s3::S3BucketVersioningState::Suspended;
     let err2 = service
         .delete(
             BlobGcPolicy::ManifestRooted,
@@ -1038,7 +1036,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     assert!(
         matches!(
             err2,
-            registry_rust::gc_service::GcServiceError::StrategyUnsupported { .. }
+            naust::gc_service::GcServiceError::StrategyUnsupported { .. }
         ),
         "expected StrategyUnsupported for Suspended, got: {:?}",
         err2
@@ -1046,7 +1044,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
 
     // State 3: AccessDenied -> StrategyUnsupported error, delete driver never called
     *driver.versioning_state.lock().unwrap() =
-        registry_rust::storage::s3::S3BucketVersioningState::AccessDenied(
+        naust::storage::s3::S3BucketVersioningState::AccessDenied(
             "AccessDenied: 403 Forbidden".to_string(),
         );
     let err3 = service
@@ -1060,7 +1058,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     assert!(
         matches!(
             err3,
-            registry_rust::gc_service::GcServiceError::StrategyUnsupported { .. }
+            naust::gc_service::GcServiceError::StrategyUnsupported { .. }
         ),
         "expected StrategyUnsupported for AccessDenied, got: {:?}",
         err3
@@ -1068,7 +1066,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
 
     // State 4: BackendError -> StrategyUnsupported error, delete driver never called
     *driver.versioning_state.lock().unwrap() =
-        registry_rust::storage::s3::S3BucketVersioningState::BackendError(
+        naust::storage::s3::S3BucketVersioningState::BackendError(
             "500 InternalServerError".to_string(),
         );
     let err4 = service
@@ -1082,7 +1080,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
     assert!(
         matches!(
             err4,
-            registry_rust::gc_service::GcServiceError::StrategyUnsupported { .. }
+            naust::gc_service::GcServiceError::StrategyUnsupported { .. }
         ),
         "expected StrategyUnsupported for BackendError, got: {:?}",
         err4
@@ -1099,7 +1097,7 @@ async fn test_s3_bucket_versioning_capability_4_state_matrix_fails_closed() {
 
     // State 4: Unversioned -> succeeds
     *driver.versioning_state.lock().unwrap() =
-        registry_rust::storage::s3::S3BucketVersioningState::Unversioned;
+        naust::storage::s3::S3BucketVersioningState::Unversioned;
     let ok = service
         .delete(
             BlobGcPolicy::ManifestRooted,
@@ -1184,7 +1182,7 @@ async fn test_integration_manifest_publication_holds_mutation_guard_excluding_gc
 
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
-    let service = registry_rust::manifest_lifecycle::ManifestLifecycleService::new(
+    let service = naust::manifest_lifecycle::ManifestLifecycleService::new(
         hooked_storage.clone(),
         Some(ref_index.clone()),
         coordinator.clone(),
@@ -1218,7 +1216,7 @@ async fn test_integration_manifest_publication_holds_mutation_guard_excluding_gc
 
     let service_clone = service.clone();
     let pub_task = tokio::spawn(async move {
-        let req = registry_rust::manifest_lifecycle::PublishManifestRequest::new(
+        let req = naust::manifest_lifecycle::PublishManifestRequest::new(
             "team/app",
             "v1.0",
             m_bytes,
@@ -1328,22 +1326,20 @@ async fn test_integration_upload_finalization_holds_guard_through_membership_dur
 
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
-    let upload_coord = Arc::new(
-        registry_rust::upload_coordinator::BlobUploadCoordinator::new(
-            hooked_storage.clone(),
-            Some(ref_index.clone()),
-            coordinator.clone(),
-            registry_rust::upload_coordinator::BlobUploadCoordinatorConfig {
-                signing_key: b"test-key".to_vec(),
-                max_upload_bytes: 10 * 1024 * 1024,
-                abort_on_digest_mismatch: true,
-                disallow_monolithic_uploads: false,
-                upload_chunk_min_bytes: None,
-                gc_pin_duration_secs: 3600,
-                finalize_grace_secs: 0,
-            },
-        ),
-    );
+    let upload_coord = Arc::new(naust::upload_coordinator::BlobUploadCoordinator::new(
+        hooked_storage.clone(),
+        Some(ref_index.clone()),
+        coordinator.clone(),
+        naust::upload_coordinator::BlobUploadCoordinatorConfig {
+            signing_key: b"test-key".to_vec(),
+            max_upload_bytes: 10 * 1024 * 1024,
+            abort_on_digest_mismatch: true,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 0,
+        },
+    ));
 
     let start_res = upload_coord.start_upload("myrepo").await.unwrap();
     let chunk = bytes::Bytes::from_static(b"upload finalization data payload");
@@ -1352,9 +1348,9 @@ async fn test_integration_upload_finalization_holds_guard_through_membership_dur
     let hex = hex::encode(sha2::Digest::finalize(hasher));
     let digest = Digest::parse(&format!("sha256:{hex}")).unwrap();
 
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(futures_util::future::ready(
-            Ok::<bytes::Bytes, registry_rust::storage::upload_session::UploadStreamError>(chunk),
+            Ok::<bytes::Bytes, naust::storage::upload_session::UploadStreamError>(chunk),
         )));
     let append_res = upload_coord
         .append_upload(
@@ -1481,22 +1477,20 @@ async fn test_integration_proxy_blob_publication_holds_guard_through_membership_
 
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
-    let upload_coord = Arc::new(
-        registry_rust::upload_coordinator::BlobUploadCoordinator::new(
-            hooked_storage.clone(),
-            Some(ref_index.clone()),
-            coordinator.clone(),
-            registry_rust::upload_coordinator::BlobUploadCoordinatorConfig {
-                signing_key: b"test-key".to_vec(),
-                max_upload_bytes: 10 * 1024 * 1024,
-                abort_on_digest_mismatch: true,
-                disallow_monolithic_uploads: false,
-                upload_chunk_min_bytes: None,
-                gc_pin_duration_secs: 3600,
-                finalize_grace_secs: 0,
-            },
-        ),
-    );
+    let upload_coord = Arc::new(naust::upload_coordinator::BlobUploadCoordinator::new(
+        hooked_storage.clone(),
+        Some(ref_index.clone()),
+        coordinator.clone(),
+        naust::upload_coordinator::BlobUploadCoordinatorConfig {
+            signing_key: b"test-key".to_vec(),
+            max_upload_bytes: 10 * 1024 * 1024,
+            abort_on_digest_mismatch: true,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 0,
+        },
+    ));
 
     let blob_data = bytes::Bytes::from_static(b"proxy-cached blob content data");
     let mut hasher = sha2::Sha256::default();
@@ -1504,10 +1498,10 @@ async fn test_integration_proxy_blob_publication_holds_guard_through_membership_
     let hex = hex::encode(sha2::Digest::finalize(hasher));
     let digest = Digest::parse(&format!("sha256:{hex}")).unwrap();
 
-    let stream: registry_rust::storage::upload_session::UploadByteStream = Box::pin(
+    let stream: naust::storage::upload_session::UploadByteStream = Box::pin(
         futures_util::stream::once(futures_util::future::ready(Ok::<
             bytes::Bytes,
-            registry_rust::storage::upload_session::UploadStreamError,
+            naust::storage::upload_session::UploadStreamError,
         >(blob_data.clone()))),
     );
 
@@ -1582,10 +1576,10 @@ async fn test_integration_proxy_blob_publication_holds_guard_through_membership_
     gc_task.await.unwrap();
 
     // 6. Test idempotent duplicate publication
-    let stream2: registry_rust::storage::upload_session::UploadByteStream = Box::pin(
+    let stream2: naust::storage::upload_session::UploadByteStream = Box::pin(
         futures_util::stream::once(futures_util::future::ready(Ok::<
             bytes::Bytes,
-            registry_rust::storage::upload_session::UploadStreamError,
+            naust::storage::upload_session::UploadStreamError,
         >(blob_data.clone()))),
     );
     let pub_res2 = upload_coord
@@ -1634,22 +1628,20 @@ async fn test_integration_cross_mount_cannot_race_gc_deletion() {
 
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
-    let upload_coord = Arc::new(
-        registry_rust::upload_coordinator::BlobUploadCoordinator::new(
-            hooked_storage.clone(),
-            Some(ref_index.clone()),
-            coordinator.clone(),
-            registry_rust::upload_coordinator::BlobUploadCoordinatorConfig {
-                signing_key: b"test-key".to_vec(),
-                max_upload_bytes: 10 * 1024 * 1024,
-                abort_on_digest_mismatch: true,
-                disallow_monolithic_uploads: false,
-                upload_chunk_min_bytes: None,
-                gc_pin_duration_secs: 3600,
-                finalize_grace_secs: 0,
-            },
-        ),
-    );
+    let upload_coord = Arc::new(naust::upload_coordinator::BlobUploadCoordinator::new(
+        hooked_storage.clone(),
+        Some(ref_index.clone()),
+        coordinator.clone(),
+        naust::upload_coordinator::BlobUploadCoordinatorConfig {
+            signing_key: b"test-key".to_vec(),
+            max_upload_bytes: 10 * 1024 * 1024,
+            abort_on_digest_mismatch: true,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 0,
+        },
+    ));
 
     let blob_bytes = bytes::Bytes::from_static(b"source blob content for cross mount");
     let mut hasher = sha2::Sha256::default();
@@ -1769,7 +1761,7 @@ async fn test_integration_repository_unlink_and_gc_revalidation_serialize() {
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let ledger = Arc::new(
-        registry_rust::repository_membership_ledger::RepositoryMembershipLedger::new(
+        naust::repository_membership_ledger::RepositoryMembershipLedger::new(
             hooked_storage.clone(),
             Some(ref_index.clone()),
             coordinator.clone(),
@@ -1901,7 +1893,7 @@ async fn test_integration_fs_deletion_requires_both_gc_proof_types() {
     );
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         storage.clone(),
         ref_index.clone(),
         coordinator,
@@ -1957,7 +1949,7 @@ async fn test_integration_s3_deletion_requires_both_gc_proof_types() {
     );
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         s3_storage_dyn.clone(),
         ref_index.clone(),
         coordinator,
@@ -2047,7 +2039,7 @@ async fn test_integration_gc_candidate_releases_guard_between_items() {
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         hooked_storage.clone(),
         ref_index.clone(),
         coordinator.clone(),
@@ -2132,7 +2124,7 @@ async fn test_integration_nested_manifest_composition_no_reacquisition_deadlock(
         .unwrap();
     let coordinator = ConsistencyCoordinator::new();
 
-    let service = registry_rust::manifest_lifecycle::ManifestLifecycleService::new(
+    let service = naust::manifest_lifecycle::ManifestLifecycleService::new(
         storage.clone(),
         Some(ref_index.clone()),
         coordinator.clone(),
@@ -2162,7 +2154,7 @@ async fn test_integration_nested_manifest_composition_no_reacquisition_deadlock(
     );
     let m_bytes = bytes::Bytes::from(manifest_json);
 
-    let req = registry_rust::manifest_lifecycle::PublishManifestRequest::new(
+    let req = naust::manifest_lifecycle::PublishManifestRequest::new(
         "nested-app",
         "v1.0",
         m_bytes,
@@ -2218,22 +2210,20 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
 
     let hooked_storage = Arc::new(HookedStorage::new(base_storage.clone(), hooks));
 
-    let upload_coord = Arc::new(
-        registry_rust::upload_coordinator::BlobUploadCoordinator::new(
-            hooked_storage.clone(),
-            Some(ref_index.clone()),
-            coordinator.clone(),
-            registry_rust::upload_coordinator::BlobUploadCoordinatorConfig {
-                signing_key: b"test-key".to_vec(),
-                max_upload_bytes: 10 * 1024 * 1024,
-                abort_on_digest_mismatch: true,
-                disallow_monolithic_uploads: false,
-                upload_chunk_min_bytes: None,
-                gc_pin_duration_secs: 3600,
-                finalize_grace_secs: 0,
-            },
-        ),
-    );
+    let upload_coord = Arc::new(naust::upload_coordinator::BlobUploadCoordinator::new(
+        hooked_storage.clone(),
+        Some(ref_index.clone()),
+        coordinator.clone(),
+        naust::upload_coordinator::BlobUploadCoordinatorConfig {
+            signing_key: b"test-key".to_vec(),
+            max_upload_bytes: 10 * 1024 * 1024,
+            abort_on_digest_mismatch: true,
+            disallow_monolithic_uploads: false,
+            upload_chunk_min_bytes: None,
+            gc_pin_duration_secs: 3600,
+            finalize_grace_secs: 0,
+        },
+    ));
 
     let start_res = upload_coord.start_upload("canceldemo").await.unwrap();
     let chunk = bytes::Bytes::from_static(b"data that will be cancelled post-CAS");
@@ -2242,9 +2232,9 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
     let hex = hex::encode(sha2::Digest::finalize(hasher));
     let digest = Digest::parse(&format!("sha256:{hex}")).unwrap();
 
-    let stream: registry_rust::storage::upload_session::UploadByteStream =
+    let stream: naust::storage::upload_session::UploadByteStream =
         Box::pin(futures_util::stream::once(futures_util::future::ready(
-            Ok::<bytes::Bytes, registry_rust::storage::upload_session::UploadStreamError>(chunk),
+            Ok::<bytes::Bytes, naust::storage::upload_session::UploadStreamError>(chunk),
         )));
     let append_res = upload_coord
         .append_upload(
@@ -2300,7 +2290,7 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
         .unwrap();
 
     // 6. Verify orphan remains protected while durable pin lease is valid
-    let policy_ctx = registry_rust::blob_gc::PolicyContext::build(
+    let policy_ctx = naust::blob_gc::PolicyContext::build(
         &base_storage,
         &ref_index,
         BlobGcPolicy::ManifestRooted,
@@ -2319,7 +2309,7 @@ async fn test_integration_cancellation_during_guarded_mutation_releases_coordina
 
     // 8. Service execution at expiry time: candidate is quarantined and deleted
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         base_storage.clone(),
         ref_index.clone(),
         coordinator.clone(),

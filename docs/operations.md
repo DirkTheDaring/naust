@@ -12,7 +12,7 @@ One GC engine (`src/blob_gc/`), backend-selected strategy:
 
 **Three entry points:**
 
-1. **CLI (offline):** `registry-rust blob-gc {plan|quarantine|delete}` — guarded by `FsRootLock` (`fs_root/.locks/registry-rust.lock`) and `RuntimeMutationAuthority`; S3 destructive ops additionally require `--confirm-all-writers-stopped`. Since 2026-09-26 (KI-05 resolved) the CLI **respects** `blob_gc.enabled=false` (and `enable_delete=false` for delete) and refuses with a clear error; pass `--force-gc` to override deliberately. `plan` remains read-only and ungated.
+1. **CLI (offline):** `naust blob-gc {plan|quarantine|delete}` — guarded by `FsRootLock` (`fs_root/.locks/naust.lock`) and `RuntimeMutationAuthority`; S3 destructive ops additionally require `--confirm-all-writers-stopped`. Since 2026-09-26 (KI-05 resolved) the CLI **respects** `blob_gc.enabled=false` (and `enable_delete=false` for delete) and refuses with a clear error; pass `--force-gc` to override deliberately. `plan` remains read-only and ungated.
 2. **Admin HTTP:** `/_admin/gc/{health,plan,quarantine,delete}`, registered only when `admin_api.enabled`. `plan` is read-only and not kill-switch gated; `quarantine` needs `blob_gc.enabled=true`; `delete` additionally `blob_gc.enable_delete=true`.
 3. **Background scheduler:** gated by `blob_gc.schedule_enabled` (interval `schedule_interval_secs`, missed ticks skipped). Each run first executes the **repository-membership sweep** (Active → Candidate → Unlink aging); the sweep has no CLI or admin route.
 
@@ -34,7 +34,7 @@ One GC engine (`src/blob_gc/`), backend-selected strategy:
 
 **Locks:** cross-process safety = FsRootLock (CLI vs server) + deployment writer lease (`RuntimeMutationAuthority`; on S3 an ETag-guarded lease object at `meta/exclusive_writer.lock` — `src/storage/s3.rs:2012`; on the filesystem backend the storage-level lease is the trait's no-op default and single-writer exclusion comes from `FsRootLock`). Deletion needs both a `GcMutationPermit` and a `GcRevalidationGuard`. FS GC run lock file: `quarantine/gc.lock` (two code comments still say `quarantine/.lock` — KI-08).
 
-**Ref index:** sled, 7 trees, states `ready/building/dirty`; rebuild is destructive and serialized; upload finalization heals the index *before* the fail-closed pin gate. Maintenance: `registry-rust ref-index {check|rebuild|ensure}`.
+**Ref index:** sled, 7 trees, states `ready/building/dirty`; rebuild is destructive and serialized; upload finalization heals the index *before* the fail-closed pin gate. Maintenance: `naust ref-index {check|rebuild|ensure}`.
 
 **Membership backfill (pre-existing data):** the server refuses to boot on non-empty storage until `migrate-membership apply` + `verify` have marked storage Ready (empty storage auto-marks). The migration is resumable (checkpoint with 60 s owner lease).
 
@@ -49,7 +49,7 @@ Model: single auth middleware on `/v2/*`; anonymous pull default-on (`auth.anony
 enabled = true
 [[auth.robots.accounts]]
 name = "ci"
-secret_hash = "$argon2id$..."           # never plaintext; generate via `registry-rust hash-secret` (reads stdin)
+secret_hash = "$argon2id$..."           # never plaintext; generate via `naust hash-secret` (reads stdin)
 grants = [ { repo_prefix = "org1/", actions = ["pull","push"] } ]
 max_ttl_secs = 600
 
@@ -68,7 +68,7 @@ grants = [ { repo_prefix = "org1/", actions = ["pull","push"] } ]
 
 **Playbooks:**
 
-- *Rotate a robot/user secret:* generate a new hash (`registry-rust hash-secret`, secret on stdin), replace `secret_hash`, restart. Old secrets stop working immediately.
+- *Rotate a robot/user secret:* generate a new hash (`naust hash-secret`, secret on stdin), replace `secret_hash`, restart. Old secrets stop working immediately.
 - *Rotate token signing keys (overlap):* add the new key as the FIRST `[[token.signing_keys]]` entry, keep old keys listed for ≥ max token TTL, restart; then remove old keys and restart. The first entry mints; all entries verify. `TOKEN_SIGNING_KEY` env is ignored while the keyring is present.
 - *Suspected leakage:* rotate the affected `secret_hash` or remove the compromised signing key, restart. the `token_issued`/`token_denied`/`token_error` tracing events (with denial reasons) are emitted since 2026-09-26 (KI-04 resolved) — filter on `event = "token_denied"` to follow the staged-rollout playbook.
 - *Token endpoint rate limit:* global fixed window, env-only (`TOKEN_RATE_LIMIT_RPM`, default 1200/60 s; `0` disables). Outside `Config`, so `check-config` does not validate it (KI-09).
@@ -87,12 +87,12 @@ Cached content lives in a separate root/prefix (`proxy.cache.fs_root` / `cache_s
 
 ## 5. Packaging and deployment cautions
 
-- The packaged conffiles under `etc/registry-rust/` currently ship environment-specific values, an unknown config key that hard-fails strict mode, and credential material — review before deploying a package (KI-11).
+- The packaged conffiles under `etc/naust/` currently ship environment-specific values, an unknown config key that hard-fails strict mode, and credential material — review before deploying a package (KI-11).
 - RPM and DEB systemd units diverge (DEB lacks `LimitNOFILE`/`ReadWritePaths`; KI-21).
 - The container image build does not stage the `storage-layer-rust` path dependencies; build viability is unverified (KI-10).
 - Non-Linux hosts: `FsStorage` requires Linux `openat2` and fails closed at startup elsewhere; non-Linux operation is unverified (GATE-O15).
 
 ## 6. Development / observability notes (ADR-010 crate split)
 
-- **Log-filter targets:** the FS storage `tracing` targets renamed with the crate split — `registry_rust::storage::fs` → `registry_core::storage::fs`. Update any `RUST_LOG`/collector filters that reference the old target (KI-27b, resolved here).
-- **Test invocation:** the workspace has two crates; bare `cargo test` at the repo root runs only the server package. Use `cargo test --workspace --locked` to include `registry-core`'s ~900 unit tests (KI-27c, resolved here).
+- **Log-filter targets:** the FS storage `tracing` targets renamed with the crate split — `naust::storage::fs` → `naust_core::storage::fs`. Update any `RUST_LOG`/collector filters that reference the old target (KI-27b, resolved here).
+- **Test invocation:** the workspace has two crates; bare `cargo test` at the repo root runs only the server package. Use `cargo test --workspace --locked` to include `naust-core`'s ~900 unit tests (KI-27c, resolved here).

@@ -1,7 +1,7 @@
 use std::process::Command;
 
-use registry_rust::config::{Config, ConfigError, StorageBackend};
-use registry_rust::storage::StorageErrorKind;
+use naust::config::{Config, ConfigError, StorageBackend};
+use naust::storage::StorageErrorKind;
 
 fn run_isolated(worker_name: &str, env_vars: &[(&str, &str)]) {
     let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
@@ -461,13 +461,13 @@ fn worker_config_storage_wiring_constructor_validation() {
     cfg.fs_root = temp.path().to_path_buf();
 
     // Valid configuration succeeds
-    let wiring = registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg)
+    let wiring = naust::storage_wiring::storage_wiring_try_from_config(&cfg)
         .expect("valid limits must succeed");
     assert_eq!(wiring.gc_service_port().kind(), "fs");
 
     // Invalid max_depth = 0
     cfg.fs_gc_discovery_max_depth = 0;
-    let err = match registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg) {
+    let err = match naust::storage_wiring::storage_wiring_try_from_config(&cfg) {
         Ok(_) => panic!("max_depth = 0 must fail constructor validation"),
         Err(e) => e,
     };
@@ -477,7 +477,7 @@ fn worker_config_storage_wiring_constructor_validation() {
     // Reset and test invalid terminal_dir_max_name_bytes < 128
     cfg.fs_gc_discovery_max_depth = 32;
     cfg.fs_gc_discovery_terminal_dir_max_name_bytes = 64;
-    let err = match registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg) {
+    let err = match naust::storage_wiring::storage_wiring_try_from_config(&cfg) {
         Ok(_) => panic!("name bytes < 128 must fail constructor validation"),
         Err(e) => e,
     };

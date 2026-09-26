@@ -169,7 +169,7 @@ When designing an extracted generic listing primitive in `storage-fs` (`storage-
 
 - **Repository Audit:**
   - A workspace search for HTTP `Range` and `Content-Range` headers confirms range reading lives exclusively in the presentation layer:
-    - [`src/http_api/handlers.rs:319-358`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers.rs#L319-L358): in `get_blob_or_manifest`, byte ranges (`bytes=s-e`) are sliced from the asynchronous chunk stream returned by `app.get_blob()`.
+    - [`src/http_api/handlers.rs:319-358`](src/http_api/handlers.rs#L319-L358): in `get_blob_or_manifest`, byte ranges (`bytes=s-e`) are sliced from the asynchronous chunk stream returned by `app.get_blob()`.
     - Chunked upload handlers in `src/http_api/handlers.rs:1357,1443` evaluate `Content-Range` for upload offset validation.
 - **Backend Primitive:**
   - There is **no backend range-read primitive** in `StoragePort`, `BlobStoragePort`, `FsStorage`, or `S3Storage`.

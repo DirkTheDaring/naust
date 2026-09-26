@@ -6,8 +6,8 @@
 
 - **Document:** `docs/architecture/filesystem-timestamps-and-emptiness-containment.md`
 - **Status:** Implementation & Compatibility Record (working tree, not committed)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `3b647132f867accd7551ddb0ca297064be89abb9` (`master`), changes applied in the working tree only.
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — the required primitive, `FsMetadataReader::inspect_file_metadata`, already existed).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `3b647132f867accd7551ddb0ca297064be89abb9` (`master`), changes applied in the working tree only.
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (strictly read-only; unchanged — the required primitive, `FsMetadataReader::inspect_file_metadata`, already existed).
 - **Scope:** Gap-inventory items R-4 (`repo_timestamps` / `max_mtime_in_dir`) and R-5 (`is_storage_empty`'s `fs_dir_has_any_entry` probes). The `list_repositories` leg of `is_storage_empty` was already contained by the committed catalog batch.
 
 ---

@@ -1,5 +1,5 @@
 //! Contained filesystem quarantine and upload-inspection point reads for
-//! `registry-rust` (gap items R-13–R-15, partial).
+//! `naust` (gap items R-13–R-15, partial).
 //!
 //! # Architecture and Scope
 //!

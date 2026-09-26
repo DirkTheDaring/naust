@@ -1,4 +1,4 @@
-//! Contained filesystem storage-emptiness inspection for `registry-rust`.
+//! Contained filesystem storage-emptiness inspection for `naust`.
 //!
 //! # Architecture and Scope
 //!

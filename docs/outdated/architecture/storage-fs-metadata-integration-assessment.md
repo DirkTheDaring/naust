@@ -487,7 +487,7 @@ The smallest useful prerequisite supported by the findings is to establish the b
 Implement a backend-private, synchronous capability probe method on `FsMetadataReader` in `storage-layer-rust` that executes Linux `openat2` on `"."` beneath the pinned root directory descriptor, validating that the host kernel and container execution environment permit descriptor-relative resolution before queries are served.
 
 ### 6.2 Exact Repository and File Scope
-- Repository: `/home/dietmar/devel/rust/storage-layer-rust`
+- Repository: `~/devel/rust/storage-layer-rust`
 - Files to modify:
   1. `crates/storage-fs/src/reader.rs`:
      - Implement `pub fn probe_capability(&self) -> Result<(), FsMetadataError>`.
@@ -517,7 +517,7 @@ Implement a backend-private, synchronous capability probe method on `FsMetadataR
 
 ### 6.5 Required Verification Commands
 ```bash
-cd /home/dietmar/devel/rust/storage-layer-rust
+cd ~/devel/rust/storage-layer-rust
 cargo fmt --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings

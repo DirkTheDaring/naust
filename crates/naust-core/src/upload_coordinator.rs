@@ -200,7 +200,7 @@ pub struct BlobUploadCoordinatorConfig {
 impl Default for BlobUploadCoordinatorConfig {
     fn default() -> Self {
         Self {
-            signing_key: b"registry-rust-state-secret".to_vec(),
+            signing_key: b"naust-state-secret".to_vec(),
             max_upload_bytes: 0,
             abort_on_digest_mismatch: false,
             disallow_monolithic_uploads: false,

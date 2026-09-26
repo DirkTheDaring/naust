@@ -2,9 +2,9 @@
 //! blobs the historical ambient `read_dir` walker saw (parity on FS), and the
 //! same surface works on S3 — the capability the old walker could never have.
 
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::ports::CacheEvictionPort;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::ports::CacheEvictionPort;
 use sha2::Digest as _;
 use std::collections::BTreeMap;
 
@@ -130,7 +130,7 @@ async fn fs_port_enumeration_fails_closed_on_malformed_entries() {
         let err = storage.list_cache_blobs_page(None, 10).await.unwrap_err();
         assert_eq!(
             err.internal_kind(),
-            Some(registry_rust::storage::StorageErrorKind::CorruptData),
+            Some(naust::storage::StorageErrorKind::CorruptData),
             "junk {path} must fail closed"
         );
     }
@@ -149,14 +149,14 @@ async fn fs_evict_cache_blob_unlinks_and_is_version_conditional() {
     let enumerated = &page.items[0];
 
     // Stale-version delete is refused.
-    let stale = registry_rust::storage::BlobObjectVersion("bogus".to_string());
+    let stale = naust::storage::BlobObjectVersion("bogus".to_string());
     let refused = storage
         .evict_cache_blob(&digest, Some(&stale))
         .await
         .unwrap();
     assert!(matches!(
         refused,
-        registry_rust::storage::GcDeleteResult::PreconditionFailed { .. }
+        naust::storage::GcDeleteResult::PreconditionFailed { .. }
     ));
     assert!(
         root.join("blobs/sha256")
@@ -170,10 +170,7 @@ async fn fs_evict_cache_blob_unlinks_and_is_version_conditional() {
         .evict_cache_blob(&digest, Some(&enumerated.version))
         .await
         .unwrap();
-    assert!(matches!(
-        deleted,
-        registry_rust::storage::GcDeleteResult::Deleted
-    ));
+    assert!(matches!(deleted, naust::storage::GcDeleteResult::Deleted));
     assert!(
         !root
             .join("blobs/sha256")
@@ -187,8 +184,5 @@ async fn fs_evict_cache_blob_unlinks_and_is_version_conditional() {
         .evict_cache_blob(&digest, Some(&enumerated.version))
         .await
         .unwrap();
-    assert!(matches!(
-        missing,
-        registry_rust::storage::GcDeleteResult::NotFound
-    ));
+    assert!(matches!(missing, naust::storage::GcDeleteResult::NotFound));
 }

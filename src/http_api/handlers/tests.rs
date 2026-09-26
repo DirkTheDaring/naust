@@ -72,8 +72,7 @@ async fn admin_gc_returns_503_when_service_missing() {
 
 #[tokio::test]
 async fn admin_gc_maps_already_running_to_conflict() {
-    let fs_root =
-        std::env::temp_dir().join(format!("registry-rust-admin-gc-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-admin-gc-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
     let ref_index_path = fs_root.join("ref-index");
     let _ = std::fs::create_dir_all(&ref_index_path);
@@ -111,8 +110,7 @@ async fn admin_gc_maps_already_running_to_conflict() {
 
 #[tokio::test]
 async fn admin_gc_quarantine_blocked_when_kill_switch_off() {
-    let fs_root =
-        std::env::temp_dir().join(format!("registry-rust-admin-gc-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-admin-gc-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
     let ref_index_path = fs_root.join("ref-index");
     let _ = std::fs::create_dir_all(&ref_index_path);
@@ -151,8 +149,7 @@ async fn admin_gc_quarantine_blocked_when_kill_switch_off() {
 
 #[tokio::test]
 async fn admin_gc_delete_blocked_when_delete_gate_off() {
-    let fs_root =
-        std::env::temp_dir().join(format!("registry-rust-admin-gc-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-admin-gc-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
     let ref_index_path = fs_root.join("ref-index");
     let _ = std::fs::create_dir_all(&ref_index_path);
@@ -192,8 +189,7 @@ async fn admin_gc_delete_blocked_when_delete_gate_off() {
 
 #[tokio::test]
 async fn meta_catalog_include_tags_adds_tags_and_tag_count() {
-    let fs_root =
-        std::env::temp_dir().join(format!("registry-rust-meta-tags-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-meta-tags-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
 
     // Create repos + tags on disk.
@@ -245,10 +241,8 @@ async fn meta_catalog_include_tags_adds_tags_and_tag_count() {
 
 #[tokio::test]
 async fn meta_catalog_include_platforms_adds_tag_details_with_platforms() {
-    let fs_root = std::env::temp_dir().join(format!(
-        "registry-rust-meta-platforms-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let fs_root =
+        std::env::temp_dir().join(format!("naust-meta-platforms-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
 
     let repo = "org1/repoa";
@@ -671,7 +665,7 @@ fn minimal_config_for_token_tests() -> Config {
         },
         catalog_requires_auth: false,
         public_url: Some("http://127.0.0.1:5000".to_string()),
-        token_service: "registry-rust".to_string(),
+        token_service: "naust".to_string(),
         token_signing_key: "test-key".to_string(),
         token_signing_keys: vec![security::TokenSigningKey {
             kid: "default".to_string(),
@@ -1352,7 +1346,7 @@ async fn test_handler_delete_session_with_invalid_state_rejected() {
 
 #[tokio::test]
 async fn test_manifest_put_rejects_malformed_layer_digest() {
-    let fs_root = std::env::temp_dir().join(format!("registry-rust-test-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-test-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
     let mut cfg = minimal_config_for_token_tests();
     cfg.fs_root = fs_root.clone();
@@ -1414,7 +1408,7 @@ async fn test_manifest_put_rejects_malformed_layer_digest() {
 
 #[tokio::test]
 async fn test_manifest_put_rejects_malformed_config_structure() {
-    let fs_root = std::env::temp_dir().join(format!("registry-rust-test-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-test-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
     let mut cfg = minimal_config_for_token_tests();
     cfg.fs_root = fs_root.clone();
@@ -1466,7 +1460,7 @@ async fn test_manifest_put_rejects_malformed_config_structure() {
 
 #[tokio::test]
 async fn test_repo_named_quota_or_limited_behaves_normally() {
-    let fs_root = std::env::temp_dir().join(format!("registry-rust-test-{}", uuid::Uuid::new_v4()));
+    let fs_root = std::env::temp_dir().join(format!("naust-test-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::create_dir_all(&fs_root);
     let mut cfg = minimal_config_for_token_tests();
     cfg.fs_root = fs_root.clone();
@@ -1549,7 +1543,7 @@ async fn token_endpoint_increments_auth_metrics() {
     let resp = crate::http_api::auth_token::token(
         State(state.clone()),
         RawQuery(Some(
-            "service=registry-rust&scope=repository:library/app:pull".to_string(),
+            "service=naust&scope=repository:library/app:pull".to_string(),
         )),
         HeaderMap::new(),
     )

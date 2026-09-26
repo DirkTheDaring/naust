@@ -2,7 +2,7 @@
 
 # Container Image Testing Guide
 
-This guide describes how to run and test the `registry-rust` container image locally with authentication, OCI compliance checks, and API workflows.
+This guide describes how to run and test the `naust` container image locally with authentication, OCI compliance checks, and API workflows.
 
 ---
 
@@ -16,7 +16,7 @@ podman run -d --name my-registry \
   -e REGISTRY_USERNAME=admin \
   -e REGISTRY_PASSWORD=adminpassword \
   -v ./registry-data:/data:Z \
-  localhost/registry-rust:latest
+  localhost/naust:latest
 ```
 
 > **Note:** If using Docker instead of Podman, replace `podman` with `docker` and omit the `:Z` volume flag if SELinux is not in enforcing mode.
@@ -61,7 +61,7 @@ curl -i http://127.0.0.1:5000/v2/
 #### 2. Request a Bearer Token (using Basic Auth)
 ```bash
 TOKEN=$(curl -s -u admin:adminpassword \
-  "http://127.0.0.1:5000/token?service=registry-rust&scope=repository:testrepo:pull,push" \
+  "http://127.0.0.1:5000/token?service=naust&scope=repository:testrepo:pull,push" \
   | jq -r .token)
 
 echo "Acquired Token: ${TOKEN:0:20}..."
@@ -124,7 +124,7 @@ DATA = b'automated test payload\n'
 digest = 'sha256:' + hashlib.sha256(DATA).hexdigest()
 
 # 1. Fetch Bearer Token
-token_url = f'{HOST}/token?service=registry-rust&scope=repository:{REPO}:pull,push'
+token_url = f'{HOST}/token?service=naust&scope=repository:{REPO}:pull,push'
 req = urllib.request.Request(token_url)
 basic_b64 = base64.b64encode(f'{USER}:{PASS}'.encode()).decode()
 req.add_header('Authorization', f'Basic {basic_b64}')

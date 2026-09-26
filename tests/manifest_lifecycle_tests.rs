@@ -7,23 +7,23 @@ use sha2::Digest as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::manifest_lifecycle::{
+use naust::blob_ref_index::BlobRefIndex;
+use naust::manifest_lifecycle::{
     LifecycleJournalRecord, LifecycleOpKind, LifecyclePhase, ManifestLifecycleError,
     ManifestLifecycleService, ProxyPublicationEvidence, PublishManifestRequest, TagSnapshot,
 };
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::mutation_authority::{
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::mutation_authority::{
     DeploymentWriterLockDoc, RuntimeMutationAuthority,
     admin_clear_abandoned_deployment_writer_lock, force_unlock_deployment_writer,
     inspect_deployment_writer_lock,
 };
-use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
-use registry_rust::storage::s3::S3Driver;
-use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::{
+use naust::storage::repo_membership::RepoBlobMembershipRecord;
+use naust::storage::s3::S3Driver;
+use naust::storage::s3::S3Storage;
+use naust::storage::{
     ConditionalDeleteResult, RepositoryBlobMembershipStorage, Storage, StorageError,
     StorageErrorKind,
 };
@@ -56,7 +56,7 @@ async fn setup_test_service(
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index.rebuild(&storage).await.unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service =
         ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
 
@@ -75,8 +75,7 @@ async fn write_test_blob(storage: &(impl Storage + ?Sized), repo: &str, content:
         .await
         .unwrap();
 
-    let canonical_repo =
-        registry_rust::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
+    let canonical_repo = naust::registry::canonical_name::CanonicalRepoName::parse(repo).unwrap();
     let rec = RepoBlobMembershipRecord::new_upload(
         canonical_repo,
         digest.clone(),
@@ -1945,7 +1944,7 @@ async fn test_proxy_eviction_multiple_tags_removes_only_target_tag_alias() {
             repo,
             "tag2",
             &m_d,
-            registry_rust::storage::TagMutationPolicy::Replace,
+            naust::storage::TagMutationPolicy::Replace,
         )
         .await
         .unwrap();
@@ -3057,7 +3056,7 @@ async fn test_proxy_eviction_restart_journal_deletion_lost_retry_is_idempotent()
     let service = ManifestLifecycleService::new(
         storage.clone(),
         Some(ref_index.clone()),
-        registry_rust::consistency::ConsistencyCoordinator::new(),
+        naust::consistency::ConsistencyCoordinator::new(),
     );
 
     // First recovery attempt
@@ -3267,7 +3266,7 @@ async fn test_migrated_dirty_index_state_rebuild_after_crash() {
         .await
         .unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service = ManifestLifecycleService::new(storage.clone(), Some(idx.clone()), coordinator);
 
     let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
@@ -3315,7 +3314,7 @@ async fn test_migrated_concurrent_overwrite_publications_converge() {
         .await
         .unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service = Arc::new(ManifestLifecycleService::new(
         storage.clone(),
         Some(idx.clone()),
@@ -3378,7 +3377,7 @@ async fn test_migrated_same_digest_retry_after_dirty_rebuilds_and_succeeds() {
         .await
         .unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service = ManifestLifecycleService::new(storage.clone(), Some(idx.clone()), coordinator);
 
     let config_d = write_test_blob(storage.as_ref(), "test/repo", b"{}").await;
@@ -3512,7 +3511,7 @@ async fn setup_fault_service(
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index.rebuild(&fault_storage).await.unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service =
         ManifestLifecycleService::new(fault_storage.clone(), Some(ref_index.clone()), coordinator);
 
@@ -3693,7 +3692,7 @@ async fn test_evict_proxy_cached_entry_fails_on_corrupt_manifest_parse_error() {
     assert!(matches!(
         err,
         ManifestLifecycleError::Storage(StorageError::Internal {
-            kind: registry_rust::storage::StorageErrorKind::CorruptData,
+            kind: naust::storage::StorageErrorKind::CorruptData,
             ..
         })
     ));
@@ -4190,7 +4189,7 @@ async fn test_manifest_listing_lifecycle_error_propagation_on_promoted_listing_f
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index.rebuild(&storage).await.unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service =
         ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
 
@@ -4388,7 +4387,7 @@ async fn test_manifest_lifecycle_delete_tag_precondition_failed_cleanup() {
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index.rebuild(&storage).await.unwrap();
 
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service =
         ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
     let repo = "test-precondition-cleanup-repo";
@@ -4566,11 +4565,11 @@ async fn test_manifest_lifecycle_delete_tag_conditional_delete_failure_before_re
         .await
         .unwrap()
         .expect("journal must remain on disk following failure before tag removal");
-    let journal_record: registry_rust::manifest_lifecycle::LifecycleJournalRecord =
+    let journal_record: naust::manifest_lifecycle::LifecycleJournalRecord =
         serde_json::from_slice(&journal_bytes).unwrap();
     assert_eq!(
         journal_record.phase,
-        registry_rust::manifest_lifecycle::LifecyclePhase::TagDeleteInitiated,
+        naust::manifest_lifecycle::LifecyclePhase::TagDeleteInitiated,
         "journal phase must remain TagDeleteInitiated"
     );
 
@@ -4592,7 +4591,7 @@ async fn test_manifest_lifecycle_root_replacement_sequencing() {
     let storage = Arc::new(FsStorage::new(root_path.clone(), 50 * 1024 * 1024));
     let ref_index = Arc::new(BlobRefIndex::open(ref_idx_path).unwrap());
     ref_index.rebuild(&storage).await.unwrap();
-    let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
+    let coordinator = naust::consistency::ConsistencyCoordinator::new();
     let service =
         ManifestLifecycleService::new(storage.clone(), Some(ref_index.clone()), coordinator);
     let repo = "repl-test-repo";
@@ -4693,7 +4692,7 @@ async fn test_delete_manifest_recovery_tag_listing_error_first_page_propagates_b
             repo,
             tag_name,
             &m_d,
-            registry_rust::storage::TagMutationPolicy::Replace,
+            naust::storage::TagMutationPolicy::Replace,
         )
         .await
         .unwrap();
@@ -4950,12 +4949,7 @@ async fn test_delete_manifest_recovery_tag_listing_error_later_page_propagates()
     for i in 0..70 {
         let tag = format!("tag-{i:03}");
         storage
-            .mutate_tag(
-                repo,
-                &tag,
-                &m_d,
-                registry_rust::storage::TagMutationPolicy::Replace,
-            )
+            .mutate_tag(repo, &tag, &m_d, naust::storage::TagMutationPolicy::Replace)
             .await
             .unwrap();
     }
@@ -5134,7 +5128,7 @@ async fn test_proxy_evict_recovery_tag_listing_error_first_page_propagates_backe
             repo,
             tag_name,
             &m_d,
-            registry_rust::storage::TagMutationPolicy::Replace,
+            naust::storage::TagMutationPolicy::Replace,
         )
         .await
         .unwrap();
@@ -5360,7 +5354,7 @@ async fn test_proxy_evict_recovery_tag_listing_error_later_page_propagates() {
                 repo,
                 &tag,
                 &m2_d,
-                registry_rust::storage::TagMutationPolicy::Replace,
+                naust::storage::TagMutationPolicy::Replace,
             )
             .await
             .unwrap();
@@ -5511,12 +5505,7 @@ async fn test_proxy_evict_recovery_tag_listing_discovers_other_referencing_tag()
 
     // There is another tag referencing this target_digest
     storage
-        .mutate_tag(
-            repo,
-            "v2",
-            &m_d,
-            registry_rust::storage::TagMutationPolicy::Replace,
-        )
+        .mutate_tag(repo, "v2", &m_d, naust::storage::TagMutationPolicy::Replace)
         .await
         .unwrap();
 
@@ -5805,7 +5794,7 @@ async fn test_evict_proxy_cached_entry_tag_listing_error_later_page_propagates()
                 repo,
                 &tag,
                 &m2_d,
-                registry_rust::storage::TagMutationPolicy::Replace,
+                naust::storage::TagMutationPolicy::Replace,
             )
             .await
             .unwrap();
@@ -5941,12 +5930,7 @@ async fn test_evict_proxy_cached_entry_tag_listing_discovers_other_referencing_t
 
     // Add another tag pointing to same manifest
     storage
-        .mutate_tag(
-            repo,
-            "v2",
-            &m_d,
-            registry_rust::storage::TagMutationPolicy::Replace,
-        )
+        .mutate_tag(repo, "v2", &m_d, naust::storage::TagMutationPolicy::Replace)
         .await
         .unwrap();
 
@@ -6146,7 +6130,7 @@ mod legacy_s3_token_recovery {
         ManifestLifecycleService::new(
             storage,
             None,
-            registry_rust::consistency::ConsistencyCoordinator::new(),
+            naust::consistency::ConsistencyCoordinator::new(),
         )
     }
 

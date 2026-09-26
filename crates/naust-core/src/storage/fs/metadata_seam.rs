@@ -1,5 +1,5 @@
 //! Registry metadata integration seam for evaluating `storage-fs` against
-//! `registry-rust` storage semantics and quarantine orchestration.
+//! `naust` storage semantics and quarantine orchestration.
 
 use crate::registry::digest::Digest;
 use crate::storage::{StorageError, StorageErrorKind};

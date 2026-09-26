@@ -20,10 +20,10 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 fn bin_path() -> String {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry-rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_registry_rust") {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_naust") {
         return p;
     }
 
@@ -31,11 +31,7 @@ fn bin_path() -> String {
     let deps_dir = exe.parent().expect("exe parent");
     let profile_dir = deps_dir.parent().expect("deps parent");
 
-    let bin_name = if cfg!(windows) {
-        "registry-rust.exe"
-    } else {
-        "registry-rust"
-    };
+    let bin_name = if cfg!(windows) { "naust.exe" } else { "naust" };
 
     profile_dir.join(bin_name).to_string_lossy().to_string()
 }
@@ -1634,7 +1630,7 @@ async fn test_audit_remediation_suite() {
     // 22. Token endpoint issues delete action in scopes
     let token_resp = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push,delete"
+            "{base_url}/token?service=naust&scope=repository:{repo}:pull,push,delete"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -1678,7 +1674,7 @@ async fn test_audit_remediation_suite() {
     // 23. Deny push operation on target repository when token is scoped for a different repository -> 403 Forbidden
     let wrong_token_resp = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:other-repo:push"
+            "{base_url}/token?service=naust&scope=repository:other-repo:push"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -1725,7 +1721,7 @@ async fn test_audit_remediation_suite() {
     // 26. Deny delete operation when token only grants pull,push scope -> 403 Forbidden
     let pull_push_token_resp = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:{repo}:pull,push"
+            "{base_url}/token?service=naust&scope=repository:{repo}:pull,push"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -1750,7 +1746,7 @@ async fn test_audit_remediation_suite() {
     let v_repo = "v2-compliance-test";
     let token_v_resp = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:{v_repo}:pull,push"
+            "{base_url}/token?service=naust&scope=repository:{v_repo}:pull,push"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -1802,7 +1798,7 @@ async fn test_audit_remediation_suite() {
     let other_repo = "other-unauthorized-repo";
     let token_other_resp = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:{other_repo}:pull,push"
+            "{base_url}/token?service=naust&scope=repository:{other_repo}:pull,push"
         ))
         .basic_auth("demo", Some("demo"))
         .send()
@@ -1830,7 +1826,7 @@ async fn test_audit_remediation_suite() {
     let page_repo = "tags-multi-page-repo";
     let token_page_resp = client
         .get(format!(
-            "{base_url}/token?service=registry-rust&scope=repository:{page_repo}:pull,push"
+            "{base_url}/token?service=naust&scope=repository:{page_repo}:pull,push"
         ))
         .basic_auth("demo", Some("demo"))
         .send()

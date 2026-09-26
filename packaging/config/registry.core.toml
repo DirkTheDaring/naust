@@ -1,11 +1,11 @@
-# registry-rust — core configuration TEMPLATE (packaged as /etc/registry-rust/registry.core.toml)
+# naust — core configuration TEMPLATE (packaged as /etc/naust/registry.core.toml)
 #
 # This file ships with NEUTRAL placeholder values (KI-11): replace the
 # <PLACEHOLDER> markers for your environment before starting the service.
 # Layer it with the auth file:
-#   registry-rust server \
-#     --config /etc/registry-rust/registry.core.toml \
-#     --config /etc/registry-rust/registry.auth.toml
+#   naust server \
+#     --config /etc/naust/registry.core.toml \
+#     --config /etc/naust/registry.auth.toml
 # Precedence: defaults < config files (in order) < env vars
 
 [profile]
@@ -31,7 +31,7 @@ enabled = false
 # provider = "ispone"
 # email = "<YOUR-ACME-CONTACT-EMAIL>"
 # names = ["registry.<YOUR-DOMAIN>"]
-# output_dir = "/var/lib/registry-rust/tls"
+# output_dir = "/var/lib/naust/tls"
 # authorization = "<YOUR-ACME-PROVIDER-AUTHORIZATION>"
 debug = false
 
@@ -39,11 +39,11 @@ debug = false
 backend = "fs"
 
 [storage.fs]
-root = "/var/lib/registry-rust/data"
+root = "/var/lib/naust/data"
 
 [storage.ref_index]
 enabled = true
-path = "/var/lib/registry-rust/ref-index"
+path = "/var/lib/naust/ref-index"
 auto_rebuild_on_corruption = true
 
 [blob_gc]

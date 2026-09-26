@@ -11,40 +11,40 @@ use axum::http::header;
 use axum::routing::get;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use registry_rust::app_state::AppState;
-use registry_rust::application::blob::BlobMutationService;
-use registry_rust::application::blob_read::BlobReadService;
-use registry_rust::application::catalog::{CatalogQueryParams, CatalogQueryService};
-use registry_rust::application::errors::{
+use naust::app_state::AppState;
+use naust::application::blob::BlobMutationService;
+use naust::application::blob_read::BlobReadService;
+use naust::application::catalog::{CatalogQueryParams, CatalogQueryService};
+use naust::application::errors::{
     BlobMutationError, BlobReadError, ManifestMutationError, ManifestReadError, TagQueryError,
 };
-use registry_rust::application::manifest::ManifestMutationService;
-use registry_rust::application::manifest_read::ManifestReadService;
-use registry_rust::application::proxy::ProxyTarget;
-use registry_rust::application::referrers::{ReferrersQueryParams, ReferrersQueryService};
-use registry_rust::application::tags::{TagQueryParams, TagQueryService};
-use registry_rust::blob_gc::BlobGcPolicy;
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::config::{
+use naust::application::manifest::ManifestMutationService;
+use naust::application::manifest_read::ManifestReadService;
+use naust::application::proxy::ProxyTarget;
+use naust::application::referrers::{ReferrersQueryParams, ReferrersQueryService};
+use naust::application::tags::{TagQueryParams, TagQueryService};
+use naust::blob_gc::BlobGcPolicy;
+use naust::blob_ref_index::BlobRefIndex;
+use naust::config::{
     AuthStrategy, EvictionPolicy, ProxyConfig, ProxyMode, ProxyRepoRule, RedirectPolicy, TagPolicy,
 };
-use registry_rust::consistency::ConsistencyCoordinator;
-use registry_rust::gc_service::{GcBudgets, GcService};
-use registry_rust::manifest_lifecycle::ProxyPublicationEvidence;
-use registry_rust::proxy::{Proxy, ProxyRepoPattern};
-use registry_rust::registry::canonical_name::CanonicalRepoName;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::mutation_authority::RuntimeMutationAuthority;
-use registry_rust::storage::ports::*;
-use registry_rust::storage::repo_membership::RepoBlobMembershipRecord;
-use registry_rust::storage::s3::S3Storage;
-use registry_rust::storage::upload_session::UploadByteStream;
-use registry_rust::storage::{
+use naust::consistency::ConsistencyCoordinator;
+use naust::gc_service::{GcBudgets, GcService};
+use naust::manifest_lifecycle::ProxyPublicationEvidence;
+use naust::proxy::{Proxy, ProxyRepoPattern};
+use naust::registry::canonical_name::CanonicalRepoName;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::mutation_authority::RuntimeMutationAuthority;
+use naust::storage::ports::*;
+use naust::storage::repo_membership::RepoBlobMembershipRecord;
+use naust::storage::s3::S3Storage;
+use naust::storage::upload_session::UploadByteStream;
+use naust::storage::{
     BlobMeta, FinalizeOutcome, FinalizedReceipt, ReferrerDescriptor, StorageError,
     StorageErrorKind, UploadTransitionError,
 };
-use registry_rust::upload_coordinator::BlobUploadCoordinatorConfig;
+use naust::upload_coordinator::BlobUploadCoordinatorConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -228,7 +228,7 @@ impl TestServices {
             .expect("acquire authority");
 
         GcService::with_coordinator_and_authority(
-            Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+            Arc::new(naust::policy::GcPolicy::from(&cfg)),
             base_storage,
             self.ref_index.clone(),
             ConsistencyCoordinator::new(),
@@ -272,7 +272,7 @@ impl HttpTestServer {
             proxy_cache,
         );
 
-        let router = registry_rust::supervisor::build_router(app_state);
+        let router = naust::supervisor::build_router(app_state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
@@ -2262,7 +2262,7 @@ async fn test_proxy_blob_publication_crash_after_membership_before_pin_release_m
             .expect("acquire authority");
 
     let gc_service = GcService::with_coordinator_and_authority(
-        Arc::new(registry_rust::policy::GcPolicy::from(&cfg)),
+        Arc::new(naust::policy::GcPolicy::from(&cfg)),
         reopened_storage.clone(),
         reopened_index.clone(),
         ConsistencyCoordinator::new(),
@@ -4036,7 +4036,7 @@ async fn test_http_distinguish_valid_input_storage_error_and_tag_precondition_fa
     ));
     app_state.manifest_read_service = new_manifest_read;
 
-    let router = registry_rust::supervisor::build_router(app_state);
+    let router = naust::supervisor::build_router(app_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let _handle = tokio::spawn(async move {

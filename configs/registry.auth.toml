@@ -1,6 +1,6 @@
-# Auth configuration for registry-rust (expected to change frequently).
+# Auth configuration for naust (expected to change frequently).
 # Layer this on top of a core config:
-#   ./registry-rust server --config ./configs/registry.core.toml --config ./configs/registry.auth.toml
+#   ./naust server --config ./configs/registry.core.toml --config ./configs/registry.auth.toml
 
 [auth]
 # Authentication transport mechanism:

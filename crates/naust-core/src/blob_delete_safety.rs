@@ -260,10 +260,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp_fs_root() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "registry-rust-delete-safety-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("naust-delete-safety-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("create temp fs_root");
         p
     }

@@ -1,4 +1,4 @@
-NAME := registry-rust
+NAME := naust
 VERSION_FILE ?= $(shell if [ -f VERSION ]; then echo VERSION; elif [ -f version ]; then echo version; else echo ""; fi)
 ifneq ($(VERSION_FILE),)
 VERSION := $(shell tr -d '[:space:]' < $(VERSION_FILE))
@@ -8,12 +8,12 @@ endif
 RELEASE ?= 1
 
 CONTAINER_ENGINE ?= $(shell (command -v podman >/dev/null 2>&1 && echo podman) || (command -v docker >/dev/null 2>&1 && echo docker) || echo podman)
-IMAGE_NAME ?= registry-rust
+IMAGE_NAME ?= naust
 IMAGE_TAG ?= $(VERSION)
 
 DEB_VERSION := $(VERSION)-$(RELEASE)
 DEB_ARCH := $(shell (command -v dpkg >/dev/null 2>&1 && dpkg --print-architecture) || (uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/' -e 's/armv7l/armhf/'))
-DEB_MAINTAINER ?= $(shell sh -c 'n=$$(git config --get user.name 2>/dev/null || true); e=$$(git config --get user.email 2>/dev/null || true); if [ -n "$$n" ] && [ -n "$$e" ]; then printf "%s <%s>" "$$n" "$$e"; else printf "Registry Rust Maintainers <registry-rust@example.com>"; fi')
+DEB_MAINTAINER ?= $(shell sh -c 'n=$$(git config --get user.name 2>/dev/null || true); e=$$(git config --get user.email 2>/dev/null || true); if [ -n "$$n" ] && [ -n "$$e" ]; then printf "%s <%s>" "$$n" "$$e"; else printf "Registry Rust Maintainers <naust@example.com>"; fi')
 
 TOPDIR := $(CURDIR)/dist/rpmbuild
 SOURCES := $(TOPDIR)/SOURCES
@@ -82,21 +82,21 @@ $(TARBALL): rpm-dirs
 	cargo build --release
 	@rm -rf dist/rpmstage
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/bin
-	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/etc/registry-rust
+	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/etc/naust
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/systemd
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/sysusers.d
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/sysconfig
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/man
-	@cp -a target/release/registry-rust dist/rpmstage/$(NAME)-$(VERSION)/bin/registry-rust
-	@cp -a packaging/config/*.toml dist/rpmstage/$(NAME)-$(VERSION)/etc/registry-rust/
-	@cp -a packaging/systemd/registry-rust.service dist/rpmstage/$(NAME)-$(VERSION)/systemd/registry-rust.service
-	@cp -a packaging/systemd/sysusers.d/registry-rust.conf dist/rpmstage/$(NAME)-$(VERSION)/sysusers.d/registry-rust.conf
-	@cp -a packaging/systemd/tmpfiles.d/registry-rust.conf dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d/registry-rust.conf
-	@cp -a packaging/sysconfig/registry-rust dist/rpmstage/$(NAME)-$(VERSION)/sysconfig/registry-rust
+	@cp -a target/release/naust dist/rpmstage/$(NAME)-$(VERSION)/bin/naust
+	@cp -a packaging/config/*.toml dist/rpmstage/$(NAME)-$(VERSION)/etc/naust/
+	@cp -a packaging/systemd/naust.service dist/rpmstage/$(NAME)-$(VERSION)/systemd/naust.service
+	@cp -a packaging/systemd/sysusers.d/naust.conf dist/rpmstage/$(NAME)-$(VERSION)/sysusers.d/naust.conf
+	@cp -a packaging/systemd/tmpfiles.d/naust.conf dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d/naust.conf
+	@cp -a packaging/sysconfig/naust dist/rpmstage/$(NAME)-$(VERSION)/sysconfig/naust
 	@cp -a README.md dist/rpmstage/$(NAME)-$(VERSION)/README.md
 	@cp -a docs/blob-gc.md dist/rpmstage/$(NAME)-$(VERSION)/blob-gc.md
-	@cp -a packaging/deb/doc/registry-rust.1 dist/rpmstage/$(NAME)-$(VERSION)/man/registry-rust.1
+	@cp -a packaging/deb/doc/naust.1 dist/rpmstage/$(NAME)-$(VERSION)/man/naust.1
 	@tar -C dist/rpmstage -czf $(TARBALL) $(NAME)-$(VERSION)
 	@cp -a $(SPEC) $(SPECS)/$(NAME).spec
 
@@ -172,26 +172,26 @@ deb: deb-dirs
 	@rm -rf $(DEB_STAGE)
 	@mkdir -p $(DEB_STAGE)/DEBIAN
 	@mkdir -p $(DEB_STAGE)/usr/bin
-	@mkdir -p $(DEB_STAGE)/etc/registry-rust
+	@mkdir -p $(DEB_STAGE)/etc/naust
 	@mkdir -p $(DEB_STAGE)/etc/default
 	@mkdir -p $(DEB_STAGE)/usr/lib/systemd/system
-	@mkdir -p $(DEB_STAGE)/usr/share/doc/registry-rust
+	@mkdir -p $(DEB_STAGE)/usr/share/doc/naust
 	@mkdir -p $(DEB_STAGE)/usr/share/man/man1
 	@mkdir -p $(DEB_STAGE)/usr/share/lintian/overrides
-	@install -m 0755 target/release/registry-rust $(DEB_STAGE)/usr/bin/registry-rust
-	@if command -v strip >/dev/null 2>&1; then strip --strip-unneeded $(DEB_STAGE)/usr/bin/registry-rust || true; fi
-	@install -m 0644 packaging/config/registry.core.toml $(DEB_STAGE)/etc/registry-rust/registry.core.toml
-	@install -m 0644 packaging/config/registry.auth.toml $(DEB_STAGE)/etc/registry-rust/registry.auth.toml
-	@install -m 0644 packaging/deb/default/registry-rust $(DEB_STAGE)/etc/default/registry-rust
-	@install -m 0644 packaging/deb/systemd/registry-rust.service $(DEB_STAGE)/usr/lib/systemd/system/registry-rust.service
-	@install -m 0644 README.md $(DEB_STAGE)/usr/share/doc/registry-rust/README.md
-	@install -m 0644 docs/blob-gc.md $(DEB_STAGE)/usr/share/doc/registry-rust/blob-gc.md
-	@install -m 0644 packaging/deb/doc/copyright $(DEB_STAGE)/usr/share/doc/registry-rust/copyright
-	@install -m 0644 packaging/deb/doc/changelog.Debian $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian
-	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/doc/registry-rust/changelog.Debian; fi
-	@install -m 0644 packaging/deb/doc/registry-rust.1 $(DEB_STAGE)/usr/share/man/man1/registry-rust.1
-	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/man/man1/registry-rust.1; fi
-	@install -m 0644 packaging/deb/lintian/registry-rust $(DEB_STAGE)/usr/share/lintian/overrides/registry-rust
+	@install -m 0755 target/release/naust $(DEB_STAGE)/usr/bin/naust
+	@if command -v strip >/dev/null 2>&1; then strip --strip-unneeded $(DEB_STAGE)/usr/bin/naust || true; fi
+	@install -m 0644 packaging/config/registry.core.toml $(DEB_STAGE)/etc/naust/registry.core.toml
+	@install -m 0644 packaging/config/registry.auth.toml $(DEB_STAGE)/etc/naust/registry.auth.toml
+	@install -m 0644 packaging/deb/default/naust $(DEB_STAGE)/etc/default/naust
+	@install -m 0644 packaging/deb/systemd/naust.service $(DEB_STAGE)/usr/lib/systemd/system/naust.service
+	@install -m 0644 README.md $(DEB_STAGE)/usr/share/doc/naust/README.md
+	@install -m 0644 docs/blob-gc.md $(DEB_STAGE)/usr/share/doc/naust/blob-gc.md
+	@install -m 0644 packaging/deb/doc/copyright $(DEB_STAGE)/usr/share/doc/naust/copyright
+	@install -m 0644 packaging/deb/doc/changelog.Debian $(DEB_STAGE)/usr/share/doc/naust/changelog.Debian
+	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/doc/naust/changelog.Debian; fi
+	@install -m 0644 packaging/deb/doc/naust.1 $(DEB_STAGE)/usr/share/man/man1/naust.1
+	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/man/man1/naust.1; fi
+	@install -m 0644 packaging/deb/lintian/naust $(DEB_STAGE)/usr/share/lintian/overrides/naust
 	@installed_size=$$(du -sk --exclude=DEBIAN $(DEB_STAGE) 2>/dev/null | awk '{print $$1}'); \
 	if [ -z "$$installed_size" ]; then installed_size=$$(du -sk $(DEB_STAGE) | awk '{print $$1}'); fi; \
 	sed \

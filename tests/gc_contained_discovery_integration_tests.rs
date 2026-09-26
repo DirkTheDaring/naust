@@ -5,20 +5,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use registry_rust::blob_gc::policy::{GcPolicyError, build_manifest_protected_set};
-use registry_rust::blob_gc::{
+use naust::blob_gc::policy::{GcPolicyError, build_manifest_protected_set};
+use naust::blob_gc::{
     BlobGcError, BlobGcLimits, BlobGcPolicy, blob_gc_delete_with_authority, blob_gc_plan,
     blob_gc_quarantine_with_authority,
 };
-use registry_rust::blob_ref_index::BlobRefIndex;
-use registry_rust::config::{Config, StorageBackend};
-use registry_rust::consistency::ConsistencyCoordinator;
-use registry_rust::registry::digest::Digest;
-use registry_rust::storage::fs::FsStorage;
-use registry_rust::storage::mutation_authority::{GcMutationPermit, RuntimeMutationAuthority};
-use registry_rust::storage::ports::*;
-use registry_rust::storage::repo_membership::RepositoryBlobMembershipStorage;
-use registry_rust::storage::{
+use naust::blob_ref_index::BlobRefIndex;
+use naust::config::{Config, StorageBackend};
+use naust::consistency::ConsistencyCoordinator;
+use naust::registry::digest::Digest;
+use naust::storage::fs::FsStorage;
+use naust::storage::mutation_authority::{GcMutationPermit, RuntimeMutationAuthority};
+use naust::storage::ports::*;
+use naust::storage::repo_membership::RepositoryBlobMembershipStorage;
+use naust::storage::{
     BlobObjectVersion, GcBlobPage, GcCursor, GcDeleteResult, GcQuarantineResult, GcStorageStrategy,
     ManifestMeta, RepoBlobMembershipRecord, RepoTimestamps, StorageError, StorageErrorKind,
 };
@@ -310,7 +310,7 @@ async fn test_capability_forwarding_through_production_wiring_and_arc() {
     cfg.fs_root = fs_root.clone();
 
     // Production wiring construction
-    let wiring = registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg)
+    let wiring = naust::storage_wiring::storage_wiring_try_from_config(&cfg)
         .expect("storage wiring must construct from config");
     let storage = wiring.gc_service_port();
 
@@ -407,7 +407,7 @@ async fn test_routing_none_invokes_generic_traversal() {
     cfg.storage_backend = StorageBackend::S3;
     cfg.s3_bucket = Some("test-bucket".to_string());
 
-    let wiring = registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg)
+    let wiring = naust::storage_wiring::storage_wiring_try_from_config(&cfg)
         .expect("s3 wiring must construct");
     let base_storage = wiring.gc_service_port();
 
@@ -506,7 +506,7 @@ async fn test_storage_wiring_constructor_validation_rejects_invalid_limits() {
 
     // Invalid max_depth = 0
     cfg.fs_gc_discovery_max_depth = 0;
-    let err = match registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg) {
+    let err = match naust::storage_wiring::storage_wiring_try_from_config(&cfg) {
         Err(e) => e,
         Ok(_) => panic!("should have failed with invalid max_depth"),
     };
@@ -516,7 +516,7 @@ async fn test_storage_wiring_constructor_validation_rejects_invalid_limits() {
     // Reset and test invalid name bytes < 128
     cfg.fs_gc_discovery_max_depth = 32;
     cfg.fs_gc_discovery_terminal_dir_max_name_bytes = 64;
-    let err = match registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg) {
+    let err = match naust::storage_wiring::storage_wiring_try_from_config(&cfg) {
         Err(e) => e,
         Ok(_) => panic!("should have failed with invalid name bytes"),
     };
@@ -556,8 +556,7 @@ async fn test_configured_limits_reaching_discovery_and_refs_independently() {
     cfg_disc.fs_root = fs_root.clone();
     cfg_disc.fs_gc_discovery_max_manifest_dirs = 2;
 
-    let wiring_disc =
-        registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg_disc).unwrap();
+    let wiring_disc = naust::storage_wiring::storage_wiring_try_from_config(&cfg_disc).unwrap();
     let storage_disc = wiring_disc.gc_service_port();
 
     let err = storage_disc
@@ -577,8 +576,7 @@ async fn test_configured_limits_reaching_discovery_and_refs_independently() {
     cfg_ref.fs_root = fs_root.clone();
     cfg_ref.fs_gc_discovery_max_terminal_dir_enumerations = 1;
 
-    let wiring_ref =
-        registry_rust::storage_wiring::storage_wiring_try_from_config(&cfg_ref).unwrap();
+    let wiring_ref = naust::storage_wiring::storage_wiring_try_from_config(&cfg_ref).unwrap();
     let storage_ref = wiring_ref.gc_service_port();
 
     let err = storage_ref

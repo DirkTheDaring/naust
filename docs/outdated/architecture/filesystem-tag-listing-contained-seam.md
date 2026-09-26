@@ -13,12 +13,12 @@
 
 **Reviewed Design Reference:**
 - Document: `docs/architecture/filesystem-tag-listing-contained-integration-design.md`
-- Archive: `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-1145/filesystem-tag-listing-contained-integration-design.tar.gz`
+- Archive: `~/devel/rust/manifest-read-review-evidence/session-20260912-1145/filesystem-tag-listing-contained-integration-design.tar.gz`
   - SHA-256: `5b6229f35fc3781ab69786c88e17fc3c2e4abc6f6d21c47e32e6cf1f03dbf930` (25553 bytes)
 
 **Authorization Boundary:**
 This implementation fulfills the reviewed test-only integration seam.
-- **Test-Only Scope**: Implemented entirely under `#[cfg(test)]` in [`src/storage/fs/tag_listing.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tag_listing.rs) and declared under `#[cfg(test)]` in [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs).
+- **Test-Only Scope**: Implemented entirely under `#[cfg(test)]` in [`src/storage/fs/tag_listing.rs`](src/storage/fs/tag_listing.rs) and declared under `#[cfg(test)]` in [`src/storage/fs.rs`](src/storage/fs.rs).
 - **Production Unchanged**: Production `FsStorage::list_tags`, `FsStorage::list_tags_page`, `list_tag_files`, and `delete_manifest` are completely untouched.
 - **Production Policy Decisions Remain Open**: Passing seam tests does not authorize production cutover.
 - **Canonical Quality Gates**: All eight quality gates remain explicitly **OPEN**: `O-03`, `O-04`, `O-05`, `O-06`, `O-13`, `O-15`, `O-16`, `D-06`.

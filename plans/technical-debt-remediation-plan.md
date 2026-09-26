@@ -1,5 +1,7 @@
 # Technical-debt remediation — architecture solution and plan
 
+> **Naming note (2026-09-26, ADR-012):** after this plan closed, the product was renamed `registry-rust`→`naust` and `registry-core`→`naust-core`. Names and paths below are historical.
+
 - **Status:** proposed (not started)
 - **Date:** 2026-09-26 (rev 2 — corrected after senior-architect review, see "Review provenance" below)
 - **Baseline:** `master` @ `c049d7d` (ADR-010 split complete); debt register = [`../docs/technical-debt.md`](../docs/technical-debt.md) (KI-01…KI-27, GATE-O03…O16, FSD06)

@@ -4,8 +4,8 @@
 
 - **Document:** `docs/architecture/filesystem-read-containment-post-timestamps-assessment.md`
 - **Status:** Gap Assessment Delta (supersedes the R-4/R-5 rows of `filesystem-read-containment-post-catalog-assessment.md`; earlier assessments preserved unchanged as historical records)
-- **Primary Repository Baseline:** `/home/dietmar/devel/rust/registry-rust` at HEAD `3b647132f867accd7551ddb0ca297064be89abb9` (`master`), with the timestamps/emptiness containment batch applied in the working tree (uncommitted).
-- **Dependency Repository:** `/home/dietmar/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
+- **Primary Repository Baseline:** `~/devel/rust/registry-rust` at HEAD `3b647132f867accd7551ddb0ca297064be89abb9` (`master`), with the timestamps/emptiness containment batch applied in the working tree (uncommitted).
+- **Dependency Repository:** `~/devel/rust/storage-layer-rust` at HEAD `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e` (read-only, unchanged).
 - **Implementation Record:** `docs/architecture/filesystem-timestamps-and-emptiness-containment.md`
 
 ## 1. Resolved / Changed Items

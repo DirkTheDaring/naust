@@ -14,14 +14,14 @@
 
 ## 1. Executive Summary & Characterization Scope
 
-This document records the empirical characterization of filesystem tag read and conditional mutation operations in [`FsStorage`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs), specifically:
-1. Direct tag resolution: [`FsStorage::resolve_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L939-L951)
-2. Version-aware tag retrieval: [`FsStorage::get_tag_with_version`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1250-L1269)
-3. Version-dependent conditional tag deletion: [`FsStorage::delete_tag_conditional`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1271-L1335)
+This document records the empirical characterization of filesystem tag read and conditional mutation operations in [`FsStorage`](src/storage/fs.rs), specifically:
+1. Direct tag resolution: [`FsStorage::resolve_tag`](src/storage/fs.rs#L939-L951)
+2. Version-aware tag retrieval: [`FsStorage::get_tag_with_version`](src/storage/fs.rs#L1250-L1269)
+3. Version-dependent conditional tag deletion: [`FsStorage::delete_tag_conditional`](src/storage/fs.rs#L1271-L1335)
 
-Following the recommendation of the architectural assessment ([`docs/architecture/filesystem-read-containment-remaining-gaps.md`](file:///home/dietmar/devel/rust/registry-rust/docs/architecture/filesystem-read-containment-remaining-gaps.md)), this slice performs **characterization only**. Production implementations, configurations, dependencies, and external crates remain completely unchanged. No production routing or containment semantics are altered in this step.
+Following the recommendation of the architectural assessment ([`docs/architecture/filesystem-read-containment-remaining-gaps.md`](docs/architecture/filesystem-read-containment-remaining-gaps.md)), this slice performs **characterization only**. Production implementations, configurations, dependencies, and external crates remain completely unchanged. No production routing or containment semantics are altered in this step.
 
-The empirical observations are codified in eleven focused characterization tests in [`src/storage/fs/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs), establishing an automated behavioral baseline across ten distinct dimensions:
+The empirical observations are codified in eleven focused characterization tests in [`src/storage/fs/tests.rs`](src/storage/fs/tests.rs), establishing an automated behavioral baseline across ten distinct dimensions:
 - Missing tag files and missing repository directories.
 - Valid SHA-256 and SHA-512 digest formats, both with and without trailing newlines.
 - Arbitrary whitespace handling: spaces, tabs, carriage returns (`\r\n`), and substantial whitespace padding exceeding 256 bytes.
@@ -41,7 +41,7 @@ The empirical observations are codified in eleven focused characterization tests
 
 #### 2.1.1 Tag Read Methods (`resolve_tag` & `get_tag_with_version`)
 
-Both tag read methods reside in [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs):
+Both tag read methods reside in [`src/storage/fs.rs`](src/storage/fs.rs):
 
 ```rust
 // [src/storage/fs.rs:939-951]
@@ -81,7 +81,7 @@ async fn get_tag_with_version(
 }
 ```
 
-Path construction relies on private helper [`tag_path`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L364-L367):
+Path construction relies on private helper [`tag_path`](src/storage/fs.rs#L364-L367):
 ```rust
 // [src/storage/fs.rs:364-367]
 fn tag_path(&self, name: &str, tag: &str) -> PathBuf {
@@ -91,7 +91,7 @@ fn tag_path(&self, name: &str, tag: &str) -> PathBuf {
 
 #### 2.1.2 Actual Conditional Mutation Implementation (`delete_tag_conditional`)
 
-The actual production implementation of [`delete_tag_conditional`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1271-L1335) does **not** call `get_tag_with_version` or `tokio::fs::remove_file`. Instead, it executes an offloaded synchronous blocking routine via `tokio::task::spawn_blocking`:
+The actual production implementation of [`delete_tag_conditional`](src/storage/fs.rs#L1271-L1335) does **not** call `get_tag_with_version` or `tokio::fs::remove_file`. Instead, it executes an offloaded synchronous blocking routine via `tokio::task::spawn_blocking`:
 
 ```rust
 // [src/storage/fs.rs:1271-1335]
@@ -175,25 +175,25 @@ Production invocation points across the codebase are inventory-verified as follo
 
 | Target Method | Caller Location | Caller Method & Type | Functional Purpose |
 | :--- | :--- | :--- | :--- |
-| `resolve_tag` | [`src/application/manifest_read.rs:92, 177, 293, 307, 320, 368, 384`](file:///home/dietmar/devel/rust/registry-rust/src/application/manifest_read.rs) | `ManifestReadService` methods | Resolving tag references to manifest digests during manifest fetch workflows |
-| `resolve_tag` | [`src/application/tags.rs:117`](file:///home/dietmar/devel/rust/registry-rust/src/application/tags.rs#L117) | `TagQueryService::resolve_tag` | Application-level tag inspection service |
-| `resolve_tag` | [`src/application/catalog.rs:158`](file:///home/dietmar/devel/rust/registry-rust/src/application/catalog.rs#L158) | `CatalogQueryService::tag_platforms_for_repo` | Catalog tag resolution |
-| `resolve_tag` | [`src/blob_delete_safety.rs:105, 140`](file:///home/dietmar/devel/rust/registry-rust/src/blob_delete_safety.rs#L105) | Free functions `scan_storage_for_blob` (L105) & `find_repo_blob_reference` (L140) | Verifying tag target existence before authorizing blob deletion |
-| `resolve_tag` | [`src/blob_ref_index.rs:776`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L776) | `BlobRefIndex::refresh_tag_rooted_conservative` (tests at L1284, L1297) | Reference index reconstruction and active reconciliation |
-| `resolve_tag` | [`src/membership_migration.rs:21, 129`](file:///home/dietmar/devel/rust/registry-rust/src/membership_migration.rs#L21) | Free functions `plan_membership_migration` (L21) & `execute_membership_migration` (L129) | Extracting manifest digests for repository-blob membership linking |
-| `resolve_tag` | [`src/supervisor.rs:951`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L951) | Free function `compute_protected_blobs` in `src/supervisor.rs` | Background supervisor repository consistency check |
-| `get_tag_with_version` | [`src/manifest_lifecycle.rs:629, 648`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L629) | `ManifestLifecycleService::recover_pending_journal_under_lock` | Inspecting tag versions during journal replay for `DeleteTag` and `ProxyEvict` |
-| `get_tag_with_version` | [`src/manifest_lifecycle.rs:1156`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1156) | `ManifestLifecycleService::evict_proxy_cached_entry` | Snapshotting target tag version into `journal.relevant_tags` before proxy cache eviction |
-| `get_tag_with_version` | [`src/manifest_lifecycle.rs:1401, 1442`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1401) | `ManifestLifecycleService::delete_manifest` | Observing tag versions for batch tag snapshotting and retry loops |
-| `get_tag_with_version` | [`src/manifest_lifecycle.rs:1550`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1550) | `ManifestLifecycleService::delete_tag` | Observing tag version, snapshotting to journal, and feeding `delete_tag_conditional` |
-| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:572, 653`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L653) | `ManifestLifecycleService::recover_pending_journal_under_lock` | Journal recovery replay of conditional tag deletions |
-| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:1202`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1202) | `ManifestLifecycleService::evict_proxy_cached_entry` | Conditionally removing tag alias using snapshotted version token |
-| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:1429`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1429) | `ManifestLifecycleService::delete_manifest` | Conditionally removing snapshotted tag batch |
-| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:1593`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1593) | `ManifestLifecycleService::delete_tag` | Authoritative optimistic-concurrency tag deletion |
+| `resolve_tag` | [`src/application/manifest_read.rs:92, 177, 293, 307, 320, 368, 384`](src/application/manifest_read.rs) | `ManifestReadService` methods | Resolving tag references to manifest digests during manifest fetch workflows |
+| `resolve_tag` | [`src/application/tags.rs:117`](src/application/tags.rs#L117) | `TagQueryService::resolve_tag` | Application-level tag inspection service |
+| `resolve_tag` | [`src/application/catalog.rs:158`](src/application/catalog.rs#L158) | `CatalogQueryService::tag_platforms_for_repo` | Catalog tag resolution |
+| `resolve_tag` | [`src/blob_delete_safety.rs:105, 140`](src/blob_delete_safety.rs#L105) | Free functions `scan_storage_for_blob` (L105) & `find_repo_blob_reference` (L140) | Verifying tag target existence before authorizing blob deletion |
+| `resolve_tag` | [`src/blob_ref_index.rs:776`](src/blob_ref_index.rs#L776) | `BlobRefIndex::refresh_tag_rooted_conservative` (tests at L1284, L1297) | Reference index reconstruction and active reconciliation |
+| `resolve_tag` | [`src/membership_migration.rs:21, 129`](src/membership_migration.rs#L21) | Free functions `plan_membership_migration` (L21) & `execute_membership_migration` (L129) | Extracting manifest digests for repository-blob membership linking |
+| `resolve_tag` | [`src/supervisor.rs:951`](src/supervisor.rs#L951) | Free function `compute_protected_blobs` in `src/supervisor.rs` | Background supervisor repository consistency check |
+| `get_tag_with_version` | [`src/manifest_lifecycle.rs:629, 648`](src/manifest_lifecycle.rs#L629) | `ManifestLifecycleService::recover_pending_journal_under_lock` | Inspecting tag versions during journal replay for `DeleteTag` and `ProxyEvict` |
+| `get_tag_with_version` | [`src/manifest_lifecycle.rs:1156`](src/manifest_lifecycle.rs#L1156) | `ManifestLifecycleService::evict_proxy_cached_entry` | Snapshotting target tag version into `journal.relevant_tags` before proxy cache eviction |
+| `get_tag_with_version` | [`src/manifest_lifecycle.rs:1401, 1442`](src/manifest_lifecycle.rs#L1401) | `ManifestLifecycleService::delete_manifest` | Observing tag versions for batch tag snapshotting and retry loops |
+| `get_tag_with_version` | [`src/manifest_lifecycle.rs:1550`](src/manifest_lifecycle.rs#L1550) | `ManifestLifecycleService::delete_tag` | Observing tag version, snapshotting to journal, and feeding `delete_tag_conditional` |
+| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:572, 653`](src/manifest_lifecycle.rs#L653) | `ManifestLifecycleService::recover_pending_journal_under_lock` | Journal recovery replay of conditional tag deletions |
+| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:1202`](src/manifest_lifecycle.rs#L1202) | `ManifestLifecycleService::evict_proxy_cached_entry` | Conditionally removing tag alias using snapshotted version token |
+| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:1429`](src/manifest_lifecycle.rs#L1429) | `ManifestLifecycleService::delete_manifest` | Conditionally removing snapshotted tag batch |
+| `delete_tag_conditional` | [`src/manifest_lifecycle.rs:1593`](src/manifest_lifecycle.rs#L1593) | `ManifestLifecycleService::delete_tag` | Authoritative optimistic-concurrency tag deletion |
 
 #### Lifecycle Service Source Excerpt
 
-In [`src/manifest_lifecycle.rs:1550-1615`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1550-L1615), `ManifestLifecycleService::delete_tag` coordinates optimistic tag removal:
+In [`src/manifest_lifecycle.rs:1550-1615`](src/manifest_lifecycle.rs#L1550-L1615), `ManifestLifecycleService::delete_tag` coordinates optimistic tag removal:
 
 ```rust
 // [src/manifest_lifecycle.rs:1550-1605]
@@ -264,7 +264,7 @@ match self
 
 ## 3. Behavioral Characterization Findings
 
-The eleven automated test functions in [`src/storage/fs/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs) characterize behavior across ten empirical dimensions:
+The eleven automated test functions in [`src/storage/fs/tests.rs`](src/storage/fs/tests.rs) characterize behavior across ten empirical dimensions:
 
 ### 3.1 Missing Tag and Missing Repository
 - **Behavior:**

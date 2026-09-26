@@ -29,7 +29,7 @@ This assessment analyzes the architectural, operational, and caller-level implic
 
 ### 1.1 Current Baseline State
 1. **Seam Status**: The contained tag-read seam implemented in `src/storage/fs/tag_seam.rs` is strictly **test-only**, gated behind `#[cfg(test)]` in `src/storage/fs.rs`.
-2. **Production Routing Status**: Active production methods [`FsStorage::resolve_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L940-L951) and [`FsStorage::get_tag_with_version`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1250-L1269) remain **100% on legacy ambient pathname operations** (`tokio::fs::read_to_string` and `tokio::fs::read`).
+2. **Production Routing Status**: Active production methods [`FsStorage::resolve_tag`](src/storage/fs.rs#L940-L951) and [`FsStorage::get_tag_with_version`](src/storage/fs.rs#L1250-L1269) remain **100% on legacy ambient pathname operations** (`tokio::fs::read_to_string` and `tokio::fs::read`).
 3. **Accepted Test Scope**:
    - Recorded evidence: 28 seam tests passed, 10 characterization tests passed, two permission tests remained unexecuted, and non-Linux verification remains outstanding.
    - Neither ignored test was executed (kept unexecuted pending genuine unprivileged execution).
@@ -86,9 +86,9 @@ This assessment analyzes the architectural, operational, and caller-level implic
 ```
 
 ### 2.1 Proposed Production Entry Points
-A production cutover would modify exactly two methods inside [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs):
-1. **[`FsStorage::resolve_tag`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L940-L951)**: Replace `let path = self.tag_path(name, tag); tokio::fs::read_to_string(&path)...` with delegation to `resolve_tag_seam` using `self.reader.as_ref()`.
-2. **[`FsStorage::get_tag_with_version`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1250-L1269)**: Replace `let tag_path = self.tag_path(repo, tag); tokio::fs::read(&tag_path)...` with delegation to `get_tag_with_version_seam` using `self.reader.as_ref()`.
+A production cutover would modify exactly two methods inside [`src/storage/fs.rs`](src/storage/fs.rs):
+1. **[`FsStorage::resolve_tag`](src/storage/fs.rs#L940-L951)**: Replace `let path = self.tag_path(name, tag); tokio::fs::read_to_string(&path)...` with delegation to `resolve_tag_seam` using `self.reader.as_ref()`.
+2. **[`FsStorage::get_tag_with_version`](src/storage/fs.rs#L1250-L1269)**: Replace `let tag_path = self.tag_path(repo, tag); tokio::fs::read(&tag_path)...` with delegation to `get_tag_with_version_seam` using `self.reader.as_ref()`.
 
 ### 2.2 Module Promotion
 `src/storage/fs/tag_seam.rs` is currently declared exclusively in `src/storage/fs.rs` as:
@@ -104,19 +104,19 @@ Promoting to production requires:
 ### 2.3 Shared-Reader Utilization
 The cutover passes `self.reader.as_ref()` (`&storage_fs::FsMetadataReader`), which implements `storage_core::ObjectPayloadReader`.
 - Demonstrates zero descriptor reopening overhead for `root_fd`.
-- Reuses the identical `FsMetadataReader` instance shared by `FsBlobCasReadAdapter` and manifest reading routines ([`manifest::head_manifest_impl`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/manifest.rs#L149), [`manifest::get_manifest_impl`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/manifest.rs#L117)).
+- Reuses the identical `FsMetadataReader` instance shared by `FsBlobCasReadAdapter` and manifest reading routines ([`manifest::head_manifest_impl`](src/storage/fs/manifest.rs#L149), [`manifest::get_manifest_impl`](src/storage/fs/manifest.rs#L117)).
 
 ### 2.4 Affected Callers
 The cutover impacts all downstream consumers of the `Storage` and `TagReader` capability ports:
-1. **Manifest Fetch & Cache Validation** ([`src/application/manifest_read.rs:92, 177, 293, 307, 320, 368, 384`](file:///home/dietmar/devel/rust/registry-rust/src/application/manifest_read.rs)): Calls `resolve_tag` during [`ManifestReadService::resolve_reference_digest`](file:///home/dietmar/devel/rust/registry-rust/src/application/manifest_read.rs#L271) and `ensure_tag_fresh`.
-2. **Tag Inspection API** ([`src/application/tags.rs:117`](file:///home/dietmar/devel/rust/registry-rust/src/application/tags.rs#L117)): Calls `resolve_tag` via `TagQueryService::resolve_tag`.
-3. **Catalog Platform Inspection** ([`src/application/catalog.rs:158`](file:///home/dietmar/devel/rust/registry-rust/src/application/catalog.rs#L158)): Calls `resolve_tag` via `CatalogQueryService::tag_platforms_for_repo`.
-4. **Blob Deletion Safety Pre-checks** ([`src/blob_delete_safety.rs:105, 140`](file:///home/dietmar/devel/rust/registry-rust/src/blob_delete_safety.rs#L105)): Calls `resolve_tag` via `scan_storage_for_blob` and `find_repo_blob_reference` to verify whether a tag targets a blob before deletion.
-5. **Reference Index Reconciliation** ([`src/blob_ref_index.rs:776`](file:///home/dietmar/devel/rust/registry-rust/src/blob_ref_index.rs#L776)): Calls `resolve_tag` during `BlobRefIndex::refresh_tag_rooted_conservative`.
-6. **Membership Migration** ([`src/membership_migration.rs:21, 129, 218`](file:///home/dietmar/devel/rust/registry-rust/src/membership_migration.rs#L21)): Calls `resolve_tag` to discover target digests for repository-blob membership linking.
-7. **Supervisor Consistency Checks** ([`src/supervisor.rs:951`](file:///home/dietmar/devel/rust/registry-rust/src/supervisor.rs#L951)): Calls `resolve_tag` during `compute_protected_blobs`.
-8. **Tag Lifecycle Deletion** ([`src/manifest_lifecycle.rs:1550`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1550)): Calls `get_tag_with_version` to inspect tag version, snapshot to journal, and feed optimistic concurrency check in `delete_tag_conditional`.
-9. **Manifest Deletion & Proxy Eviction** ([`src/manifest_lifecycle.rs:629, 648, 1156, 1401, 1442`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1156)): Calls `get_tag_with_version` during proxy cache eviction and manifest deletion to snapshot associated tag versions.
+1. **Manifest Fetch & Cache Validation** ([`src/application/manifest_read.rs:92, 177, 293, 307, 320, 368, 384`](src/application/manifest_read.rs)): Calls `resolve_tag` during [`ManifestReadService::resolve_reference_digest`](src/application/manifest_read.rs#L271) and `ensure_tag_fresh`.
+2. **Tag Inspection API** ([`src/application/tags.rs:117`](src/application/tags.rs#L117)): Calls `resolve_tag` via `TagQueryService::resolve_tag`.
+3. **Catalog Platform Inspection** ([`src/application/catalog.rs:158`](src/application/catalog.rs#L158)): Calls `resolve_tag` via `CatalogQueryService::tag_platforms_for_repo`.
+4. **Blob Deletion Safety Pre-checks** ([`src/blob_delete_safety.rs:105, 140`](src/blob_delete_safety.rs#L105)): Calls `resolve_tag` via `scan_storage_for_blob` and `find_repo_blob_reference` to verify whether a tag targets a blob before deletion.
+5. **Reference Index Reconciliation** ([`src/blob_ref_index.rs:776`](src/blob_ref_index.rs#L776)): Calls `resolve_tag` during `BlobRefIndex::refresh_tag_rooted_conservative`.
+6. **Membership Migration** ([`src/membership_migration.rs:21, 129, 218`](src/membership_migration.rs#L21)): Calls `resolve_tag` to discover target digests for repository-blob membership linking.
+7. **Supervisor Consistency Checks** ([`src/supervisor.rs:951`](src/supervisor.rs#L951)): Calls `resolve_tag` during `compute_protected_blobs`.
+8. **Tag Lifecycle Deletion** ([`src/manifest_lifecycle.rs:1550`](src/manifest_lifecycle.rs#L1550)): Calls `get_tag_with_version` to inspect tag version, snapshot to journal, and feed optimistic concurrency check in `delete_tag_conditional`.
+9. **Manifest Deletion & Proxy Eviction** ([`src/manifest_lifecycle.rs:629, 648, 1156, 1401, 1442`](src/manifest_lifecycle.rs#L1156)): Calls `get_tag_with_version` during proxy cache eviction and manifest deletion to snapshot associated tag versions.
 
 ### 2.5 Strict Non-Goals: What Remains Outside the Cutover
 - **Public Port Interfaces**: `Storage::resolve_tag`, `Storage::get_tag_with_version`, `TagReader` trait methods retain identical signatures and error return types (`StorageError`).
@@ -132,8 +132,8 @@ The cutover impacts all downstream consumers of the `Storage` and `TagReader` ca
 The proposed contained seam introduces deliberate security-driven divergences from legacy behavior. Error mappings cannot be generalized into a single status code across endpoints; they must be traced through the exact conversion branches of each caller.
 
 ### 3.1 Tracing Endpoint 1: `GET /v2/<name>/manifests/<reference>`
-Handler: [`src/http_api/handlers.rs::manifest_get`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers.rs#L536-L589)  
-Service: [`ManifestReadService::resolve_reference_digest`](file:///home/dietmar/devel/rust/registry-rust/src/application/manifest_read.rs#L271-L316)
+Handler: [`src/http_api/handlers.rs::manifest_get`](src/http_api/handlers.rs#L536-L589)  
+Service: [`ManifestReadService::resolve_reference_digest`](src/application/manifest_read.rs#L271-L316)
 
 ```
 [Incoming Request: GET /v2/<name>/manifests/<reference>]
@@ -200,10 +200,10 @@ In `src/http_api/handlers.rs:575`:
 
 ### 3.2 Tracing Endpoint 2: `DELETE /v2/<name>/manifests/<reference>` & `DELETE /v2/<name>/tags/<tag>`
 Handlers:
-- [`src/http_api/handlers.rs::manifest_delete`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/handlers.rs#L448-L491) (DELETE `/v2/<name>/manifests/<reference>`)
-- [`src/http_api/tags.rs::tag_delete`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/tags.rs#L107-L141) (DELETE `/v2/<name>/tags/<tag>`)  
-Application Service: [`ManifestService::delete_tag`](file:///home/dietmar/devel/rust/registry-rust/src/application/manifest.rs#L69-L88)  
-Lifecycle Service: [`ManifestLifecycleService::delete_tag`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1540-L1620)
+- [`src/http_api/handlers.rs::manifest_delete`](src/http_api/handlers.rs#L448-L491) (DELETE `/v2/<name>/manifests/<reference>`)
+- [`src/http_api/tags.rs::tag_delete`](src/http_api/tags.rs#L107-L141) (DELETE `/v2/<name>/tags/<tag>`)  
+Application Service: [`ManifestService::delete_tag`](src/application/manifest.rs#L69-L88)  
+Lifecycle Service: [`ManifestLifecycleService::delete_tag`](src/manifest_lifecycle.rs#L1540-L1620)
 
 ```
 [Incoming Request: DELETE /v2/<name>/manifests/<reference> or /tags/<tag>]
@@ -307,7 +307,7 @@ Tracing the conversion from source:
    - `Storage(StorageError::Unsupported)`
    - `Err(_) => errors::internal_error().into_response()`
 4. `TagPreconditionFailed` has **no explicit match arm** in either handler. It falls through to `Err(_) => errors::internal_error()`.
-5. [`errors::internal_error()`](file:///home/dietmar/devel/rust/registry-rust/src/http_api/errors.rs#L301-L310) constructs:
+5. [`errors::internal_error()`](src/http_api/errors.rs#L301-L310) constructs:
    `error_response(StatusCode::INTERNAL_SERVER_ERROR, body)` with code `"UNKNOWN"`.
 6. Therefore, `TagPreconditionFailed` returns **HTTP 500 Internal Server Error**, not HTTP 412 Precondition Failed or HTTP 409 Conflict.
 
@@ -341,7 +341,7 @@ Tracing the conversion from source:
 ## 4. Lifecycle Side-Effects & Recovery Accounting
 
 ### 4.1 Separate Accounting of Prior Operations in `delete_tag`
-Prior to invoking `self.storage.get_tag_with_version(repo, tag)`, [`ManifestLifecycleService::delete_tag`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs#L1547-L1548) executes two discrete operations:
+Prior to invoking `self.storage.get_tag_with_version(repo, tag)`, [`ManifestLifecycleService::delete_tag`](src/manifest_lifecycle.rs#L1547-L1548) executes two discrete operations:
 ```rust
 let mut guard = self.acquire_coordination(repo).await?;
 self.recover_and_ensure_index_healthy(repo).await?;
@@ -397,7 +397,7 @@ If `get_tag_with_version` succeeds, `delete_tag` marks the index dirty and write
 4. **Cleanup Deletion Failure**:
    - `delete_tag_conditional` returns `PreconditionFailed` or `NotFound`, but `self.delete_journal(repo).await` fails.
    - **Crucial Qualification**: Cleanup failure propagates and prevents subsequent `mark_ready`; actual journal presence depends on the failure stage:
-     - Inspecting `FsStorage::delete_lifecycle_journal` ([`src/storage/fs.rs:1367-1380`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1367)):
+     - Inspecting `FsStorage::delete_lifecycle_journal` ([`src/storage/fs.rs:1367-1380`](src/storage/fs.rs#L1367)):
      - If `tokio::fs::remove_file(&path)` fails (e.g. `EACCES`, `EPERM`, `EIO` before unlink), the journal file was NOT removed and remains on disk.
      - If `remove_file` succeeded, the file was unlinked from storage (and subsequent `fsync_dir` errors are ignored with `let _ = fsync_dir(...)`).
      - If `delete_journal` fails with `Err`, the `?` returns early, bypassing the subsequent `idx.mark_ready()` attempt; index remains dirty.

@@ -11,18 +11,18 @@ Contents: §1 acceptance gates · §2 carried open decisions · §3 implementati
 
 ## 1. Acceptance gates (GATE-O03…GATE-FSD06)
 
-**Authority: UNRESOLVED.** No in-repo document defines these gates or who may close them. The numbering (only O-03/04/05/06/13/15/16 and one "D-06" ever occur; O-01/02/07–12/14 occur nowhere in this repo or `../storage-layer-rust`) is inherited from an out-of-tree review process; the earliest in-repo docs assert the gates "retain their existing meanings" without stating them (`outdated/architecture/o-05-filesystem-metadata-containment.md`, commit `f7ad9f9`, 2026-09-08; O-04/O-15 added at `5f504ac`). **No gate is closed, and this register closes none.**
+**Authority: RESOLVED (2026-09-26, ADR-013)** — the repository maintainer is the gate/release authority; closures are recorded decisions, never silent. Historical note: no in-repo document previously defined these gates or who may close them. The numbering (only O-03/04/05/06/13/15/16 and one "D-06" ever occur; O-01/02/07–12/14 occur nowhere in this repo or `../storage-layer-rust`) is inherited from an out-of-tree review process; the earliest in-repo docs assert the gates "retain their existing meanings" without stating them (`outdated/architecture/o-05-filesystem-metadata-containment.md`, commit `f7ad9f9`, 2026-09-08; O-04/O-15 added at `5f504ac`). **All eight gates were CLOSED by ADR-013 (2026-09-26)**; the per-gate sections below are preserved as the historical record of their criteria and evidence.
 
 | Tracking ID | Historical ID | Status | Closure requires |
 |---|---|---|---|
-| GATE-O03 | O-03 | OPEN | documentation act + human decision |
-| GATE-O04 | O-04 | OPEN | code change **or** accepted exception + decision record |
-| GATE-O05 | O-05 | OPEN | verification/doc act + human acceptance |
-| GATE-O06 | O-06 | OPEN | verification run + documentation act |
-| GATE-O13 | O-13 | OPEN | human decision first (least-advanced gate) |
-| GATE-O15 | O-15 | OPEN | non-Linux verification run **or** Linux-only ADR |
-| GATE-O16 | O-16 | OPEN | verification run + documentation act (cheapest) |
-| GATE-FSD06 | fs-doc "D-06" | OPEN | human acceptance, per clause (master gate) |
+| GATE-O03 | O-03 | **CLOSED (ADR-013)** | contract ratified; token standardization accepted as withheld |
+| GATE-O04 | O-04 | **CLOSED (ADR-013)** | residues accepted as permanent exceptions (incl. deletion-durability carve-out) |
+| GATE-O05 | O-05 | **CLOSED (ADR-013)** | audit re-enumeration accepted; TAG-DEC-03 ratified (fail-closed 500) |
+| GATE-O06 | O-06 | **CLOSED (ADR-013)** | committed evidence (`evidence/2026-09-26-debt-remediation/`) |
+| GATE-O13 | O-13 | **CLOSED (D6 2026-09-26)** | public GitHub (`DirkTheDaring/naust`), MIT, self-hosted deployments; release records follow the first push |
+| GATE-O15 | O-15 | **CLOSED (ADR-013)** | Linux-only declared (FsStorage requires `openat2`) |
+| GATE-O16 | O-16 | **CLOSED (ADR-013)** | committed evidence (see O-06) |
+| GATE-FSD06 | fs-doc "D-06" | **CLOSED (ADR-013)** | clauses covered by ADR-009…013 closures |
 
 **ID-collision warning (historical evidence, preserved):** `outdated/architecture/filesystem-gc-contained-discovery-production-cutover.md` (lines ~14–24 of the original) redefines **all eight** IDs to unrelated subjects; `outdated/architecture/filesystem-tag-read-contained-seam.md` redefines O-03. Both carry corrective banners — never read gate meanings from those tables. "D-06" also collides with the **assessment** debt item D-06 (stringly `StorageError` — Resolved by ADR-009); GATE-FSD06 refers only to the filesystem-doc acceptance gate.
 
@@ -95,13 +95,13 @@ Recorded in now-archived slice documents; obligations preserved here (canonical 
 
 | Item | Original source (archived) | Subject | Status |
 |---|---|---|---|
-| TAG-DEC-01 | `outdated/architecture/filesystem-tag-read-production-readiness-assessment.md` | Tag-read cutover decision (recorded DEFERRED) | OPEN — cutover shipped while pending |
-| TAG-DEC-02 | same | (recorded PENDING APPROVAL) | OPEN |
-| TAG-DEC-03 | same | Symlink rejection behavior change: dangling-symlink tag reads 404→500 | OPEN — blocks GATE-O05 sign-off |
-| TAG-DEC-04 | same | (recorded PENDING REVIEW) | OPEN |
-| TAG-DEC-05 | same | (recorded DEFERRED) | OPEN |
-| TAG-DEC-06 | same | (recorded PENDING REVIEW) | OPEN |
-| D7 (metadata assessment) | `outdated/architecture/storage-fs-metadata-integration-assessment.md` (§ "Recommendation (Awaiting Acceptance)") | Metadata-seam recommendation acceptance | OPEN |
+| TAG-DEC-01 | `outdated/architecture/filesystem-tag-read-production-readiness-assessment.md` | Tag-read cutover decision (recorded DEFERRED) | **RATIFIED (ADR-013)** |
+| TAG-DEC-02 | same | (recorded PENDING APPROVAL) | **RATIFIED (ADR-013)** |
+| TAG-DEC-03 | same | Symlink rejection behavior change: dangling-symlink tag reads 404→500 | **RATIFIED (ADR-013)** — fail-closed 500 is the contract |
+| TAG-DEC-04 | same | (recorded PENDING REVIEW) | **RATIFIED (ADR-013)** |
+| TAG-DEC-05 | same | (recorded DEFERRED) | **RATIFIED (ADR-013)** |
+| TAG-DEC-06 | same | (recorded PENDING REVIEW) | **RATIFIED (ADR-013)** |
+| D7 (metadata assessment) | `outdated/architecture/storage-fs-metadata-integration-assessment.md` (§ "Recommendation (Awaiting Acceptance)") | Metadata-seam recommendation acceptance | **ACCEPTED (ADR-013)** |
 
 ## 3. Implementation gaps and defects
 
@@ -114,7 +114,7 @@ Recorded in now-archived slice documents; obligations preserved here (canonical 
 | KI-05 | **RESOLVED (2026-09-26, remediation R3).** The CLI now respects `blob_gc.enabled=false` (and `enable_delete=false` for delete) and refuses with a clear error; `--force-gc` reproduces the historical override. Test-covered both ways (`test_cli_respects_blob_gc_kill_switch`). | Closed. |
 | KI-06 | **RESOLVED (2026-09-26, remediation R0).** ~~`CommandIntent` diverged from `CommandPolicy`.~~ Unused classification + exhaustive test deleted; `CommandPolicy` is the single source (ADR-006 addendum). | Closed. |
 | KI-08 | **RESOLVED (2026-09-26, remediation R0).** Comments now say `quarantine/gc.lock`, matching the code. | Closed. |
-| KI-12 | **RESOLVED as accepted design (2026-09-26, remediation D7/R0).** The no-op `renew_repo_lease` is now a *recorded* design: `RuntimeMutationAuthority` provides cross-process mutation exclusivity; the per-repo flock is belt-and-braces scoping within it, and a second TTL would add failure modes without safety (rationale doc-comment at the impl in `crates/registry-core/src/storage/fs.rs`). GATE-O04's lease row inherits this rationale. | Closed (criterion: "recorded accepted design" met). |
+| KI-12 | **RESOLVED as accepted design (2026-09-26, remediation D7/R0).** The no-op `renew_repo_lease` is now a *recorded* design: `RuntimeMutationAuthority` provides cross-process mutation exclusivity; the per-repo flock is belt-and-braces scoping within it, and a second TTL would add failure modes without safety (rationale doc-comment at the impl in `crates/naust-core/src/storage/fs.rs`). GATE-O04's lease row inherits this rationale. | Closed (criterion: "recorded accepted design" met). |
 | KI-13 | **RESOLVED (2026-09-26, remediation R0; partially by ADR-010 Phase 1c).** The vestigial `_cfg` param was deleted in Phase 1c; the unused `_storage` parameter was removed from `fetch_manifest_and_cache` (inherent method, `UpstreamFetcher` trait, all call sites) before any external trait consumer exists; the stale branch-logic test comments in `blob_gc/policy.rs` were rewritten to describe contained discovery. | Closed. |
 | KI-14 | **RESOLVED (2026-09-26, remediation R0).** Dead `blob_gc_sweep` entry point and its unit tests deleted (zero external callers verified). Scheduled cleanup continues to use `blob_gc_quarantine`/`blob_gc_delete` directly. | Closed. |
 
@@ -122,13 +122,13 @@ Recorded in now-archived slice documents; obligations preserved here (canonical 
 
 | ID | Item | Details |
 |---|---|---|
-| KI-07 | **RESOLVED (2026-09-26, ADR-010 Phase 1b, commit `fe9d8bd`).** ~~Inverted module edge — `application/errors.rs` imported `http_api::upload_state`.~~ `upload_state` moved to core (`crates/registry-core/src/upload_lifecycle/state.rs`); the criterion ("no `http_api` import under `application/`") now holds by construction — `application/` lives in the `registry-core` crate, which cannot reference server modules (enforced by the compiler and `make core-boundary`). | Closed. |
+| KI-07 | **RESOLVED (2026-09-26, ADR-010 Phase 1b, commit `fe9d8bd`).** ~~Inverted module edge — `application/errors.rs` imported `http_api::upload_state`.~~ `upload_state` moved to core (`crates/naust-core/src/upload_lifecycle/state.rs`); the criterion ("no `http_api` import under `application/`") now holds by construction — `application/` lives in the `naust-core` crate, which cannot reference server modules (enforced by the compiler and `make core-boundary`). | Closed. |
 | KI-22 | **GATE-O04 write residues (deferred by design, partially unrecorded).** `meta/membership_ready.json` + `meta/migration_checkpoint.json` pathname writes (`src/storage/fs.rs:3650-3717`), blocking `fs::write_membership_sync`, repo-lease flock (KI-12). | Deferral recorded for the `meta/` writes and sync writer (`src/storage/membership_domain.rs:22-32` out-of-scope list); **no deferral rationale exists for the repo lease**. *Next:* contain or record exceptions (GATE-O04). *Criterion:* GATE-O04's proposed criteria. |
 | KI-23 | **Repository-existence family not on ObjectStore.** Contained but backend-specific probe (`src/storage/fs/tag_listing.rs:13-17`; "later phase" in `tag_domain.rs:112`, `fs.rs:669-671`). | Explicitly deferred in code prose. *Next:* migrate when a repository-family design exists. *Criterion:* probe served by a backend-neutral family, or deferral converted to accepted design. |
 | KI-24 | **Membership tree enumeration on per-backend seam** (`src/storage/fs/membership_read.rs`), not `ObjectStore::list_page` — the accepted contract has no common-prefix rows (`membership_domain.rs:22-30`). | Explicitly deferred; blocked on the listing-contract limitation (relates to GATE-O03). *Criterion:* enumeration backend-neutral, or limitation accepted. |
 | KI-25 | **Reaper inspection-read containment follow-up** noted in `src/storage/fs/upload_quarantine_read.rs:14,330` (reaper *mutations* are contained; an inspection-read follow-up remains). A test-only prototype of a single-tree cleanup exists (`tests/upload_lifecycle_contained_cleanup_prototype.rs`) and was never productionized. | *Criterion:* follow-up implemented or recorded as unnecessary. |
 | KI-26 | **RESOLVED with recorded residues (2026-09-26, remediation R4 — see ADR-011).** The 1538-line dispatcher is split by resource family; mechanical config reads go through the `HttpTransferPolicy` snapshot; `/_admin/gc/*` delegates to `GcAdminService` (owns run-id sequence + defaults; `gc_run_seq` removed from `AppState`); `/token` delegates to `TokenService` (decision, allowlist, signing, observability). The service census (7 core + 2 server) and the `GarbageCollectionService`/`ProxyService` re-scoping are recorded in ADR-011, which also records four accepted residues (config-parameterized token decision fns; auth-boundary reads in handlers; flat `AppState`; omnibus-`Storage`-as-vehicle). | Closed (criterion met: every residual recorded as accepted architecture). |
-| KI-27 | **ADR-010 split residues (2026-09-26).** (a) Core visibility widened for server wiring (`storage::facade`, `fs::{manifest_listing, tag_listing, repo_discovery, manifest_refs, read_adapter}`, two `#[doc(hidden)]` reader accessors) pending deliberate Phase 3 curation — deferred while registry-core is 0.x-unstable with one consumer. (b) **resolved 2026-09-26**: tracing-target rename documented in `operations.md` §6. (c) **resolved 2026-09-26**: `cargo test --workspace` documented in `operations.md` §6 and the root README. | *Criterion:* (a) revisited when a second consumer exists; (b)/(c) closed. |
+| KI-27 | **ADR-010 split residues (2026-09-26).** (a) Core visibility widened for server wiring (`storage::facade`, `fs::{manifest_listing, tag_listing, repo_discovery, manifest_refs, read_adapter}`, two `#[doc(hidden)]` reader accessors) pending deliberate Phase 3 curation — deferred while naust-core is 0.x-unstable with one consumer. (b) **resolved 2026-09-26**: tracing-target rename documented in `operations.md` §6. (c) **resolved 2026-09-26**: `cargo test --workspace` documented in `operations.md` §6 and the root README. | *Criterion:* (a) revisited when a second consumer exists; (b)/(c) closed. |
 
 ## 5. Missing verification / acceptance evidence
 
@@ -165,6 +165,6 @@ Acceptance status is canonical in [`requirements.md`](requirements.md); this sec
 | KI-11 | **RESOLVED (2026-09-26, remediation R5).** Packages now ship NEUTRAL tracked templates (`packaging/config/registry.{core,auth}.toml` — placeholders only, ACME disabled, `debug=false`, no unknown keys, no credential material; validated by `check-config`). The Makefile/RPM/DEB staging no longer reads the untracked local `etc/` tree (which had made package contents machine-dependent). Local `etc/`, `tls/`, `certs/` were verified **gitignored and untracked** (the register's "in the working tree" concern carried no git-history risk); they remain local dev fixtures. Pre-push tree scan stays on the R6 checklist. | Closed. |
 | KI-15 | Multi-platform image visibility question (see all platform variants, not just amd64). | Migrated from `outdated/root/ISSUES.txt`. Open product question. |
 | KI-16 | `docker buildx imagetools create` usage note for mirroring multi-arch images. | Migrated from `outdated/root/BUG0.txt`. Note only. |
-| KI-21 | **RESOLVED (2026-09-26, remediation R5).** DEB unit aligned with RPM: `LimitNOFILE=65536`, `ReadOnlyPaths=/etc/registry-rust`, `StateDirectoryMode=0750` added (it already had `ReadWritePaths` — the register row was partially stale). `ProtectSystem=strict` retained in both. | Closed. |
+| KI-21 | **RESOLVED (2026-09-26, remediation R5).** DEB unit aligned with RPM: `LimitNOFILE=65536`, `ReadOnlyPaths=/etc/naust`, `StateDirectoryMode=0750` added (it already had `ReadWritePaths` — the register row was partially stale). `ProtectSystem=strict` retained in both. | Closed. |
 
 Resolved-by-observation notes from the migrated trackers: harbor-style groups exist (REQ-007); cache separation exists (`proxy.cache.fs_root`/`s3_prefix`); "do I need the harbor api?" is an open product question, not tracked as debt.

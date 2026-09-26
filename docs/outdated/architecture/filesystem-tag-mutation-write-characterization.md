@@ -18,7 +18,7 @@ This is the **characterization** step of the repo-scoped write-containment slice
 
 **No production code, dependency, configuration, or external crate is changed by this step.** The only change is the addition of behavior-freezing tests. Tag *reads* (`resolve_tag`, `get_tag_with_version`) were already contained and characterized in the tag-read slice; this slice targets the remaining ambient **write** side.
 
-Production methods characterized, all in [`src/storage/fs.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs):
+Production methods characterized, all in [`src/storage/fs.rs`](src/storage/fs.rs):
 
 1. `set_tag` (delegates to `mutate_tag(.., Replace)`).
 2. `mutate_tag` (`CreateOnly` / `Replace` policies).
@@ -46,7 +46,7 @@ These are recorded as *observed behavior*, **not** as containment guarantees —
 
 ## 3. Codified Tests
 
-Added as module `tag_mutation_write_characterization` in [`src/storage/fs/tests.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs), all exercising the real `FsStorage` methods:
+Added as module `tag_mutation_write_characterization` in [`src/storage/fs/tests.rs`](src/storage/fs/tests.rs), all exercising the real `FsStorage` methods:
 
 | Test | Freezes |
 |---|---|

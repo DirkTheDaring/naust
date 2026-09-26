@@ -10,23 +10,23 @@ This document records the empirical baseline and architectural characterization 
 
 ### Verified Repository Baselines
 
-- **Primary Repository**: `/home/dietmar/devel/rust/registry-rust`
+- **Primary Repository**: `~/devel/rust/registry-rust`
   - Current HEAD: `f1d6d9c128a8a713f2d929b03c3a66ed06bf30fe`
   - Active Branch: `master`
   - Prior Commit: `fix(storage): use contained filesystem tag listing in production`
-- **Dependency Repository**: `/home/dietmar/devel/rust/storage-layer-rust`
+- **Dependency Repository**: `~/devel/rust/storage-layer-rust`
   - Current HEAD: `0a628fd08232c3a5ce37c7a2d1d5f3ba2b2fe08e`
   - Active Branch: `main`
   - Strictly read-only throughout this work.
 - **Accepted Prior Assessment**:
-  - Archive: `/home/dietmar/devel/rust/manifest-read-review-evidence/session-20260912-2345/filesystem-read-containment-post-tag-listing-assessment.tar.gz`
+  - Archive: `~/devel/rust/manifest-read-review-evidence/session-20260912-2345/filesystem-read-containment-post-tag-listing-assessment.tar.gz`
   - SHA-256: `d99b526451e8b8c8c7cbfc37dfaa16afdcc68ce983262da1e3bde1d5b63dda05`
   - Size: 39,799 bytes (8 payload files + `MANIFEST.sha256`).
 
 ### Scope & Constraints
 
-- **Authorized Scope**: Test-only additions under `#[cfg(test)]` in [src/storage/fs/tests.rs](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/tests.rs) (28 characterization tests in `referrers_read_characterization`) and this documentation artifact.
-- **Production Preservation**: Zero production code changes. [src/storage/fs.rs](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs), [src/application/referrers.rs](file:///home/dietmar/devel/rust/registry-rust/src/application/referrers.rs), [src/http_api/referrers.rs](file:///home/dietmar/devel/rust/registry-rust/src/http_api/referrers.rs), storage traits, mutation methods, and configuration files are preserved byte-for-byte.
+- **Authorized Scope**: Test-only additions under `#[cfg(test)]` in [src/storage/fs/tests.rs](src/storage/fs/tests.rs) (28 characterization tests in `referrers_read_characterization`) and this documentation artifact.
+- **Production Preservation**: Zero production code changes. [src/storage/fs.rs](src/storage/fs.rs), [src/application/referrers.rs](src/application/referrers.rs), [src/http_api/referrers.rs](src/http_api/referrers.rs), storage traits, mutation methods, and configuration files are preserved byte-for-byte.
 - **Canonical Quality Gates**: All canonical gates remain explicitly **OPEN**:
   - `O-03`: Key and continuation-token contracts.
   - `O-04`: Filesystem write durability and containment.
@@ -43,7 +43,7 @@ This document records the empirical baseline and architectural characterization 
 
 ### 1. Storage Symbols
 
-- **`FsStorage::referrers_path`** ([src/storage/fs.rs:671-678](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L671-L678)):
+- **`FsStorage::referrers_path`** ([src/storage/fs.rs:671-678](src/storage/fs.rs#L671-L678)):
   ```rust
   fn referrers_path(&self, name: &str, subject: &Digest) -> PathBuf {
       self.root
@@ -55,7 +55,7 @@ This document records the empirical baseline and architectural characterization 
   ```
   Constructs an uncontained ambient pathname. Does not check repository boundaries or validate against directory traversal.
 
-- **`FsStorage::list_referrers`** ([src/storage/fs.rs:1721-1735](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1721-L1735)):
+- **`FsStorage::list_referrers`** ([src/storage/fs.rs:1721-1735](src/storage/fs.rs#L1721-L1735)):
   ```rust
   async fn list_referrers(
       &self,
@@ -74,7 +74,7 @@ This document records the empirical baseline and architectural characterization 
   ```
   Performs an uncontained direct read using `tokio::fs::read`. Treats `NotFound` as terminal empty success (`Ok(Vec::new())`). All other I/O errors and JSON deserialization errors map to `StorageError::Internal { kind: StorageErrorKind::Io, .. }`. Preserves file storage order without sorting.
 
-- **`FsStorage::list_referrers_page`** ([src/storage/fs.rs:1232-1261](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1232-L1261)):
+- **`FsStorage::list_referrers_page`** ([src/storage/fs.rs:1232-1261](src/storage/fs.rs#L1232-L1261)):
   ```rust
   async fn list_referrers_page(
       &self,
@@ -112,8 +112,8 @@ This document records the empirical baseline and architectural characterization 
 ### 2. Caller Reachability Audit
 
 - **Public OCI Route Caller**:
-  - `GET /v2/<name>/referrers/<digest>` is handled by `http_api::referrers::get_referrers` ([src/http_api/referrers.rs:25-102](file:///home/dietmar/devel/rust/registry-rust/src/http_api/referrers.rs#L25-L102)).
-  - Handler delegates to `ReferrersQueryService::query_referrers` ([src/application/referrers.rs:36-95](file:///home/dietmar/devel/rust/registry-rust/src/application/referrers.rs#L36-L95)).
+  - `GET /v2/<name>/referrers/<digest>` is handled by `http_api::referrers::get_referrers` ([src/http_api/referrers.rs:25-102](src/http_api/referrers.rs#L25-L102)).
+  - Handler delegates to `ReferrersQueryService::query_referrers` ([src/application/referrers.rs:36-95](src/application/referrers.rs#L36-L95)).
   - `query_referrers` calls `reader.list_referrers(repo, subject).await` **directly**.
   - **The public query service does NOT call `list_referrers_page`**.
   - Service-level error handling:
@@ -124,7 +124,7 @@ This document records the empirical baseline and architectural characterization 
 - **Status of `list_referrers_page`**:
   - Exhaustive codebase inspection confirms that **there is no active production caller of `list_referrers_page`**.
   - All existing references are:
-    1. Trait declarations on `Storage` ([src/storage/mod.rs:431](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L431)) and `ReferrersReader` ([src/storage/ports/mod.rs:123](file:///home/dietmar/devel/rust/registry-rust/src/storage/ports/mod.rs#L123)).
+    1. Trait declarations on `Storage` ([src/storage/mod.rs:431](src/storage/mod.rs#L431)) and `ReferrersReader` ([src/storage/ports/mod.rs:123](src/storage/ports/mod.rs#L123)).
     2. Forwarding adapter implementations in `Arc<dyn Storage>`, `Arc<dyn ReferrersReader>`, and macro `impl_referrers_reader!`.
     3. Unused delegating methods in `supervisor.rs:1705`, `manifest_lifecycle.rs:1904`, `blob_ref_index.rs:1268`.
     4. Mock implementations in `tests/ports_wiring_tests.rs` and `tests/support/gc_coordination.rs`.
@@ -211,11 +211,11 @@ The following matrix records the empirically observed behavior of `FsStorage::li
 - **Zero Page Limit Behavior & Read Precedence**:
   - When `page_limit == 0`, `end_idx = start_idx`. `end_idx < refs.len()` may be true (e.g. `0 < 2`), but `page_slice` has length 0, so `page_slice.last()` returns `None`.
   - Both valid JSON files and corrupted JSON files yield empty terminal success `Ok((vec![], None))`.
-  - **Source vs. Behavioral Evidence**: Behavioral observation alone does not distinguish whether `page_limit == 0` short-circuited or whether the read/parse occurred and errors were swallowed by `unwrap_or_default()`. Source code inspection of [src/storage/fs.rs:1239](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1239) confirms that `self.list_referrers(repo, subject).await` is invoked unconditionally on line 1239 before `page_limit` is inspected on line 1251.
+  - **Source vs. Behavioral Evidence**: Behavioral observation alone does not distinguish whether `page_limit == 0` short-circuited or whether the read/parse occurred and errors were swallowed by `unwrap_or_default()`. Source code inspection of [src/storage/fs.rs:1239](src/storage/fs.rs#L1239) confirms that `self.list_referrers(repo, subject).await` is invoked unconditionally on line 1239 before `page_limit` is inspected on line 1251.
 
 ### 3. Descriptor Schema & Field Deserialization
 
-- The in-storage JSON document is deserialized into `Vec<ReferrerDescriptor>` ([src/storage/mod.rs:341-351](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L341-L351)):
+- The in-storage JSON document is deserialized into `Vec<ReferrerDescriptor>` ([src/storage/mod.rs:341-351](src/storage/mod.rs#L341-L351)):
   ```rust
   pub struct ReferrerDescriptor {
       pub media_type: String,
@@ -241,9 +241,9 @@ The following matrix records the empirically observed behavior of `FsStorage::li
 ### 5. Relationship to Mutation Boundaries
 
 - `list_referrers` is called during mutations:
-  - **`FsStorage::add_referrer`** ([src/storage/fs.rs:1736-1755](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1736-L1755)): Calls `self.list_referrers(name, subject).await?`, appends the new descriptor (or updates if digest already exists), serializes the array, and writes to disk via `tokio::fs::write`.
-  - **`FsStorage::remove_referrer`** ([src/storage/fs.rs:1757-1785](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1757-L1785)): Calls `self.list_referrers(name, subject).await?`, filters out the matching digest, and writes back or deletes the file if the vector becomes empty.
-  - **`delete_manifest`** ([src/storage/fs.rs:1140-1200](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L1140-L1200)): Removes the referrers file `<hex>.json` when the subject manifest is deleted.
+  - **`FsStorage::add_referrer`** ([src/storage/fs.rs:1736-1755](src/storage/fs.rs#L1736-L1755)): Calls `self.list_referrers(name, subject).await?`, appends the new descriptor (or updates if digest already exists), serializes the array, and writes to disk via `tokio::fs::write`.
+  - **`FsStorage::remove_referrer`** ([src/storage/fs.rs:1757-1785](src/storage/fs.rs#L1757-L1785)): Calls `self.list_referrers(name, subject).await?`, filters out the matching digest, and writes back or deletes the file if the vector becomes empty.
+  - **`delete_manifest`** ([src/storage/fs.rs:1140-1200](src/storage/fs.rs#L1140-L1200)): Removes the referrers file `<hex>.json` when the subject manifest is deleted.
 - These mutations rely on `list_referrers` failing fail-closed on corrupted data (`?` propagates `StorageError::io`). If `list_referrers` were to swallow errors (like `list_referrers_page` does), `add_referrer` on a corrupted file would overwrite existing referrers with an array containing only the newly added referrer, destroying the corrupted data without notice.
 
 ---

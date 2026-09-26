@@ -735,7 +735,7 @@ Rather than combining multiple architectural changes, work should proceed with a
 **Recommended Slice:** **Lifecycle Reference-Discovery Hardening**.
 
 ### 5.1 Proposed Result Contract & Implementation Details
-- Target file: [`registry-rust/src/manifest_lifecycle.rs`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_lifecycle.rs)
+- Target file: [`registry-rust/src/manifest_lifecycle.rs`](src/manifest_lifecycle.rs)
 - Update `is_blob_referenced_in_repo` to return `Result<bool, StorageError>`:
   - Propagate `list_manifest_digests_page` errors via `?`.
   - Propagate `get_manifest` errors via `?`.
@@ -749,7 +749,7 @@ Rather than combining multiple architectural changes, work should proceed with a
   - On error, proxy memberships are not unlinked, journal is retained on disk, and error is returned to caller.
 
 ### 5.2 Required Test Coverage
-Target file: [`registry-rust/tests/manifest_lifecycle_tests.rs`](file:///home/dietmar/devel/rust/registry-rust/tests/manifest_lifecycle_tests.rs)
+Target file: [`registry-rust/tests/manifest_lifecycle_tests.rs`](tests/manifest_lifecycle_tests.rs)
 1. **Listing Failure Propagation:** Verify that a simulated listing error in `list_manifest_digests_page` causes `is_blob_referenced_in_repo` to return `Err` and prevents proxy blob unlinking.
 2. **Manifest Read Failure Propagation:** Verify that a simulated I/O error in `get_manifest` causes `is_blob_referenced_in_repo` to return `Err`.
 3. **Corrupt Manifest Reference Failure:** Verify that unparseable manifest bytes return `StorageErrorKind::CorruptData`.

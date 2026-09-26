@@ -29,13 +29,13 @@
 ## 1. Executive Summary & Routing Architecture
 
 Under `BlobGcPolicy::ManifestRooted`, garbage collection (GC) reachability analysis in `registry-rust` constructs an in-memory set of protected content digests reachable from stored container manifests. Currently, production GC on the filesystem backend bypasses contained storage abstractions:
-1. `build_manifest_protected_set` in [`src/blob_gc/policy.rs:166-225`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L166-L225) executes an uncontained bypass walker [`build_manifest_protected_set_fs`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L227-L299) whenever `storage.kind() == "fs"` and `cfg.fs_root.join("repos")` exists on disk.
-2. This direct bypass traverses raw disk paths using uncontained `tokio::fs::read_dir`, completely bypassing the pinned directory descriptor owned by [`FsStorage`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L190-L200) and ignoring descriptor containment constraints (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`).
-3. If the bypass is not taken, execution falls back to `storage.list_repositories()`, which invokes [`FsStorage::list_repo_names`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs.rs#L566-L641). As established in empirical characterization, public catalog discovery is **not** equivalent to GC reachability discovery: it omits root-adjacent manifests (`repos/manifests`), skips repositories beneath reserved segments (`repos/tags/...`, `repos/blobs/...`, `repos/meta/...`, `repos/referrers/...`), suppresses structural errors, and operates on unpinned pathnames.
+1. `build_manifest_protected_set` in [`src/blob_gc/policy.rs:166-225`](src/blob_gc/policy.rs#L166-L225) executes an uncontained bypass walker [`build_manifest_protected_set_fs`](src/blob_gc/policy.rs#L227-L299) whenever `storage.kind() == "fs"` and `cfg.fs_root.join("repos")` exists on disk.
+2. This direct bypass traverses raw disk paths using uncontained `tokio::fs::read_dir`, completely bypassing the pinned directory descriptor owned by [`FsStorage`](src/storage/fs.rs#L190-L200) and ignoring descriptor containment constraints (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`).
+3. If the bypass is not taken, execution falls back to `storage.list_repositories()`, which invokes [`FsStorage::list_repo_names`](src/storage/fs.rs#L566-L641). As established in empirical characterization, public catalog discovery is **not** equivalent to GC reachability discovery: it omits root-adjacent manifests (`repos/manifests`), skips repositories beneath reserved segments (`repos/tags/...`, `repos/blobs/...`, `repos/meta/...`, `repos/referrers/...`), suppresses structural errors, and operates on unpinned pathnames.
 
 Two test-only seams are committed to `registry-rust`:
-- [`src/storage/fs/repo_discovery.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/repo_discovery.rs) (commit `3bbe006148c83add6acfb2f7e0c5df9a21d38b7e`): Discovers terminal manifest-directory `ObjectKey`s beneath the pinned root descriptor.
-- [`src/storage/fs/manifest_refs_seam.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/manifest_refs_seam.rs) (commit `d51ea1ac69921dfdbd583b6b197b80b1f149e232`): Enumerates terminal directories beneath the same reader, opens payloads, parses references via [`parse_manifest_refs`](file:///home/dietmar/devel/rust/registry-rust/src/manifest_refs.rs#L62-L110), and produces an exact reference set with zero partial sets on error.
+- [`src/storage/fs/repo_discovery.rs`](src/storage/fs/repo_discovery.rs) (commit `3bbe006148c83add6acfb2f7e0c5df9a21d38b7e`): Discovers terminal manifest-directory `ObjectKey`s beneath the pinned root descriptor.
+- [`src/storage/fs/manifest_refs_seam.rs`](src/storage/fs/manifest_refs_seam.rs) (commit `d51ea1ac69921dfdbd583b6b197b80b1f149e232`): Enumerates terminal directories beneath the same reader, opens payloads, parses references via [`parse_manifest_refs`](src/manifest_refs.rs#L62-L110), and produces an exact reference set with zero partial sets on error.
 
 This document designs the **production integration** connecting GC reachability to the contained reader, resolving ownership, delegation, compatibility, resource budgeting, and execution safety.
 
@@ -88,7 +88,7 @@ This document designs the **production integration** connecting GC reachability 
 
 ### 2.1 Concrete Storage Trait Architecture: Required Methods Without Defaults
 
-In `registry-rust`, storage capabilities are partitioned into port traits in [`src/storage/ports/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/ports/mod.rs) and underlying backend traits in [`src/storage/mod.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs).
+In `registry-rust`, storage capabilities are partitioned into port traits in [`src/storage/ports/mod.rs`](src/storage/ports/mod.rs) and underlying backend traits in [`src/storage/mod.rs`](src/storage/mod.rs).
 
 To guarantee compile-time enforcement of capability delegation and avoid silent runtime fallbacks, `discover_manifest_references` **must be defined as a required trait method without a default implementation** on both `GcStorage` and `GcStoragePort`:
 
@@ -179,27 +179,27 @@ Tests must explicitly verify capability preservation through actual production w
 
 Every named production function, error type, and test harness was verified directly against repository source:
 
-- **`PolicyContext::build`**: [`src/blob_gc/policy.rs:115-136`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L115-L136)
+- **`PolicyContext::build`**: [`src/blob_gc/policy.rs:115-136`](src/blob_gc/policy.rs#L115-L136)
   - Constructs `PolicyContext` under a given `BlobGcPolicy`.
   - Line 122: `idx.check_health()?;`
   - Line 128: `BlobGcPolicy::ManifestRooted => Some(build_manifest_protected_set(cfg, storage).await?),`
-- **`build_manifest_protected_set`**: [`src/blob_gc/policy.rs:166-225`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L166-L225)
+- **`build_manifest_protected_set`**: [`src/blob_gc/policy.rs:166-225`](src/blob_gc/policy.rs#L166-L225)
   - Existing signature: `pub async fn build_manifest_protected_set(cfg: &crate::config::Config, storage: &(impl storage::GcServiceStoragePort + ?Sized)) -> Result<HashSet<String>, GcPolicyError>`
   - Lines 170–176: Direct uncontained bypass branch (`storage.kind() == "fs"` and `tokio::fs::metadata(&cfg.fs_root.join("repos")).await.is_ok()`).
   - Lines 178–224: Storage-port fallback loop.
   - **Proposed Change**: Replace lines 170–176 with a call to `storage.discover_manifest_references().await`. If `Some(set)` is returned, convert to `HashSet<String>` and return. If `None` is returned, take lines 178–224.
-- **`build_manifest_protected_set_fs`**: [`src/blob_gc/policy.rs:227-299`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L227-L299)
+- **`build_manifest_protected_set_fs`**: [`src/blob_gc/policy.rs:227-299`](src/blob_gc/policy.rs#L227-L299)
   - Existing uncontained raw filesystem traversal. Retired upon cutover.
-- **`blob_gc_plan`**: [`src/blob_gc/mod.rs:129-194`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L129-L194)
+- **`blob_gc_plan`**: [`src/blob_gc/mod.rs:129-194`](src/blob_gc/mod.rs#L129-L194)
   - Line 137: `let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;`
   - Called **once** up-front before candidate batch iteration. Read-only.
-- **`blob_gc_quarantine_with_authority`**: [`src/blob_gc/mod.rs:226-320`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L226-L320)
+- **`blob_gc_quarantine_with_authority`**: [`src/blob_gc/mod.rs:226-320`](src/blob_gc/mod.rs#L226-L320)
   - Line 276: `let _reval_guard = consistency.acquire_gc_revalidation().await;`
   - Line 278: `let mut policy_ctx = PolicyContext::build(cfg, storage, idx, policy).await?;`
   - Called **per candidate** under `_reval_guard`.
-- **`blob_gc_delete_with_authority`**: [`src/blob_gc/mod.rs:352-393`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L352-L393)
+- **`blob_gc_delete_with_authority`**: [`src/blob_gc/mod.rs:352-393`](src/blob_gc/mod.rs#L352-L393)
   - Public deletion entry point. Dispatches to `blob_gc_delete_fs_with_authority` for filesystem strategy.
-- **`blob_gc_delete_fs_with_authority`**: [`src/blob_gc/mod.rs:395-586`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L395-L586)
+- **`blob_gc_delete_fs_with_authority`**: [`src/blob_gc/mod.rs:395-586`](src/blob_gc/mod.rs#L395-L586)
   - Lines 486–491: Reads quarantine timestamp; if `None`, **writes quarantine timestamp file** (`write_quarantine_time(cfg, &digest, now)`). This disk mutation occurs **before** age evaluation and **before** discovery!
   - Line 494: `check_candidate_age(q_at, now, quarantine_delay)`
   - Line 508: `let reval_guard = consistency.acquire_gc_revalidation().await;`
@@ -208,7 +208,7 @@ Every named production function, error type, and test harness was verified direc
 
 ### 3.2 Explicit Error Modeling: `GcPolicyError::ManifestDiscovery`
 
-In [`src/blob_gc/policy.rs:60-108`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/policy.rs#L60-L108), `GcPolicyError` does not contain a general storage error conversion function. A new dedicated variant must be added:
+In [`src/blob_gc/policy.rs:60-108`](src/blob_gc/policy.rs#L60-L108), `GcPolicyError` does not contain a general storage error conversion function. A new dedicated variant must be added:
 
 ```rust
 // Proposed addition in src/blob_gc/policy.rs
@@ -241,7 +241,7 @@ let discovery_res = storage
 
 ### 3.3 Representation of Storage Errors: `StorageError::backend(...)`
 
-All error constructions in the proposed code conform to the actual constructors in [`src/storage/mod.rs:102-165`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L102-L165):
+All error constructions in the proposed code conform to the actual constructors in [`src/storage/mod.rs:102-165`](src/storage/mod.rs#L102-L165):
 - `StorageError::backend(msg)` constructs `StorageError::Internal { kind: StorageErrorKind::Backend, message: msg.to_string() }`.
 - `StorageError::io(msg)` constructs `StorageError::Internal { kind: StorageErrorKind::Io, message: msg.to_string() }`.
 - `StorageError::corrupt_data(msg)` constructs `StorageError::Internal { kind: StorageErrorKind::CorruptData, message: msg.to_string() }`.
@@ -298,7 +298,7 @@ The committed test seams resolved several semantic differences compared to the d
 
 The discovery and reference collection architecture requires limits across seven distinct dimensions:
 
-1. **Intermediate Directory Discovery Bounds ([`repo_discovery`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/repo_discovery.rs)):**
+1. **Intermediate Directory Discovery Bounds ([`repo_discovery`](src/storage/fs/repo_discovery.rs)):**
    - `max_depth`: Maximum directory traversal depth beneath `repos/` (depth 0).
    - `max_dir_enumerations`: Maximum directory enumeration attempts across intermediate folders.
    - `max_total_discovery_entries`: Cumulative dirents inspected across intermediate directory enumerations.
@@ -306,7 +306,7 @@ The discovery and reference collection architecture requires limits across seven
    - `max_discovery_retained_path_bytes`: Logical path bytes retained in pending queue and terminal list.
 2. **Intermediate Directory Single-Batch Bounds:**
    - `intermediate_dir_limits: DirEnumerationLimits`: Per-directory limits (`max_entries`, `max_total_name_bytes`) passed to `enumerate_dir` on intermediate folders.
-3. **Terminal Directory Enumeration Bounds ([`manifest_refs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/manifest_refs_seam.rs)):**
+3. **Terminal Directory Enumeration Bounds ([`manifest_refs`](src/storage/fs/manifest_refs_seam.rs)):**
    - `max_terminal_dir_enumerations`: Maximum terminal manifest directories enumerated.
    - `terminal_per_dir_limits: DirEnumerationLimits`: Per-directory limits passed to `enumerate_dir` on each terminal `manifests/` directory.
    - `max_total_manifest_entries`: Cumulative dirents inspected across all terminal directories combined.
@@ -370,7 +370,7 @@ The following table provides the exhaustive production configuration contract ac
 
 ### 5.5 Configuration Loading, Serde Deserialization & Error Semantics
 
-The configuration contract directly integrates into [`src/config.rs`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs) using its actual existing mechanisms:
+The configuration contract directly integrates into [`src/config.rs`](src/config.rs) using its actual existing mechanisms:
 
 1. **Serde File Configuration:**
    - In `src/config.rs:1004`, `FileStorageFs` contains a sub-struct:
@@ -427,9 +427,9 @@ The configuration contract directly integrates into [`src/config.rs`](file:///ho
          max_manifest_payload_bytes: Option<u64>,
      }
      ```
-   - In [`src/config.rs:2482-2512`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs#L2482-L2512), `load_config_files` parses TOML documents into a temporary `toml::Value` purely to merge overlays via `merge_toml_value`, and then deserializes the merged table into `FileConfig` via `merged.try_into()`. The application does **not** perform dynamic key lookups on `toml::Value`.
+   - In [`src/config.rs:2482-2512`](src/config.rs#L2482-L2512), `load_config_files` parses TOML documents into a temporary `toml::Value` purely to merge overlays via `merge_toml_value`, and then deserializes the merged table into `FileConfig` via `merged.try_into()`. The application does **not** perform dynamic key lookups on `toml::Value`.
 2. **Environment Variable Parsing Helpers:**
-   - In [`src/config.rs:2997-3008`](file:///home/dietmar/devel/rust/registry-rust/src/config.rs#L2997-L3008), `env_usize_opt(&[hierarchical, flat])?` and `env_u64_opt(&[hierarchical, flat])?` resolve environment variables:
+   - In [`src/config.rs:2997-3008`](src/config.rs#L2997-L3008), `env_usize_opt(&[hierarchical, flat])?` and `env_u64_opt(&[hierarchical, flat])?` resolve environment variables:
      - They check the slice of keys in order (hierarchical alias first, flat alias second).
      - If set, the string is trimmed (`v.trim()`) and parsed via `.parse::<usize>()` or `.parse::<u64>()`.
 3. **Numeric Parsing Failures & Integer Overflow:**
@@ -633,7 +633,7 @@ impl FsStorage {
 
 Construction of primary storage and proxy cache storage are strictly separated:
 
-1. **Primary Storage Construction ([`src/storage/mod.rs:829-842`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L829-L842)):**
+1. **Primary Storage Construction ([`src/storage/mod.rs:829-842`](src/storage/mod.rs#L829-L842)):**
    - In `storage_wiring_try_from_config(config: &Config)`:
    - For `StorageBackend::Filesystem`, `FsStorage` is constructed via `try_new_with_gc_limits`, passing:
      - `config.fs_root.clone()`
@@ -642,7 +642,7 @@ Construction of primary storage and proxy cache storage are strictly separated:
      - Validated `DiscoveryLimits` populated from `config.fs_gc_discovery_*`
      - Validated `ManifestReferenceLimits` populated from `config.fs_gc_discovery_*`
    - The resulting `FsStorage` is wrapped in `Arc::new` and converted into `StorageWiring::from_backend`, exposing both `gc_port` and `gc_service_port`.
-2. **Proxy Cache Storage Construction ([`src/storage/mod.rs:880-905`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L880-L905)):**
+2. **Proxy Cache Storage Construction ([`src/storage/mod.rs:880-905`](src/storage/mod.rs#L880-L905)):**
    - In `proxy_cache_storage_try_from_config(config: &Config, upstream: Option<&ProxyUpstreamRoute>)`:
    - For `StorageBackend::Filesystem`, proxy cache storage constructs `FsStorage` via `try_new_with_limits(root, config.max_upload_bytes, limits)`.
    - This forwards to `try_new_with_gc_limits` with compiled safe defaults (`DiscoveryLimits::default()` and `ManifestReferenceLimits::default()`).
@@ -654,7 +654,7 @@ Construction of primary storage and proxy cache storage are strictly separated:
 `FsStorage` construction performs blocking filesystem operations synchronously (`ensure_dir`, `FsMetadataReader::open(&root)`, and `reader.probe_capability()`).
 
 The asynchronous startup sequence **must explicitly preserve** the `spawn_blocking` boundary:
-1. In [`src/storage/mod.rs:939-959`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L939-L959), `storage_wiring_try_from_config_async_with_factory` executes:
+1. In [`src/storage/mod.rs:939-959`](src/storage/mod.rs#L939-L959), `storage_wiring_try_from_config_async_with_factory` executes:
    ```rust
    match config.storage_backend {
        StorageBackend::Filesystem => {
@@ -670,9 +670,9 @@ The asynchronous startup sequence **must explicitly preserve** the `spawn_blocki
        StorageBackend::S3 => storage_factory(config),
    }
    ```
-2. In [`src/runtime.rs:249-275`](file:///home/dietmar/devel/rust/registry-rust/src/runtime.rs#L249-L275), `init_server_storage_wiring` invokes `storage_wiring_try_from_config_async_with_factory`, ensuring the primary server runtime offloads root descriptor opening and capability probing to a dedicated worker thread.
-3. In [`src/cli/runtime.rs:63`](file:///home/dietmar/devel/rust/registry-rust/src/cli/runtime.rs#L63), the CLI runtime composition similarly delegates through `storage_wiring_try_from_config_async_with_factory`.
-4. In [`src/storage/mod.rs:961-980`](file:///home/dietmar/devel/rust/registry-rust/src/storage/mod.rs#L961-L980), `proxy_cache_storage_try_from_config_async_with_factory` offloads proxy cache constructor execution to `tokio::task::spawn_blocking`.
+2. In [`src/runtime.rs:249-275`](src/runtime.rs#L249-L275), `init_server_storage_wiring` invokes `storage_wiring_try_from_config_async_with_factory`, ensuring the primary server runtime offloads root descriptor opening and capability probing to a dedicated worker thread.
+3. In [`src/cli/runtime.rs:63`](src/cli/runtime.rs#L63), the CLI runtime composition similarly delegates through `storage_wiring_try_from_config_async_with_factory`.
+4. In [`src/storage/mod.rs:961-980`](src/storage/mod.rs#L961-L980), `proxy_cache_storage_try_from_config_async_with_factory` offloads proxy cache constructor execution to `tokio::task::spawn_blocking`.
 
 This explicit offloading prevents blocking the Tokio reactor thread pool during initial storage initialization.
 
@@ -684,11 +684,11 @@ This explicit offloading prevents blocking the Tokio reactor thread pool during 
 
 Manifest discovery executes at three distinct points in the GC lifecycle:
 
-1. **Pre-Planning ([`blob_gc_plan`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L129-L194)):**
+1. **Pre-Planning ([`blob_gc_plan`](src/blob_gc/mod.rs#L129-L194)):**
    - Executed **once** at line 137 before CAS candidate iteration begins.
    - Entirely read-only. Populates `PolicyContext.manifest_protected`.
    - If discovery fails, planning aborts immediately; 0 candidate blobs are scanned or reported as eligible.
-2. **Candidate Quarantine ([`blob_gc_quarantine_with_authority`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L226-L320)):**
+2. **Candidate Quarantine ([`blob_gc_quarantine_with_authority`](src/blob_gc/mod.rs#L226-L320)):**
    - Executed **per candidate** inside the iteration loop at line 278.
    - Sequence for candidate $N$:
      1. Verify candidate age: `check_candidate_age` (L263).
@@ -698,7 +698,7 @@ Manifest discovery executes at three distinct points in the GC lifecycle:
      5. Check pins (`policy_ctx.is_pinned`) and references (`policy_ctx.is_referenced`).
      6. If unreferenced: execute quarantine mutation (`storage.quarantine_blob`) (L290).
      7. Drop `_reval_guard`.
-3. **Quarantine Deletion ([`blob_gc_delete_fs_with_authority`](file:///home/dietmar/devel/rust/registry-rust/src/blob_gc/mod.rs#L395-L586)):**
+3. **Quarantine Deletion ([`blob_gc_delete_fs_with_authority`](src/blob_gc/mod.rs#L395-L586)):**
    - Executed **per candidate** inside the quarantine inspection loop.
    - Sequence for quarantine candidate $N$:
      1. **Metadata Initialization (Disk Mutation!):** Lines 486–491 read `read_quarantine_time(cfg, &digest)`. If missing, it executes `write_quarantine_time(cfg, &digest, now)` and continues. This writes a timestamp file to disk **before** age evaluation and **before** discovery!
@@ -744,7 +744,7 @@ Omission of a manifest from the discovered protected set weakens reachability pr
 
 ### 7.1 Promotion without Divergent Implementations
 
-The test seams ([`repo_discovery.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/repo_discovery.rs) and [`manifest_refs_seam.rs`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/manifest_refs_seam.rs)) were authored with production-ready error handling and checked arithmetic. They will be promoted directly:
+The test seams ([`repo_discovery.rs`](src/storage/fs/repo_discovery.rs) and [`manifest_refs_seam.rs`](src/storage/fs/manifest_refs_seam.rs)) were authored with production-ready error handling and checked arithmetic. They will be promoted directly:
 1. Remove `#[cfg(test)]` guards in `src/storage/fs.rs`.
 2. Move `manifest_refs_seam.rs` to `src/storage/fs/manifest_refs.rs`.
 3. Retain unit and fault-injection tests in `mod tests` within those files.

@@ -27,7 +27,7 @@ password = "demo"
 allow_repos = ["myrepo"]
 
 [token]
-service = "registry-rust"
+service = "naust"
 signing_key = "minio-smoke-signing-key-change-me"
 ttl_secs = 600
 

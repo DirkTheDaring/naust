@@ -128,7 +128,7 @@ Under the contained seam:
 
 ### 3.4 Actual Error Translation Taxonomy (Delegation to `read_adapter.rs`)
 
-The test seam does **not** implement a custom error translator. It delegates directly to [`super::read_adapter::translate_payload_read_error`](file:///home/dietmar/devel/rust/registry-rust/src/storage/fs/read_adapter.rs#L176-L178), which invokes `translate_read_error(err, ReadOp::Payload)` (`read_adapter.rs:93-168`).
+The test seam does **not** implement a custom error translator. It delegates directly to [`super::read_adapter::translate_payload_read_error`](src/storage/fs/read_adapter.rs#L176-L178), which invokes `translate_read_error(err, ReadOp::Payload)` (`read_adapter.rs:93-168`).
 
 The table below reflects the exact, source-checked mapping implemented in `read_adapter.rs`:
 

@@ -1,6 +1,6 @@
 # Documentation
 
-Entry point for `registry-rust` documentation. **Audited code revision for all canonical documents: `master` @ `2718bc16`**, with a targeted 2026-09-26 amendment for the ADR-010 `registry-core` crate split (architecture README §1–§3/§6, ADR-010, technical-debt KI-07/KI-26/KI-27 — other documents were not re-audited). One canonical home per concern; everything links by stable ID (`REQ-nnn`, `KI-nn`, `GATE-…`, ADR number) — status is stated only in the owning register.
+Entry point for `naust` documentation. **Audited code revision for all canonical documents: `master` @ `2718bc16`**, with a targeted 2026-09-26 amendment for the ADR-010 `naust-core` crate split (architecture README §1–§3/§6, ADR-010, technical-debt KI-07/KI-26/KI-27 — other documents were not re-audited). One canonical home per concern; everything links by stable ID (`REQ-nnn`, `KI-nn`, `GATE-…`, ADR number) — status is stated only in the owning register.
 
 | Read this | For |
 |---|---|
