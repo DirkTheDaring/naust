@@ -253,7 +253,7 @@ pub(crate) async fn open_blob_seam(
 /// Accepts an already-constructed reader `R` implementing both [`storage_core::ObjectMetadataReader`]
 /// and [`storage_core::ObjectPayloadReader`].
 #[derive(Debug)]
-pub(crate) struct FsBlobCasReadAdapter<R: ?Sized> {
+pub struct FsBlobCasReadAdapter<R: ?Sized> {
     reader: Arc<R>,
 }
 
@@ -264,8 +264,9 @@ impl<R: ?Sized> FsBlobCasReadAdapter<R> {
     }
 
     /// Returns a reference to the inner shared reader.
-    #[cfg(test)]
-    pub(crate) fn reader(&self) -> &Arc<R> {
+    #[cfg(any(test, feature = "test-mocks"))]
+    #[doc(hidden)] // white-box window for wiring tests; curated in plan Phase 3
+    pub fn reader(&self) -> &Arc<R> {
         &self.reader
     }
 }

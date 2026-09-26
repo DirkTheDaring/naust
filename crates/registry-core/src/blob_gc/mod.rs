@@ -1171,8 +1171,6 @@ mod tests {
             .await
             .unwrap();
 
-        let fs_root = temp.path().to_path_buf();
-
         let candidate_bytes = b"test blob for malformed journal check";
         let hash = sha2::Sha256::digest(candidate_bytes);
         let hex = hex::encode(hash);

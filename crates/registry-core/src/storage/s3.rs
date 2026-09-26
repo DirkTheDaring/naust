@@ -3629,6 +3629,10 @@ impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for S3Stor
     }
 }
 
+#[cfg(any(test, feature = "test-mocks"))]
+#[path = "s3/mock.rs"]
+pub mod mock;
+
 #[cfg(test)]
 #[path = "s3/tests.rs"]
 pub(crate) mod tests;

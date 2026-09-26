@@ -1,3 +1,4 @@
+use super::test_helpers::{make_test_stream, prepare_finalizable_session, tmp_fs_root, write_file};
 use super::*;
 use crate::storage::StorageErrorKind;
 use std::sync::Arc;
@@ -12,22 +13,6 @@ async fn expect_open_blob_err(
         Ok(_) => panic!("{panic_msg}"),
         Err(err) => err,
     }
-}
-
-pub(crate) fn tmp_fs_root() -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "registry-rust-fsstorage-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&p).expect("create temp fs_root");
-    p
-}
-
-pub(crate) fn write_file(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dirs");
-    }
-    std::fs::write(path, bytes).expect("write file");
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -402,11 +387,6 @@ async fn test_fs_direct_repeated_replacements() {
         .await
         .unwrap();
     assert_eq!(m2, crate::storage::TagMutation::Replaced { previous: d1 });
-}
-
-fn make_test_stream(chunks: Vec<Bytes>) -> UploadByteStream {
-    let items: Vec<Result<Bytes, UploadStreamError>> = chunks.into_iter().map(Ok).collect();
-    Box::pin(futures_util::stream::iter(items))
 }
 
 fn make_failing_stream(first_chunk: Bytes, err: UploadStreamError) -> UploadByteStream {
@@ -3347,40 +3327,6 @@ async fn test_fs_reaper_rolls_forward_published_finalizing_with_accurate_count()
 
 /// Drive a session through create -> append(sha256) -> begin_finalize and return
 /// the prepared handle plus the payload digest.
-pub(crate) async fn prepare_finalizable_session(
-    storage: &FsStorage,
-    repo: &str,
-    data: &[u8],
-) -> (UploadSessionId, PreparedFinalize, Digest) {
-    let session = storage.create_session(repo).await.unwrap();
-    let stream = make_test_stream(vec![Bytes::copy_from_slice(data)]);
-    storage
-        .append_if_offset(
-            &session,
-            UploadOffsetPrecondition::Exact(0),
-            stream,
-            1024 * 1024,
-        )
-        .await
-        .unwrap();
-
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(data);
-    let digest = Digest::parse(&format!("sha256:{}", hex::encode(hasher.finalize()))).unwrap();
-
-    let prepared = storage
-        .begin_finalize(
-            &session,
-            UploadOffsetPrecondition::Exact(data.len() as u64),
-            None,
-            &digest,
-            1024 * 1024,
-            true,
-        )
-        .await
-        .unwrap();
-    (session, prepared, digest)
-}
 
 /// The ambient on-disk path of the membership record written by the lifecycle,
 /// mirroring `repo-memberships/by-repo/{key}/{algo}/{hex}.json`.

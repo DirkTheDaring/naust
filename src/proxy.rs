@@ -2,14 +2,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use sha2::Digest as _;
-use std::{
-    collections::HashMap,
-    fmt,
-    net::IpAddr,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, fmt, net::IpAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 

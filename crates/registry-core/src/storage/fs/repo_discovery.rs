@@ -84,7 +84,7 @@ use crate::storage::StorageError;
 
 /// Caller-supplied limits for bounded repository directory discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DiscoveryLimits {
+pub struct DiscoveryLimits {
     /// Maximum directory depth relative to `repos/` (root `repos/` is depth 0).
     pub max_depth: usize,
     /// Maximum number of directory enumerations performed during the walk.

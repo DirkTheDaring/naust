@@ -8,16 +8,16 @@ use crate::storage::ports::{BlobCasReader, StorageWiring};
 
 /// Crate-private compatibility facade wrapping `StorageWiring`.
 #[derive(Clone)]
-pub(crate) struct StorageWiringFacade {
+pub struct StorageWiringFacade {
     wiring: StorageWiring,
 }
 
 impl StorageWiringFacade {
-    pub(crate) fn new(wiring: StorageWiring) -> Self {
+    pub fn new(wiring: StorageWiring) -> Self {
         Self { wiring }
     }
 
-    pub(crate) fn blob_reader(&self) -> Arc<dyn BlobCasReader> {
+    pub fn blob_reader(&self) -> Arc<dyn BlobCasReader> {
         self.wiring.blob_reader()
     }
 }

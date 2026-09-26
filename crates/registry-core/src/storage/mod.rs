@@ -8,7 +8,8 @@ use std::{pin::Pin, sync::Arc};
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
-pub(crate) mod facade;
+// `pub` for the server composition root (storage wiring); curated in plan Phase 3.
+pub mod facade;
 pub mod fs;
 pub(crate) mod journal_domain;
 pub(crate) mod manifest_domain;

@@ -47,7 +47,7 @@ impl<T> ManifestRefReader for T where
 
 /// Caller-supplied limits for manifest reference collection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ManifestReferenceLimits {
+pub struct ManifestReferenceLimits {
     /// Maximum directory enumeration calls across all terminal directories.
     pub max_terminal_dir_enumerations: usize,
     /// Per-directory limits passed to each `reader.enumerate_dir` call.

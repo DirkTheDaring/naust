@@ -134,6 +134,18 @@ Gate: `scripts/check-core-boundary.sh` / `make core-boundary`.
 * **Server workers need the concrete engine**: proxy GC/scrub in `supervisor.rs` call engine methods outside the seam (correctly — eviction is not a core concern). `AppState` gained `proxy_upstream_engines: Vec<Arc<Proxy>>` parallel to the (now trait-object) `proxy_upstreams: Vec<ProxyTarget>`.
 * **1e: gate GREEN** (`core-boundary gate: clean`). Verification: fmt clean; lib 1127/0/13; full workspace test run 1490 passed / 31 failed, with all 31 failures isolated to the environment-gated `s3_live_integration` suite (base-reproduced pre-change; Phase 4 item).
 
+### Phase 2 learnings (2026-09-26, completed)
+
+* **Layout adjustment (G3-driven, ADR-010 addendum):** the root package stays `registry-rust` at the repo root; the workspace gains one member, `crates/registry-core`. Moving the server to `crates/registry-rust` would have churned Dockerfile/packaging/conformance paths for zero architectural gain — the release binary still lands at `target/release/registry-rust`.
+* **Server `lib.rs` re-exports core modules under their old paths** (`pub use registry_core::storage;` etc., plus the two `#[macro_export]` macros), so `registry_rust::…` paths in all 20 integration suites kept compiling unchanged.
+* **Cross-crate test seams solved with a core `test-mocks` feature**: the deterministic S3 mock (extracted from `s3/tests.rs` into `storage/s3/mock.rs`), FS test helpers (`storage/fs/test_helpers.rs`), and two white-box reader accessors are `#[cfg(any(test, feature = "test-mocks"))]`; the server enables the feature via its dev-dependency on registry-core — dev-only, same unification guarantee as the sibling crates' `fault-injection`/`mock-client`.
+* **Visibility widenings** required by the server (now `pub`, to be curated in Phase 3): `storage::facade`, `fs::{manifest_listing, tag_listing, repo_discovery, manifest_refs, read_adapter}`, `FsStorage::try_new_with_all_limits`.
+* **Operator-visible change**: three `tracing` targets renamed `registry_rust::storage::fs` → `registry_core::storage::fs` (log-filter configs may reference them) — Phase 4 docs note.
+* `manifest_publication` shim deleted per ADR-010 §2.6, together with its compatibility test (`test_public_api_manifest_publication_compatibility`).
+* **Test invocation changed**: `cargo test` at the root no longer runs core's unit tests — use `cargo test --workspace`. Core standalone: 909 lib tests; workspace totals 1489 passed / 31 env-gated / 14 ignored (−1 vs pre-split = the deleted shim test).
+* Gate script repointed: forbidden-crate grep over `crates/registry-core` + `cargo check -p registry-core` — the compiler is now the primary boundary. Its first post-split run caught three stale `registry_rust::…` tracing target strings.
+* Verification: gate clean; fmt clean; release build produces `target/release/registry-rust` (G3); conformance matrices fs/basic/token green post-split (s3 + live suite need MinIO → Phase 4).
+
 Reverse edge (server → core, legal after split): `proxy.rs:582,662` → `application::{Blob,Manifest}MutationService`.
 
 Verified clean: `membership_migration` (imports only `manifest_refs` + `storage`), `upload_state.rs` (zero crate imports), `consistency`, `fs_root_lock`, `task_supervisor`, `glob` (used only by `request_routing`/`rbac`/`config` — server side); no core production code touches `auth`, `rbac`, `security`, `audit`, or `request_routing`; storage layer imports nothing above it except the listed `config` sites.

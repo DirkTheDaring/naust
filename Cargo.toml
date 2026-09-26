@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/registry-core"]
+
 [package]
 name = "registry-rust"
 version = "0.9.0"
@@ -43,23 +46,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 acmecert-core = { path = "../acmecert/crates/acmecert-core" }
+registry-core = { path = "crates/registry-core" }
 storage-core = { path = "../storage-layer-rust/crates/storage-core" }
 storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
 storage-s3 = { path = "../storage-layer-rust/crates/storage-s3" }
 
-[features]
-default = ["storage-fs"]
-storage-fs = []
-storage-s3 = []
-
 [dev-dependencies]
+registry-core = { path = "crates/registry-core", features = ["test-mocks"] }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
-# Enable the dependency's deterministic fault-injection seam for tests ONLY. With the
-# edition-2024 resolver, dev-dependency features are not unified into normal builds, so
-# production `FsStorage` never contains the seam.
-storage-fs = { path = "../storage-layer-rust/crates/storage-fs", features = ["fault-injection"] }
-# The deterministic in-memory S3 client mock drives the real S3ObjectStore adapter in
-# registry tag tests without an S3 endpoint. Dev-only; never unified into normal builds.
-storage-s3 = { path = "../storage-layer-rust/crates/storage-s3", features = ["mock-client"] }

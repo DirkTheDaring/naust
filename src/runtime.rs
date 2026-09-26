@@ -1265,7 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_exact_lock_key_alone_is_empty() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         // 1. Unprefixed storage with exact lock key
         let driver = Arc::new(MockS3Driver::new(1000));
@@ -1317,7 +1317,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_lock_key_plus_ordinary_object_is_non_empty() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         let driver = Arc::new(MockS3Driver::new(1000));
         {
@@ -1352,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_unexpected_nested_lock_is_non_empty() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         let driver = Arc::new(MockS3Driver::new(1000));
         {
@@ -1381,7 +1381,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_other_meta_lock_is_non_empty() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         let driver = Arc::new(MockS3Driver::new(1000));
         {
@@ -1409,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_lock_like_object_on_page_one_aborts_non_empty() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         let driver = Arc::new(MockS3Driver::new(1000));
         {
@@ -1437,7 +1437,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_page_one_lock_only_and_page_two_has_data() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         let driver = Arc::new(MockS3Driver::new(1000));
         // Page 1: only writer lock
@@ -1481,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_s3_page_two_request_fails() {
         use crate::storage::s3::S3Storage;
-        use crate::storage::s3::tests::MockS3Driver;
+        use crate::storage::s3::mock::MockS3Driver;
 
         let driver = Arc::new(MockS3Driver::new(1000));
         {

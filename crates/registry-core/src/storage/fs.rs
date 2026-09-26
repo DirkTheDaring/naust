@@ -506,7 +506,7 @@ impl std::fmt::Debug for ReaperBoundaryHookSlot {
 
 impl FsStorage {
     /// Crate-visible constructor enforcing complete limit validation including tag listing limits.
-    pub(crate) fn try_new_with_all_limits(
+    pub fn try_new_with_all_limits(
         root: PathBuf,
         max_upload_bytes: u64,
         manifest_listing_limits: storage_fs::DirEnumerationLimits,
@@ -823,16 +823,18 @@ impl FsStorage {
     }
 
     /// Returns a reference to the underlying read adapter.
-    #[cfg(test)]
-    pub(crate) fn read_adapter(
+    #[cfg(any(test, feature = "test-mocks"))]
+    #[doc(hidden)] // white-box window for wiring tests; curated in plan Phase 3
+    pub fn read_adapter(
         &self,
     ) -> &std::sync::Arc<read_adapter::FsBlobCasReadAdapter<storage_fs::FsMetadataReader>> {
         &self.read_adapter
     }
 
     /// Returns a reference to the shared root metadata reader.
-    #[cfg(test)]
-    pub(crate) fn reader(&self) -> &std::sync::Arc<storage_fs::FsMetadataReader> {
+    #[cfg(any(test, feature = "test-mocks"))]
+    #[doc(hidden)] // white-box window for wiring tests; curated in plan Phase 3
+    pub fn reader(&self) -> &std::sync::Arc<storage_fs::FsMetadataReader> {
         &self.reader
     }
 
@@ -931,7 +933,7 @@ impl FsStorage {
             let mib = observed_len as f64 / (1024.0 * 1024.0);
             let mib_s = mib / elapsed.as_secs_f64().max(0.000_001);
             tracing::debug!(
-                target: "registry_rust::storage::fs",
+                target: "registry_core::storage::fs",
                 event = "upload_hash_resume_rebuild",
                 uuid,
                 size_bytes = observed_len,
@@ -1510,7 +1512,7 @@ impl Storage for FsStorage {
             let secs = elapsed.as_secs_f64().max(0.000_001);
             let mib_s = mib / secs;
             tracing::debug!(
-                target: "registry_rust::storage::fs",
+                target: "registry_core::storage::fs",
                 event = "upload_append",
                 uuid,
                 chunk_bytes = chunk.len(),
@@ -1661,7 +1663,7 @@ impl Storage for FsStorage {
         let hash_mib_s = (hash_ms_u64 >= 1).then(|| size_mib / (hash_ms_u64 as f64 / 1000.0));
         let total_mib_s = (total_ms_u64 >= 1).then(|| size_mib / (total_ms_u64 as f64 / 1000.0));
         tracing::info!(
-            target: "registry_rust::storage::fs",
+            target: "registry_core::storage::fs",
             event = "upload_finalize",
             uuid,
             digest = %digest.as_str(),
@@ -4217,6 +4219,10 @@ impl GcStorage for FsStorage {
     }
 }
 
+#[cfg(any(test, feature = "test-mocks"))]
+#[path = "fs/test_helpers.rs"]
+pub mod test_helpers;
+
 #[cfg(test)]
 #[path = "fs/tests.rs"]
 pub(crate) mod tests;
@@ -4226,7 +4232,7 @@ pub(crate) mod tests;
 mod contained_metadata;
 
 #[path = "fs/read_adapter.rs"]
-pub(crate) mod read_adapter;
+pub mod read_adapter;
 
 #[cfg(test)]
 #[path = "fs/metadata_seam.rs"]
@@ -4240,20 +4246,20 @@ mod payload_seam;
 pub(crate) mod listing;
 
 #[path = "fs/manifest_listing.rs"]
-pub(crate) mod manifest_listing;
+pub mod manifest_listing;
 
 #[path = "fs/repo_discovery.rs"]
-pub(crate) mod repo_discovery;
+pub mod repo_discovery;
 
 #[path = "fs/manifest_refs.rs"]
-pub(crate) mod manifest_refs;
+pub mod manifest_refs;
 
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use manifest_refs as manifest_refs_seam;
 
 #[path = "fs/tag_listing.rs"]
-pub(crate) mod tag_listing;
+pub mod tag_listing;
 
 #[path = "fs/catalog_discovery.rs"]
 pub(crate) mod catalog_discovery;

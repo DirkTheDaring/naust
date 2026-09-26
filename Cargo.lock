@@ -2320,6 +2320,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "registry-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "base64",
+ "bytes",
+ "clap",
+ "fs2",
+ "futures-util",
+ "hex",
+ "hmac 0.12.1",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sled",
+ "storage-core",
+ "storage-fs",
+ "storage-s3",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "registry-rust"
 version = "0.9.0"
 dependencies = [
@@ -2344,6 +2376,7 @@ dependencies = [
  "ipnet",
  "libc",
  "regex",
+ "registry-core",
  "reqwest",
  "rustls",
  "semver",

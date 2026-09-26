@@ -5,7 +5,7 @@ use crate::registry::digest::Digest;
 use crate::storage::Storage;
 use crate::storage::fs::FsStorage;
 use crate::storage::fs::repo_discovery;
-use crate::storage::fs::tests::{prepare_finalizable_session, tmp_fs_root, write_file};
+use crate::storage::fs::test_helpers::{prepare_finalizable_session, tmp_fs_root, write_file};
 use crate::storage::upload_session::{FinalizeOutcome, UploadSessionStorage};
 use crate::storage::{BlobMeta, StorageErrorKind};
 use bytes::Bytes;

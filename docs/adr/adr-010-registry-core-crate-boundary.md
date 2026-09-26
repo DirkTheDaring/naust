@@ -21,6 +21,8 @@ A verified coupling inventory (plan appendix, at `be40792`) shows the boundary i
 
 Cargo workspace in this repository: `crates/registry-core` (library) + `crates/registry-rust` (server/CLI binary). Sibling path-deps: `storage-core`/`storage-fs`/`storage-s3` become core dependencies; `acmecert-core` stays server-only. The module partition (every `lib.rs` module assigned) is recorded in the plan, Phase 2.
 
+> **Addendum (2026-09-26, Phase 2 execution):** the server package stays at the repository root (package `registry-rust`, `src/`); only `crates/registry-core` was added as a workspace member. Relocating the server under `crates/` would have churned the Dockerfile, packaging, and conformance-harness paths for no architectural gain. The boundary semantics of this ADR are unchanged.
+
 ### 2.2 Proxy seam
 
 Core defines an `UpstreamFetcher` trait plus core-owned `ProxyError`, `RepoDecision`, `FetchManifestResult`, and `TagMeta` types, carrying exactly the surface `application/{manifest_read,proxy,errors}.rs` uses today. The reqwest engine (`src/proxy.rs`) stays in the server and implements the trait; its back-calls into `application::{Blob,Manifest}MutationService` become legal server→core edges.

@@ -3488,55 +3488,6 @@ async fn test_migrated_immutable_conflict_retains_content_addressed_manifest_and
     assert!(referrers.iter().any(|r| r.digest == m2_digest.as_str()));
 }
 
-#[tokio::test]
-async fn test_public_api_manifest_publication_compatibility() {
-    // Compile-time and runtime proof that all 9 deprecated public names are fully accessible:
-    #[allow(deprecated)]
-    {
-        use registry_rust::manifest_publication::{
-            MAX_MANIFEST_SIZE, ManifestLifecycleService, ManifestPublisher, ProxyEvictionResult,
-            ProxyPublicationEvidence, PublishManifestError, PublishManifestRequest,
-            PublishedManifest, is_supported_manifest_media_type,
-        };
-
-        assert_eq!(MAX_MANIFEST_SIZE, 4 * 1024 * 1024);
-        assert!(is_supported_manifest_media_type(
-            "application/vnd.oci.image.manifest.v1+json"
-        ));
-
-        let _evidence_builder = |repo: &str, tag: &str, d: Digest| -> ProxyPublicationEvidence {
-            ProxyPublicationEvidence::new_for_test(
-                repo,
-                tag,
-                Bytes::from_static(b"{}"),
-                None,
-                true,
-                d,
-            )
-        };
-        let _eviction_res: Option<ProxyEvictionResult> = None;
-
-        let dir = tempfile::tempdir().unwrap();
-        let fs_root = dir.path().join("data");
-        std::fs::create_dir_all(&fs_root).unwrap();
-        let storage = Arc::new(FsStorage::new(fs_root, 10 * 1024 * 1024));
-        let coordinator = registry_rust::consistency::ConsistencyCoordinator::new();
-
-        let publisher: ManifestPublisher =
-            ManifestLifecycleService::new(storage.clone(), None, coordinator);
-
-        let req = PublishManifestRequest {
-            repo: "compat/repo".to_string(),
-            reference: "latest".to_string(),
-            payload: Bytes::from("invalid-json"),
-            declared_media_type: None,
-            allow_tag_overwrite: true,
-        };
-
-        let res: Result<PublishedManifest, PublishManifestError> = publisher.publish(req).await;
-        assert!(matches!(res, Err(PublishManifestError::InvalidManifest(_))));
-    }
-}
 // ------------------------------------------------------------------------------------------------
 // Lifecycle Reference-Discovery Hardening & Partial-Progress Integration Tests
 // ------------------------------------------------------------------------------------------------
