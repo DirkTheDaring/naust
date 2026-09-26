@@ -13963,7 +13963,13 @@ mod referrer_write_containment {
             .ino();
 
         std::fs::remove_dir_all(root.join("repos").join("delrepo")).unwrap();
+        let ext4_keeper = occupy_freed_inode(
+            std::path::Path::new(&root.join("repos").join("delrepo"))
+                .parent()
+                .unwrap(),
+        );
         std::fs::create_dir_all(root.join("repos").join("delrepo")).unwrap();
+        std::fs::remove_file(ext4_keeper).unwrap();
         let second_inode = std::fs::metadata(root.join("repos").join("delrepo"))
             .unwrap()
             .ino();

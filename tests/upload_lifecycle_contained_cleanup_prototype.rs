@@ -1477,6 +1477,10 @@ fn candidate_change_between_inspect_and_action_is_rejected() {
     let mut hook = |_a: &PinnedUploadsAuthority, uuid: &str| {
         let meta = root.join("uploads").join(format!("{uuid}.meta.json"));
         std::fs::remove_file(&meta).unwrap();
+        // ext4 reuses the freed inode immediately; hold it so the swapped-in
+        // candidate is a genuinely new identity.
+        let keeper = meta.parent().unwrap().join(".inode-keeper");
+        std::fs::write(&keeper, b"inode keeper").unwrap();
         std::fs::write(
             &meta,
             MetaRecord {
@@ -1486,6 +1490,7 @@ fn candidate_change_between_inspect_and_action_is_rejected() {
             .to_json(),
         )
         .unwrap();
+        std::fs::remove_file(&keeper).unwrap();
         swapped = true;
     };
 
