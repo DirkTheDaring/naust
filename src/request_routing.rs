@@ -154,6 +154,7 @@ mod tests {
             upstream_username: None,
             upstream_password: None,
             allowed_upstream_hosts: vec![],
+            token_realm_hosts: vec![],
             allowed_repo_prefixes,
             block_private_networks: true,
             redirect_policy: RedirectPolicy::AnyPublic,
@@ -227,6 +228,7 @@ mod tests {
                 upstream_username: None,
                 upstream_password: None,
                 allowed_upstream_hosts: vec![],
+                token_realm_hosts: vec![],
                 allowed_repo_prefixes: vec![
                     crate::proxy::ProxyAllowedPrefix::parse("library").unwrap(),
                 ],
@@ -247,6 +249,7 @@ mod tests {
                 upstream_username: None,
                 upstream_password: None,
                 allowed_upstream_hosts: vec![],
+                token_realm_hosts: vec![],
                 allowed_repo_prefixes: vec![],
                 block_private_networks: true,
                 redirect_policy: RedirectPolicy::AnyPublic,

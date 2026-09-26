@@ -78,7 +78,7 @@ Wave 1 (ADR-001…009) is landed for production consumers; Wave 2 (filesystem co
 - **Composition roots:** server = `runtime.rs` then `supervisor.rs`; CLI = `cli/runtime.rs` + `cli/policy.rs`. `ServerRuntime` holds exactly `app_state`, optional `ref_index`, and the mutation-authority mutex.
 - **`ConsistencyCoordinator` scope:** per composition root, not process-global (server: one; CLI: one per operation; task supervisor: one). Within each root the ADR-001 encapsulation holds.
 - **Bypasses closed (2026-09-26, ADR-011):** `/_admin/gc/*` delegates to `GcAdminService`; `/token` delegates to `TokenService`; the flat `AppState` field list is a recorded accepted residue (ADR-011 §4).
-- **Auth boundary:** single middleware (`auth.rs::require_auth_middleware`) for `/v2/*`; anonymous pull default-on with a hardcoded private-name heuristic override (KI-17); `/token` mints HMAC-SHA256 JWT-shaped tokens from a key ring; RBAC is deny-by-default with granted ⊆ requested ∩ policy (`src/rbac.rs`).
+- **Auth boundary:** single middleware (`auth.rs::require_auth_middleware`) for `/v2/*`; anonymous pull default-on, overridden by path-boundary `auth.private_name_prefixes` (ADR-014; anonymous tokens cannot carry `*` repository scopes); `/token` mints HMAC-SHA256 JWT-shaped tokens from a key ring; RBAC is deny-by-default with granted ⊆ requested ∩ policy (`src/rbac.rs`). Catalog and `/_meta` share one visibility decision.
 
 ## 4. Filesystem / ObjectStore cutover state
 

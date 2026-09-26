@@ -31,6 +31,8 @@ listen_addr = "127.0.0.1:5000"
 backend = "fs"
 [storage.fs]
 root = "./data"
+[token]
+signing_key = "test-signing-key"
 "#,
     )
     .unwrap();

@@ -62,6 +62,9 @@ pub(crate) enum RuntimeBuildError {
     #[error("proxy cache storage construction failed: {0}")]
     ProxyCache(#[source] crate::storage::StorageError),
 
+    #[error("{0}")]
+    InsecureTokenKey(String),
+
     #[error("startup phase hook '{phase:?}' failed: {message}")]
     PhaseHook {
         phase: crate::supervisor::StartupPhase,
@@ -98,11 +101,7 @@ pub(crate) fn assemble_application_services(
     buffered_body_sem: Option<Arc<Semaphore>>,
 ) -> ApplicationServices {
     let upload_coord_config = BlobUploadCoordinatorConfig {
-        signing_key: config
-            .token_signing_keys
-            .first()
-            .map(|k| k.key.as_bytes().to_vec())
-            .unwrap_or_else(|| b"naust-state-secret".to_vec()),
+        signing_key: config.token_primary_signing_key().key.as_bytes().to_vec(),
         max_upload_bytes: config.max_upload_bytes,
         abort_on_digest_mismatch: config.upload_policy.abort_on_digest_mismatch,
         disallow_monolithic_uploads: config.disallow_monolithic_uploads,
@@ -310,6 +309,10 @@ where
         + Sync
         + 'static,
 {
+    config
+        .ensure_server_token_key()
+        .map_err(|err| RuntimeBuildError::InsecureTokenKey(err.to_string()))?;
+
     let injector = injector.unwrap_or_else(|| Arc::new(crate::supervisor::NoopFaultInjector));
     let proxy_cache_factory = Arc::new(proxy_cache_factory);
 
@@ -470,6 +473,7 @@ where
             per.upstream_username = up.upstream_username.clone();
             per.upstream_password = up.upstream_password.clone();
             per.allowed_upstream_hosts = up.allowed_upstream_hosts.clone();
+            per.token_realm_hosts = up.token_realm_hosts.clone();
             per.allowed_repo_prefixes = up.allowed_repo_prefixes.clone();
             per.block_private_networks = up.block_private_networks;
             per.redirect_policy = up.redirect_policy;
@@ -807,8 +811,19 @@ mod tests {
         }
     }
 
+    fn install_test_signing_key(cfg: &mut Config) {
+        cfg.token_signing_key = "test-runtime-signing-key".to_string();
+        cfg.token_signing_keys = vec![crate::security::TokenSigningKey {
+            kid: "default".to_string(),
+            key: cfg.token_signing_key.clone(),
+        }];
+        cfg.token_signing_key_ephemeral = false;
+        cfg.allow_ephemeral_token_signing_key = false;
+    }
+
     fn create_test_config(temp: &TempDir) -> Config {
         let mut cfg = Config::from_env().unwrap();
+        install_test_signing_key(&mut cfg);
         cfg.fs_root = temp.path().join("registry");
         cfg.listen_addr = "127.0.0.1:0".parse().unwrap();
         cfg.ref_index.path = temp.path().join("ref_index.db");
@@ -1877,6 +1892,7 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let mut cfg = Config::from_env().unwrap();
+        install_test_signing_key(&mut cfg);
         cfg.storage_backend = StorageBackend::S3;
         cfg.s3_endpoint = Some(endpoint.clone());
         cfg.s3_region = Some(region.clone());
@@ -2023,6 +2039,7 @@ mod tests {
             upstream_username: None,
             upstream_password: None,
             allowed_upstream_hosts: vec!["localhost".to_string()],
+            token_realm_hosts: vec![],
             allowed_repo_prefixes: vec![],
             block_private_networks: false,
             redirect_policy: crate::config::RedirectPolicy::AnyPublic,

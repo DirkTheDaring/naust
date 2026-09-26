@@ -3,7 +3,18 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
+
+/// Equal-length byte compare. Different lengths return false immediately.
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.ct_eq(right).into()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
@@ -363,13 +374,12 @@ pub fn issue_bearer_token_with_key(
 fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
     let s = scope_name.trim().trim_start_matches('/');
     let t = target_name.trim().trim_start_matches('/');
-    if s.is_empty() || t.is_empty() {
+    // Repository scope names are exact (ADR-015). `*` and `…/*` authorize nothing.
+    // Namespace wildcards stay on RBAC grants; the token carries one canonical name.
+    if s.is_empty() || t.is_empty() || s.contains('*') {
         return false;
     }
-    if s == t || s == "*" {
-        return true;
-    }
-    if s.ends_with("/*") && t.starts_with(&s[..s.len() - 1]) {
+    if s == t {
         return true;
     }
     let s_no_lib = s.strip_prefix("library/").unwrap_or(s);
@@ -391,14 +401,11 @@ pub fn token_allows_repo_action(claims: &TokenClaims, repo: &str, action: RepoAc
 
 pub fn token_allows_catalog_action(claims: &TokenClaims) -> bool {
     claims.scopes.iter().any(|s| {
-        (s.typ == "registry"
+        s.typ == "registry"
             && (s.name == "catalog" || s.name == "*")
             && s.actions
                 .iter()
-                .any(|a| a == "*" || a == "pull" || a == "push" || a == "read"))
-            || ((s.typ == "repository" || s.typ == "repo")
-                && s.name == "*"
-                && s.actions.iter().any(|a| a == "*"))
+                .any(|a| a == "*" || a == "pull" || a == "push" || a == "read")
     })
 }
 
@@ -810,13 +817,13 @@ mod tests {
             RepoAction::Pull
         ));
 
-        // 2. Prefix scope (teams/backend/*)
-        assert!(token_allows_repo_action(
+        // 2. A `…/*` scope name authorizes nothing (ADR-015). Grants keep the wildcard.
+        assert!(!token_allows_repo_action(
             &claims,
             "teams/backend/service",
             RepoAction::Pull
         ));
-        assert!(token_allows_repo_action(
+        assert!(!token_allows_repo_action(
             &claims,
             "teams/backend/service",
             RepoAction::Push
@@ -869,5 +876,51 @@ mod tests {
         assert!(!token_allows_repo_action(&claims, "", RepoAction::Pull));
         assert!(!token_allows_repo_action(&claims, "   ", RepoAction::Pull));
         assert!(!token_allows_repo_action(&claims, "/", RepoAction::Pull));
+    }
+
+    #[test]
+    fn expansive_repository_scope_does_not_authorize_repo_or_catalog() {
+        let claims = TokenClaims {
+            sub: None,
+            aud: Some("service".to_string()),
+            exp: now_secs() + 3600,
+            iat: Some(now_secs()),
+            jti: None,
+            iss: None,
+            kid: None,
+            scopes: vec![
+                TokenScope {
+                    typ: "repository".to_string(),
+                    name: "*".to_string(),
+                    actions: vec!["*".to_string()],
+                },
+                TokenScope {
+                    typ: "repository".to_string(),
+                    name: "teams/backend/*".to_string(),
+                    actions: vec!["pull".to_string()],
+                },
+            ],
+        };
+        assert!(!token_allows_repo_action(
+            &claims,
+            "any/repo",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_repo_action(
+            &claims,
+            "teams/backend/service",
+            RepoAction::Pull
+        ));
+        assert!(!token_allows_catalog_action(&claims));
+
+        let catalog = TokenClaims {
+            scopes: vec![TokenScope {
+                typ: "registry".to_string(),
+                name: "catalog".to_string(),
+                actions: vec!["*".to_string()],
+            }],
+            ..claims
+        };
+        assert!(token_allows_catalog_action(&catalog));
     }
 }

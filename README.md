@@ -508,7 +508,7 @@ Best-practice profile (`BEST_PRACTICE=1` or `[profile].name="best_practice"`) ch
 - `catalog.requires_auth`: default `true` (instead of `false`)
 - `timeouts.request_timeout_secs`: default `60` (instead of `300`)
 - `timeouts.upload_request_timeout_secs`: default `7200` (instead of `3600`)
-- `token.signing_key` / `token.signing_keys`: required (no random fallback)
+- `token.signing_key` / `token.signing_keys`: required (no ephemeral fallback)
 
 ### Token signing key rotation (overlap)
 
@@ -590,7 +590,7 @@ key = "<old-long-random-secret>"
 | Disallow monolithic uploads | `uploads.disallow_monolithic_uploads` | `REGISTRY__UPLOADS__DISALLOW_MONOLITHIC_UPLOADS` | `DISALLOW_MONOLITHIC_UPLOADS` | `false` (best-practice: `true`) |
 | Catalog requires auth | `catalog.requires_auth` | `REGISTRY__CATALOG__REQUIRES_AUTH` | `CATALOG_REQUIRES_AUTH` | `false` (best-practice: `true`) |
 | Token service | `token.service` | `REGISTRY__TOKEN__SERVICE` | `TOKEN_SERVICE` | `naust` |
-| Token signing key (legacy single key) | `token.signing_key` | `REGISTRY__TOKEN__SIGNING_KEY` | `TOKEN_SIGNING_KEY` | random per-process (best-practice: required) |
+| Token signing key (legacy single key) | `token.signing_key` | `REGISTRY__TOKEN__SIGNING_KEY` | `TOKEN_SIGNING_KEY` | required for `serve` (dev opt-in: `token.allow_ephemeral_signing_key`) |
 | Token signing keys (overlap rotation) | `token.signing_keys` | (n/a) | (n/a) | unset |
 | Token TTL | `token.ttl_secs` | `REGISTRY__TOKEN__TTL_SECS` | `TOKEN_TTL_SECS` | `600` |
 
@@ -657,7 +657,7 @@ Auth/token (for Docker/Podman clients):
 
 - `PUBLIC_URL` (recommended; e.g. `http://127.0.0.1:5000` or `https://127.0.0.1:5000`)
 - `TOKEN_SERVICE` (default `naust`)
-- `TOKEN_SIGNING_KEY` (default: random per process; set a fixed secret for stable long-running deployments). Ignored when `[[token.signing_keys]]` is configured in TOML — the keyring always wins (see "Token signing key rotation" above).
+- `TOKEN_SIGNING_KEY` (required for `serve` and `check-config`; `token.allow_ephemeral_signing_key` permits a process-local key for local development). Ignored when `[[token.signing_keys]]` is configured in TOML — the keyring always wins (see "Token signing key rotation" above).
 - `TOKEN_TTL_SECS` (default `600`)
 
 TLS:

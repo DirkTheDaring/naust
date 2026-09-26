@@ -2,7 +2,14 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use sha2::Digest as _;
-use std::{collections::HashMap, fmt, net::IpAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
@@ -218,8 +225,11 @@ impl fmt::Display for ProxyAllowedPrefix {
 pub struct Proxy {
     cfg: ProxyConfig,
     client: reqwest::Client,
+    /// Hosts that may be fetched for blobs and manifests.
     upstream_host_allow: Vec<String>,
-    upstream_base_domain: Option<String>,
+    /// Host of `upstream_base_url` plus `token_realm_hosts`. Content-allowlist
+    /// entries are not credential hosts (ADR-015).
+    credential_hosts: Vec<String>,
     upstream_sem: Arc<Semaphore>,
     token_cache: Arc<Mutex<HashMap<String, CachedToken>>>,
     db: sled::Db,
@@ -262,12 +272,25 @@ impl Proxy {
         } else {
             cfg.allowed_upstream_hosts.clone()
         };
+        let mut credential_hosts = vec![upstream_host];
+        for host in &cfg.token_realm_hosts {
+            if !credential_hosts
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(host))
+            {
+                credential_hosts.push(host.clone());
+            }
+        }
 
-        let upstream_base_domain = base_domain(&upstream_host);
-
-        let client = reqwest::Client::builder()
+        let mut client_builder = reqwest::Client::builder()
             .redirect(Policy::none())
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(60));
+        if cfg.block_private_networks {
+            // The resolver is the connect-time check. A lookup performed only
+            // before `send` can be rebound to a blocked address.
+            client_builder = client_builder.dns_resolver(Arc::new(PrivateIpBlockingResolver));
+        }
+        let client = client_builder
             .build()
             .map_err(|e| ProxyError::Internal(e.to_string()))?;
 
@@ -277,7 +300,7 @@ impl Proxy {
             cfg: cfg.clone(),
             client,
             upstream_host_allow,
-            upstream_base_domain,
+            credential_hosts,
             upstream_sem: Arc::new(Semaphore::new(cfg.max_concurrent_upstream.max(1))),
             token_cache: Arc::new(Mutex::new(HashMap::new())),
             db,
@@ -290,24 +313,10 @@ impl Proxy {
     }
 
     fn is_token_realm_host_allowed(&self, host: &str) -> bool {
-        if self
-            .upstream_host_allow
+        let host = host.trim().trim_end_matches('.');
+        self.credential_hosts
             .iter()
             .any(|h| h.eq_ignore_ascii_case(host))
-        {
-            return true;
-        }
-
-        // Generic safe-ish default for Bearer token exchange without per-registry hardcoding:
-        // allow token realm hosts under the same base domain as the configured upstream host.
-        // Example: registry-1.docker.io -> auth.docker.io (base domain docker.io).
-        let Some(up) = self.upstream_base_domain.as_deref() else {
-            return false;
-        };
-        let Some(h) = base_domain(host) else {
-            return false;
-        };
-        h.as_str().eq_ignore_ascii_case(up)
     }
 
     pub fn decision_for_repo(&self, repo: &str) -> Result<RepoDecision, ProxyError> {
@@ -1157,27 +1166,15 @@ impl SingleFlight {
     }
 }
 
-fn base_domain(host: &str) -> Option<String> {
-    let host = host.trim().trim_end_matches('.');
-    if host.is_empty() {
-        return None;
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        other => other,
     }
-
-    // Never treat IPs as having a "base domain".
-    if host.parse::<IpAddr>().is_ok() {
-        return None;
-    }
-
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() < 2 {
-        return None;
-    }
-
-    Some(format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]).to_ascii_lowercase())
 }
 
 fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 || v4.is_private()
@@ -1193,6 +1190,36 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || v6.is_multicast()
         }
+    }
+}
+
+/// DNS resolver that never returns a blocked address. reqwest connects to
+/// these results, so a later lookup cannot rebind onto a private IP.
+struct PrivateIpBlockingResolver;
+
+impl reqwest::dns::Resolve for PrivateIpBlockingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let looked_up = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            let allowed: Vec<SocketAddr> = looked_up
+                .filter(|addr| !is_blocked_ip(addr.ip()))
+                .map(|mut addr| {
+                    addr.set_port(0);
+                    addr
+                })
+                .collect();
+            if allowed.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "resolved addresses are blocked by private-network policy",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -1278,6 +1305,7 @@ mod tests {
             upstream_username: None,
             upstream_password: None,
             allowed_upstream_hosts: vec!["localhost".to_string()],
+            token_realm_hosts: vec!["auth.example.test".to_string()],
             allowed_repo_prefixes: vec![],
             block_private_networks: false,
             redirect_policy: RedirectPolicy::AnyPublic,
@@ -1297,6 +1325,71 @@ mod tests {
         };
         let proxy = Proxy::new(&cfg).unwrap().unwrap();
         (proxy, temp_dir)
+    }
+
+    #[test]
+    fn mapped_ipv4_addresses_are_blocked_like_ipv4() {
+        let mapped_loopback: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let mapped_link_local: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        let mapped_public: IpAddr = "::ffff:1.1.1.1".parse().unwrap();
+        let public_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        assert!(is_blocked_ip(mapped_loopback));
+        assert!(is_blocked_ip(mapped_link_local));
+        assert!(!is_blocked_ip(mapped_public));
+        assert!(!is_blocked_ip(public_v6));
+        assert!(is_blocked_ip("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn token_realm_hosts_are_explicit() {
+        let (proxy, _temp) = create_test_proxy();
+        assert!(proxy.is_token_realm_host_allowed("localhost"));
+        assert!(proxy.is_token_realm_host_allowed("auth.example.test"));
+        assert!(!proxy.is_token_realm_host_allowed("evil.example.test"));
+        assert!(!proxy.is_token_realm_host_allowed("auth.docker.io"));
+    }
+
+    #[test]
+    fn content_allowlist_hosts_are_not_credential_hosts() {
+        let temp_dir = TempDir::new().unwrap();
+        let cfg = ProxyConfig {
+            enabled: true,
+            mode: ProxyMode::Allowlist,
+            upstream_base_url: Some("https://registry.example.test".to_string()),
+            upstream_username: Some("user".to_string()),
+            upstream_password: Some("secret".to_string()),
+            allowed_upstream_hosts: vec![
+                "registry.example.test".to_string(),
+                "cdn.example.test".to_string(),
+            ],
+            token_realm_hosts: vec!["auth.example.test".to_string()],
+            allowed_repo_prefixes: vec![],
+            block_private_networks: false,
+            redirect_policy: RedirectPolicy::SameHost,
+            max_concurrent_upstream: 10,
+            index_path: temp_dir.path().join("proxy.db"),
+            cache_fs_root: None,
+            cache_s3_prefix: None,
+            gc_interval_secs: 0,
+            scrub_enabled: false,
+            scrub_interval_secs: 0,
+            scrub_max_files_per_run: 0,
+            max_cache_bytes: None,
+            repo_rules: vec![],
+            upstreams: vec![],
+            routing_proxy_hosts: vec![],
+            routing_trust_x_forwarded_host: false,
+        };
+        let proxy = Proxy::new(&cfg).unwrap().unwrap();
+        assert!(
+            proxy
+                .upstream_host_allow
+                .iter()
+                .any(|h| h == "cdn.example.test")
+        );
+        assert!(proxy.is_token_realm_host_allowed("registry.example.test"));
+        assert!(proxy.is_token_realm_host_allowed("auth.example.test"));
+        assert!(!proxy.is_token_realm_host_allowed("cdn.example.test"));
     }
 
     #[test]

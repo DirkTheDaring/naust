@@ -112,8 +112,9 @@ pub struct Config {
 
     pub auth_strategy: AuthStrategy,
     pub anonymous_pull: bool,
-    /// Repositories whose first path segment starts with one of these prefixes
-    /// require auth even when `anonymous_pull` is on (KI-17).
+    /// Repository names that require auth even when `anonymous_pull` is on (KI-17, ADR-014).
+    /// A prefix matches the whole name or a path-boundary prefix (`private` matches
+    /// `private` and `private/app`, not `private-repo`).
     pub private_name_prefixes: Vec<String>,
     /// Whether an explicit `*` RBAC grant also confers registry catalog scope (KI-18).
     pub star_grants_catalog: bool,
@@ -249,6 +250,10 @@ pub struct Config {
     pub token_service: String,
     pub token_signing_key: String,
     pub token_signing_keys: Vec<crate::security::TokenSigningKey>,
+    /// True when the key was generated because none was configured (ADR-014).
+    pub token_signing_key_ephemeral: bool,
+    /// Dev opt-in: allow `serve` / `check-config` to run with an ephemeral key.
+    pub allow_ephemeral_token_signing_key: bool,
     pub token_ttl_secs: u64,
     /// /token fixed-window rate limit: max requests per window (0 disables).
     pub token_rate_limit_rpm: u32,
@@ -390,6 +395,10 @@ pub struct ProxyConfig {
     // Safety net: explicit allowlist of upstream hosts.
     pub allowed_upstream_hosts: Vec<String>,
 
+    /// Hosts, besides the upstream host, that may receive upstream Basic
+    /// credentials during token exchange (ADR-014). Not inferred from DNS labels.
+    pub token_realm_hosts: Vec<String>,
+
     // Safety net: even in proxy-any mode, only allow these prefixes.
     // Examples: ["library/", "myorg/"]
     pub allowed_repo_prefixes: Vec<crate::proxy::ProxyAllowedPrefix>,
@@ -453,6 +462,7 @@ pub struct ProxyUpstreamRoute {
 
     // Safety settings (can be different per upstream).
     pub allowed_upstream_hosts: Vec<String>,
+    pub token_realm_hosts: Vec<String>,
     pub allowed_repo_prefixes: Vec<crate::proxy::ProxyAllowedPrefix>,
     pub block_private_networks: bool,
     pub redirect_policy: RedirectPolicy,
@@ -481,7 +491,7 @@ pub enum RedirectPolicy {
 
 impl Default for RedirectPolicy {
     fn default() -> Self {
-        Self::AnyPublic
+        Self::SameHost
     }
 }
 
@@ -745,6 +755,8 @@ struct FileProxyRouting {
 struct FileProxySafety {
     #[serde(default)]
     allowed_upstream_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    token_realm_hosts: Option<Vec<String>>,
     #[serde(default)]
     allowed_repo_prefixes: Option<Vec<String>>,
     #[serde(default)]
@@ -1016,6 +1028,8 @@ struct FileToken {
     service: Option<String>,
     #[serde(default)]
     signing_key: Option<String>,
+    #[serde(default)]
+    allow_ephemeral_signing_key: Option<bool>,
     #[serde(default)]
     signing_keys: Vec<FileTokenSigningKey>,
     #[serde(default)]
@@ -2374,6 +2388,14 @@ impl Config {
             );
         }
 
+        let allow_ephemeral_token_signing_key = env_bool_opt(&[
+            "REGISTRY__TOKEN__ALLOW_EPHEMERAL_SIGNING_KEY",
+            "TOKEN_ALLOW_EPHEMERAL_SIGNING_KEY",
+        ])?
+        .or(file_cfg.token.allow_ephemeral_signing_key)
+        .unwrap_or(false);
+
+        let mut token_signing_key_ephemeral = false;
         let (token_signing_key, token_signing_keys) = if !file_signing_keys.is_empty() {
             if env_token_signing_key.is_some() {
                 eprintln!(
@@ -2405,6 +2427,10 @@ impl Config {
                             field: "token.signing_key (required in best_practice profile)",
                         });
                     }
+                    token_signing_key_ephemeral = true;
+                    eprintln!(
+                        "Warning: no token signing key configured; generated an ephemeral key. serve and check-config refuse it unless token.allow_ephemeral_signing_key is true"
+                    );
                     uuid::Uuid::new_v4().to_string()
                 }
             };
@@ -2489,6 +2515,22 @@ impl Config {
         .filter(|v| !v.is_empty())
         .or_else(|| file_cfg.proxy.safety.allowed_upstream_hosts.clone())
         .unwrap_or_default();
+
+        let token_realm_hosts = normalize_host_list(
+            env_str_opt(&[
+                "REGISTRY__PROXY__SAFETY__TOKEN_REALM_HOSTS",
+                "PROXY_TOKEN_REALM_HOSTS",
+            ])
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .or_else(|| file_cfg.proxy.safety.token_realm_hosts.clone())
+            .unwrap_or_default(),
+        );
 
         let allowed_repo_prefixes_raw = env_str_opt(&[
             "REGISTRY__PROXY__SAFETY__ALLOWED_REPO_PREFIXES",
@@ -2719,6 +2761,7 @@ impl Config {
             upstream_username,
             upstream_password,
             allowed_upstream_hosts,
+            token_realm_hosts,
             allowed_repo_prefixes,
             block_private_networks,
             redirect_policy,
@@ -2883,6 +2926,8 @@ impl Config {
             token_service,
             token_signing_key,
             token_signing_keys,
+            token_signing_key_ephemeral,
+            allow_ephemeral_token_signing_key,
             token_ttl_secs,
             token_rate_limit_rpm,
             token_rate_limit_window_secs,
@@ -2912,6 +2957,22 @@ impl Config {
             abort_on_digest_mismatch: self.upload_policy.abort_on_digest_mismatch,
         }
     }
+    /// `serve` and `check-config` refuse a generated signing key unless the
+    /// operator opted in (ADR-014).
+    pub fn ensure_server_token_key(&self) -> Result<(), ConfigError> {
+        if self.token_signing_key_ephemeral && !self.allow_ephemeral_token_signing_key {
+            Err(ConfigError::MissingRequired {
+                field: "token.signing_key (set token.signing_key or token.signing_keys; token.allow_ephemeral_signing_key is for local development only)",
+            })
+        } else if self.token_signing_keys.is_empty() || self.token_signing_key.is_empty() {
+            Err(ConfigError::MissingRequired {
+                field: "token.signing_key",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn auth_configured(&self) -> bool {
         !self.anonymous_pull
             || (self.push_username.is_some() && self.push_password.is_some())
@@ -2919,8 +2980,8 @@ impl Config {
             || (self.users.enabled && !self.users.accounts.is_empty())
     }
 
-    /// KI-17 (resolved): the private-name override is explicit configuration
-    /// (`auth.private_name_prefixes`), defaulting to the historical list.
+    /// KI-17 (resolved) / ADR-014: the private-name override is explicit
+    /// configuration (`auth.private_name_prefixes`), matched on a path boundary.
     /// Angle-bracket/encoding smells stay hardcoded — they indicate injection
     /// attempts, not naming policy.
     pub fn is_repo_private(&self, repo: &str) -> bool {
@@ -2932,12 +2993,28 @@ impl Config {
         let r = norm.strip_prefix("library/").unwrap_or(&norm);
         self.private_name_prefixes
             .iter()
-            .any(|p| !p.is_empty() && r.starts_with(p.to_ascii_lowercase().as_str()))
+            .any(|p| repo_matches_private_prefix(r, p))
             || r.contains('<')
             || r.contains('>')
             || r.contains("%3c")
             || r.contains("%3e")
     }
+}
+
+fn repo_matches_private_prefix(repo: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim().trim_matches('/').to_ascii_lowercase();
+    if prefix.is_empty() {
+        return false;
+    }
+    repo == prefix || repo.starts_with(&format!("{prefix}/"))
+}
+
+fn normalize_host_list(hosts: Vec<String>) -> Vec<String> {
+    hosts
+        .into_iter()
+        .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 pub fn default_private_name_prefixes() -> Vec<String> {
@@ -3303,6 +3380,13 @@ fn resolve_proxy_upstreams(
             .clone()
             .or_else(|| global_safety.allowed_upstream_hosts.clone())
             .unwrap_or_default();
+        let token_realm_hosts = normalize_host_list(
+            r.safety
+                .token_realm_hosts
+                .clone()
+                .or_else(|| global_safety.token_realm_hosts.clone())
+                .unwrap_or_default(),
+        );
 
         let raw_prefixes = r
             .safety
@@ -3376,6 +3460,7 @@ fn resolve_proxy_upstreams(
             upstream_username,
             upstream_password,
             allowed_upstream_hosts,
+            token_realm_hosts,
             allowed_repo_prefixes,
             block_private_networks,
             redirect_policy,

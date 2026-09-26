@@ -19,6 +19,7 @@ use std::{
 
 pub async fn catalog_list(
     state: AppState,
+    headers: &HeaderMap,
     method: Method,
     query: &HashMap<String, String>,
     route_mode: V2RouteMode,
@@ -38,50 +39,102 @@ pub async fn catalog_list(
                 },
             };
 
-            match state
+            let listed = match state
                 .catalog_query_service
-                .query_catalog(params, proxy_target)
+                .list_repositories(proxy_target)
                 .await
             {
-                Ok(page) => {
-                    let payload = serde_json::json!({
-                        "repositories": page.repositories,
-                    });
-                    let bytes = match serde_json::to_vec(&payload) {
-                        Ok(b) => b,
-                        Err(_) => return errors::internal_error().into_response(),
-                    };
+                Ok(repos) => repos,
+                Err(crate::application::CatalogQueryError::Storage(StorageError::Unsupported)) => {
+                    return errors::not_implemented().into_response();
+                }
+                Err(_) => return errors::internal_error().into_response(),
+            };
+            let visible = match visible_repositories(&state, headers, listed) {
+                Ok(repos) => repos,
+                Err(resp) => return resp,
+            };
+            let (page_repositories, has_more) =
+                page_repository_names(visible, params.n, params.last.as_deref());
+            let next_last = if has_more {
+                page_repositories.last().cloned()
+            } else {
+                None
+            };
+            {
+                let payload = serde_json::json!({
+                    "repositories": page_repositories,
+                });
+                let bytes = match serde_json::to_vec(&payload) {
+                    Ok(b) => b,
+                    Err(_) => return errors::internal_error().into_response(),
+                };
 
-                    let mut headers = registry_headers();
-                    headers.insert("Content-Type", "application/json".parse().unwrap());
-                    headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+                let mut headers = registry_headers();
+                headers.insert("Content-Type", "application/json".parse().unwrap());
+                headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
-                    if page.has_more {
-                        if let (Some(n_raw), Some(last_repo)) =
-                            (query.get("n"), page.next_last.as_deref())
-                        {
-                            let last_repo = url_encode_component(last_repo);
-                            let link =
-                                format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
-                            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                                headers.insert(http::header::LINK, v);
-                            }
+                if has_more {
+                    if let (Some(n_raw), Some(last_repo)) = (query.get("n"), next_last.as_deref()) {
+                        let last_repo = url_encode_component(last_repo);
+                        let link =
+                            format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
+                        if let Ok(v) = http::HeaderValue::from_str(&link) {
+                            headers.insert(http::header::LINK, v);
                         }
                     }
+                }
 
-                    if method == Method::HEAD {
-                        return (StatusCode::OK, headers).into_response();
-                    }
-                    (StatusCode::OK, headers, Body::from(bytes)).into_response()
+                if method == Method::HEAD {
+                    return (StatusCode::OK, headers).into_response();
                 }
-                Err(crate::application::CatalogQueryError::Storage(StorageError::Unsupported)) => {
-                    errors::not_implemented().into_response()
-                }
-                Err(_) => errors::internal_error().into_response(),
+                (StatusCode::OK, headers, Body::from(bytes)).into_response()
             }
         }
         _ => errors::method_not_allowed("GET, HEAD"),
     }
+}
+
+fn visible_repositories(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut repos: Vec<String>,
+) -> Result<Vec<String>, Response> {
+    match crate::auth::authorize_catalog(state, headers) {
+        crate::auth::CatalogAccess::Denied => {
+            Err(crate::auth::unauthorized_catalog_challenge(state).into_response())
+        }
+        crate::auth::CatalogAccess::Full => Ok(repos),
+        crate::auth::CatalogAccess::PublicOnly => {
+            repos.retain(|name| !state.config.is_repo_private(name));
+            Ok(repos)
+        }
+    }
+}
+
+fn page_repository_names(
+    mut names: Vec<String>,
+    n: Option<usize>,
+    last: Option<&str>,
+) -> (Vec<String>, bool) {
+    names.sort();
+    let total = names.len();
+    let n_take = n.unwrap_or(usize::MAX);
+    let start = match last {
+        Some(last) => names
+            .iter()
+            .position(|name| name.as_str() > last)
+            .unwrap_or(names.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(n_take).min(total);
+    let page: Vec<String> = names
+        .into_iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect();
+    let has_more = n.is_some() && !page.is_empty() && page.len() == n_take && end < total;
+    (page, has_more)
 }
 
 pub fn repo_org(name: &str) -> Option<&str> {
@@ -129,13 +182,13 @@ pub async fn meta_orgs(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
     let repos = match state.catalog_query_service.list_repositories(None).await {
         Ok(r) => r,
         Err(_) => return errors::internal_error().into_response(),
+    };
+    let repos = match visible_repositories(&state, &headers, repos) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
 
     let mut orgs: Vec<String> = repos
@@ -198,13 +251,13 @@ pub async fn meta_org_repos(
     Path(org): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
     let repos = match state.catalog_query_service.list_repositories(None).await {
         Ok(r) => r,
         Err(_) => return errors::internal_error().into_response(),
+    };
+    let repos = match visible_repositories(&state, &headers, repos) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
 
     let org_prefix = format!("{org}/");
@@ -282,8 +335,14 @@ pub async fn meta_repo(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
+    match crate::auth::authorize_catalog(&state, &headers) {
+        crate::auth::CatalogAccess::Denied => {
+            return crate::auth::unauthorized_catalog_challenge(&state).into_response();
+        }
+        crate::auth::CatalogAccess::PublicOnly if state.config.is_repo_private(&name) => {
+            return errors::name_unknown().into_response();
+        }
+        crate::auth::CatalogAccess::Full | crate::auth::CatalogAccess::PublicOnly => {}
     }
 
     let ts = match state
@@ -319,13 +378,13 @@ pub async fn meta_catalog(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.config.catalog_requires_auth && !crate::auth::is_authenticated(&state, &headers) {
-        return crate::auth::unauthorized_catalog_challenge(&state).into_response();
-    }
-
-    let mut repos = match state.catalog_query_service.list_repositories(None).await {
+    let repos = match state.catalog_query_service.list_repositories(None).await {
         Ok(r) => r,
         Err(_) => return errors::internal_error().into_response(),
+    };
+    let mut repos = match visible_repositories(&state, &headers, repos) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
 
     if let Some(org) = query.get("org") {

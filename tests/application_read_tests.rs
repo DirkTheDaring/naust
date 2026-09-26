@@ -309,6 +309,7 @@ fn create_test_proxy_config(
         upstream_username: None,
         upstream_password: None,
         allowed_upstream_hosts: vec!["127.0.0.1".to_string()],
+        token_realm_hosts: vec![],
         allowed_repo_prefixes: vec![],
         block_private_networks: false,
         redirect_policy: RedirectPolicy::AnyPublic,

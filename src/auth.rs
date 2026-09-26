@@ -165,8 +165,124 @@ fn verify_any_basic_credentials(cfg: &crate::config::Config, user: &str, pass: &
     if let (Some(expected_user), Some(expected_pass)) =
         (cfg.push_username.as_deref(), cfg.push_password.as_deref())
     {
-        if user == expected_user && pass == expected_pass {
+        if configured_secrets_match(user, pass, expected_user, expected_pass) {
             return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn configured_secrets_match(
+    user: &str,
+    pass: &str,
+    expected_user: &str,
+    expected_pass: &str,
+) -> bool {
+    let user_ok = crate::security::constant_time_eq(user, expected_user);
+    let pass_ok = crate::security::constant_time_eq(pass, expected_pass);
+    user_ok && pass_ok
+}
+
+pub(crate) fn catalog_auth_required(cfg: &crate::config::Config) -> bool {
+    cfg.catalog_requires_auth
+        || !cfg.anonymous_pull
+        || cfg.push_username.is_some()
+        || cfg.users.enabled
+        || cfg.robots.enabled
+}
+
+pub(crate) enum CatalogAccess {
+    Full,
+    PublicOnly,
+    Denied,
+}
+
+pub(crate) fn authorize_catalog(state: &AppState, headers: &HeaderMap) -> CatalogAccess {
+    if catalog_shows_private_names(state, headers) {
+        CatalogAccess::Full
+    } else if catalog_auth_required(&state.config) {
+        CatalogAccess::Denied
+    } else {
+        CatalogAccess::PublicOnly
+    }
+}
+
+fn catalog_shows_private_names(state: &AppState, headers: &HeaderMap) -> bool {
+    if let Some(token) = bearer_token_from_headers(headers) {
+        if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+            &state.config.token_signing_keys,
+            token,
+            &state.config.token_service,
+            state.config.token_ttl_secs,
+        ) {
+            if bearer_claims_are_authenticated(&claims)
+                && security::token_allows_catalog_action(&claims)
+            {
+                return true;
+            }
+        }
+    }
+
+    if state.config.auth_strategy != crate::config::AuthStrategy::Token {
+        if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
+            if basic_allows_catalog(&state.config, basic.username(), basic.password()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn basic_allows_catalog(cfg: &crate::config::Config, user: &str, pass: &str) -> bool {
+    let requested = [crate::security::TokenScope {
+        typ: "registry".to_string(),
+        name: "catalog".to_string(),
+        actions: vec!["*".to_string()],
+    }];
+
+    if cfg.robots.enabled {
+        if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
+            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+                return !crate::rbac::grant_scopes_by_prefix_with_options(
+                    &requested,
+                    &account.grants,
+                    cfg.star_grants_catalog,
+                )
+                .is_empty();
+            }
+            return false;
+        }
+    }
+
+    if cfg.users.enabled {
+        if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
+            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+                let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
+                for group_name in &account.groups {
+                    if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name) {
+                        union_grants.extend(group.grants.clone());
+                    }
+                }
+                return !crate::rbac::grant_scopes_by_prefix_with_options(
+                    &requested,
+                    &union_grants,
+                    cfg.star_grants_catalog,
+                )
+                .is_empty();
+            }
+            return false;
+        }
+    }
+
+    if let (Some(expected_user), Some(expected_pass)) =
+        (cfg.push_username.as_deref(), cfg.push_password.as_deref())
+    {
+        if configured_secrets_match(user, pass, expected_user, expected_pass) {
+            return cfg.push_implies_delete
+                || cfg
+                    .push_actions
+                    .iter()
+                    .any(|a| a == "*" || a == "pull" || a == "push");
         }
     }
     false
@@ -244,7 +360,7 @@ pub(crate) fn verify_direct_basic_access(
     if let (Some(expected_user), Some(expected_pass)) =
         (cfg.push_username.as_deref(), cfg.push_password.as_deref())
     {
-        if user == expected_user && pass == expected_pass {
+        if configured_secrets_match(user, pass, expected_user, expected_pass) {
             let action_norm = action.to_ascii_lowercase();
             let action_allowed = if cfg.push_implies_delete {
                 action_norm == "pull" || action_norm == "push" || action_norm == "delete"
@@ -320,52 +436,19 @@ pub async fn require_auth_middleware(
         .unwrap_or(false);
     let pull_needs_auth = !state.config.anonymous_pull || is_private_repo;
 
-    let required_action = match &route {
-        crate::http_api::routing::OciRoute::Catalog => {
-            let auth_required = state.config.catalog_requires_auth
-                || !state.config.anonymous_pull
-                || state.config.push_username.is_some()
-                || state.config.users.enabled
-                || state.config.robots.enabled;
-            if !auth_required {
-                return next.run(request).await;
-            }
-            security::RepoAction::Pull
-        }
-        _ => match route.required_action(&method) {
-            Some(action) => action,
-            None => security::RepoAction::Pull,
-        },
-    };
-
+    // Catalog visibility is only `authorize_catalog` (ADR-015). A catalog-scoped
+    // bearer with an empty subject is not enough to pass this gate.
     if matches!(route, crate::http_api::routing::OciRoute::Catalog) {
-        if let Some(token) = bearer_token_from_headers(request.headers()) {
-            if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
-                &state.config.token_signing_keys,
-                token,
-                &state.config.token_service,
-                state.config.token_ttl_secs,
-            ) {
-                if security::token_allows_catalog_action(&claims) {
-                    return next.run(request).await;
-                } else {
-                    return errors::denied("catalog access denied").into_response();
-                }
-            } else {
-                return unauthorized_catalog_challenge(&state);
-            }
-        }
-        if state.config.auth_strategy != crate::config::AuthStrategy::Token {
-            if let Some(Authorization(basic)) =
-                request.headers().typed_get::<Authorization<Basic>>()
-            {
-                if verify_any_basic_credentials(&state.config, basic.username(), basic.password()) {
-                    return next.run(request).await;
-                }
-            }
-        }
-        return unauthorized_catalog_challenge(&state);
+        return match authorize_catalog(&state, request.headers()) {
+            CatalogAccess::Denied => unauthorized_catalog_challenge(&state),
+            CatalogAccess::Full | CatalogAccess::PublicOnly => next.run(request).await,
+        };
     }
+
+    let required_action = match route.required_action(&method) {
+        Some(action) => action,
+        None => security::RepoAction::Pull,
+    };
 
     let Some(canonical_repo) = route.repository() else {
         return unauthorized_registry_challenge(&state, None, None);

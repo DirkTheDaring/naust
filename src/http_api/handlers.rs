@@ -142,6 +142,7 @@ pub async fn v2_dispatch(
             }
             crate::http_api::catalog::catalog_list(
                 state,
+                &headers,
                 method,
                 &query,
                 route_mode,

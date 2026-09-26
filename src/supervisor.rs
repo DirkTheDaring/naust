@@ -1427,6 +1427,7 @@ mod tests {
             upstream_username: None,
             upstream_password: None,
             allowed_upstream_hosts: vec!["localhost".to_string()],
+            token_realm_hosts: vec![],
             allowed_repo_prefixes: vec![],
             block_private_networks: false,
             redirect_policy: crate::config::RedirectPolicy::AnyPublic,

@@ -671,6 +671,8 @@ fn minimal_config_for_token_tests() -> Config {
             kid: "default".to_string(),
             key: "test-key".to_string(),
         }],
+        token_signing_key_ephemeral: false,
+        allow_ephemeral_token_signing_key: false,
         token_ttl_secs: 600,
         token_rate_limit_rpm: 0,
         token_rate_limit_window_secs: 60,
@@ -683,6 +685,7 @@ fn minimal_config_for_token_tests() -> Config {
             upstream_username: None,
             upstream_password: None,
             allowed_upstream_hosts: Vec::new(),
+            token_realm_hosts: Vec::new(),
             allowed_repo_prefixes: Vec::new(),
             block_private_networks: true,
             redirect_policy: crate::config::RedirectPolicy::AnyPublic,
@@ -1569,9 +1572,14 @@ fn private_name_prefixes_are_configurable() {
     let mut cfg = minimal_config_for_token_tests();
     cfg.anonymous_pull = true;
 
-    // Historical defaults.
-    assert!(cfg.is_repo_private("private-repo"));
-    assert!(cfg.is_repo_private("library/secret-stuff"));
+    // Path-boundary match (ADR-014): the prefix is a whole name or a `prefix/` path.
+    assert!(cfg.is_repo_private("private"));
+    assert!(cfg.is_repo_private("private/app"));
+    assert!(!cfg.is_repo_private("private-repo"));
+    assert!(!cfg.is_repo_private("privately-owned/app"));
+    assert!(cfg.is_repo_private("library/secret/app"));
+    assert!(!cfg.is_repo_private("library/secret-stuff"));
+    assert!(!cfg.is_repo_private("team/private/app"));
     assert!(!cfg.is_repo_private("public/app"));
 
     // Custom list replaces the defaults.
@@ -1581,8 +1589,80 @@ fn private_name_prefixes_are_configurable() {
 
     // Empty list disables prefix-based privacy; injection smells stay caught.
     cfg.private_name_prefixes = Vec::new();
-    assert!(!cfg.is_repo_private("private-repo"));
+    assert!(!cfg.is_repo_private("private/app"));
     assert!(cfg.is_repo_private("weird%3cname"));
+}
+
+#[test]
+fn anonymous_wildcard_pull_scope_is_rejected() {
+    let cfg = minimal_config_for_token_tests();
+    let requested = parse_scopes("repository:*:pull");
+    let token_scopes = sanitize_token_scopes(&requested);
+    let err = decide_token_scopes_for_request(&cfg, &token_scopes, None)
+        .expect_err("wildcard pull must not be minted anonymously");
+    assert!(matches!(err, TokenRejection::Unauthorized));
+
+    let exact = sanitize_token_scopes(&parse_scopes("repository:library/app:pull"));
+    let decision = decide_token_scopes_for_request(&cfg, &exact, None).expect("public repo");
+    assert!(decision.subject.is_none());
+    assert_eq!(decision.scopes.len(), 1);
+}
+
+#[test]
+fn anonymous_catalog_scope_is_rejected() {
+    let cfg = minimal_config_for_token_tests();
+    for raw in ["registry:catalog:*", "registry:*:*"] {
+        let requested = sanitize_token_scopes(&parse_scopes(raw));
+        let err = decide_token_scopes_for_request(&cfg, &requested, None)
+            .expect_err("catalog scope must not be minted anonymously");
+        assert!(matches!(err, TokenRejection::Unauthorized), "{raw}");
+    }
+
+    let mut cfg = minimal_config_for_token_tests();
+    cfg.robots.enabled = true;
+    let hash = robot_secrets::hash_robot_secret("s3cr3t").expect("hash");
+    cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+        name: "cataloger".to_string(),
+        secret_hash: hash,
+        grants: vec![crate::rbac::Grant::try_new("*", vec!["pull".to_string()]).unwrap()],
+        max_ttl_secs: None,
+    });
+    let requested = sanitize_token_scopes(&parse_scopes("registry:catalog:*"));
+    let decision = decide_token_scopes_for_request(
+        &cfg,
+        &requested,
+        Some(("cataloger".to_string(), "s3cr3t".to_string())),
+    )
+    .expect("authenticated catalog scope");
+    assert_eq!(decision.subject.as_deref(), Some("robot:cataloger"));
+    assert_eq!(decision.scopes.len(), 1);
+    assert_eq!(decision.scopes[0].name, "catalog");
+}
+
+#[test]
+fn basic_catalog_requires_a_catalog_grant() {
+    use crate::auth::basic_allows_catalog;
+    use crate::rbac::Grant;
+
+    let mut cfg = minimal_config_for_token_tests();
+    cfg.robots.enabled = true;
+    let hash = robot_secrets::hash_robot_secret("s3cr3t").expect("hash");
+    cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+        name: "puller".to_string(),
+        secret_hash: hash.clone(),
+        grants: vec![Grant::try_new("org/", vec!["pull".to_string()]).unwrap()],
+        max_ttl_secs: None,
+    });
+    cfg.robots.accounts.push(crate::config::RobotAccountConfig {
+        name: "cataloger".to_string(),
+        secret_hash: hash,
+        grants: vec![Grant::try_new("*", vec!["pull".to_string()]).unwrap()],
+        max_ttl_secs: None,
+    });
+
+    assert!(!basic_allows_catalog(&cfg, "puller", "s3cr3t"));
+    assert!(basic_allows_catalog(&cfg, "cataloger", "s3cr3t"));
+    assert!(!basic_allows_catalog(&cfg, "cataloger", "wrong"));
 }
 
 /// KI-18: `*` grants confer catalog scope only when the policy option is on

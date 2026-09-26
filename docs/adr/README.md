@@ -17,5 +17,7 @@ Accepted decisions, in order. **Naming note (2026-09-26, ADR-012):** the product
 | [011](adr-011-service-census-and-server-decomposition.md) | Service census (7 core + 2 server); `/token` + admin-GC facades; handler decomposition; KI-26 residues recorded | Accepted | — |
 | [012](adr-012-product-naming-naust.md) | Product renamed **Naust**; crates `naust`/`naust-core`; MIT license; historical docs keep old names | Accepted | — |
 | [013](adr-013-gate-authority-and-closures.md) | Gate authority = maintainer; GATE-O03/04/05/06/15/16/FSD06 closed; TAG-DEC-01…06 + D7 ratified; REQ-013 dropped, REQ-014 ratified | Accepted | — |
+| [014](adr-014-auth-and-proxy-trust-boundaries.md) | Anonymous tokens stay exact and public; catalog uses one visibility decision; proxy egress and credential hosts are explicit | Accepted | clauses 2, 3, 5 amended by ADR-015 |
+| [015](adr-015-catalog-credential-and-scope-match.md) | One catalog predicate; upstream Basic stays off content hosts; repository `*` authorizes nothing | Accepted | amends ADR-014 |
 
 Context: current architecture [`../architecture/README.md`](../architecture/README.md) · requirements [`../requirements.md`](../requirements.md) · remaining work [`../technical-debt.md`](../technical-debt.md).

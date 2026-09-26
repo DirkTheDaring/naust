@@ -346,10 +346,13 @@ max_cache_bytes = 10737418240
 # block_private_networks = true
 # max_concurrent_upstream = 16
 # Redirect handling:
-# - any_public (default): follow HTTPS:443 redirects with private-network blocking (needed for Docker Hub blobs)
-# - same_host: only follow redirects that stay on the upstream host
+# - same_host (default): only follow redirects that stay on the upstream host
+# - any_public: follow HTTPS:443 redirects with private-network blocking (needed for Docker Hub blobs)
 # - disabled: do not follow redirects
-# redirect_policy = "any_public"
+# redirect_policy = "same_host"
+# Hosts that may receive upstream Basic credentials during token exchange.
+# Docker Hub: token_realm_hosts = ["auth.docker.io"]
+# token_realm_hosts = []
 #
 # [proxy.upstreams.cache]
 # index_path = "./data/cache/proxy-index-docker"

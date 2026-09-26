@@ -1621,7 +1621,7 @@ async fn test_audit_remediation_suite() {
 
     // 21. Private repository challenge
     let priv_resp = client
-        .get(format!("{base_url}/v2/private-repo/tags/list"))
+        .get(format!("{base_url}/v2/private/repo/tags/list"))
         .send()
         .await
         .expect("priv tags");

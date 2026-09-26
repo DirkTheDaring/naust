@@ -278,7 +278,8 @@ pub async fn execute_cli(cli: Cli) -> Result<(), CliError> {
 
     match command {
         CliCommand::CheckConfig => {
-            let _cfg = load_config(config_paths)?;
+            let cfg = load_config(config_paths)?;
+            cfg.ensure_server_token_key().map_err(CliError::Config)?;
             println!("OK");
             Ok(())
         }

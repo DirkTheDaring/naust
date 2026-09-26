@@ -2031,6 +2031,7 @@ dependencies = [
  "storage-core",
  "storage-fs",
  "storage-s3",
+ "subtle",
  "tempfile",
  "thiserror 2.0.20",
  "time",

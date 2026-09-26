@@ -120,7 +120,9 @@ pub fn admin_basic_subject(
         return Err(resp);
     };
 
-    if user != expected_user || pass != expected_pass {
+    let user_ok = crate::security::constant_time_eq(&user, expected_user);
+    let pass_ok = crate::security::constant_time_eq(&pass, expected_pass);
+    if !user_ok || !pass_ok {
         let mut resp = StatusCode::UNAUTHORIZED.into_response();
         resp.headers_mut().insert(
             http::header::WWW_AUTHENTICATE,

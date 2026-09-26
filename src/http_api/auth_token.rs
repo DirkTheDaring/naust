@@ -130,11 +130,38 @@ pub fn wants_auth_from_token_scopes(
     let wants_delete = token_scopes
         .iter()
         .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete));
-    let wants_catalog = token_scopes
-        .iter()
-        .any(|s| s.typ == "registry" && (s.name == "catalog" || s.name == "*"));
+    let wants_catalog = token_scopes.iter().any(scope_is_registry_catalog);
     let wants_private = token_scopes.iter().any(|s| cfg.is_repo_private(&s.name));
-    wants_push || wants_delete || wants_private || (wants_catalog && cfg.catalog_requires_auth)
+    let wants_expansive = token_scopes
+        .iter()
+        .any(|s| scope_name_is_expansive(&s.name));
+    wants_push
+        || wants_delete
+        || wants_private
+        || wants_expansive
+        || (wants_catalog && crate::auth::catalog_auth_required(cfg))
+}
+
+fn scope_name_is_expansive(name: &str) -> bool {
+    name.trim().trim_start_matches('/').contains('*')
+}
+
+fn scope_is_registry_catalog(scope: &security::TokenScope) -> bool {
+    scope.typ == "registry" && (scope.name == "catalog" || scope.name == "*")
+}
+
+/// Anonymous tokens stay exact and public (ADR-014, amended by ADR-015).
+/// A scope name containing `*`, a registry catalog scope, or a private
+/// repository name is not issued without a subject.
+fn anonymous_scope_may_be_issued(
+    cfg: &crate::config::Config,
+    scope: &security::TokenScope,
+) -> bool {
+    if scope_name_is_expansive(&scope.name) || scope_is_registry_catalog(scope) {
+        return false;
+    }
+    let is_repo = scope.typ == "repository" || scope.typ == "repo" || scope.typ == "image";
+    !(is_repo && cfg.is_repo_private(&scope.name))
 }
 
 pub fn decide_token_scopes_for_request(
@@ -147,9 +174,17 @@ pub fn decide_token_scopes_for_request(
     let requires_auth = wants_auth || !cfg.anonymous_pull;
 
     if !requires_auth {
+        let scopes: Vec<security::TokenScope> = token_scopes
+            .iter()
+            .filter(|s| anonymous_scope_may_be_issued(cfg, s))
+            .cloned()
+            .collect();
+        if scopes.len() != token_scopes.len() {
+            return Err(TokenRejection::Unauthorized);
+        }
         return Ok(TokenDecision {
             subject: None,
-            scopes: token_scopes.to_vec(),
+            scopes,
             ttl_secs: cfg.token_ttl_secs,
         });
     }
@@ -246,7 +281,7 @@ pub fn decide_token_scopes_for_request(
     let Some((user, pass)) = basic else {
         return Err(TokenRejection::Unauthorized);
     };
-    if user != expected_user || pass != expected_pass {
+    if !crate::auth::configured_secrets_match(&user, &pass, expected_user, expected_pass) {
         return Err(TokenRejection::Unauthorized);
     }
 
