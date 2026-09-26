@@ -500,16 +500,9 @@ pub struct ProxyRepoRule {
 // consumers keep compiling until the Phase 2 crate split.
 pub use crate::policy::TagPolicy;
 
-#[derive(Clone, Debug)]
-pub enum EvictionPolicy {
-    Default,
-    KeepTags(Vec<String>),
-    // Keep the highest SemVer tag among *cached tags* (optionally filtered by regex).
-    KeepLatestCachedSemver {
-        tag_regex: Option<String>,
-        allow_prerelease: bool,
-    },
-}
+// Moved to the core policy module (ADR-010 §2.3); re-exported here so server-side
+// consumers keep compiling until the Phase 2 crate split.
+pub use crate::policy::EvictionPolicy;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StorageBackend {

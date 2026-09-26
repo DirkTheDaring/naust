@@ -79,14 +79,14 @@ impl ManifestReadService {
 
     async fn ensure_tag_fresh(
         &self,
-        proxy: &crate::proxy::Proxy,
-        decision: &crate::proxy::RepoDecision,
+        proxy: &dyn crate::upstream::UpstreamFetcher,
+        decision: &crate::upstream::RepoDecision,
         cache: &Arc<dyn crate::storage::ports::ProxyStoragePort>,
         tag: &str,
         ttl_secs: u64,
         always_revalidate: bool,
     ) -> Result<(), ManifestReadError> {
-        let now = crate::proxy::Proxy::now_unix();
+        let now = crate::upstream::now_unix();
         let current_digest = self
             .tag_reader
             .resolve_tag(decision.local_repo.as_str(), tag)
@@ -117,7 +117,7 @@ impl ManifestReadService {
                 .await;
             return match res {
                 Ok(_) => Ok(()),
-                Err(crate::proxy::ProxyError::NotFound) => Err(ManifestReadError::TagNotFound),
+                Err(crate::upstream::ProxyError::NotFound) => Err(ManifestReadError::TagNotFound),
                 Err(e) => Err(ManifestReadError::Proxy(e)),
             };
         }
@@ -137,7 +137,7 @@ impl ManifestReadService {
             .await;
 
         match head {
-            Ok(crate::proxy::FetchManifestResult::NotModified { etag, digest }) => {
+            Ok(crate::upstream::FetchManifestResult::NotModified { etag, digest }) => {
                 // If we don't have the manifest locally (or no tag pointer), fetch the body.
                 if current_digest.is_none()
                     || self
@@ -179,12 +179,12 @@ impl ManifestReadService {
                     .ok()
                     .or(digest)
                 {
-                    let m = crate::proxy::TagMeta {
+                    let m = crate::upstream::TagMeta {
                         digest: d.as_str(),
                         expires_at_unix: if always_revalidate {
                             now
                         } else {
-                            crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                            crate::upstream::ttl_expires_at(ttl_secs)
                         },
                         etag,
                     };
@@ -192,7 +192,7 @@ impl ManifestReadService {
                 }
                 Ok(())
             }
-            Ok(crate::proxy::FetchManifestResult::HeadOk { etag, digest, .. }) => {
+            Ok(crate::upstream::FetchManifestResult::HeadOk { etag, digest, .. }) => {
                 let needs_get = match (&current_digest, &digest) {
                     (Some(local), Some(up)) if local.hex() == up.hex() => self
                         .manifest_reader
@@ -224,26 +224,27 @@ impl ManifestReadService {
                             );
                             ManifestReadError::Proxy(e)
                         })?;
-                    if let crate::proxy::FetchManifestResult::Fetched { digest, etag, .. } = fetched
+                    if let crate::upstream::FetchManifestResult::Fetched { digest, etag, .. } =
+                        fetched
                     {
-                        let m = crate::proxy::TagMeta {
+                        let m = crate::upstream::TagMeta {
                             digest: digest.as_str(),
                             expires_at_unix: if always_revalidate {
                                 now
                             } else {
-                                crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                                crate::upstream::ttl_expires_at(ttl_secs)
                             },
                             etag,
                         };
                         proxy.put_tag_meta(decision.local_repo.as_str(), tag, &m);
                     }
                 } else if let Some(d) = digest {
-                    let m = crate::proxy::TagMeta {
+                    let m = crate::upstream::TagMeta {
                         digest: d.as_str(),
                         expires_at_unix: if always_revalidate {
                             now
                         } else {
-                            crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                            crate::upstream::ttl_expires_at(ttl_secs)
                         },
                         etag,
                     };
@@ -251,13 +252,13 @@ impl ManifestReadService {
                 }
                 Ok(())
             }
-            Ok(crate::proxy::FetchManifestResult::Fetched { digest, etag, .. }) => {
-                let m = crate::proxy::TagMeta {
+            Ok(crate::upstream::FetchManifestResult::Fetched { digest, etag, .. }) => {
+                let m = crate::upstream::TagMeta {
                     digest: digest.as_str(),
                     expires_at_unix: if always_revalidate {
                         now
                     } else {
-                        crate::proxy::Proxy::ttl_expires_at(ttl_secs)
+                        crate::upstream::ttl_expires_at(ttl_secs)
                     },
                     etag,
                 };
@@ -337,11 +338,13 @@ impl ManifestReadService {
                     )
                     .await
                 {
-                    Ok(crate::proxy::FetchManifestResult::Fetched { digest, .. }) => Ok(digest),
+                    Ok(crate::upstream::FetchManifestResult::Fetched { digest, .. }) => Ok(digest),
                     Ok(_) => Err(ManifestReadError::Internal(
                         "unexpected fetch result".to_string(),
                     )),
-                    Err(crate::proxy::ProxyError::NotFound) => Err(ManifestReadError::TagNotFound),
+                    Err(crate::upstream::ProxyError::NotFound) => {
+                        Err(ManifestReadError::TagNotFound)
+                    }
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
@@ -357,7 +360,7 @@ impl ManifestReadService {
             }
             TagPolicy::TtlSeconds(ttl) => {
                 self.ensure_tag_fresh(
-                    &target.proxy,
+                    target.proxy.as_ref(),
                     &decision,
                     &target.cache_storage,
                     reference,
@@ -373,7 +376,7 @@ impl ManifestReadService {
             }
             TagPolicy::AlwaysRevalidate => {
                 self.ensure_tag_fresh(
-                    &target.proxy,
+                    target.proxy.as_ref(),
                     &decision,
                     &target.cache_storage,
                     reference,
@@ -484,7 +487,7 @@ impl ManifestReadService {
                             });
                         }
                     }
-                    Err(crate::proxy::ProxyError::NotFound) => {
+                    Err(crate::upstream::ProxyError::NotFound) => {
                         return Err(ManifestReadError::NotFound);
                     }
                     Err(e) => return Err(ManifestReadError::Proxy(e)),
@@ -592,7 +595,7 @@ impl ManifestReadService {
                             });
                         }
                     }
-                    Err(crate::proxy::ProxyError::NotFound) => {
+                    Err(crate::upstream::ProxyError::NotFound) => {
                         return Err(ManifestReadError::NotFound);
                     }
                     Err(e) => return Err(ManifestReadError::Proxy(e)),

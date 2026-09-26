@@ -548,7 +548,9 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
                 .unwrap_or_else(|| state.config.fs_root.join(format!("cache-upstream-{i}")));
             let max_cache_bytes = up.max_cache_bytes;
             let storage = ctx.cache_storage;
-            let proxy_for_gc = ctx.proxy;
+            let Some(proxy_for_gc) = state.proxy_upstream_engines.get(i).cloned() else {
+                continue;
+            };
             let repo_rules_for_gc = repo_rules.clone();
 
             supervisor

@@ -125,6 +125,15 @@ Gate: `scripts/check-core-boundary.sh` / `make core-boundary`.
 * **Live-S3 suite is environment-gated**: `tests/s3_live_integration.rs` fails without a running MinIO (base-reproduced at the pre-1c commit — not a regression). Live qualification remains a Phase 4 item, as planned.
 * Verification at completion: fmt clean; lib 1127/0/13; all non-live integration suites green; gate violations reduced to the 24 proxy-seam lines in `application/` (= exactly the 1d scope).
 
+### Phase 1d/1e learnings and G2 decision (2026-09-26, completed — Phase 1 DONE)
+
+* **G2 verdict: trait CONFIRMED, fallback not invoked.** `UpstreamFetcher` landed with 12 methods — over the ~8 heuristic numerically, but the second fallback trigger (leaking reqwest/config types) never fired: `ProxyError` is message-only, and the publication back-calls take core types (`BlobMutationService`, `ManifestMutationService`, `&dyn ProxyStoragePort`, `&dyn BlobUploadCoordinatorStoragePort`). The trait does not mirror the engine: auth/token caching, singleflight, egress policy, GC/scrub/eviction all stay engine-internal.
+* **Gate blind spot #2 found**: `application/blob_read.rs` consumes the engine through `ProxyTarget` *method calls* (no `crate::proxy` path anywhere), so the line-regex never saw it. Real coupling surface was larger than the token count suggested; the trait covers it (`decision_for_repo`, `head_blob_upstream`, `fetch_blob_into_storage`, `note_blob_access`).
+* **`RepoDecision` dragged `EvictionPolicy`** — moved to core `policy` alongside `TagPolicy` (config re-exports for compat).
+* Moved to new core `src/upstream/`: `ProxyError`, `RepoDecision`, `TagMeta`, `FetchManifestResult`, `now_unix`/`ttl_expires_at` helpers, the trait. `proxy.rs` re-exports the moved types and implements the trait by delegation to its inherent methods.
+* **Server workers need the concrete engine**: proxy GC/scrub in `supervisor.rs` call engine methods outside the seam (correctly — eviction is not a core concern). `AppState` gained `proxy_upstream_engines: Vec<Arc<Proxy>>` parallel to the (now trait-object) `proxy_upstreams: Vec<ProxyTarget>`.
+* **1e: gate GREEN** (`core-boundary gate: clean`). Verification: fmt clean; lib 1127/0/13; full workspace test run 1490 passed / 31 failed, with all 31 failures isolated to the environment-gated `s3_live_integration` suite (base-reproduced pre-change; Phase 4 item).
+
 Reverse edge (server → core, legal after split): `proxy.rs:582,662` → `application::{Blob,Manifest}MutationService`.
 
 Verified clean: `membership_migration` (imports only `manifest_refs` + `storage`), `upload_state.rs` (zero crate imports), `consistency`, `fs_root_lock`, `task_supervisor`, `glob` (used only by `request_routing`/`rbac`/`config` — server side); no core production code touches `auth`, `rbac`, `security`, `audit`, or `request_routing`; storage layer imports nothing above it except the listed `config` sites.

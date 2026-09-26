@@ -50,6 +50,9 @@ pub struct AppState {
     pub proxy_cache: Option<Arc<dyn crate::storage::ports::ProxyStoragePort>>,
     // Multi-upstream: proxy/cache selected per request host.
     pub proxy_upstreams: Vec<ProxyTarget>,
+    // Concrete per-upstream engines for server-side workers (GC/scrub); the
+    // application layer only ever sees the ProxyTarget trait objects above.
+    pub proxy_upstream_engines: Vec<Arc<proxy::Proxy>>,
     pub buffered_body_sem: Arc<Semaphore>,
     pub request_sem: Arc<Semaphore>,
     pub upload_request_sem: Arc<Semaphore>,

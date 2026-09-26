@@ -460,6 +460,7 @@ where
     }
 
     let mut proxy_upstreams: Vec<ProxyTarget> = Vec::new();
+    let mut proxy_upstream_engines: Vec<Arc<crate::proxy::Proxy>> = Vec::new();
     if config.proxy.enabled && !config.proxy.upstreams.is_empty() {
         for (i, up) in config.proxy.upstreams.iter().enumerate() {
             let mut per = config.proxy.clone();
@@ -522,6 +523,7 @@ where
                     }
                 };
 
+            proxy_upstream_engines.push(proxy.clone());
             proxy_upstreams.push(ProxyTarget {
                 proxy,
                 cache_storage: cache,
@@ -627,6 +629,7 @@ where
         proxy,
         proxy_cache,
         proxy_upstreams,
+        proxy_upstream_engines,
         buffered_body_sem,
         request_sem,
         upload_request_sem,
@@ -699,6 +702,7 @@ pub(crate) fn build_test_app_state(
         proxy,
         proxy_cache,
         proxy_upstreams: Vec::new(),
+        proxy_upstream_engines: Vec::new(),
         buffered_body_sem: Arc::new(Semaphore::new(1)),
         request_sem: Arc::new(Semaphore::new(1)),
         upload_request_sem: Arc::new(Semaphore::new(1)),

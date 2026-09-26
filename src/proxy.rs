@@ -235,13 +235,9 @@ pub struct Proxy {
 
 const MAX_TOKEN_CACHE_ENTRIES: usize = 1024;
 
-#[derive(Clone, Debug)]
-pub struct RepoDecision {
-    pub local_repo: CanonicalRepoName,
-    pub upstream_repo: CanonicalRepoName,
-    pub tag_policy: TagPolicy,
-    pub eviction_policy: EvictionPolicy,
-}
+// Moved to the core upstream seam (ADR-010 §2.2); re-exported for server-side
+// consumers until the Phase 2 crate split.
+pub use crate::upstream::{FetchManifestResult, ProxyError, RepoDecision, TagMeta};
 
 #[derive(Clone, Debug)]
 struct CachedToken {
@@ -249,40 +245,7 @@ struct CachedToken {
     expires_at_unix: u64,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct TagMeta {
-    pub digest: String,
-    pub expires_at_unix: u64,
-    pub etag: Option<String>,
-}
-
 pub use crate::manifest_refs::ManifestRefs;
-
-#[derive(thiserror::Error, Debug)]
-pub enum ProxyError {
-    #[error("proxy disabled")]
-    Disabled,
-    #[error("repo not allowed")]
-    RepoNotAllowed,
-    #[error("upstream not configured")]
-    UpstreamNotConfigured,
-    #[error("invalid upstream url")]
-    InvalidUpstreamUrl,
-    #[error("upstream host not allowed: {0}")]
-    UpstreamHostNotAllowed(String),
-    #[error("blocked upstream egress to private network: {0}")]
-    BlockedEgress(String),
-    #[error("upstream request failed: {0}")]
-    Upstream(String),
-    #[error("digest mismatch")]
-    DigestMismatch,
-    #[error("not found")]
-    NotFound,
-    #[error("too large")]
-    TooLarge,
-    #[error("internal: {0}")]
-    Internal(String),
-}
 
 impl Proxy {
     pub fn new(cfg: &ProxyConfig) -> Result<Option<Self>, ProxyError> {
@@ -905,14 +868,11 @@ impl Proxy {
     }
 
     pub fn now_unix() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs()
+        crate::upstream::now_unix()
     }
 
     pub fn ttl_expires_at(ttl_secs: u64) -> u64 {
-        Self::now_unix().saturating_add(ttl_secs)
+        crate::upstream::ttl_expires_at(ttl_secs)
     }
 
     async fn send_with_bearer(
@@ -1164,24 +1124,6 @@ impl Proxy {
         );
         Ok(token)
     }
-}
-
-pub enum FetchManifestResult {
-    Fetched {
-        digest: Digest,
-        media_type: String,
-        etag: Option<String>,
-        bytes: Bytes,
-    },
-    HeadOk {
-        media_type: String,
-        etag: Option<String>,
-        digest: Option<Digest>,
-    },
-    NotModified {
-        etag: Option<String>,
-        digest: Option<Digest>,
-    },
 }
 
 #[derive(Default)]
@@ -1446,5 +1388,84 @@ mod tests {
             proxy.get_manifest_refs(repo, &digest).is_none(),
             "malformed manifest must not be indexed in proxy db"
         );
+    }
+}
+
+/// Core upstream seam (ADR-010 §2.2): the application layer consumes the
+/// engine exclusively through this impl.
+#[async_trait::async_trait]
+impl crate::upstream::UpstreamFetcher for Proxy {
+    fn decision_for_repo(&self, repo: &str) -> Result<RepoDecision, ProxyError> {
+        Proxy::decision_for_repo(self, repo)
+    }
+
+    fn upstream_base_url_for_log(&self) -> Option<&str> {
+        Proxy::upstream_base_url_for_log(self)
+    }
+
+    async fn head_blob_upstream(
+        &self,
+        decision: &RepoDecision,
+        digest: &Digest,
+    ) -> Result<u64, ProxyError> {
+        Proxy::head_blob_upstream(self, decision, digest).await
+    }
+
+    async fn fetch_blob_into_storage(
+        &self,
+        decision: &RepoDecision,
+        digest: &Digest,
+        cache_storage: &dyn crate::storage::ports::ProxyStoragePort,
+        mutation_service: &crate::application::BlobMutationService,
+    ) -> Result<(), ProxyError> {
+        Proxy::fetch_blob_into_storage(self, decision, digest, cache_storage, mutation_service)
+            .await
+    }
+
+    async fn fetch_manifest_and_cache(
+        &self,
+        decision: &RepoDecision,
+        reference: &str,
+        storage: &dyn crate::storage::BlobUploadCoordinatorStoragePort,
+        max_bytes: usize,
+        revalidate_only: bool,
+        if_none_match: Option<String>,
+        manifest_service: &crate::application::ManifestMutationService,
+    ) -> Result<crate::upstream::FetchManifestResult, ProxyError> {
+        Proxy::fetch_manifest_and_cache(
+            self,
+            decision,
+            reference,
+            storage,
+            max_bytes,
+            revalidate_only,
+            if_none_match,
+            manifest_service,
+        )
+        .await
+    }
+
+    fn get_tag_meta(&self, repo: &str, tag: &str) -> Option<TagMeta> {
+        Proxy::get_tag_meta(self, repo, tag)
+    }
+
+    fn put_tag_meta(&self, repo: &str, tag: &str, meta: &TagMeta) {
+        Proxy::put_tag_meta(self, repo, tag, meta)
+    }
+
+    fn note_blob_access(&self, digest: &Digest) {
+        Proxy::note_blob_access(self, digest)
+    }
+
+    fn note_manifest_access(&self, repo: &str, digest: &Digest) {
+        Proxy::note_manifest_access(self, repo, digest)
+    }
+
+    fn note_tag_access(&self, repo: &str, tag: &str) {
+        Proxy::note_tag_access(self, repo, tag)
+    }
+
+    fn get_manifest_refs(&self, repo: &str, digest: &Digest) -> Option<ManifestRefs> {
+        Proxy::get_manifest_refs(self, repo, digest)
     }
 }

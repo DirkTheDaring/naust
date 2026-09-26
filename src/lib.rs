@@ -39,6 +39,7 @@ pub mod task_supervisor;
 pub mod token_rate_limit;
 pub mod upload_coordinator;
 pub mod upload_lifecycle;
+pub mod upstream;
 
 #[doc(hidden)]
 pub mod test_support;

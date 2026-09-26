@@ -179,7 +179,7 @@ pub enum BlobReadError {
     #[error("upstream error: {0}")]
     Upstream(String),
     #[error("proxy error: {0}")]
-    Proxy(#[source] crate::proxy::ProxyError),
+    Proxy(#[source] crate::upstream::ProxyError),
     #[error("mutation error: {0}")]
     Mutation(#[source] BlobMutationError),
     #[error("storage error: {0}")]
@@ -211,7 +211,7 @@ pub enum ManifestReadError {
     #[error("upstream error: {0}")]
     Upstream(String),
     #[error("proxy error: {0}")]
-    Proxy(#[source] crate::proxy::ProxyError),
+    Proxy(#[source] crate::upstream::ProxyError),
     #[error("mutation error: {0}")]
     Mutation(#[source] ManifestMutationError),
     #[error("storage error: {0}")]

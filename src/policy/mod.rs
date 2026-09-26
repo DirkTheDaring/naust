@@ -15,6 +15,18 @@ pub enum TagPolicy {
     AlwaysRevalidate,
 }
 
+/// Proxy-cache eviction policy (moved from `config`).
+#[derive(Clone, Debug)]
+pub enum EvictionPolicy {
+    Default,
+    KeepTags(Vec<String>),
+    // Keep the highest SemVer tag among *cached tags* (optionally filtered by regex).
+    KeepLatestCachedSemver {
+        tag_regex: Option<String>,
+        allow_prerelease: bool,
+    },
+}
+
 /// Disposition of legacy/unknown multipart uploads during S3 session cleanup
 /// (moved from `config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
