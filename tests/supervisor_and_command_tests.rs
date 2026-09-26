@@ -1098,6 +1098,9 @@ root = "/dev/null/nonexistent-root-path-that-fails-storage-creation"
 [storage.ref_index]
 enabled = false
 path = "/dev/null/nonexistent-index"
+
+[token]
+signing_key = "test-signing-key"
 "#;
     tokio::fs::write(&cfg_path, invalid_toml).await.unwrap();
 

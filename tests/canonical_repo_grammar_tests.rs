@@ -96,6 +96,9 @@ path = "{}"
 [admin_api]
 enabled = false
 
+[token]
+signing_key = "test-signing-key"
+
 [limits]
 max_upload_bytes = 104857600
 max_request_body_bytes = 33554432
@@ -733,6 +736,9 @@ path = "{}"
 [admin_api]
 enabled = false
 
+[token]
+signing_key = "test-signing-key"
+
 [limits]
 max_upload_bytes = 104857600
 max_request_body_bytes = 33554432
@@ -821,6 +827,9 @@ root = "{}"
 
 [proxy]
 enabled = true
+
+[token]
+signing_key = "test-signing-key"
 
 [proxy.safety]
 allowed_repo_prefixes = ["upstream/team__cache/"]

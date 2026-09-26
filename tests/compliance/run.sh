@@ -84,6 +84,7 @@ run_matrix() {
       REGISTRY_AUTH_STRATEGY="${auth_strategy}" \
       LISTEN_ADDR="127.0.0.1:${port}" \
       PUBLIC_URL="http://127.0.0.1:${port}" \
+      TOKEN_SIGNING_KEY="conformance-signing-key" \
       STORAGE_BACKEND=fs \
       STORAGE_FS_ROOT="${data_dir}" \
       ALLOW_TAG_OVERWRITE=1 \
@@ -100,6 +101,7 @@ run_matrix() {
       REGISTRY_AUTH_STRATEGY="${auth_strategy}" \
       LISTEN_ADDR="127.0.0.1:${port}" \
       PUBLIC_URL="http://127.0.0.1:${port}" \
+      TOKEN_SIGNING_KEY="conformance-signing-key" \
       STORAGE_BACKEND=s3 \
       STORAGE_S3_ENDPOINT="${S3_ENDPOINT}" \
       STORAGE_S3_BUCKET="${S3_BUCKET}" \

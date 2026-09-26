@@ -80,6 +80,7 @@ async fn start_server_with_opts(
     cmd.env("STORAGE_BACKEND", "fs");
     cmd.env("STORAGE_FS_ROOT", &fs_root);
     cmd.env("LISTEN_ADDR", format!("127.0.0.1:{port}"));
+    cmd.env("TOKEN_SIGNING_KEY", "test-signing-key");
     cmd.env("PUBLIC_URL", format!("http://127.0.0.1:{port}"));
     cmd.env("REGISTRY_PUSH_ALLOW_REPOS", "*");
     cmd.env("REGISTRY_AUTH_STRATEGY", opts.auth_strategy);

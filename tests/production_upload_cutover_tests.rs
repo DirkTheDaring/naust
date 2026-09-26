@@ -721,6 +721,9 @@ password = "demo"
 allow_repos = ["*"]
 actions = ["pull", "push", "delete"]
 
+[token]
+signing_key = "test-signing-key"
+
 [storage]
 backend = "fs"
 

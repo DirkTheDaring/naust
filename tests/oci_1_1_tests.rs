@@ -85,6 +85,9 @@ path = "{}"
 [admin_api]
 enabled = false
 
+[token]
+signing_key = "test-signing-key"
+
 [limits]
 max_upload_bytes = 104857600
 max_request_body_bytes = 33554432
@@ -1697,7 +1700,7 @@ async fn test_audit_remediation_suite() {
 
     // 24. Unauthenticated request to private repo returns 401 challenge
     let challenge_resp = client
-        .get(format!("{base_url}/v2/private-test-repo/tags/list"))
+        .get(format!("{base_url}/v2/private/test-repo/tags/list"))
         .send()
         .await
         .expect("unauth private tags");

@@ -78,6 +78,9 @@ password = "demo"
 allow_repos = ["*"]
 actions = ["pull", "push", "delete"]
 
+[token]
+signing_key = "test-signing-key"
+
 [storage]
 backend = "fs"
 
@@ -449,6 +452,7 @@ async fn test_untrusted_xff_spoofing_prevented() {
     // Untrusted peer 127.0.0.1 sends fake X-Forwarded-For headers
     let r1 = client
         .get(&url)
+        .basic_auth("demo", Some("demo"))
         .header("X-Forwarded-For", "198.51.100.1")
         .send()
         .await
@@ -457,6 +461,7 @@ async fn test_untrusted_xff_spoofing_prevented() {
 
     let r2 = client
         .get(&url)
+        .basic_auth("demo", Some("demo"))
         .header("X-Forwarded-For", "198.51.100.2")
         .send()
         .await

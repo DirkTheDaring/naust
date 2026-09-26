@@ -230,6 +230,9 @@ fn test_topology_1_fs_with_online_gc_succeeds() {
 [server]
 listen_addr = "127.0.0.1:5000"
 
+[token]
+signing_key = "test-signing-key"
+
 [storage]
 backend = "fs"
 
@@ -270,6 +273,9 @@ fn test_topology_2_s3_local_index_online_gc_without_single_instance_fails() {
         r#"
 [server]
 listen_addr = "127.0.0.1:5000"
+
+[token]
+signing_key = "test-signing-key"
 
 [storage]
 backend = "s3"
@@ -320,6 +326,9 @@ fn test_topology_3_s3_local_index_online_gc_disabled_succeeds() {
 [server]
 listen_addr = "127.0.0.1:5000"
 
+[token]
+signing_key = "test-signing-key"
+
 [storage]
 backend = "s3"
 
@@ -362,6 +371,9 @@ fn test_topology_4_s3_with_affirmative_single_instance_succeeds() {
         r#"
 [server]
 listen_addr = "127.0.0.1:5000"
+
+[token]
+signing_key = "test-signing-key"
 
 [storage]
 backend = "s3"
@@ -409,6 +421,9 @@ fn test_cli_offline_s3_gc_rejected_without_confirmation() {
             r#"
 [server]
 listen_addr = "127.0.0.1:5000"
+
+[token]
+signing_key = "test-signing-key"
 
 [storage]
 backend = "s3"
@@ -468,6 +483,9 @@ fn test_cli_offline_s3_gc_plan_dry_run_allowed_without_confirmation() {
             r#"
 [server]
 listen_addr = "127.0.0.1:5000"
+
+[token]
+signing_key = "test-signing-key"
 
 [storage]
 backend = "s3"
