@@ -188,3 +188,10 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 * KI-18: `auth.star_grants_catalog` (default true) via a new `grant_scopes_by_prefix_with_options`; the old signature delegates with the historical behavior, so RBAC tests stay valid.
 * Register/requirements/operations/README all reconciled in the same commit.
 * Acceptance: fmt/gate clean; workspace 1511 passed / env-gated live suite only; conformance fs/basic/token green.
+
+### R5 learnings (2026-09-26, completed — KI-10/11/21 CLOSED)
+
+* **KI-11 was misdescribed in two directions**: (worse) packaging read config from the **untracked, environment-specific** local `etc/` tree — package contents were machine-dependent, not merely sensitive; (better) `tls/`, `certs/`, `etc/` were already gitignored/untracked, so there was no git-history exposure to scrub. Fix: neutral tracked templates in `packaging/config/` (placeholders, ACME off, `debug=false`, no unknown keys; **validated with `check-config`**), Makefile/DEB staging repointed.
+* KI-21's row was partially stale too (DEB already had `ReadWritePaths`); actual gaps were `LimitNOFILE`, `ReadOnlyPaths`, `StateDirectoryMode` — added.
+* KI-10: `make vendor-sync` + Dockerfile staging for `/storage-layer-rust` (workspace manifest included — the crates use `workspace = true` field inheritance). **Container build verified end-to-end: `podman build` exit 0, binary executes in the image** (first verified container build in the register's history).
+* Vendored storage-layer sources are committed under `vendor/`, matching the existing acmecert convention (self-contained container builds).

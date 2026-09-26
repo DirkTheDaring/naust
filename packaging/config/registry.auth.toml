@@ -1,0 +1,34 @@
+# registry-rust — auth configuration TEMPLATE (packaged as /etc/registry-rust/registry.auth.toml)
+#
+# Ships with NEUTRAL placeholders (KI-11): no credentials are packaged.
+# Generate secret hashes with:  registry-rust hash-secret   (reads the secret
+# from stdin and prints an Argon2id hash).
+
+[auth]
+# Anonymous pulls are allowed by default; repositories whose name starts with
+# one of auth.private_name_prefixes still require auth.
+anonymous_pull = true
+# private_name_prefixes = ["private", "secret", "protected", "restricted"]
+# star_grants_catalog = true
+
+[token]
+service = "registry-rust"
+ttl_secs = 600
+# REQUIRED before serving authenticated traffic: a strong random signing key.
+# signing_key = "<GENERATE-A-LONG-RANDOM-SECRET>"
+# rate_limit_rpm = 1200
+# rate_limit_window_secs = 60
+
+[auth.robots]
+enabled = false
+# [[auth.robots.accounts]]
+# name = "ci-bot"
+# secret_hash = "<OUTPUT-OF-registry-rust-hash-secret>"
+# grants = [{ repo = "myorg/*", actions = ["pull", "push"] }]
+
+[auth.users]
+enabled = false
+# [[auth.users.accounts]]
+# name = "alice"
+# secret_hash = "<OUTPUT-OF-registry-rust-hash-secret>"
+# groups = ["developers"]

@@ -101,6 +101,14 @@ cat /proc/$(pidof registry-rust)/limits | grep -i "open files"
 ls /proc/$(pidof registry-rust)/fd | wc -l
 ```
 
+### Packaged configuration templates
+
+RPM/DEB packages install neutral templates from `packaging/config/` (placeholders
+only — no credentials or environment-specific values). Your local `etc/`, `tls/`,
+and `certs/` directories are gitignored dev fixtures and are never packaged.
+Container builds stage the sibling path-dependencies from `vendor/`; refresh with
+`make vendor-sync` after changing `../acmecert` or `../storage-layer-rust`.
+
 ## Build RPM (containerized, Fedora)
 
 The default `make rpm` builds on the host.

@@ -1,0 +1,59 @@
+# registry-rust — core configuration TEMPLATE (packaged as /etc/registry-rust/registry.core.toml)
+#
+# This file ships with NEUTRAL placeholder values (KI-11): replace the
+# <PLACEHOLDER> markers for your environment before starting the service.
+# Layer it with the auth file:
+#   registry-rust server \
+#     --config /etc/registry-rust/registry.core.toml \
+#     --config /etc/registry-rust/registry.auth.toml
+# Precedence: defaults < config files (in order) < env vars
+
+[profile]
+# Optional: "best_practice" tightens defaults and makes token.signing_key required.
+name = ""
+
+[server]
+listen_addr = "0.0.0.0:5000"
+# Recommended behind proxies and for the token realm:
+# public_url = "https://<YOUR-REGISTRY-HOSTNAME>"
+
+[server.tls]
+# If both are set, the server serves HTTPS. Certificates hot-reload on change
+# (server.tls.reload_poll_secs, default 300).
+cert_path = ""
+key_path  = ""
+
+# Optional ACME DNS-01 provisioning (disabled in the template). When enabled,
+# renewal also runs at runtime (server.tls.acme.renew_check_interval_secs) and
+# SAN coverage of `names` is enforced at startup.
+[server.tls.acme]
+enabled = false
+# provider = "ispone"
+# email = "<YOUR-ACME-CONTACT-EMAIL>"
+# names = ["registry.<YOUR-DOMAIN>"]
+# output_dir = "/var/lib/registry-rust/tls"
+# authorization = "<YOUR-ACME-PROVIDER-AUTHORIZATION>"
+debug = false
+
+[storage]
+backend = "fs"
+
+[storage.fs]
+root = "/var/lib/registry-rust/data"
+
+[storage.ref_index]
+enabled = true
+path = "/var/lib/registry-rust/ref-index"
+auto_rebuild_on_corruption = true
+
+[blob_gc]
+# Operator kill switches: quarantine/delete (admin API, scheduler, and CLI
+# without --force-gc) refuse while these are false.
+enabled = false
+enable_delete = false
+
+[proxy]
+enabled = false
+
+[limits]
+# trusted_proxies = ["<YOUR-REVERSE-PROXY-CIDR>"]

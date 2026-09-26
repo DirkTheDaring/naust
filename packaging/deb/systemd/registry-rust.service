@@ -16,15 +16,21 @@ ExecStart=/usr/bin/registry-rust --config /etc/registry-rust/registry.core.toml 
 
 WorkingDirectory=/var/lib/registry-rust
 StateDirectory=registry-rust
+StateDirectoryMode=0750
 
 Restart=on-failure
 RestartSec=2
+
+# Avoid EMFILE ("Too many open files") under concurrent pushes/pulls
+# (aligned with the RPM unit, KI-21).
+LimitNOFILE=65536
 
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/registry-rust
+ReadOnlyPaths=/etc/registry-rust
 
 [Install]
 WantedBy=multi-user.target

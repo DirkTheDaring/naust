@@ -33,6 +33,22 @@ conformance:
 core-boundary:
 	scripts/check-core-boundary.sh
 
+# Stage sibling path-dependencies into vendor/ for container builds (KI-10).
+# acmecert: crates/acmecert-core; storage-layer-rust: all three crates + the
+# workspace manifest (the crates use workspace field inheritance).
+.PHONY: vendor-sync
+vendor-sync:
+	@rm -rf vendor/acmecert vendor/storage-layer-rust
+	@mkdir -p vendor/acmecert/crates vendor/storage-layer-rust/crates
+	@cp -a ../acmecert/Cargo.toml vendor/acmecert/Cargo.toml
+	@cp -a ../acmecert/crates/acmecert-core vendor/acmecert/crates/
+	@cp -a ../storage-layer-rust/Cargo.toml vendor/storage-layer-rust/Cargo.toml
+	@cp -a ../storage-layer-rust/crates/storage-core vendor/storage-layer-rust/crates/
+	@cp -a ../storage-layer-rust/crates/storage-fs vendor/storage-layer-rust/crates/
+	@cp -a ../storage-layer-rust/crates/storage-s3 vendor/storage-layer-rust/crates/
+	@find vendor -name target -type d -prune -exec rm -rf {} + 2>/dev/null || true
+	@echo "vendor/ refreshed from ../acmecert and ../storage-layer-rust"
+
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 
 .PHONY: rpmlint
@@ -73,7 +89,7 @@ $(TARBALL): rpm-dirs
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/sysconfig
 	@mkdir -p dist/rpmstage/$(NAME)-$(VERSION)/man
 	@cp -a target/release/registry-rust dist/rpmstage/$(NAME)-$(VERSION)/bin/registry-rust
-	@cp -a etc/registry-rust/*.toml dist/rpmstage/$(NAME)-$(VERSION)/etc/registry-rust/
+	@cp -a packaging/config/*.toml dist/rpmstage/$(NAME)-$(VERSION)/etc/registry-rust/
 	@cp -a packaging/systemd/registry-rust.service dist/rpmstage/$(NAME)-$(VERSION)/systemd/registry-rust.service
 	@cp -a packaging/systemd/sysusers.d/registry-rust.conf dist/rpmstage/$(NAME)-$(VERSION)/sysusers.d/registry-rust.conf
 	@cp -a packaging/systemd/tmpfiles.d/registry-rust.conf dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d/registry-rust.conf
@@ -164,8 +180,8 @@ deb: deb-dirs
 	@mkdir -p $(DEB_STAGE)/usr/share/lintian/overrides
 	@install -m 0755 target/release/registry-rust $(DEB_STAGE)/usr/bin/registry-rust
 	@if command -v strip >/dev/null 2>&1; then strip --strip-unneeded $(DEB_STAGE)/usr/bin/registry-rust || true; fi
-	@install -m 0644 etc/registry-rust/registry.core.toml $(DEB_STAGE)/etc/registry-rust/registry.core.toml
-	@install -m 0644 etc/registry-rust/registry.auth.toml $(DEB_STAGE)/etc/registry-rust/registry.auth.toml
+	@install -m 0644 packaging/config/registry.core.toml $(DEB_STAGE)/etc/registry-rust/registry.core.toml
+	@install -m 0644 packaging/config/registry.auth.toml $(DEB_STAGE)/etc/registry-rust/registry.auth.toml
 	@install -m 0644 packaging/deb/default/registry-rust $(DEB_STAGE)/etc/default/registry-rust
 	@install -m 0644 packaging/deb/systemd/registry-rust.service $(DEB_STAGE)/usr/lib/systemd/system/registry-rust.service
 	@install -m 0644 README.md $(DEB_STAGE)/usr/share/doc/registry-rust/README.md

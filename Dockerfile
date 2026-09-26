@@ -10,11 +10,18 @@ RUN apk add --no-cache build-base musl-dev
 # Copy source code and vendor dependencies
 COPY . .
 
-# Ensure path dependency for acmecert-core is available at /acmecert/crates/acmecert-core
+# Stage vendored path dependencies where the manifests expect them
+# (../acmecert and ../storage-layer-rust relative to /app). Refresh vendor/
+# with `make vendor-sync` before building (KI-10).
 RUN if [ -d "vendor/acmecert" ]; then \
       mkdir -p /acmecert/crates \
       && cp -r vendor/acmecert/crates/acmecert-core /acmecert/crates/ \
       && cp vendor/acmecert/Cargo.toml /acmecert/Cargo.toml; \
+    fi
+RUN if [ -d "vendor/storage-layer-rust" ]; then \
+      mkdir -p /storage-layer-rust \
+      && cp -r vendor/storage-layer-rust/crates /storage-layer-rust/ \
+      && cp vendor/storage-layer-rust/Cargo.toml /storage-layer-rust/Cargo.toml; \
     fi
 
 RUN cargo build --release
