@@ -28,6 +28,11 @@ TARBALL := $(SOURCES)/$(NAME)-$(VERSION).tar.gz
 conformance:
 	tests/compliance/run.sh
 
+# ADR-010 allowlist gate: core modules may import only core modules (incl. test code).
+.PHONY: core-boundary
+core-boundary:
+	scripts/check-core-boundary.sh
+
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 
 .PHONY: rpmlint

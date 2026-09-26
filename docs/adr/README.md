@@ -13,5 +13,6 @@ Accepted decisions, in order. **All nine ADRs were claim-verified against the so
 | [007](adr-007-manifest-compatibility-consolidation.md) | 10-line deprecated `manifest_publication` re-export shim | Accepted | — (conforms exactly) |
 | [008](adr-008-http-transport-test-topology.md) | File-backed `#[cfg(test)]` sidecar test modules | Accepted | — |
 | [009](adr-009-structured-storage-error-taxonomy.md) | Structured `StorageErrorKind`; 0.9.0 release boundary | Accepted | tag `v0.9.0` created 2026-09-06 (after authoring); publication open → GATE-O13 |
+| [010](adr-010-registry-core-crate-boundary.md) | `registry-core` crate boundary: workspace split, proxy `UpstreamFetcher` seam, core-owned policy types, allowlist gate | Accepted | — |
 
 Context: current architecture [`../architecture/README.md`](../architecture/README.md) · requirements [`../requirements.md`](../requirements.md) · remaining work [`../technical-debt.md`](../technical-debt.md).
