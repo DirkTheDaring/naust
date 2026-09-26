@@ -222,14 +222,6 @@ impl BlobGcCommand {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CommandIntent {
-    ReadOnly,
-    MutationCapableServer,
-    MutationCapableMaintenance { lock_suffix: &'static str },
-    DestructiveAdminRecovery,
-}
-
 impl CliCommand {
     pub fn policy(&self) -> CommandPolicy {
         match self {
@@ -246,47 +238,6 @@ impl CliCommand {
             CliCommand::Server => CommandPolicy::ExclusiveMutation {
                 lock_suffix: "server",
             },
-        }
-    }
-
-    pub fn intent(&self) -> CommandIntent {
-        match self {
-            CliCommand::CheckConfig
-            | CliCommand::HashSecret
-            | CliCommand::AuditPermissions
-            | CliCommand::InspectLock => CommandIntent::ReadOnly,
-
-            CliCommand::RefIndex { command } => match command {
-                RefIndexCommand::Check => CommandIntent::ReadOnly,
-                RefIndexCommand::Rebuild => CommandIntent::MutationCapableMaintenance {
-                    lock_suffix: "ref-index-rebuild",
-                },
-                RefIndexCommand::Ensure => CommandIntent::MutationCapableMaintenance {
-                    lock_suffix: "ref-index-ensure",
-                },
-            },
-
-            CliCommand::BlobGc { command } => match command {
-                BlobGcCommand::Plan { .. } => CommandIntent::ReadOnly,
-                BlobGcCommand::Quarantine { .. } => CommandIntent::MutationCapableMaintenance {
-                    lock_suffix: "blob-gc-quarantine",
-                },
-                BlobGcCommand::Delete { .. } => CommandIntent::MutationCapableMaintenance {
-                    lock_suffix: "blob-gc-delete",
-                },
-            },
-
-            CliCommand::MigrateMembership { command } => match command {
-                MigrateMembershipCommand::Plan | MigrateMembershipCommand::Verify => {
-                    CommandIntent::ReadOnly
-                }
-                MigrateMembershipCommand::Apply => CommandIntent::MutationCapableMaintenance {
-                    lock_suffix: "migrate-membership-apply",
-                },
-            },
-
-            CliCommand::AdminClearLock { .. } => CommandIntent::DestructiveAdminRecovery,
-            CliCommand::Server => CommandIntent::MutationCapableServer,
         }
     }
 }

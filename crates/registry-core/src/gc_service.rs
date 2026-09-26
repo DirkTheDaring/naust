@@ -291,7 +291,7 @@ impl GcService {
         // -----------------------------------------------------------------------------------------
         // LOCK ORDER (strictly preserved across all GC mutation paths):
         // 1. self.run_lock: In-process mutual exclusion between concurrent GC executions.
-        // 2. _fs_gc_lock: Cross-process file lock on `quarantine/.lock` (for filesystem backend).
+        // 2. _fs_gc_lock: Cross-process file lock on `quarantine/gc.lock` (for filesystem backend).
         // 3. (auth_guard & consistency_coordinator): Acquired per bounded candidate check inside
         //    blob_gc_quarantine / blob_gc_delete.
         // -----------------------------------------------------------------------------------------
@@ -421,7 +421,7 @@ impl GcService {
         // -----------------------------------------------------------------------------------------
         // LOCK ORDER (strictly preserved across all GC mutation paths):
         // 1. self.run_lock: In-process mutual exclusion between concurrent GC executions.
-        // 2. _fs_gc_lock: Cross-process file lock on `quarantine/.lock` (for filesystem backend).
+        // 2. _fs_gc_lock: Cross-process file lock on `quarantine/gc.lock` (for filesystem backend).
         // 3. (auth_guard & consistency_coordinator): Acquired per bounded candidate check inside
         //    blob_gc_delete.
         // -----------------------------------------------------------------------------------------

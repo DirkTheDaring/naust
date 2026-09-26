@@ -1374,6 +1374,11 @@ impl Storage for FsStorage {
         Ok(true)
     }
 
+    /// Accepted design (D7, 2026-09-26 — KI-12/KI-22): renew is deliberately a no-op
+    /// on the filesystem backend. Cross-process mutation exclusivity is provided by
+    /// `RuntimeMutationAuthority` (cluster lock), and the per-repo flock taken at
+    /// acquire time is belt-and-braces scoping within that authority; enforcing a
+    /// second TTL here would add expiry/renewal failure modes without adding safety.
     async fn renew_repo_lease(
         &self,
         _repo: &str,

@@ -81,7 +81,6 @@ impl ManifestReadService {
         &self,
         proxy: &dyn crate::upstream::UpstreamFetcher,
         decision: &crate::upstream::RepoDecision,
-        cache: &Arc<dyn crate::storage::ports::ProxyStoragePort>,
         tag: &str,
         ttl_secs: u64,
         always_revalidate: bool,
@@ -108,7 +107,6 @@ impl ManifestReadService {
                 .fetch_manifest_and_cache(
                     decision,
                     tag,
-                    cache.as_blob_upload_coordinator_storage_port(),
                     self.max_request_body_bytes,
                     false,
                     None,
@@ -128,7 +126,6 @@ impl ManifestReadService {
             .fetch_manifest_and_cache(
                 decision,
                 tag,
-                cache.as_blob_upload_coordinator_storage_port(),
                 self.max_request_body_bytes,
                 true,
                 if_none_match,
@@ -154,7 +151,6 @@ impl ManifestReadService {
                         .fetch_manifest_and_cache(
                             decision,
                             tag,
-                            cache.as_blob_upload_coordinator_storage_port(),
                             self.max_request_body_bytes,
                             false,
                             None,
@@ -208,7 +204,6 @@ impl ManifestReadService {
                         .fetch_manifest_and_cache(
                             decision,
                             tag,
-                            cache,
                             self.max_request_body_bytes,
                             false,
                             None,
@@ -328,9 +323,6 @@ impl ManifestReadService {
                     .fetch_manifest_and_cache(
                         &decision,
                         reference,
-                        target
-                            .cache_storage
-                            .as_blob_upload_coordinator_storage_port(),
                         self.max_request_body_bytes,
                         false,
                         None,
@@ -359,15 +351,8 @@ impl ManifestReadService {
                 }
             }
             TagPolicy::TtlSeconds(ttl) => {
-                self.ensure_tag_fresh(
-                    target.proxy.as_ref(),
-                    &decision,
-                    &target.cache_storage,
-                    reference,
-                    ttl,
-                    false,
-                )
-                .await?;
+                self.ensure_tag_fresh(target.proxy.as_ref(), &decision, reference, ttl, false)
+                    .await?;
                 match target.cache_storage.resolve_tag(repo, reference).await {
                     Ok(d) => Ok(d),
                     Err(StorageError::NotFound) => Err(ManifestReadError::TagNotFound),
@@ -375,15 +360,8 @@ impl ManifestReadService {
                 }
             }
             TagPolicy::AlwaysRevalidate => {
-                self.ensure_tag_fresh(
-                    target.proxy.as_ref(),
-                    &decision,
-                    &target.cache_storage,
-                    reference,
-                    0,
-                    true,
-                )
-                .await?;
+                self.ensure_tag_fresh(target.proxy.as_ref(), &decision, reference, 0, true)
+                    .await?;
                 match target.cache_storage.resolve_tag(repo, reference).await {
                     Ok(d) => Ok(d),
                     Err(StorageError::NotFound) => Err(ManifestReadError::TagNotFound),
@@ -464,7 +442,6 @@ impl ManifestReadService {
                     .fetch_manifest_and_cache(
                         &decision,
                         upstream_ref,
-                        &target.cache_storage,
                         self.max_request_body_bytes,
                         false,
                         None,
@@ -571,7 +548,6 @@ impl ManifestReadService {
                     .fetch_manifest_and_cache(
                         &decision,
                         upstream_ref,
-                        &target.cache_storage,
                         self.max_request_body_bytes,
                         false,
                         None,

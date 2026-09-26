@@ -8,7 +8,7 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex, oneshot};
 
 use registry_rust::cli::{
-    BlobGcCommand, Cli, CliCommand, CliError, CommandIntent, CommandPolicy, MaintenanceRuntime,
+    BlobGcCommand, Cli, CliCommand, CliError, CommandPolicy, MaintenanceRuntime,
     MigrateMembershipCommand, RefIndexCommand, execute_cli, run_cli,
 };
 use registry_rust::config::Config;
@@ -56,125 +56,6 @@ fn create_test_config(temp_dir: &TempDir) -> Config {
     let cfg_path = temp_dir.path().join("test_cfg.toml");
     std::fs::write(&cfg_path, create_test_config_toml(temp_dir)).unwrap();
     Config::from_env_with_files(&[cfg_path]).unwrap()
-}
-
-// ------------------------------------------------------------------------------------------------
-// 1. Exhaustive command intent classification matrix
-// ------------------------------------------------------------------------------------------------
-#[test]
-fn test_command_intent_exhaustive_classification_matrix() {
-    assert_eq!(CliCommand::CheckConfig.intent(), CommandIntent::ReadOnly);
-    assert_eq!(CliCommand::HashSecret.intent(), CommandIntent::ReadOnly);
-    assert_eq!(
-        CliCommand::AuditPermissions.intent(),
-        CommandIntent::ReadOnly
-    );
-    assert_eq!(CliCommand::InspectLock.intent(), CommandIntent::ReadOnly);
-
-    assert_eq!(
-        CliCommand::RefIndex {
-            command: RefIndexCommand::Check
-        }
-        .intent(),
-        CommandIntent::ReadOnly
-    );
-    assert_eq!(
-        CliCommand::RefIndex {
-            command: RefIndexCommand::Rebuild
-        }
-        .intent(),
-        CommandIntent::MutationCapableMaintenance {
-            lock_suffix: "ref-index-rebuild"
-        }
-    );
-    assert_eq!(
-        CliCommand::RefIndex {
-            command: RefIndexCommand::Ensure
-        }
-        .intent(),
-        CommandIntent::MutationCapableMaintenance {
-            lock_suffix: "ref-index-ensure"
-        }
-    );
-
-    assert_eq!(
-        CliCommand::BlobGc {
-            command: BlobGcCommand::Plan {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
-                min_age_secs: 100,
-                max_per_run: 10,
-            }
-        }
-        .intent(),
-        CommandIntent::ReadOnly
-    );
-    assert_eq!(
-        CliCommand::BlobGc {
-            command: BlobGcCommand::Quarantine {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
-                min_age_secs: 100,
-                max_per_run: 10,
-                confirm_all_writers_stopped: true,
-            }
-        }
-        .intent(),
-        CommandIntent::MutationCapableMaintenance {
-            lock_suffix: "blob-gc-quarantine"
-        }
-    );
-    assert_eq!(
-        CliCommand::BlobGc {
-            command: BlobGcCommand::Delete {
-                policy: registry_rust::blob_gc::BlobGcPolicy::ManifestRooted,
-                quarantine_delay_secs: 100,
-                max_per_run: 10,
-                confirm_all_writers_stopped: true,
-            }
-        }
-        .intent(),
-        CommandIntent::MutationCapableMaintenance {
-            lock_suffix: "blob-gc-delete"
-        }
-    );
-
-    assert_eq!(
-        CliCommand::MigrateMembership {
-            command: MigrateMembershipCommand::Plan
-        }
-        .intent(),
-        CommandIntent::ReadOnly
-    );
-    assert_eq!(
-        CliCommand::MigrateMembership {
-            command: MigrateMembershipCommand::Verify
-        }
-        .intent(),
-        CommandIntent::ReadOnly
-    );
-    assert_eq!(
-        CliCommand::MigrateMembership {
-            command: MigrateMembershipCommand::Apply
-        }
-        .intent(),
-        CommandIntent::MutationCapableMaintenance {
-            lock_suffix: "migrate-membership-apply"
-        }
-    );
-
-    assert_eq!(
-        CliCommand::AdminClearLock {
-            expected_owner: "owner".to_string(),
-            expected_etag: "etag".to_string(),
-            confirm: "FORCE".to_string(),
-        }
-        .intent(),
-        CommandIntent::DestructiveAdminRecovery
-    );
-
-    assert_eq!(
-        CliCommand::Server.intent(),
-        CommandIntent::MutationCapableServer
-    );
 }
 
 // ------------------------------------------------------------------------------------------------

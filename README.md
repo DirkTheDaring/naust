@@ -69,6 +69,9 @@ make conformance
 tests/compliance/run.sh fs token # selected matrices only
 ```
 
+Unit/integration tests span both workspace crates (`registry-core` + the server);
+run `cargo test --workspace --locked` — bare `cargo test` covers only the server package.
+
 See `tests/compliance/README.md` for matrices, environment knobs, and the
 historically-skipped-specs runner (`tests/compliance/run-skipped.sh`).
 

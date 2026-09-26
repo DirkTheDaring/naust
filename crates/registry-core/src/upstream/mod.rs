@@ -10,7 +10,7 @@ use crate::manifest_refs::ManifestRefs;
 use crate::policy::{EvictionPolicy, TagPolicy};
 use crate::registry::canonical_name::CanonicalRepoName;
 use crate::registry::digest::Digest;
-use crate::storage::ports::{BlobUploadCoordinatorStoragePort, ProxyStoragePort};
+use crate::storage::ports::ProxyStoragePort;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -118,7 +118,6 @@ pub trait UpstreamFetcher: Send + Sync {
         &self,
         decision: &RepoDecision,
         reference: &str,
-        storage: &dyn BlobUploadCoordinatorStoragePort,
         max_bytes: usize,
         revalidate_only: bool,
         if_none_match: Option<String>,

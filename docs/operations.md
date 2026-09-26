@@ -93,3 +93,8 @@ Cached content lives in a separate root/prefix (`proxy.cache.fs_root` / `cache_s
 - RPM and DEB systemd units diverge (DEB lacks `LimitNOFILE`/`ReadWritePaths`; KI-21).
 - The container image build does not stage the `storage-layer-rust` path dependencies; build viability is unverified (KI-10).
 - Non-Linux hosts: `FsStorage` requires Linux `openat2` and fails closed at startup elsewhere; non-Linux operation is unverified (GATE-O15).
+
+## 6. Development / observability notes (ADR-010 crate split)
+
+- **Log-filter targets:** the FS storage `tracing` targets renamed with the crate split — `registry_rust::storage::fs` → `registry_core::storage::fs`. Update any `RUST_LOG`/collector filters that reference the old target (KI-27b, resolved here).
+- **Test invocation:** the workspace has two crates; bare `cargo test` at the repo root runs only the server package. Use `cargo test --workspace --locked` to include `registry-core`'s ~900 unit tests (KI-27c, resolved here).

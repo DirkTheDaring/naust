@@ -196,3 +196,7 @@ pub enum CliError {
 ## Reconciliation addendum (2026-09-19, `master` `2718bc16`)
 
 The decision stands as implemented. One divergence recorded: an unused parallel classification `CommandIntent` (`src/cli/mod.rs:225-291`) disagrees with the enforced `CommandPolicy` on `migrate-membership verify` (`ReadOnly` vs `ExclusiveInspection`). Tracked as [KI-06](../technical-debt.md); resolution is an unapproved code decision.
+
+## Reconciliation addendum (2026-09-26, technical-debt remediation R0)
+
+KI-06 resolved: the unused `CommandIntent` classification and its exhaustive test were deleted; `CommandPolicy` is the single command-classification source. No behavioral change (the divergent variant was never consulted).

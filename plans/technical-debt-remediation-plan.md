@@ -150,3 +150,13 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 | S4 | Decision drift — D-items answered ad hoc mid-phase | Med | Med | Docket answered before its phase starts; answers recorded in this file + register |
 | S5 | Secret handling (KI-11) — accidental publication | Low | Very high | Hard sequencing rule R5-before-any-push; pre-push checklist includes a tree scan for PEM keys |
 | S6 | Scope creep into core API changes | Med | Med | Core seam changes are named and bounded: R0's trait-param removal, R2's port extension + `cache_eviction` planner. Everything else is server/composition side; core-boundary gate in every phase's acceptance |
+
+---
+
+## Execution log
+
+### R0 learnings (2026-09-26, completed, closes 6 register lines)
+
+* KI-08, KI-13 (both `_storage` seam removal — trait+impl+7 call sites — and the stale branch comments), KI-14, KI-06 (+ ADR-006 addendum), KI-27b/c (operations.md §6 + README), KI-12 recorded per D7 (rationale doc-comment at `renew_repo_lease` + register closure inheriting into GATE-O04's lease row).
+* Learning: `blob_gc_sweep` had **zero** callers even in unit tests (the register's "unit-test only" was already stale) — deletion cost one public fn and nothing else. Removing `_storage` also surfaced and removed a second dead thread: `ensure_tag_fresh`'s unused `cache` parameter.
+* Acceptance: fmt/gate clean; workspace 1488 passed (−1 = deleted CommandIntent matrix test) / 31 env-gated / 14 ignored; conformance fs/basic/token green.

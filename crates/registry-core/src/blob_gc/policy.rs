@@ -329,7 +329,7 @@ mod tests {
 
         let storage = Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
 
-        // Branch 1: storage.kind() == "fs" && fs_root.join("repos").is_ok()
+        // Case 1: fs storage with an existing repos/ tree — contained discovery succeeds.
         assert_eq!(storage.kind(), "fs");
         assert!(tokio::fs::metadata(fs_root.join("repos")).await.is_ok());
         let protected_fs = build_manifest_protected_set(storage.as_ref())
@@ -339,7 +339,8 @@ mod tests {
         assert!(protected_fs.contains(cfg_digest));
         assert!(protected_fs.contains(layer_digest));
 
-        // Branch 2: storage.kind() == "fs" BUT fs_root.join("repos") does not exist
+        // Case 2: contained discovery reads the storage's pinned root, so an unrelated
+        // (even non-existent) ambient path is irrelevant; the port still serves the set.
         let non_existent_root = temp.path().join("non_existent_root");
         assert!(
             tokio::fs::metadata(non_existent_root.join("repos"))
@@ -354,7 +355,7 @@ mod tests {
         assert!(protected_fallback.contains(cfg_digest));
         assert!(protected_fallback.contains(layer_digest));
 
-        // Branch 3: storage.kind() == "s3" (non-fs) even if fs_root.join("repos") exists
+        // Case 3: s3 storage — discovery is served entirely by the storage port.
         let (s3_storage, driver) = crate::storage::s3::tests::create_mock_storage();
         let s3_arc: Arc<dyn GcServiceStoragePort> = Arc::new(s3_storage);
         assert_eq!(s3_arc.kind(), "s3");
