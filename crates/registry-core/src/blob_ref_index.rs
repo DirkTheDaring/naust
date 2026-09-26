@@ -1833,6 +1833,7 @@ mod tests {
 
     crate::impl_storage_ports!(MockStorage);
     crate::impl_gc_storage_port!(MockStorage);
+    crate::impl_cache_eviction_port!(MockStorage);
 
     fn temp_index_path() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

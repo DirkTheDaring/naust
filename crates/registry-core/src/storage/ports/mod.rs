@@ -287,8 +287,57 @@ impl<T: ?Sized> BlobUploadCoordinatorStoragePort for T where
 }
 
 /// Minimum cohesive storage capability required by `ProxyTarget`.
+/// Cache-scoped physical eviction capability (remediation A3/R2, KI-02).
+///
+/// Deliberately permit-free, unlike `GcStoragePort`: the proxy cache store is
+/// exclusively owned by this process (per-upstream roots/prefixes), so the
+/// primary CAS's GC-vs-mutation permit protocol does not apply. Safety comes
+/// from (a) version-conditional deletes on S3 (the enumerated ETag must still
+/// match) and (b) POSIX unlink semantics on FS (a concurrently open read keeps
+/// its handle; a later cache miss re-fetches from upstream).
+#[async_trait]
+pub trait CacheEvictionPort: Send + Sync {
+    async fn list_cache_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError>;
+
+    /// Physically removes one cached blob. `version` is required on S3
+    /// (conditional delete); on FS a `Some` version is validated against the
+    /// live leaf before unlinking.
+    async fn evict_cache_blob(
+        &self,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError>;
+}
+
+#[async_trait]
+impl<T: ?Sized + CacheEvictionPort + Send + Sync> CacheEvictionPort for Arc<T> {
+    async fn list_cache_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        (**self).list_cache_blobs_page(cursor, limit).await
+    }
+    async fn evict_cache_blob(
+        &self,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        (**self).evict_cache_blob(digest, version).await
+    }
+}
+
 pub trait ProxyStoragePort:
-    BlobUploadCoordinatorStoragePort + BlobIndexStoragePort + ReferrersReader + Send + Sync
+    BlobUploadCoordinatorStoragePort
+    + BlobIndexStoragePort
+    + ReferrersReader
+    + CacheEvictionPort
+    + Send
+    + Sync
 {
     fn as_blob_upload_coordinator_storage_port(&self) -> &dyn BlobUploadCoordinatorStoragePort;
     fn as_catalog_reader(&self) -> &dyn RepositoryCatalogReader;
@@ -300,7 +349,12 @@ pub trait ProxyStoragePort:
 
 impl<T> ProxyStoragePort for T
 where
-    T: BlobUploadCoordinatorStoragePort + BlobIndexStoragePort + ReferrersReader + Send + Sync,
+    T: BlobUploadCoordinatorStoragePort
+        + BlobIndexStoragePort
+        + ReferrersReader
+        + CacheEvictionPort
+        + Send
+        + Sync,
 {
     fn as_blob_upload_coordinator_storage_port(&self) -> &dyn BlobUploadCoordinatorStoragePort {
         self
@@ -707,6 +761,32 @@ macro_rules! impl_gc_storage_port {
     };
 }
 
+/// Delegating `CacheEvictionPort` for test doubles that already implement the
+/// omnibus `GcStorage` (listing forwards; eviction is unsupported). The real
+/// backends implement the port manually (contained unlink / conditional delete).
+#[macro_export]
+macro_rules! impl_cache_eviction_port {
+    ($target:ty) => {
+        #[async_trait::async_trait]
+        impl $crate::storage::ports::CacheEvictionPort for $target {
+            async fn list_cache_blobs_page(
+                &self,
+                cursor: Option<&$crate::storage::GcCursor>,
+                limit: usize,
+            ) -> Result<$crate::storage::GcBlobPage, $crate::storage::StorageError> {
+                $crate::storage::GcStorage::list_cas_blobs_page(self, cursor, limit).await
+            }
+            async fn evict_cache_blob(
+                &self,
+                _digest: &$crate::registry::digest::Digest,
+                _version: Option<&$crate::storage::BlobObjectVersion>,
+            ) -> Result<$crate::storage::GcDeleteResult, $crate::storage::StorageError> {
+                Err($crate::storage::StorageError::Unsupported)
+            }
+        }
+    };
+}
+
 impl_storage_ports!(crate::storage::fs::FsStorage);
 impl_storage_ports!(crate::storage::s3::S3Storage);
 
@@ -1073,6 +1153,7 @@ impl StorageWiring {
             + GcServiceStoragePort
             + ClusterLockStore
             + GcStoragePort
+            + CacheEvictionPort
             + StorageReadinessInspector
             + 'static,
     {

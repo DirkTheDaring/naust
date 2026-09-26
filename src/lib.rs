@@ -9,6 +9,7 @@ pub mod auth;
 pub use registry_core::blob_delete_safety;
 pub use registry_core::blob_gc;
 pub use registry_core::blob_ref_index;
+pub use registry_core::cache_eviction;
 pub mod cli;
 pub mod config;
 pub use registry_core::consistency;
@@ -43,7 +44,7 @@ pub use registry_core::upstream;
 #[doc(hidden)]
 pub use registry_core::test_support;
 
-pub use registry_core::{impl_gc_storage_port, impl_storage_ports};
+pub use registry_core::{impl_cache_eviction_port, impl_gc_storage_port, impl_storage_ports};
 
 pub fn install_rustls_crypto_provider() {
     let provider = rustls::crypto::aws_lc_rs::default_provider();

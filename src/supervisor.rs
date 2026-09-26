@@ -1809,6 +1809,27 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl crate::storage::ports::CacheEvictionPort for InjectedProxyStorage {
+        async fn list_cache_blobs_page(
+            &self,
+            _cursor: Option<&crate::storage::GcCursor>,
+            _limit: usize,
+        ) -> Result<crate::storage::GcBlobPage, crate::storage::StorageError> {
+            Ok(crate::storage::GcBlobPage {
+                items: Vec::new(),
+                next_cursor: None,
+            })
+        }
+        async fn evict_cache_blob(
+            &self,
+            _digest: &crate::registry::digest::Digest,
+            _version: Option<&crate::storage::BlobObjectVersion>,
+        ) -> Result<crate::storage::GcDeleteResult, crate::storage::StorageError> {
+            Err(crate::storage::StorageError::Unsupported)
+        }
+    }
+
     impl crate::storage::upload_session::UploadSessionStorage for InjectedProxyStorage {}
     impl crate::storage::repo_membership::RepositoryBlobMembershipStorage for InjectedProxyStorage {}
 

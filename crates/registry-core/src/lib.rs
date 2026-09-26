@@ -48,6 +48,7 @@ pub mod application;
 pub mod blob_delete_safety;
 pub mod blob_gc;
 pub mod blob_ref_index;
+pub mod cache_eviction;
 pub mod consistency;
 pub use consistency::{ConsistencyCoordinator, GcRevalidationGuard, MutationGuard};
 pub mod fs_root_lock;

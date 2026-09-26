@@ -3990,6 +3990,55 @@ fn snapshot_leaf_candidate_version(
 }
 
 #[async_trait]
+impl crate::storage::ports::CacheEvictionPort for FsStorage {
+    async fn list_cache_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        listing::list_cas_blobs_page_impl(self.reader.as_ref(), cursor, limit).await
+    }
+
+    /// Contained unlink of a cached CAS leaf (cache stores only; see the
+    /// trait docs for why this is deliberately permit-free).
+    async fn evict_cache_blob(
+        &self,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        let Some(shard) = self.cas_blobs_shard(digest, false).await? else {
+            return Ok(GcDeleteResult::NotFound);
+        };
+        let leaf = Self::blob_leaf(digest)?;
+
+        if let Some(expected) = version {
+            let handle = match shard.open_leaf_read(&leaf).await {
+                Ok(h) => h,
+                Err(FsMutateError::NotFound) => return Ok(GcDeleteResult::NotFound),
+                Err(err) => return Err(map_fs_mutate_err(err)),
+            };
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let file = handle.into_file();
+                snapshot_leaf_candidate_version(&file)
+            })
+            .await
+            .map_err(map_blocking_join_error)??;
+            if &snapshot.version != expected {
+                return Ok(GcDeleteResult::PreconditionFailed {
+                    current_version: Some(snapshot.version),
+                });
+            }
+        }
+
+        match shard.unlink(&leaf, false).await {
+            Ok(()) => Ok(GcDeleteResult::Deleted),
+            Err(FsMutateError::NotFound) => Ok(GcDeleteResult::NotFound),
+            Err(err) => Err(map_fs_mutate_err(err)),
+        }
+    }
+}
+
+#[async_trait]
 impl GcStorage for FsStorage {
     async fn list_cas_blobs_page(
         &self,

@@ -1381,6 +1381,46 @@ fn map_put_err(
 }
 
 #[async_trait]
+impl crate::storage::ports::CacheEvictionPort for S3Storage {
+    async fn list_cache_blobs_page(
+        &self,
+        cursor: Option<&GcCursor>,
+        limit: usize,
+    ) -> Result<GcBlobPage, StorageError> {
+        GcStorage::list_cas_blobs_page(self, cursor, limit).await
+    }
+
+    /// Version-conditional delete of a cached CAS object (cache prefixes only;
+    /// see the trait docs for why this is deliberately permit-free).
+    async fn evict_cache_blob(
+        &self,
+        digest: &Digest,
+        version: Option<&BlobObjectVersion>,
+    ) -> Result<GcDeleteResult, StorageError> {
+        let Some(version) = version else {
+            return Err(StorageError::conflict(
+                "S3 cache eviction requires the enumerated object version/ETag; unconditional delete is forbidden",
+            ));
+        };
+        let bucket = self.bucket()?;
+        let key = self.blob_key2(digest);
+        let res = self
+            .driver
+            .delete_object_conditional(bucket, &key, Some(version.0.clone()))
+            .await?;
+        match res {
+            ConditionalDeleteResult::Deleted => Ok(GcDeleteResult::Deleted),
+            ConditionalDeleteResult::NotFound => Ok(GcDeleteResult::NotFound),
+            ConditionalDeleteResult::PreconditionFailed { current_version } => {
+                Ok(GcDeleteResult::PreconditionFailed {
+                    current_version: current_version.map(BlobObjectVersion),
+                })
+            }
+        }
+    }
+}
+
+#[async_trait]
 impl GcStorage for S3Storage {
     async fn check_bucket_versioning_for_gc(&self) -> Result<(), StorageError> {
         match self.check_bucket_versioning().await {

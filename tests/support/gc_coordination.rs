@@ -538,6 +538,7 @@ impl Storage for HookedStorage {
 
 registry_rust::impl_storage_ports!(HookedStorage);
 registry_rust::impl_gc_storage_port!(HookedStorage);
+registry_rust::impl_cache_eviction_port!(HookedStorage);
 
 use registry_rust::storage::fs::FsStorage;
 use std::sync::Mutex as StdMutex;
@@ -1118,6 +1119,7 @@ impl Storage for LifecycleFaultStorage {
 
 registry_rust::impl_storage_ports!(LifecycleFaultStorage);
 registry_rust::impl_gc_storage_port!(LifecycleFaultStorage);
+registry_rust::impl_cache_eviction_port!(LifecycleFaultStorage);
 
 #[allow(dead_code)]
 pub fn tmp_dir(prefix: &str) -> PathBuf {
