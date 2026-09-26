@@ -146,6 +146,12 @@ Gate: `scripts/check-core-boundary.sh` / `make core-boundary`.
 * Gate script repointed: forbidden-crate grep over `crates/registry-core` + `cargo check -p registry-core` — the compiler is now the primary boundary. Its first post-split run caught three stale `registry_rust::…` tracing target strings.
 * Verification: gate clean; fmt clean; release build produces `target/release/registry-rust` (G3); conformance matrices fs/basic/token green post-split (s3 + live suite need MinIO → Phase 4).
 
+### Phase 3 learnings (2026-09-26, completed — deliberately thin per plan option, with the example included)
+
+* Shipped: crate-level rustdoc stating the four load-bearing contracts (seven-step finalize with heal-before-pin, five GC axes + capability-based strategy, membership readiness gate, coordinator-per-composition-root); a `prelude` module with the primary surface; and **`examples/minimal_registry.rs` — a complete registry composed from core alone (wiring → authority → ref-index → coordinator → services), executed successfully end-to-end (blob pushes, manifest publish, tag resolve)**. The example is the ADR-010 purpose proof and doubles as consumer documentation.
+* **Deferred (recorded, not forgotten): aggressive `pub` → `pub(crate)` tightening.** The 0.x-unstable posture is declared in the crate manifest; the widened wiring internals from Phase 2 are already `#[doc(hidden)]` or documented as Phase 3 debt. Tightening before a second consumer exists would be speculative churn against a surface that Phase 2's re-export shim still mirrors into `registry_rust::…`.
+* Acceptance: full workspace suite 1489 passed / 31 env-gated / 14 ignored; fmt clean; gate clean; `cargo doc -p registry-core` builds (remaining warnings are pre-existing white-box module docs).
+
 Reverse edge (server → core, legal after split): `proxy.rs:582,662` → `application::{Blob,Manifest}MutationService`.
 
 Verified clean: `membership_migration` (imports only `manifest_refs` + `storage`), `upload_state.rs` (zero crate imports), `consistency`, `fs_root_lock`, `task_supervisor`, `glob` (used only by `request_routing`/`rbac`/`config` — server side); no core production code touches `auth`, `rbac`, `security`, `audit`, or `request_routing`; storage layer imports nothing above it except the listed `config` sites.
