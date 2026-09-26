@@ -1,83 +1,60 @@
 name: ci
 
+# Real pipeline definition (remediation R6). NOTE (KI-19/GATE-O13): this
+# repository has no remote yet, so this workflow has never executed on a
+# hosted runner; it mirrors the local verification commands exactly.
+
 on:
   push:
   pull_request:
 
 jobs:
-  test:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-
-      - name: Build
-        run: cargo build
-
-      - name: Unit tests
-        run: cargo test
-
-      - name: Smoke test
-        env:
-          CARGO_TARGET_DIR: target
-          REGISTRY_USERNAME: demo
-          REGISTRY_PASSWORD: demo
-        run: scripts/smoke.sh
-
-      - name: MinIO Live S3 contract test suite
-        env:
-          TEST_S3_ENDPOINT: "http://127.0.0.1:9000"
-          TEST_S3_REGION: "us-east-1"
-          TEST_S3_BUCKET: "registry-live-test"
-          AWS_ACCESS_KEY_ID: "minioadmin"
-          AWS_SECRET_ACCESS_KEY: "minioadmin"
+      # Sibling path-deps are vendored; stage them where the manifests expect them.
+      - name: Stage vendored path dependencies
         run: |
-          scripts/start-minio.sh
-          cargo test --test s3_live_integration -- --nocapture
+          mkdir -p ../acmecert ../storage-layer-rust
+          cp -a vendor/acmecert/. ../acmecert/
+          cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Core boundary gate (ADR-010)
+        run: make core-boundary
+      - name: Workspace tests
+        run: cargo test --workspace --locked
+      - name: Conformance (fs, basic, token)
+        run: tests/compliance/run.sh fs basic token
 
-      - name: MinIO (S3 backend) smoke test
-        env:
-          REGISTRY_USERNAME: demo
-          REGISTRY_PASSWORD: demo
-        run: scripts/minio-smoke.sh
-
-      - name: Podman smoke test
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y podman openssl
-          CARGO_TARGET_DIR=target REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/podman-smoke.sh
-
-  oci-conformance:
+  live-s3:
     runs-on: ubuntu-latest
+    # GitHub service containers cannot pass a command, and the official
+    # minio/minio image requires `server /data`; bitnami's image is
+    # env-configured and needs none.
+    services:
+      minio:
+        image: bitnami/minio:latest
+        ports: ['9000:9000']
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/ready"
+          --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22.x'
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: pip install pyyaml
-
-      - name: Start MinIO
-        run: scripts/start-minio.sh
-
-      - name: Run OCI Distribution v1.1.1 Conformance (FS and S3)
-        run: tests/compliance/run.sh
-
-      - name: Upload Conformance Artifacts (All Matrices)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: oci-conformance-results
-          path: tests/compliance/results/**
+      - name: Stage vendored path dependencies
+        run: |
+          mkdir -p ../acmecert ../storage-layer-rust
+          cp -a vendor/acmecert/. ../acmecert/
+          cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+      - name: Live S3 suite
+        run: cargo test --locked --test s3_live_integration -- --test-threads=1
+      - name: Conformance (s3)
+        run: tests/compliance/run.sh s3

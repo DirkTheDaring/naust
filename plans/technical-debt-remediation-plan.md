@@ -195,3 +195,9 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 * KI-21's row was partially stale too (DEB already had `ReadWritePaths`); actual gaps were `LimitNOFILE`, `ReadOnlyPaths`, `StateDirectoryMode` — added.
 * KI-10: `make vendor-sync` + Dockerfile staging for `/storage-layer-rust` (workspace manifest included — the crates use `workspace = true` field inheritance). **Container build verified end-to-end: `podman build` exit 0, binary executes in the image** (first verified container build in the register's history).
 * Vendored storage-layer sources are committed under `vendor/`, matching the existing acmecert convention (self-contained container builds).
+
+### R6 learnings (2026-09-26, completed for its LOCAL scope — KI-20 CLOSED; KI-19/GATE-O13 remain owner-blocked per D6)
+
+* Evidence convention: committed `evidence/` directory (convention in `evidence/README.md`); first record `evidence/2026-09-26-debt-remediation/RECORD.md` + JUnit/exit artifacts for all four conformance matrices — closes KI-20's criterion at stated revisions.
+* CI definition rewritten to mirror the real pipeline (fmt → `make core-boundary` → `cargo test --workspace --locked` → conformance fs/basic/token; separate live-S3 job with a MinIO **bitnami** service container — the official image needs a `server` command GH services cannot pass). Vendored path-dep staging included. Honest caveat kept in the file: never executed on a hosted runner (no remote).
+* D6 remains the only open decision: hosting/remote/visibility/release channel. The R5 scrub concern proved moot for git history (key material was never tracked); the pre-push checklist still applies to any future remote (`git ls-files | grep -iE '\\.pem|secret'` should stay empty — verified empty today).
