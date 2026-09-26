@@ -24,6 +24,10 @@ TARBALL := $(SOURCES)/$(NAME)-$(VERSION).tar.gz
 
 .PHONY: sync-version bump-version container image docker-build
 
+.PHONY: conformance
+conformance:
+	tests/compliance/run.sh
+
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 
 .PHONY: rpmlint

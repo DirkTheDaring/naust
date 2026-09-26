@@ -1,52 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs the official OCI Distribution Spec conformance suite (v1.1.1, commit a139cc423184af6078077b9b7ee336eddbd03f8f)
-# against Filesystem, S3 (MinIO), Basic Authentication, and Bearer Token Authentication.
+# Runs the official OCI Distribution Spec conformance suite (v1.1.1) against
+# the current registry implementation.
+#
+# Matrices:
+#   fs     - Filesystem backend, auth strategy "both"   (port 5081)
+#   s3     - S3/MinIO backend,  auth strategy "both"    (port 5082)
+#   basic  - Filesystem backend, Basic authentication   (port 5083)
+#   token  - Filesystem backend, Bearer token auth      (port 5084)
+#
+# Usage:
+#   tests/compliance/run.sh              # all matrices (s3 skipped if MinIO is unreachable)
+#   tests/compliance/run.sh fs token     # selected matrices only (explicit s3 hard-fails without MinIO)
 #
 # Requirements:
-# - git
-# - go (1.20+)
-# - curl
-# - python3 (for YAML report generation)
+# - git, go (1.20+), curl, python3 (+ pyyaml, for the derived YAML report)
+# - for the s3 matrix: MinIO at TEST_S3_ENDPOINT (default http://127.0.0.1:9000),
+#   e.g. via scripts/start-minio.sh
+#
+# The upstream suite is cached under tests/compliance/.cache (pinned commit);
+# results are written under tests/compliance/results/<matrix>/.
 
-DISTRIBUTION_SPEC_REF="${DISTRIBUTION_SPEC_REF:-v1.1.1}"
-DISTRIBUTION_SPEC_COMMIT="a139cc423184af6078077b9b7ee336eddbd03f8f"
+# shellcheck source=tests/compliance/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-RESULTS_BASE="${RESULTS_BASE:-${PWD}/conformance-results}"
-WORK_DIR="$(mktemp -d)"
-
-log() { printf '%s\n' "$*"; }
-need() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Missing required tool: $1" >&2
-    exit 127
-  fi
-}
+RESULTS_BASE="${RESULTS_BASE:-${COMPLIANCE_DIR}/results}"
 
 need git
 need go
 need curl
 need python3
 
-cleanup() {
-  rm -rf "${WORK_DIR}" || true
-}
-trap cleanup EXIT
+S3_ENDPOINT="${TEST_S3_ENDPOINT:-http://127.0.0.1:9000}"
+S3_BUCKET="${TEST_S3_BUCKET:-registry-live-test}"
 
-log "Fetching OCI distribution-spec conformance suite (commit ${DISTRIBUTION_SPEC_COMMIT})"
-git clone https://github.com/opencontainers/distribution-spec "${WORK_DIR}/distribution-spec" >/dev/null 2>&1
-(
-  cd "${WORK_DIR}/distribution-spec"
-  git checkout "${DISTRIBUTION_SPEC_COMMIT}" >/dev/null 2>&1
-)
+ALL_MATRICES=(fs s3 basic token)
+EXPLICIT_SELECTION=0
+if [[ $# -gt 0 ]]; then
+  EXPLICIT_SELECTION=1
+  MATRICES=("$@")
+  for m in "${MATRICES[@]}"; do
+    case "${m}" in
+      fs|s3|basic|token) ;;
+      *)
+        echo "Unknown matrix '${m}' (expected: fs, s3, basic, token)" >&2
+        exit 2
+        ;;
+    esac
+  done
+else
+  MATRICES=("${ALL_MATRICES[@]}")
+fi
 
-log "Building official conformance test harness binary..."
-(
-  cd "${WORK_DIR}/distribution-spec/conformance"
-  go test -c
-)
-HARNESS_BIN="${WORK_DIR}/distribution-spec/conformance/conformance.test"
+cd "${REPO_ROOT}"
+
+ensure_harness
 
 log "Building registry binary..."
 cargo build
@@ -59,8 +68,6 @@ run_matrix() {
   local results_dir="${RESULTS_BASE}/${matrix_name}"
   local data_dir=""
   local prefix=""
-  local s3_endpoint="${TEST_S3_ENDPOINT:-http://127.0.0.1:9000}"
-  local s3_bucket="${TEST_S3_BUCKET:-registry-live-test}"
   local reg_pid=""
   local reg_log="${results_dir}/registry.log"
 
@@ -94,8 +101,8 @@ run_matrix() {
       LISTEN_ADDR="127.0.0.1:${port}" \
       PUBLIC_URL="http://127.0.0.1:${port}" \
       STORAGE_BACKEND=s3 \
-      STORAGE_S3_ENDPOINT="${s3_endpoint}" \
-      STORAGE_S3_BUCKET="${s3_bucket}" \
+      STORAGE_S3_ENDPOINT="${S3_ENDPOINT}" \
+      STORAGE_S3_BUCKET="${S3_BUCKET}" \
       STORAGE_S3_PREFIX="${prefix}" \
       STORAGE_S3_REGION="${TEST_S3_REGION:-us-east-1}" \
       AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}" \
@@ -184,7 +191,7 @@ for tc in testcases:
     })
 
 data = {
-    "spec_version": "v1.1.1",
+    "spec_version": "${DISTRIBUTION_SPEC_REF}",
     "harness_commit": "${DISTRIBUTION_SPEC_COMMIT}",
     "artifact_nature": "derived_summary_from_official_junit_xml",
     "matrix": "${matrix_name}",
@@ -209,18 +216,48 @@ PY
   fi
 }
 
+s3_reachable() {
+  curl -s -o /dev/null --connect-timeout 2 "${S3_ENDPOINT}"
+}
+
 mkdir -p "${RESULTS_BASE}"
 
-log "Starting Matrix 1: Filesystem (unauthenticated / both)"
-run_matrix "fs" "fs" "both" 5081
+RAN=()
+SKIPPED_S3=0
+for m in "${MATRICES[@]}"; do
+  case "${m}" in
+    fs)
+      log "Starting matrix: Filesystem (unauthenticated / both)"
+      run_matrix "fs" "fs" "both" 5081
+      ;;
+    s3)
+      if ! s3_reachable; then
+        if [[ "${EXPLICIT_SELECTION}" == "1" ]]; then
+          echo "Matrix 's3' requested but no S3 endpoint reachable at ${S3_ENDPOINT}." >&2
+          echo "Start MinIO first, e.g.: scripts/start-minio.sh" >&2
+          exit 1
+        fi
+        log "WARNING: skipping matrix 's3' - no S3 endpoint reachable at ${S3_ENDPOINT} (start MinIO via scripts/start-minio.sh to include it)"
+        SKIPPED_S3=1
+        continue
+      fi
+      log "Starting matrix: S3 MinIO (both)"
+      run_matrix "s3" "s3" "both" 5082
+      ;;
+    basic)
+      log "Starting matrix: Basic Authentication (basic)"
+      run_matrix "basic" "fs" "basic" 5083
+      ;;
+    token)
+      log "Starting matrix: Bearer Token Authentication (token)"
+      run_matrix "token" "fs" "token" 5084
+      ;;
+  esac
+  RAN+=("${m}")
+done
 
-log "Starting Matrix 2: S3 MinIO (both)"
-run_matrix "s3" "s3" "both" 5082
-
-log "Starting Matrix 3: Basic Authentication (basic)"
-run_matrix "basic" "fs" "basic" 5083
-
-log "Starting Matrix 4: Bearer Token Authentication (token)"
-run_matrix "token" "fs" "token" 5084
-
-log "All 4 conformance matrices completed successfully with 0 failures!"
+if [[ "${SKIPPED_S3}" == "1" ]]; then
+  log "Conformance matrices completed with 0 failures: ${RAN[*]} (s3 SKIPPED - MinIO unreachable)"
+else
+  log "All conformance matrices completed successfully with 0 failures: ${RAN[*]}"
+fi

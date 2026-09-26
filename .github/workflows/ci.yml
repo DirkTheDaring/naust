@@ -73,11 +73,11 @@ jobs:
         run: scripts/start-minio.sh
 
       - name: Run OCI Distribution v1.1.1 Conformance (FS and S3)
-        run: scripts/oci-conformance.sh
+        run: tests/compliance/run.sh
 
       - name: Upload Conformance Artifacts (All Matrices)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oci-conformance-results
-          path: conformance-results/**
+          path: tests/compliance/results/**

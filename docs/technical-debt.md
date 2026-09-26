@@ -134,7 +134,7 @@ Recorded in now-archived slice documents; obligations preserved here (canonical 
 | ID | Item | Details |
 |---|---|---|
 | KI-19 | **No git remotes on either repository**; `.github/workflows/ci.yml` is a definition with no evidence of ever executing; nothing pushed/published from these clones. | [executed check 2026-09-19]. Feeds GATE-O13. *Criterion:* remotes/hosting decided (GATE-O13). |
-| KI-20 | **Run-evidence artifacts gitignored and stale.** `conformance-results/` local artifacts date 2026-08-26 (baseline era; all matrices exit 0, spec v1.1.1); `dist/` gitignored. No post-refactor conformance or live-MinIO run is recorded anywhere; **current conformance at HEAD is unverified**. | Feeds GATE-O06/O16 and REQ-001/REQ-021 verification columns. *Next:* run + archive evidence at HEAD. *Criterion:* committed/archived run reports at a stated revision. |
+| KI-20 | **Run-evidence artifacts gitignored and stale.** `conformance-results/` local artifacts date 2026-08-26 (baseline era; all matrices exit 0, spec v1.1.1); `dist/` gitignored. No post-refactor conformance or live-MinIO run is recorded anywhere; **current conformance at HEAD is unverified**. (Runner has since moved to `tests/compliance/run.sh`; new results land in `tests/compliance/results/`, also gitignored.) | Feeds GATE-O06/O16 and REQ-001/REQ-021 verification columns. *Next:* run + archive evidence at HEAD. *Criterion:* committed/archived run reports at a stated revision. |
 | — | Gates GATE-O05/O06/O15/O16 verification specifics | see §1. |
 | — | TAG-DEC-01…06, D7 | see §2. |
 

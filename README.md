@@ -53,21 +53,24 @@ CARGO_TARGET_DIR=target2 REGISTRY_USERNAME=demo REGISTRY_PASSWORD=demo scripts/p
 
 ## OCI Distribution conformance (integration test)
 
-This repo runs the OCI Distribution Spec conformance suite as a black-box CI job.
-CI is configured to run Pull + Push + Content Discovery + Content Management workflows.
+This repo runs the official OCI Distribution Spec conformance suite (pinned to v1.1.1)
+as a black-box CI job, covering the Pull + Push + Content Discovery + Content Management
+workflows across four matrices (fs, s3/MinIO, basic auth, bearer token auth).
 
-To run it locally (starts a local registry and writes reports to `./conformance-results`):
-
-```sh
-chmod +x scripts/oci-conformance.sh
-scripts/oci-conformance.sh
-```
-
-To run with Content Discovery + Content Management enabled locally:
+To run it locally (builds the registry, starts throwaway instances, and writes
+reports to `tests/compliance/results/`; the upstream suite is cached under
+`tests/compliance/.cache/` so repeat runs work offline):
 
 ```sh
-OCI_TEST_CONTENT_DISCOVERY=1 OCI_TEST_CONTENT_MANAGEMENT=1 scripts/oci-conformance.sh
+tests/compliance/run.sh          # all matrices (s3 skipped if MinIO is unreachable)
+# or
+make conformance
+
+tests/compliance/run.sh fs token # selected matrices only
 ```
+
+See `tests/compliance/README.md` for matrices, environment knobs, and the
+historically-skipped-specs runner (`tests/compliance/run-skipped.sh`).
 
 ## Run with Docker
 

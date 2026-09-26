@@ -5,15 +5,17 @@ set -euo pipefail
 # historically-skipped specs in junit.xml (env-only setup branches + cross-mount).
 #
 # Requirements:
-# - git
-# - go (1.17+; recommended 1.22+)
-# - curl
+# - git, go (1.20+), curl
 #
 # Notes:
 # - This script runs multiple focused conformance invocations and writes results
-#   under ./conformance-results/skipped/...
+#   under tests/compliance/results/skipped/...
 # - Cross-mount "automatic content discovery" is a registry behavior; we toggle it
 #   via REGISTRY_AUTOMATIC_CROSSMOUNT=1/0.
+# - The upstream suite is cached under tests/compliance/.cache (pinned commit).
+
+# shellcheck source=tests/compliance/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 ADDR="${ADDR:-127.0.0.1:5000}"
 OCI_ROOT_URL="${OCI_ROOT_URL:-http://${ADDR}}"
@@ -22,21 +24,13 @@ OCI_CROSSMOUNT_NAMESPACE="${OCI_CROSSMOUNT_NAMESPACE:-conformance/other}"
 OCI_USERNAME="${OCI_USERNAME:-${REGISTRY_USERNAME:-demo}}"
 OCI_PASSWORD="${OCI_PASSWORD:-${REGISTRY_PASSWORD:-demo}}"
 
-DISTRIBUTION_SPEC_REF="${DISTRIBUTION_SPEC_REF:-v1.1.0}"
-
-RESULTS_BASE="${RESULTS_BASE:-${PWD}/conformance-results/skipped}"
-
-log() { printf '%s\n' "$*"; }
-need() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Missing required tool: $1" >&2
-    exit 127
-  fi
-}
+RESULTS_BASE="${RESULTS_BASE:-${COMPLIANCE_DIR}/results/skipped}"
 
 need git
 need go
 need curl
+
+cd "${REPO_ROOT}"
 
 workdir="$(mktemp -d)"
 registry_data_dir=""
@@ -111,19 +105,7 @@ stop_registry() {
 log "Building registry"
 cargo build
 
-log "Fetching OCI distribution-spec conformance suite (${DISTRIBUTION_SPEC_REF})"
-if git clone --depth 1 --branch "${DISTRIBUTION_SPEC_REF}" https://github.com/opencontainers/distribution-spec "${workdir}/distribution-spec" >/dev/null 2>&1; then
-  :
-else
-  git clone https://github.com/opencontainers/distribution-spec "${workdir}/distribution-spec" >/dev/null
-  (cd "${workdir}/distribution-spec" && git checkout "${DISTRIBUTION_SPEC_REF}" >/dev/null)
-fi
-
-log "Building conformance binary"
-(
-  cd "${workdir}/distribution-spec/conformance"
-  go test -c
-)
+ensure_harness
 
 mkdir -p "${RESULTS_BASE}"
 
@@ -146,7 +128,7 @@ run_conformance() {
     export OCI_DEBUG=0
     export OCI_DELETE_MANIFEST_BEFORE_BLOBS=1
 
-    "${workdir}/distribution-spec/conformance/conformance.test" "$@"
+    "${HARNESS_BIN}" "$@"
   )
 }
 

@@ -435,7 +435,12 @@ pub async fn manifest_by_reference(
 
     let is_digest = Digest::parse(reference).is_ok();
     if !is_digest && !is_valid_tag(reference) {
-        return errors::tag_invalid().into_response();
+        // Only GET/HEAD/DELETE are routed here (PUT validates inside
+        // publish_manifest and keeps 400 TAG_INVALID). A reference that is
+        // neither a well-formed digest nor a well-formed tag cannot name any
+        // manifest, so per the distribution spec (and its conformance suite)
+        // these methods treat it as unknown rather than as a client error.
+        return errors::manifest_unknown().into_response();
     }
 
     let proxy_only = route_mode == V2RouteMode::ProxyOnly;
@@ -522,7 +527,8 @@ pub async fn manifest_by_reference(
                     errors::name_invalid().into_response()
                 }
                 Err(crate::application::ManifestReadError::InvalidTag(_)) => {
-                    errors::tag_invalid().into_response()
+                    // Read path: an invalid tag cannot exist, so report unknown (404).
+                    errors::manifest_unknown().into_response()
                 }
                 Err(crate::application::ManifestReadError::Storage(StorageError::Unsupported)) => {
                     errors::not_implemented().into_response()
@@ -576,7 +582,8 @@ pub async fn manifest_by_reference(
                     errors::name_invalid().into_response()
                 }
                 Err(crate::application::ManifestReadError::InvalidTag(_)) => {
-                    errors::tag_invalid().into_response()
+                    // Read path: an invalid tag cannot exist, so report unknown (404).
+                    errors::manifest_unknown().into_response()
                 }
                 Err(crate::application::ManifestReadError::Storage(StorageError::Unsupported)) => {
                     errors::not_implemented().into_response()

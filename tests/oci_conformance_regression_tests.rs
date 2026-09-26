@@ -633,3 +633,106 @@ async fn test_delete_only_and_pull_only_identities() {
     let del_scopes = del_body["access"].as_array().unwrap();
     assert_eq!(del_scopes[0]["actions"], serde_json::json!(["delete"]));
 }
+
+/// The official conformance suite (v1.1.1) probes GET/HEAD of
+/// `/v2/<name>/manifests/.INVALID_MANIFEST_NAME` and requires 404: a reference
+/// that is neither a well-formed digest nor a well-formed tag cannot name any
+/// manifest, so read paths must report MANIFEST_UNKNOWN rather than a 400
+/// validation error. Regression: this returned 400 TAG_INVALID at one point.
+#[tokio::test]
+async fn test_invalid_manifest_reference_is_unknown_on_read_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_guard, base_url) = start_server(&tmp, "both", Some("demo"), Some("demo")).await;
+    let client = reqwest::Client::new();
+
+    for reference in [".INVALID_MANIFEST_NAME", "sha256:zzz", "-leadingdash"] {
+        let get_res = client
+            .get(format!("{base_url}/v2/test/repo/manifests/{reference}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get_res.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "GET manifest with invalid reference {reference:?} must be 404"
+        );
+        let body: serde_json::Value = get_res.json().await.unwrap();
+        assert_eq!(
+            body["errors"][0]["code"], "MANIFEST_UNKNOWN",
+            "GET invalid reference {reference:?} must report MANIFEST_UNKNOWN"
+        );
+
+        let head_res = client
+            .head(format!("{base_url}/v2/test/repo/manifests/{reference}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head_res.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "HEAD manifest with invalid reference {reference:?} must be 404"
+        );
+
+        let del_res = client
+            .delete(format!("{base_url}/v2/test/repo/manifests/{reference}"))
+            .basic_auth("demo", Some("demo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            del_res.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "DELETE manifest with invalid reference {reference:?} must be 404"
+        );
+        let body: serde_json::Value = del_res.json().await.unwrap();
+        assert_eq!(
+            body["errors"][0]["code"], "MANIFEST_UNKNOWN",
+            "DELETE invalid reference {reference:?} must report MANIFEST_UNKNOWN"
+        );
+    }
+}
+
+/// Counterpart to the read-path 404 behavior: pushing a manifest to an invalid
+/// tag is a client error and must keep returning 400 TAG_INVALID.
+#[tokio::test]
+async fn test_invalid_tag_on_manifest_push_stays_tag_invalid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_guard, base_url) = start_server(&tmp, "both", Some("demo"), Some("demo")).await;
+    let client = reqwest::Client::new();
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            // sha256 of "{}" (the canonical empty config)
+            "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "size": 2
+        },
+        "layers": []
+    });
+
+    let put_res = client
+        .put(format!(
+            "{base_url}/v2/test/repo/manifests/.INVALID_MANIFEST_NAME"
+        ))
+        .basic_auth("demo", Some("demo"))
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .body(manifest.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        put_res.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "PUT manifest to invalid tag must remain 400"
+    );
+    let body: serde_json::Value = put_res.json().await.unwrap();
+    assert_eq!(
+        body["errors"][0]["code"], "TAG_INVALID",
+        "PUT manifest to invalid tag must report TAG_INVALID"
+    );
+}

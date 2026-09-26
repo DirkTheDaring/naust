@@ -8,3 +8,5 @@
 /dist
 /tls
 /conformance-results
+/tests/compliance/.cache
+/tests/compliance/results
