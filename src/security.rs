@@ -628,8 +628,13 @@ mod tests {
         let err = verify_bearer_token("k", "payload+sig").expect_err("format");
         assert!(matches!(err, TokenError::InvalidFormat));
 
-        // Proper structure but invalid base64/signature should not look like a format issue.
-        let err = verify_bearer_token("k", "cGF5bG9hZA.sig").expect_err("signature");
+        // Two-part tokens are the upload-state construction, not bearers.
+        let err = verify_bearer_token("k", "cGF5bG9hZA.sig").expect_err("two-part");
+        assert!(matches!(err, TokenError::InvalidFormat));
+
+        // Three-part structure with a bad signature is an invalid signature.
+        let err =
+            verify_bearer_token("k", "eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.sig").expect_err("signature");
         assert!(matches!(err, TokenError::InvalidSignature));
     }
 

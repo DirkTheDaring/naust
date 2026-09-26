@@ -1009,10 +1009,10 @@ async fn test_handler_put_finalize_with_valid_state_accepted() {
         .await
         .unwrap();
 
-    let key = b"test-signing-key";
+    let key = crate::security::upload_state_signing_key(b"test-signing-key");
     let state_token =
         crate::http_api::upload_state::UploadStateData::new(repo, &uuid, chunk.len() as u64)
-            .encode_and_sign(key);
+            .encode_and_sign(&key);
 
     let mut hasher = sha2::Sha256::new();
     sha2::Digest::update(&mut hasher, chunk);
@@ -1046,10 +1046,10 @@ async fn test_handler_put_finalize_with_stale_offset_rejected() {
         .await
         .unwrap();
 
-    let key = b"test-signing-key";
+    let key = crate::security::upload_state_signing_key(b"test-signing-key");
     // Stale offset 0 when stored offset is 20
     let state_token =
-        crate::http_api::upload_state::UploadStateData::new(repo, &uuid, 0).encode_and_sign(key);
+        crate::http_api::upload_state::UploadStateData::new(repo, &uuid, 0).encode_and_sign(&key);
 
     let mut hasher = sha2::Sha256::new();
     sha2::Digest::update(&mut hasher, chunk);
@@ -1083,13 +1083,13 @@ async fn test_handler_put_finalize_with_wrong_uuid_rejected() {
         .await
         .unwrap();
 
-    let key = b"test-signing-key";
+    let key = crate::security::upload_state_signing_key(b"test-signing-key");
     let state_token = crate::http_api::upload_state::UploadStateData::new(
         repo,
         "00000000-0000-0000-0000-000000000000",
         chunk.len() as u64,
     )
-    .encode_and_sign(key);
+    .encode_and_sign(&key);
 
     let mut hasher = sha2::Sha256::new();
     sha2::Digest::update(&mut hasher, chunk);
@@ -1123,13 +1123,13 @@ async fn test_handler_put_finalize_with_wrong_repo_rejected() {
         .await
         .unwrap();
 
-    let key = b"test-signing-key";
+    let key = crate::security::upload_state_signing_key(b"test-signing-key");
     let state_token = crate::http_api::upload_state::UploadStateData::new(
         "library/other-repo",
         &uuid,
         chunk.len() as u64,
     )
-    .encode_and_sign(key);
+    .encode_and_sign(&key);
 
     let mut hasher = sha2::Sha256::new();
     sha2::Digest::update(&mut hasher, chunk);
@@ -1224,11 +1224,11 @@ async fn test_handler_put_finalize_with_final_body_pre_append_offset_validated()
         .await
         .unwrap();
 
-    let key = b"test-signing-key";
+    let key = crate::security::upload_state_signing_key(b"test-signing-key");
     // Pre-append offset is chunk1.len()
     let state_token =
         crate::http_api::upload_state::UploadStateData::new(repo, &uuid, chunk1.len() as u64)
-            .encode_and_sign(key);
+            .encode_and_sign(&key);
 
     let mut total_bytes = chunk1.to_vec();
     total_bytes.extend_from_slice(chunk2);
@@ -1282,9 +1282,9 @@ async fn test_handler_patch_stale_offset_rejected() {
         .await
         .unwrap();
 
-    let key = b"test-signing-key";
+    let key = crate::security::upload_state_signing_key(b"test-signing-key");
     let state_token =
-        crate::http_api::upload_state::UploadStateData::new(repo, &uuid, 0).encode_and_sign(key);
+        crate::http_api::upload_state::UploadStateData::new(repo, &uuid, 0).encode_and_sign(&key);
 
     let mut query = std::collections::HashMap::new();
     query.insert("_state".to_string(), state_token);
