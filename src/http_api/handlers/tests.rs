@@ -566,6 +566,7 @@ fn minimal_config_for_token_tests() -> Config {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], 5000)),
         tls_cert_path: None,
         tls_key_path: None,
+        tls_reload_poll_secs: 300,
         tls_acme: None,
         auth_strategy: crate::config::AuthStrategy::Token,
         anonymous_pull: true,

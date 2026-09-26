@@ -1168,4 +1168,90 @@ mod tests {
             } if repository == "journal-repo"
         ));
     }
+
+    /// Restored from the deleted sweep test (R1 correction): the plan and
+    /// deletion behavior on the S3 mock — orphan eligible + deleted, pinned
+    /// blob protected — must stay covered without the removed sweep wrapper.
+    #[tokio::test]
+    async fn test_blob_gc_plan_and_delete_s3() {
+        let (s3_storage, driver) = crate::storage::s3::mock::create_mock_storage();
+        let s3_arc = Arc::new(s3_storage);
+        let storage: Arc<dyn storage::GcServiceStoragePort> = s3_arc.clone();
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(BlobRefIndex::open(temp.path().join("index.sled")).unwrap());
+        idx.ensure_healthy_or_rebuild(storage.as_ref(), true, true)
+            .await
+            .unwrap();
+
+        let fs_root = temp.path().to_path_buf();
+
+        let cluster_lock: Arc<dyn storage::ClusterLockStore> = s3_arc.clone();
+        let authority = RuntimeMutationAuthority::acquire(cluster_lock, "test-gc")
+            .await
+            .unwrap();
+
+        let orphan_bytes = b"orphan payload for gc";
+        let orphan_hash = sha2::Sha256::digest(orphan_bytes);
+        let orphan_hex = hex::encode(orphan_hash);
+        let orphan_key = format!("blobs/sha256/{}/{}", &orphan_hex[0..2], &orphan_hex);
+        driver.objects.lock().unwrap().insert(
+            orphan_key.clone(),
+            (
+                bytes::Bytes::from_static(orphan_bytes),
+                "\"etag_orphan\"".to_string(),
+            ),
+        );
+
+        let pinned_bytes = b"pinned payload in-flight";
+        let pinned_hash = sha2::Sha256::digest(pinned_bytes);
+        let pinned_hex = hex::encode(pinned_hash);
+        let pinned_digest = Digest::parse(&format!("sha256:{pinned_hex}")).unwrap();
+        let pinned_key = format!("blobs/sha256/{}/{}", &pinned_hex[0..2], &pinned_hex);
+        driver.objects.lock().unwrap().insert(
+            pinned_key.clone(),
+            (
+                bytes::Bytes::from_static(pinned_bytes),
+                "\"etag_pinned\"".to_string(),
+            ),
+        );
+        idx.pin_blob(
+            &pinned_digest,
+            SystemTime::now() + Duration::from_secs(3600),
+            "op-1",
+        )
+        .unwrap();
+
+        let coordinator = crate::consistency::ConsistencyCoordinator::new();
+        let authority_arc = Arc::new(Mutex::new(Some(authority)));
+
+        let stats = blob_gc_plan(
+            &storage,
+            &idx,
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            BlobGcLimits::unlimited(100),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.eligible_blobs, 1);
+
+        let delete_stats = blob_gc_delete(
+            &fs_root,
+            &storage,
+            &idx,
+            &coordinator,
+            &authority_arc,
+            BlobGcPolicy::ManifestRooted,
+            Duration::from_secs(0),
+            BlobGcLimits::unlimited(100),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(delete_stats.deleted_blobs, 1);
+        assert!(!driver.objects.lock().unwrap().contains_key(&orphan_key));
+        assert!(driver.objects.lock().unwrap().contains_key(&pinned_key));
+    }
 }

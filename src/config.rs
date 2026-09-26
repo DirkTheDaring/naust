@@ -99,6 +99,8 @@ pub struct Config {
 
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
+    // Poll interval for detecting externally renewed cert/key files (hot reload).
+    pub tls_reload_poll_secs: u64,
 
     pub tls_acme: Option<AcmeConfig>,
 
@@ -517,6 +519,11 @@ pub struct AcmeConfig {
     pub output_dir: PathBuf,
     pub allow_first_wildcard: bool,
     pub renewal_window_secs: u64,
+    // Interval between runtime renewal attempts (the ACME call itself renews only
+    // inside `renewal_window`).
+    pub renew_check_interval_secs: u64,
+    // Break-glass: serve despite a SAN/name mismatch at startup.
+    pub allow_san_mismatch: bool,
     pub proxy: Option<String>,
     pub debug: bool,
     pub propagation_check_disabled: bool,
@@ -824,6 +831,8 @@ struct FileTls {
     cert_path: Option<String>,
     #[serde(default)]
     key_path: Option<String>,
+    #[serde(default)]
+    reload_poll_secs: Option<u64>,
 
     #[serde(default)]
     acme: FileTlsAcme,
@@ -853,6 +862,12 @@ struct FileTlsAcme {
 
     #[serde(default)]
     renewal_window_secs: Option<u64>,
+
+    #[serde(default)]
+    renew_check_interval_secs: Option<u64>,
+
+    #[serde(default)]
+    allow_san_mismatch: Option<bool>,
 
     // Optional HTTP proxy for ACME + hook calls.
     #[serde(default)]
@@ -1337,6 +1352,20 @@ impl Config {
             .or(file_cfg.server.tls.acme.renewal_window_secs)
             .unwrap_or(30 * 24 * 60 * 60);
 
+            let renew_check_interval_secs = env_u64_opt(&[
+                "REGISTRY__SERVER__TLS__ACME__RENEW_CHECK_INTERVAL_SECS",
+                "TLS_ACME_RENEW_CHECK_INTERVAL_SECS",
+            ])?
+            .or(file_cfg.server.tls.acme.renew_check_interval_secs)
+            .unwrap_or(12 * 60 * 60);
+
+            let allow_san_mismatch = env_bool_opt(&[
+                "REGISTRY__SERVER__TLS__ACME__ALLOW_SAN_MISMATCH",
+                "TLS_ACME_ALLOW_SAN_MISMATCH",
+            ])?
+            .or(file_cfg.server.tls.acme.allow_san_mismatch)
+            .unwrap_or(false);
+
             let proxy = env_str_opt(&["REGISTRY__SERVER__TLS__ACME__PROXY", "TLS_ACME_PROXY"])
                 .or_else(|| file_cfg.server.tls.acme.proxy.clone())
                 .map(|s| s.trim().to_string())
@@ -1442,6 +1471,8 @@ impl Config {
                 output_dir,
                 allow_first_wildcard,
                 renewal_window_secs,
+                renew_check_interval_secs,
+                allow_san_mismatch,
                 proxy,
                 debug,
                 propagation_check_disabled,
@@ -2697,10 +2728,18 @@ impl Config {
             });
         }
 
+        let tls_reload_poll_secs = env_u64_opt(&[
+            "REGISTRY__SERVER__TLS__RELOAD_POLL_SECS",
+            "TLS_RELOAD_POLL_SECS",
+        ])?
+        .or(file_cfg.server.tls.reload_poll_secs)
+        .unwrap_or(300);
+
         Ok(Self {
             listen_addr,
             tls_cert_path,
             tls_key_path,
+            tls_reload_poll_secs,
             tls_acme,
             push_username,
             push_password,

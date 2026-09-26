@@ -61,39 +61,44 @@ pub struct SupervisorOptions {
     pub notify_bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 }
 
-async fn maybe_generate_tls_certs(cfg: &Config) {
-    let Some(acme) = cfg.tls_acme.as_ref() else {
-        return;
-    };
+#[derive(Debug)]
+pub(crate) enum AcmeAttemptError {
+    /// Invalid ACME configuration — fatal at startup (exit 2), never retried.
+    Config(String),
+    /// Provisioning/renewal attempt failed — retried by the TLS manager;
+    /// startup falls back to an existing certificate when present.
+    Provisioning(String),
+}
 
+impl std::fmt::Display for AcmeAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(m) => write!(f, "acme config: {m}"),
+            Self::Provisioning(m) => write!(f, "acme provisioning: {m}"),
+        }
+    }
+}
+
+/// One ACME provisioning/renewal attempt (renews only inside `renewal_window`).
+/// Non-exiting: callable at startup AND from the runtime TLS manager (KI-01).
+pub(crate) async fn try_acme_renewal(
+    acme: &crate::config::AcmeConfig,
+) -> Result<(), AcmeAttemptError> {
     use acmecert_core::prefab::{ExecHook, IsponeHttpHook};
     use acmecert_core::types::{AuthorizationHeader, ProxyUrl};
-
-    tracing::info!(
-        output_dir = %acme.output_dir.display(),
-        names = ?acme.names,
-        provider = %match &acme.provider {
-            crate::config::AcmeProvider::Ispone { .. } => "ispone",
-            crate::config::AcmeProvider::ExecPath { .. } => "exec_path",
-        },
-        "acme: ensuring TLS certificate"
-    );
 
     let proxy = match acme.proxy.as_deref() {
         Some(s) => match s.parse::<ProxyUrl>() {
             Ok(p) => Some(p),
             Err(_) => {
-                tracing::error!(
-                    proxy = %s,
-                    output_dir = %acme.output_dir.display(),
-                    names = ?acme.names,
-                    "acme.proxy is not a valid URL"
-                );
-                std::process::exit(2);
+                return Err(AcmeAttemptError::Config(format!(
+                    "acme.proxy is not a valid URL: {s}"
+                )));
             }
         },
         None => None,
     };
+    let _ = &proxy;
 
     let propagation_check = acmecert_core::api::PropagationCheck::from_flags(
         acme.propagation_check_disabled,
@@ -117,90 +122,83 @@ async fn maybe_generate_tls_certs(cfg: &Config) {
             base_url,
             authorization,
         } => {
-            let authorization = match AuthorizationHeader::from_token_or_header_value(authorization)
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        output_dir = %acme.output_dir.display(),
-                        names = ?acme.names,
-                        "acme.ispone.authorization is invalid"
-                    );
-                    std::process::exit(2);
-                }
-            };
-
-            let hook = match IsponeHttpHook::new(base_url.clone(), authorization, proxy, acme.debug)
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        base_url = %base_url,
-                        output_dir = %acme.output_dir.display(),
-                        names = ?acme.names,
-                        "failed to initialize ispone hook"
-                    );
-                    std::process::exit(1);
-                }
-            };
-
-            if let Err(e) = acmecert_core::simple::generate_pem_dir(req, opts, &hook).await {
-                let cert_path = acme.output_dir.join("cert.pem");
-                let key_path = acme.output_dir.join("key.pem");
-                if cert_path.exists() && key_path.exists() {
-                    tracing::warn!(
-                        error = %e,
-                        cert_path = %cert_path.display(),
-                        key_path = %key_path.display(),
-                        "acme: provisioning failed; using existing certificate"
-                    );
-                } else {
-                    tracing::error!(
-                        error = ?e,
-                        cert_path = %cert_path.display(),
-                        key_path = %key_path.display(),
-                        output_dir = %acme.output_dir.display(),
-                        names = ?acme.names,
-                        "acme: provisioning failed and no existing certificate is present"
-                    );
-                    std::process::exit(1);
-                }
-            }
+            let authorization = AuthorizationHeader::from_token_or_header_value(authorization)
+                .map_err(|e| {
+                    AcmeAttemptError::Config(format!("acme.ispone.authorization is invalid: {e}"))
+                })?;
+            let hook = IsponeHttpHook::new(base_url.clone(), authorization, proxy, acme.debug)
+                .map_err(|e| {
+                    AcmeAttemptError::Config(format!(
+                        "failed to initialize ispone hook (base_url {base_url}): {e}"
+                    ))
+                })?;
+            acmecert_core::simple::generate_pem_dir(req, opts, &hook)
+                .await
+                .map(|_provisioned| ())
+                .map_err(|e| AcmeAttemptError::Provisioning(format!("{e:?}")))
         }
         crate::config::AcmeProvider::ExecPath { exec_path } => {
             let hook = ExecHook {
                 path: exec_path.clone(),
                 debug: acme.debug,
             };
+            acmecert_core::simple::generate_pem_dir(req, opts, &hook)
+                .await
+                .map(|_provisioned| ())
+                .map_err(|e| AcmeAttemptError::Provisioning(format!("{e:?}")))
+        }
+    }
+}
 
-            if let Err(e) = acmecert_core::simple::generate_pem_dir(req, opts, &hook).await {
-                let cert_path = acme.output_dir.join("cert.pem");
-                let key_path = acme.output_dir.join("key.pem");
-                if cert_path.exists() && key_path.exists() {
-                    tracing::warn!(
-                        error = %e,
-                        cert_path = %cert_path.display(),
-                        key_path = %key_path.display(),
-                        "acme: provisioning failed; using existing certificate"
-                    );
-                } else {
-                    tracing::error!(
-                        error = ?e,
-                        cert_path = %cert_path.display(),
-                        key_path = %key_path.display(),
-                        output_dir = %acme.output_dir.display(),
-                        names = ?acme.names,
-                        "acme: provisioning failed and no existing certificate is present"
-                    );
-                    std::process::exit(1);
-                }
+async fn maybe_generate_tls_certs(cfg: &Config) {
+    let Some(acme) = cfg.tls_acme.as_ref() else {
+        return;
+    };
+
+    tracing::info!(
+        output_dir = %acme.output_dir.display(),
+        names = ?acme.names,
+        provider = %match &acme.provider {
+            crate::config::AcmeProvider::Ispone { .. } => "ispone",
+            crate::config::AcmeProvider::ExecPath { .. } => "exec_path",
+        },
+        "acme: ensuring TLS certificate"
+    );
+
+    match try_acme_renewal(acme).await {
+        Ok(()) => tracing::info!("acme: TLS certificate ready"),
+        Err(AcmeAttemptError::Config(msg)) => {
+            tracing::error!(
+                error = %msg,
+                output_dir = %acme.output_dir.display(),
+                names = ?acme.names,
+                "acme configuration is invalid"
+            );
+            std::process::exit(2);
+        }
+        Err(AcmeAttemptError::Provisioning(msg)) => {
+            let cert_path = acme.output_dir.join("cert.pem");
+            let key_path = acme.output_dir.join("key.pem");
+            if cert_path.exists() && key_path.exists() {
+                tracing::warn!(
+                    error = %msg,
+                    cert_path = %cert_path.display(),
+                    key_path = %key_path.display(),
+                    "acme: provisioning failed; using existing certificate"
+                );
+            } else {
+                tracing::error!(
+                    error = %msg,
+                    cert_path = %cert_path.display(),
+                    key_path = %key_path.display(),
+                    output_dir = %acme.output_dir.display(),
+                    names = ?acme.names,
+                    "acme: provisioning failed and no existing certificate is present"
+                );
+                std::process::exit(1);
             }
         }
     }
-
-    tracing::info!("acme: TLS certificate ready");
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -382,7 +380,7 @@ pub async fn run_server_supervisor(
     let mut shutdown_rx = opts.shutdown_rx;
 
     if let (Some(cert), Some(key)) = (tls_cert_path, tls_key_path) {
-        let tls = match axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await {
+        let tls = match axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await {
             Ok(t) => t,
             Err(err) => {
                 let _ = supervisor.shutdown().await;
@@ -390,6 +388,52 @@ pub async fn run_server_supervisor(
                 return Err(format!("load TLS cert/key: {err}"));
             }
         };
+
+        // TLS lifecycle (KI-01): SAN preflight (fail-closed for ACME-managed
+        // certs) and a supervised renewal/reload watcher.
+        let acme_cfg = state.config.tls_acme.clone();
+        if let Some(acme) = acme_cfg.as_ref() {
+            if let Err(msg) =
+                crate::tls_manager::preflight_startup(&cert, &acme.names, acme.allow_san_mismatch)
+            {
+                let _ = supervisor.shutdown().await;
+                let _ = runtime.release_mutation_authority().await;
+                return Err(format!("tls preflight: {msg}"));
+            }
+        } else {
+            match crate::tls_manager::inspect_cert_pem(&cert) {
+                Ok(summary) => tracing::info!(
+                    cert = %cert.display(),
+                    sans = ?summary.sans,
+                    not_after = %summary.not_after,
+                    "tls: certificate loaded (externally managed; SANs not enforced)"
+                ),
+                Err(e) => tracing::warn!(error = %e, "tls: could not inspect certificate"),
+            }
+        }
+        let watch_interval = match acme_cfg.as_ref() {
+            Some(acme) => Duration::from_secs(acme.renew_check_interval_secs.max(1)),
+            None => Duration::from_secs(state.config.tls_reload_poll_secs.max(1)),
+        };
+        let watcher = Arc::new(crate::tls_manager::TlsWatcher::new(
+            cert.clone(),
+            key.clone(),
+            acme_cfg.as_ref().map(|a| a.names.clone()),
+            acme_cfg,
+            tls.clone(),
+        ));
+        supervisor
+            .spawn_loop(
+                "tls_manager",
+                TaskClassification::LongLivedTask,
+                watch_interval,
+                None,
+                move || {
+                    let w = watcher.clone();
+                    async move { w.tick_once().await }
+                },
+            )
+            .await;
 
         injector.record_event("listener_bound").await;
         if let Err(e) = injector.on_phase(StartupPhase::ListenerBound).await {

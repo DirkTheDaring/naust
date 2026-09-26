@@ -343,7 +343,7 @@ async fn test_routing_some_empty_proves_catalog_fallback_avoided() {
     let base_storage: Arc<dyn GcServiceStoragePort> =
         Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
     let recording = RecordingGcServiceStoragePort::new(base_storage, true);
-    let cfg = Config::from_env_with_files(&[]).unwrap();
+    let _cfg = Config::from_env_with_files(&[]).unwrap();
 
     // Directly calling discover_manifest_references returns Some(empty)
     let refs = recording
@@ -380,7 +380,7 @@ async fn test_routing_err_fails_closed_proving_catalog_fallback_avoided() {
     let base_storage: Arc<dyn GcServiceStoragePort> =
         Arc::new(FsStorage::new(fs_root.clone(), 50 * 1024 * 1024));
     let recording = RecordingGcServiceStoragePort::new(base_storage, true);
-    let cfg = Config::from_env_with_files(&[]).unwrap();
+    let _cfg = Config::from_env_with_files(&[]).unwrap();
 
     let err = build_manifest_protected_set(&recording).await.unwrap_err();
 

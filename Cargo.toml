@@ -50,9 +50,11 @@ registry-core = { path = "crates/registry-core" }
 storage-core = { path = "../storage-layer-rust/crates/storage-core" }
 storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
 storage-s3 = { path = "../storage-layer-rust/crates/storage-s3" }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 registry-core = { path = "crates/registry-core", features = ["test-mocks"] }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
+rcgen = "0.14.10"

@@ -158,5 +158,14 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 ### R0 learnings (2026-09-26, completed, closes 6 register lines)
 
 * KI-08, KI-13 (both `_storage` seam removal — trait+impl+7 call sites — and the stale branch comments), KI-14, KI-06 (+ ADR-006 addendum), KI-27b/c (operations.md §6 + README), KI-12 recorded per D7 (rationale doc-comment at `renew_repo_lease` + register closure inheriting into GATE-O04's lease row).
-* Learning: `blob_gc_sweep` had **zero** callers even in unit tests (the register's "unit-test only" was already stale) — deletion cost one public fn and nothing else. Removing `_storage` also surfaced and removed a second dead thread: `ensure_tag_fresh`'s unused `cache` parameter.
+* Learning (CORRECTED during R1): `blob_gc_sweep` had no production callers, but its removal also deleted `test_blob_gc_plan_and_sweep_s3`, which bundled valuable plan/pin assertions on the S3 mock. The R1 verification's test-count reconciliation (1493 ≠ expected 1494) caught the loss; the coverage was restored as `test_blob_gc_plan_and_delete_s3` (plan + delete legs, no sweep). Lesson: when deleting a dead entry point, split its tests, don't delete them. Removing `_storage` also surfaced and removed a second dead thread: `ensure_tag_fresh`'s unused `cache` parameter.
 * Acceptance: fmt/gate clean; workspace 1488 passed (−1 = deleted CommandIntent matrix test) / 31 env-gated / 14 ignored; conformance fs/basic/token green.
+
+### R1 learnings (2026-09-26, completed — KI-01 CLOSED)
+
+* Delivered per corrected A2: `src/tls_manager.rs` (inspect/SAN-coverage/preflight + a testable `tick` and a `TlsWatcher` for `spawn_loop`), `try_acme_renewal` extracted from the startup-only provisioning (non-exiting; `Config` errors stay fatal at startup with the original exit codes, provisioning errors keep the existing-cert fallback), supervisor wiring (fail-closed ACME SAN preflight; log-only inspection for external certs; supervised `tls_manager` task at `renew_check_interval_secs`/`tls_reload_poll_secs`).
+* New knobs: `server.tls.acme.renew_check_interval_secs` (43200), `server.tls.acme.allow_san_mismatch` (false), `server.tls.reload_poll_secs` (300) — TOML + env + README table + operations.md §3 rewritten.
+* Deps added: `x509-parser` (runtime, parse-only), `rcgen` (dev).
+* **Criterion proven end-to-end**: `tests/tls_reload_tests.rs` binds ONCE, then verifies via real rustls handshakes that five successive renewals are served without restart and that a SAN-mismatched renewal is refused (old cert keeps serving). Unit matrix covers wildcard/multi-label/case SAN rules, fingerprint dedup, renewal-failure survival, garbage-PEM refusal.
+* Behavioral note: renewal now also happens per-tick at runtime; a *renewal* failure is log-and-retry (never exits), preserving the startup contract exactly.
+* Acceptance: fmt/gate clean; workspace 1494 passed (+5 unit, +1 e2e, +1 restored S3 GC test, −1 sweep-bundled test) / 31 env-gated / 14 ignored; conformance fs/basic/token green.

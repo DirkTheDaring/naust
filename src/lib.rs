@@ -34,6 +34,7 @@ pub use registry_core::storage;
 pub mod storage_wiring;
 pub mod supervisor;
 pub mod task_supervisor;
+pub mod tls_manager;
 pub mod token_rate_limit;
 pub use registry_core::upload_coordinator;
 pub use registry_core::upload_lifecycle;

@@ -529,6 +529,9 @@ key = "<old-long-random-secret>"
 | TLS ACME names | `server.tls.acme.names` | `REGISTRY__SERVER__TLS__ACME__NAMES` | `TLS_ACME_NAMES` | unset |
 | TLS ACME output dir | `server.tls.acme.output_dir` | `REGISTRY__SERVER__TLS__ACME__OUTPUT_DIR` | `TLS_ACME_OUTPUT_DIR` | unset |
 | TLS ACME renewal window | `server.tls.acme.renewal_window_secs` | `REGISTRY__SERVER__TLS__ACME__RENEWAL_WINDOW_SECS` | `TLS_ACME_RENEWAL_WINDOW_SECS` | `2592000` |
+| TLS ACME renew check interval | `server.tls.acme.renew_check_interval_secs` | `REGISTRY__SERVER__TLS__ACME__RENEW_CHECK_INTERVAL_SECS` | `TLS_ACME_RENEW_CHECK_INTERVAL_SECS` | `43200` |
+| TLS ACME allow SAN mismatch | `server.tls.acme.allow_san_mismatch` | `REGISTRY__SERVER__TLS__ACME__ALLOW_SAN_MISMATCH` | `TLS_ACME_ALLOW_SAN_MISMATCH` | `false` |
+| TLS reload poll (external certs) | `server.tls.reload_poll_secs` | `REGISTRY__SERVER__TLS__RELOAD_POLL_SECS` | `TLS_RELOAD_POLL_SECS` | `300` |
 | TLS ACME debug | `server.tls.acme.debug` | `REGISTRY__SERVER__TLS__ACME__DEBUG` | `TLS_ACME_DEBUG` | off |
 | TLS ACME proxy | `server.tls.acme.proxy` | `REGISTRY__SERVER__TLS__ACME__PROXY` | `TLS_ACME_PROXY` | unset |
 | TLS ACME ispone base URL | `server.tls.acme.ispone.base_url` | `REGISTRY__SERVER__TLS__ACME__ISPONE__BASE_URL` | `TLS_ACME_ISPONE_BASE_URL` | unset |

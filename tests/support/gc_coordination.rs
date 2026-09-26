@@ -1131,6 +1131,7 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], 5000)),
         tls_cert_path: None,
         tls_key_path: None,
+        tls_reload_poll_secs: 300,
         tls_acme: None,
         push_username: None,
         push_password: None,

@@ -75,11 +75,9 @@ grants = [ { repo_prefix = "org1/", actions = ["pull","push"] } ]
 
 ## 3. TLS / ACME
 
-Startup-only provisioning: `[server.tls.acme]` generates or reuses `cert.pem`/`key.pem` in `output_dir` before binding. **Operational caveats (KI-01, confirmed in source):**
+Provisioning runs at startup (`[server.tls.acme]` generates or reuses `cert.pem`/`key.pem` in `output_dir` before binding) **and at runtime** (KI-01 resolved 2026-09-26): a supervised `tls_manager` task re-attempts ACME renewal every `server.tls.acme.renew_check_interval_secs` (default 12 h; the ACME call renews only inside `renewal_window_secs`) and hot-swaps the served certificate via in-place reload — **no restart needed**. For externally renewed certificates (static `TLS_CERT_PATH`/`TLS_KEY_PATH` without ACME), the file is watched every `server.tls.reload_poll_secs` (default 300 s) and reloaded on change.
 
-- There is **no runtime certificate reload** — a renewed cert on disk is served only after a process restart. Schedule restarts within your renewal window.
-- **SANs are never validated** against `acme.names`; on provisioning failure the server falls back to whatever cert exists, with only a warning. Changing `names` does not force regeneration (renewal is expiry-based). Verify served SANs externally after any name change.
-- No tests cover the TLS/ACME path.
+SAN validation: at startup, ACME-managed certificates are checked against `acme.names` and the server **fails closed on a mismatch** (break-glass override: `server.tls.acme.allow_san_mismatch=true`). At runtime, a renewed certificate that fails parsing or SAN coverage is **refused** — the server keeps serving the previous certificate and logs the refusal. Served SANs and expiry are logged at every load/reload. Covered by unit tests and an end-to-end reload test (`tests/tls_reload_tests.rs`).
 
 Static TLS: set `TLS_CERT_PATH`/`TLS_KEY_PATH`. Behind a reverse proxy, see [`traefik-configuration.md`](traefik-configuration.md) and the `limits.trusted_proxies` setting (X-Forwarded-For is ignored from unlisted peers).
 
