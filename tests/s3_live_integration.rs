@@ -2406,3 +2406,115 @@ async fn test_r6_live_s3_access_denied_not_masked_as_notfound() {
     // Phase 5 — cleanup the seeded object (root creds restored above).
     harness.cleanup().await;
 }
+
+// ================================================================================================
+// 11. PROXY-CACHE EVICTION PORT (remediation R2, KI-02)
+// ================================================================================================
+
+/// Live acceptance for the backend-neutral cache eviction seam: enumeration
+/// yields real ETags, deletes are version-conditional (stale refused), and a
+/// bounded cache results once matching versions are applied.
+#[tokio::test]
+async fn test_live_s3_cache_eviction_port_conditional_and_bounding() {
+    use registry_rust::storage::GcDeleteResult;
+    use registry_rust::storage::ports::CacheEvictionPort;
+    use sha2::Digest as ShaDigest;
+
+    let harness = LiveS3Harness::new().await.unwrap();
+    let storage = harness.create_storage();
+
+    // Seed three cache blobs with correct digest-addressed keys via a raw client.
+    let url = Url::parse(&harness.endpoint).unwrap();
+    let host = url.host_str().unwrap_or("");
+    let is_local = host == "127.0.0.1" || host == "localhost" || host == "::1";
+    let loader = aws_config::defaults(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(harness.region.clone()));
+    let loader = if is_local && std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "minioadmin",
+            "minioadmin",
+            None,
+            None,
+            "static",
+        ))
+    } else {
+        loader
+    };
+    let shared = loader.load().await;
+    let config = aws_sdk_s3::config::Builder::from(&shared)
+        .endpoint_url(&harness.endpoint)
+        .force_path_style(true)
+        .build();
+    let client = aws_sdk_s3::Client::from_conf(config);
+
+    let mut digests = Vec::new();
+    for payload in [
+        &b"live cache blob A"[..],
+        b"live cache blob B",
+        b"live cache blob C",
+    ] {
+        let hex = hex::encode(sha2::Sha256::digest(payload));
+        let key = format!(
+            "{}/blobs/sha256/{}/{}",
+            harness.prefix.trim_end_matches('/'),
+            &hex[0..2],
+            &hex
+        );
+        client
+            .put_object()
+            .bucket(&harness.bucket)
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(payload))
+            .send()
+            .await
+            .expect("seed cache blob");
+        digests.push(Digest::parse(&format!("sha256:{hex}")).unwrap());
+    }
+
+    // Enumerate through the port: all three visible with real ETag versions.
+    let mut items = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = storage
+            .list_cache_blobs_page(cursor.as_ref(), 2)
+            .await
+            .expect("cache enumeration");
+        items.extend(page.items);
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(
+        items.len(),
+        3,
+        "enumeration must see the seeded cache blobs"
+    );
+
+    // Stale version is refused on live S3.
+    let stale = registry_rust::storage::BlobObjectVersion("\"deadbeef\"".to_string());
+    let refused = storage
+        .evict_cache_blob(&items[0].digest, Some(&stale))
+        .await
+        .expect("conditional call");
+    assert!(
+        matches!(refused, GcDeleteResult::PreconditionFailed { .. }),
+        "stale ETag must refuse eviction, got {refused:?}"
+    );
+
+    // Matching versions delete; the cache is bounded to a single blob.
+    for item in items.iter().take(2) {
+        let res = storage
+            .evict_cache_blob(&item.digest, Some(&item.version))
+            .await
+            .expect("eviction");
+        assert!(matches!(res, GcDeleteResult::Deleted), "got {res:?}");
+    }
+    let page = storage
+        .list_cache_blobs_page(None, 10)
+        .await
+        .expect("post-eviction enumeration");
+    assert_eq!(page.items.len(), 1, "cache must be bounded after eviction");
+
+    harness.cleanup().await;
+}

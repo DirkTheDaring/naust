@@ -574,11 +574,6 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
     }
 
     if !state.config.proxy.upstreams.is_empty() {
-        if state.config.storage_backend != StorageBackend::Filesystem {
-            tracing::warn!("proxy gc: only filesystem backend is supported for eviction currently");
-            return;
-        }
-
         let interval = Duration::from_secs(state.config.proxy.gc_interval_secs.max(1));
         let repo_rules = state.config.proxy.repo_rules.clone();
 
@@ -586,10 +581,6 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
             let Some(ctx) = state.proxy_upstreams.get(i).cloned() else {
                 continue;
             };
-            let fs_root = up
-                .cache_fs_root
-                .clone()
-                .unwrap_or_else(|| state.config.fs_root.join(format!("cache-upstream-{i}")));
             let max_cache_bytes = up.max_cache_bytes;
             let storage = ctx.cache_storage;
             let Some(proxy_for_gc) = state.proxy_upstream_engines.get(i).cloned() else {
@@ -605,11 +596,10 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
                     None,
                     move || {
                         let st = storage.clone();
-                        let fs = fs_root.clone();
                         let rules = repo_rules_for_gc.clone();
                         let prx = proxy_for_gc.clone();
                         async move {
-                            proxy_gc_once(&st, &fs, max_cache_bytes, &rules, &prx)
+                            proxy_gc_once(&st, max_cache_bytes, &rules, &prx)
                                 .await
                                 .map_err(|e| format!("proxy gc failed: {e}"))
                         }
@@ -617,10 +607,6 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
                 )
                 .await;
         }
-        return;
-    }
-    if state.config.storage_backend != StorageBackend::Filesystem {
-        tracing::warn!("proxy gc: only filesystem backend is supported for eviction currently");
         return;
     }
     let Some(cache_storage) = state.proxy_cache.clone() else {
@@ -636,12 +622,6 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
     };
 
     let interval = Duration::from_secs(state.config.proxy.gc_interval_secs.max(1));
-    let fs_root = state
-        .config
-        .proxy
-        .cache_fs_root
-        .clone()
-        .unwrap_or_else(|| state.config.fs_root.join("cache"));
     let repo_rules = state.config.proxy.repo_rules.clone();
     let storage = cache_storage;
     let proxy_for_gc = proxy;
@@ -654,11 +634,10 @@ pub async fn spawn_proxy_gc(supervisor: &TaskSupervisor, state: AppState) {
             None,
             move || {
                 let st = storage.clone();
-                let fs = fs_root.clone();
                 let rules = repo_rules.clone();
                 let prx = proxy_for_gc.clone();
                 async move {
-                    proxy_gc_once(&st, &fs, max_cache_bytes, &rules, &prx)
+                    proxy_gc_once(&st, max_cache_bytes, &rules, &prx)
                         .await
                         .map_err(|e| format!("proxy gc run failed: {e}"))
                 }
@@ -720,8 +699,15 @@ pub async fn spawn_proxy_scrub(supervisor: &TaskSupervisor, state: AppState) {
         }
         return;
     }
+    // Recorded residual (remediation A3/R2): scrub verifies on-disk content
+    // against its digest to catch local bit-rot. On S3 the object store owns
+    // payload integrity (ETag/checksum validation on PUT and GET through the
+    // SDK), so a registry-side scrub adds cost without adding detection.
+    // Eviction, by contrast, IS backend-neutral (see proxy_gc_once).
     if state.config.storage_backend != StorageBackend::Filesystem {
-        tracing::warn!("proxy scrub: only filesystem backend is supported currently");
+        tracing::info!(
+            "proxy scrub: filesystem-only by design; S3 payload integrity is enforced by the object store"
+        );
         return;
     }
 
@@ -868,85 +854,89 @@ async fn proxy_scrub_once(
 
 async fn proxy_gc_once(
     storage: &Arc<dyn storage::ports::ProxyStoragePort>,
-    fs_root: &std::path::Path,
     max_cache_bytes: u64,
     repo_rules: &[crate::config::ProxyRepoRule],
     proxy: &crate::proxy::Proxy,
 ) -> Result<(), String> {
+    use crate::storage::ports::CacheEvictionPort as _;
+
     let protected = compute_protected_blobs(storage, repo_rules, proxy).await?;
 
-    let blobs_root = fs_root.join("blobs").join("sha256");
-    let mut entries: Vec<(Digest, u64, Option<u64>, std::time::SystemTime)> = Vec::new();
-    let mut total: u64 = 0;
-
-    let mut prefixes = match tokio::fs::read_dir(&blobs_root).await {
-        Ok(d) => d,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.to_string()),
-    };
-
-    while let Ok(Some(prefix_ent)) = prefixes.next_entry().await {
-        let prefix_path = prefix_ent.path();
-        if !prefix_ent
-            .file_type()
+    // Enumerate through the port (backend-neutral, contained) and attach the
+    // engine's access metadata — the two seams the core planner deliberately
+    // does not own (remediation A3).
+    let mut candidates = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = storage
+            .list_cache_blobs_page(cursor.as_ref(), 500)
             .await
-            .map_err(|e| e.to_string())?
-            .is_dir()
-        {
-            continue;
+            .map_err(|e| format!("cache enumeration failed: {e}"))?;
+        for item in page.items {
+            let last_access = proxy.get_blob_last_access(&item.digest);
+            candidates.push(crate::cache_eviction::CacheBlobCandidate {
+                digest: item.digest,
+                size: item.size,
+                last_modified: item.last_modified,
+                last_access,
+                version: item.version,
+            });
         }
-        let mut dir = match tokio::fs::read_dir(&prefix_path).await {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        while let Ok(Some(ent)) = dir.next_entry().await {
-            let path = ent.path();
-            let ft = match ent.file_type().await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if !ft.is_file() {
-                continue;
-            }
-            let file_name = match path.file_name().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let digest = match Digest::parse(&format!("sha256:{file_name}")) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            if protected.contains(digest.hex()) {
-                continue;
-            }
-            let meta = match ent.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let size = meta.len();
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let last_access = proxy.get_blob_last_access(&digest);
-            total = total.saturating_add(size);
-            entries.push((digest, size, last_access, modified));
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
         }
     }
 
-    if total <= max_cache_bytes {
+    let plan = crate::cache_eviction::plan_evictions(candidates, &protected, max_cache_bytes);
+    if plan.evict.is_empty() {
+        tracing::debug!(
+            total_bytes = plan.total_bytes,
+            max_cache_bytes,
+            "proxy eviction: cache within budget"
+        );
         return Ok(());
     }
 
-    entries.sort_by_key(|(_, _, last, mtime)| (*last, *mtime));
-
-    let mut evicted_records: u64 = 0;
-    for (_digest, _size, _, _) in entries {
-        evicted_records += 1;
+    let mut evicted: u64 = 0;
+    let mut freed_bytes: u64 = 0;
+    let mut skipped: u64 = 0;
+    for candidate in plan.evict {
+        match storage
+            .evict_cache_blob(&candidate.digest, Some(&candidate.version))
+            .await
+        {
+            Ok(storage::GcDeleteResult::Deleted) => {
+                evicted += 1;
+                freed_bytes = freed_bytes.saturating_add(candidate.size);
+            }
+            // NotFound / PreconditionFailed: the blob vanished or was
+            // re-fetched since enumeration — leave the fresh content alone.
+            Ok(_) => skipped += 1,
+            Err(err) => {
+                skipped += 1;
+                tracing::warn!(
+                    digest = %candidate.digest,
+                    error = %err,
+                    "proxy eviction: failed to evict cached blob"
+                );
+            }
+        }
     }
 
-    if evicted_records > 0 {
-        tracing::info!(
-            evicted_records,
+    tracing::info!(
+        evicted,
+        freed_bytes,
+        skipped,
+        total_bytes = plan.total_bytes,
+        max_cache_bytes,
+        "proxy eviction: cache bounded via CacheEvictionPort"
+    );
+    if plan.residual_over_budget > 0 {
+        tracing::warn!(
+            residual_over_budget = plan.residual_over_budget,
             max_cache_bytes,
-            "proxy eviction: evicted old proxy cache metadata; physical CAS reclamation managed exclusively by BlobGcService"
+            "proxy eviction: protected content alone exceeds the cache budget"
         );
     }
     Ok(())
@@ -2260,12 +2250,8 @@ mod tests {
             )))
         });
 
-        // fs_root without blobs/sha256 directory
-        let nonexistent_fs = temp.path().join("nonexistent_fs_root");
-
         let arc_storage: Arc<dyn ProxyStoragePort> = injected;
-        let result =
-            proxy_gc_once(&arc_storage, &nonexistent_fs, 1024 * 1024, &rules, &proxy).await;
+        let result = proxy_gc_once(&arc_storage, 1024 * 1024, &rules, &proxy).await;
 
         assert!(
             result.is_err(),
@@ -2275,6 +2261,88 @@ mod tests {
         assert!(
             err_msg.contains("disk read failure"),
             "Error message must contain original error details: '{err_msg}'"
+        );
+    }
+
+    fn write_cache_blob(root: &std::path::Path, payload: &[u8]) -> crate::registry::digest::Digest {
+        use sha2::Digest as _;
+        let hex = hex::encode(sha2::Sha256::digest(payload));
+        let dir = root.join("blobs").join("sha256").join(&hex[0..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&hex), payload).unwrap();
+        crate::registry::digest::Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    /// R2 acceptance (FS): an over-budget cache is physically bounded — LRU
+    /// (never-accessed) blobs are unlinked first; recently accessed content
+    /// survives when the budget allows.
+    #[tokio::test]
+    async fn proxy_gc_once_bounds_fs_cache_lru_first() {
+        let (wiring, proxy, temp) = create_test_env();
+        let root = temp.path().join("registry");
+
+        let cold_a = write_cache_blob(&root, &[b'a'; 400]);
+        let cold_b = write_cache_blob(&root, &[b'b'; 400]);
+        let hot = write_cache_blob(&root, &[b'h'; 400]);
+        proxy.note_blob_access(&hot);
+        // Ensure the cold blobs pre-date the access note deterministically.
+        let _ = (&cold_a, &cold_b);
+
+        let storage = wiring.proxy_storage();
+        // total 1200, budget 800 -> evict 400 (one cold blob).
+        proxy_gc_once(&storage, 800, &[], &proxy).await.unwrap();
+
+        let exists = |d: &crate::registry::digest::Digest| {
+            root.join("blobs/sha256")
+                .join(&d.hex()[0..2])
+                .join(d.hex())
+                .exists()
+        };
+        let cold_left = [&cold_a, &cold_b].iter().filter(|d| exists(d)).count();
+        assert_eq!(cold_left, 1, "exactly one cold blob must be evicted");
+        assert!(exists(&hot), "recently accessed blob must survive");
+
+        // Second pass with a tiny budget clears everything unprotected.
+        proxy_gc_once(&storage, 0, &[], &proxy).await.unwrap();
+        assert!(!exists(&cold_a) && !exists(&cold_b) && !exists(&hot));
+    }
+
+    /// R2 acceptance (S3 mock): the same worker bounds an S3-backed cache —
+    /// the capability KI-02 recorded as missing.
+    #[tokio::test]
+    async fn proxy_gc_once_bounds_s3_cache() {
+        let (_wiring, proxy, _temp) = create_test_env();
+        let (s3_storage, driver) = crate::storage::s3::mock::create_mock_storage();
+        let storage: Arc<dyn crate::storage::ports::ProxyStoragePort> = Arc::new(s3_storage);
+
+        use sha2::Digest as _;
+        let mut keys = Vec::new();
+        for payload in [&[b'x'; 300][..], &[b'y'; 300], &[b'z'; 300]] {
+            let hex = hex::encode(sha2::Sha256::digest(payload));
+            let key = format!("blobs/sha256/{}/{}", &hex[0..2], &hex);
+            driver.objects.lock().unwrap().insert(
+                key.clone(),
+                (
+                    bytes::Bytes::copy_from_slice(payload),
+                    format!("\"etag-{hex}\""),
+                ),
+            );
+            keys.push(key);
+        }
+
+        // total 900, budget 350 -> at least two evictions.
+        proxy_gc_once(&storage, 350, &[], &proxy).await.unwrap();
+        let remaining: u64 = driver
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with("blobs/sha256/"))
+            .map(|(_, (b, _))| b.len() as u64)
+            .sum();
+        assert!(
+            remaining <= 350,
+            "S3 cache must be bounded to the budget, remaining={remaining}"
         );
     }
 }
