@@ -1,6 +1,6 @@
 # Plan: extract `registry-core` — a registry-primitives crate
 
-- **Status:** in execution (progress log at end of file)
+- **Status:** **COMPLETE (2026-09-26)** — all phases executed; progress log at end of file
 - **Date:** 2026-09-26
 - **Analyzed code revision:** `master` @ `be40792`
 - **Provenance:** three review passes over the initial proposal; all module assignments and coupling counts below were verified against the source at the revision above, not taken from `docs/architecture/README.md`.
@@ -151,6 +151,15 @@ Gate: `scripts/check-core-boundary.sh` / `make core-boundary`.
 * Shipped: crate-level rustdoc stating the four load-bearing contracts (seven-step finalize with heal-before-pin, five GC axes + capability-based strategy, membership readiness gate, coordinator-per-composition-root); a `prelude` module with the primary surface; and **`examples/minimal_registry.rs` — a complete registry composed from core alone (wiring → authority → ref-index → coordinator → services), executed successfully end-to-end (blob pushes, manifest publish, tag resolve)**. The example is the ADR-010 purpose proof and doubles as consumer documentation.
 * **Deferred (recorded, not forgotten): aggressive `pub` → `pub(crate)` tightening.** The 0.x-unstable posture is declared in the crate manifest; the widened wiring internals from Phase 2 are already `#[doc(hidden)]` or documented as Phase 3 debt. Tightening before a second consumer exists would be speculative churn against a surface that Phase 2's re-export shim still mirrors into `registry_rust::…`.
 * Acceptance: full workspace suite 1489 passed / 31 env-gated / 14 ignored; fmt clean; gate clean; `cargo doc -p registry-core` builds (remaining warnings are pre-existing white-box module docs).
+
+### Phase 4 learnings (2026-09-26, completed — PLAN CLOSED)
+
+* **Live-S3 qualification executed**: the pre-existing stopped MinIO container (`slice11_minio_fg_…`, found via `podman ps -a` per the R5 lesson) was started, the `s3_live_integration` suite ran **32/0/1 × 5 consecutive runs**, the s3 conformance matrix ran green (74 passed / 5 skipped), and the container was stopped again — prior state restored.
+* **All four conformance matrices green post-split** (fs, basic, token, s3).
+* Docs reconciled: architecture README amended (two-crate topology, ADR-010 seams, KI-07 resolution, refreshed verification posture, updated paths) with an explicit partial-amendment stamp; `docs/README.md` header notes the targeted amendment; technical-debt register: **KI-07 closed**, KI-26 narrowed/re-pathed, **KI-27 added** (deferred visibility curation, tracing-target rename, `cargo test --workspace` invocation note); ADR-010 §2.1 addendum records the root-package layout.
+* Final verification: `cargo fmt --all --check` clean; `make core-boundary` clean; `cargo test --workspace --locked` 1489/0(non-env)/14; live suite qualified as above.
+
+**Outcome vs. plan:** all five phases delivered; G1/G2/G3 gates each fired and were decided explicitly (G1 re-baselined scope, G2 confirmed the trait, G3 chose the root-package layout). The R1 fallback and the Phase-1 abort path were never needed. Total commits: `eafd5c7` (P0+1a), `fe9d8bd` (1b), `227e556` (1c), `75f51dc` (1d+1e), `26c0be8` (P2), `9aa1164` (P3), plus the Phase 4 docs commit.
 
 Reverse edge (server → core, legal after split): `proxy.rs:582,662` → `application::{Blob,Manifest}MutationService`.
 
