@@ -6,7 +6,6 @@ use axum::{
 };
 use headers::{Authorization, HeaderMapExt, authorization::Basic};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AdminGcBudgetsRequest {
@@ -145,15 +144,44 @@ fn parse_admin_policy(s: &str) -> Result<crate::blob_gc::BlobGcPolicy, Response>
     }
 }
 
-fn defaults_budgets(
-    cfg: &crate::config::Config,
-    b: Option<AdminGcBudgetsRequest>,
-) -> crate::gc_service::GcBudgets {
+fn overrides(b: Option<AdminGcBudgetsRequest>) -> crate::gc_admin::BudgetOverrides {
     let b = b.unwrap_or_default();
-    crate::gc_service::GcBudgets {
-        max_blobs: b.max_blobs.unwrap_or(cfg.blob_gc_default_max_blobs),
-        max_bytes: b.max_bytes.unwrap_or(cfg.blob_gc_default_max_bytes),
-        max_seconds: b.max_seconds.unwrap_or(cfg.blob_gc_default_max_seconds),
+    crate::gc_admin::BudgetOverrides {
+        max_blobs: b.max_blobs,
+        max_bytes: b.max_bytes,
+        max_seconds: b.max_seconds,
+    }
+}
+
+fn gc_admin_error_to_response(err: crate::gc_admin::GcAdminError) -> Response {
+    use crate::gc_service::GcServiceError;
+    match err {
+        crate::gc_admin::GcAdminError::Unavailable => {
+            (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response()
+        }
+        crate::gc_admin::GcAdminError::Service(GcServiceError::AlreadyRunning) => {
+            (StatusCode::CONFLICT, "gc already running").into_response()
+        }
+        crate::gc_admin::GcAdminError::Service(
+            GcServiceError::Disabled | GcServiceError::DeleteDisabled,
+        ) => (StatusCode::FORBIDDEN, "gc disabled").into_response(),
+        crate::gc_admin::GcAdminError::Service(GcServiceError::RefIndex(e)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
+        }
+        crate::gc_admin::GcAdminError::Service(GcServiceError::StrategyUnsupported {
+            message,
+            ..
+        }) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+        crate::gc_admin::GcAdminError::Service(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+fn parse_policy_param(policy: Option<&str>) -> Result<crate::blob_gc::BlobGcPolicy, Response> {
+    match policy {
+        None => Ok(crate::blob_gc::BlobGcPolicy::ManifestRooted),
+        Some(s) => parse_admin_policy(s),
     }
 }
 
@@ -166,52 +194,22 @@ pub async fn admin_gc_plan(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    let policy = match parse_policy_param(req.policy.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
-
-    let policy = match req.policy.as_deref() {
-        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
-        Some(s) => match parse_admin_policy(s) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        },
-    };
-
-    let run_id = state
-        .gc_run_seq
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-
-    let budgets = defaults_budgets(&state.config, req.budgets);
-    let min_age_secs = req
-        .min_age_secs
-        .unwrap_or(state.config.blob_gc_default_min_age_secs);
-    let min_age = Duration::from_secs(min_age_secs);
-
-    tracing::info!(event = "admin_gc", action = "plan", %subject, run_id, policy = ?policy, min_age_secs);
-
-    match service.plan(policy, min_age, budgets).await {
-        Ok(stats) => Json(AdminGcResponse {
+    tracing::info!(event = "admin_gc", action = "plan", %subject, policy = ?policy, min_age_secs = ?req.min_age_secs);
+    match state
+        .gc_admin
+        .plan(policy, req.min_age_secs, overrides(req.budgets))
+        .await
+    {
+        Ok((run_id, stats)) => Json(AdminGcResponse {
             run_id,
             stats: stats.into(),
         })
         .into_response(),
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "gc already running").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Disabled)
-        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(err) => gc_admin_error_to_response(err),
     }
 }
 
@@ -224,52 +222,22 @@ pub async fn admin_gc_quarantine(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    let policy = match parse_policy_param(req.policy.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
-
-    let policy = match req.policy.as_deref() {
-        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
-        Some(s) => match parse_admin_policy(s) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        },
-    };
-
-    let run_id = state
-        .gc_run_seq
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-
-    let budgets = defaults_budgets(&state.config, req.budgets);
-    let min_age_secs = req
-        .min_age_secs
-        .unwrap_or(state.config.blob_gc_default_min_age_secs);
-    let min_age = Duration::from_secs(min_age_secs);
-
-    tracing::info!(event = "admin_gc", action = "quarantine", %subject, run_id, policy = ?policy, min_age_secs);
-
-    match service.quarantine(policy, min_age, budgets).await {
-        Ok(stats) => Json(AdminGcResponse {
+    tracing::info!(event = "admin_gc", action = "quarantine", %subject, policy = ?policy, min_age_secs = ?req.min_age_secs);
+    match state
+        .gc_admin
+        .quarantine(policy, req.min_age_secs, overrides(req.budgets))
+        .await
+    {
+        Ok((run_id, stats)) => Json(AdminGcResponse {
             run_id,
             stats: stats.into(),
         })
         .into_response(),
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "gc already running").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Disabled)
-        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(err) => gc_admin_error_to_response(err),
     }
 }
 
@@ -282,54 +250,22 @@ pub async fn admin_gc_delete(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
+    let policy = match parse_policy_param(req.policy.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
-
-    let policy = match req.policy.as_deref() {
-        None => crate::blob_gc::BlobGcPolicy::ManifestRooted,
-        Some(s) => match parse_admin_policy(s) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        },
-    };
-
-    let run_id = state
-        .gc_run_seq
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-
-    let budgets = defaults_budgets(&state.config, req.budgets);
-    let quarantine_delay_secs = req
-        .quarantine_delay_secs
-        .unwrap_or(state.config.blob_gc_default_quarantine_delay_secs);
-    let quarantine_delay = Duration::from_secs(quarantine_delay_secs);
-
-    tracing::info!(event = "admin_gc", action = "delete", %subject, run_id, policy = ?policy, quarantine_delay_secs);
-
-    match service.delete(policy, quarantine_delay, budgets).await {
-        Ok(stats) => Json(AdminGcResponse {
+    tracing::info!(event = "admin_gc", action = "delete", %subject, policy = ?policy, quarantine_delay_secs = ?req.quarantine_delay_secs);
+    match state
+        .gc_admin
+        .delete(policy, req.quarantine_delay_secs, overrides(req.budgets))
+        .await
+    {
+        Ok((run_id, stats)) => Json(AdminGcResponse {
             run_id,
             stats: stats.into(),
         })
         .into_response(),
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "gc already running").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::Disabled) => {
-            (StatusCode::FORBIDDEN, "gc disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::DeleteDisabled) => {
-            (StatusCode::FORBIDDEN, "gc delete disabled").into_response()
-        }
-        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(err) => gc_admin_error_to_response(err),
     }
 }
 
@@ -338,24 +274,15 @@ pub async fn admin_gc_health(State(state): State<AppState>, headers: HeaderMap) 
         Ok(s) => s,
         Err(resp) => return resp,
     };
-
-    let Some(service) = state.gc_service.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gc service unavailable").into_response();
-    };
-
-    match service.health().await {
+    use crate::gc_service::GcServiceError;
+    match state.gc_admin.health().await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(crate::gc_service::GcServiceError::RefIndex(e)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        Err(crate::gc_service::GcServiceError::AlreadyRunning) => {
+        Err(crate::gc_admin::GcAdminError::Service(GcServiceError::AlreadyRunning)) => {
             (StatusCode::OK, "gc running").into_response()
         }
-        Err(crate::gc_service::GcServiceError::Disabled)
-        | Err(crate::gc_service::GcServiceError::DeleteDisabled) => StatusCode::OK.into_response(),
-        Err(crate::gc_service::GcServiceError::StrategyUnsupported { message, .. }) => {
-            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(crate::gc_admin::GcAdminError::Service(
+            GcServiceError::Disabled | GcServiceError::DeleteDisabled,
+        )) => StatusCode::OK.into_response(),
+        Err(err) => gc_admin_error_to_response(err),
     }
 }

@@ -60,7 +60,10 @@ pub struct AppState {
     pub auth_metrics: Arc<AuthMetrics>,
     pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
     pub gc_service: Option<Arc<gc_service::GcService>>,
-    pub gc_run_seq: Arc<AtomicU64>,
+    /// Admin GC facade (R4/KI-26): owns the run-id sequence and defaults.
+    pub gc_admin: Arc<crate::gc_admin::GcAdminService>,
+    /// Token issuance facade (R4/KI-26): the /token handler delegates here.
+    pub token_svc: Arc<crate::token_service::TokenService>,
     pub proxy: Option<Arc<proxy::Proxy>>,
     pub proxy_cache: Option<Arc<dyn crate::storage::ports::ProxyStoragePort>>,
     // Multi-upstream: proxy/cache selected per request host.

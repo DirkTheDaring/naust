@@ -1,9 +1,4 @@
-use crate::{
-    AppState,
-    http_api::errors,
-    http_api::handlers::{format_rfc3339, registry_headers},
-    security,
-};
+use crate::{AppState, http_api::errors, http_api::handlers::registry_headers, security};
 use axum::{
     body::Body,
     extract::{RawQuery, State},
@@ -11,10 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use headers::{Authorization, HeaderMapExt, authorization::Basic};
-use std::{
-    collections::HashSet,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashSet;
 use url::form_urlencoded;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,6 +372,7 @@ pub async fn token(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    // Parse (transport concern) …
     let mut service_param: Option<String> = None;
     let mut scopes_raw: Vec<String> = Vec::new();
     let raw = raw_query.0.unwrap_or_default();
@@ -390,138 +383,31 @@ pub async fn token(
             scopes_raw.push(v.into_owned());
         }
     }
-
-    if !service_param_is_valid(service_param.as_deref(), &state.config.token_service) {
-        state.auth_metrics.inc_token_denied();
-        tracing::info!(
-            event = "token_denied",
-            reason = "invalid_service",
-            service = ?service_param,
-            "token request denied"
-        );
-        return errors::denied("invalid token service").into_response();
-    }
-    let scopes = scopes_raw
-        .iter()
-        .flat_map(|s| parse_scopes(s))
-        .collect::<Vec<_>>();
-
-    let token_scopes = sanitize_token_scopes(&scopes);
-
     let basic = headers
         .typed_get::<Authorization<Basic>>()
         .map(|Authorization(b)| (b.username().to_string(), b.password().to_string()));
 
-    let decision = match decide_token_scopes_for_request(&state.config, &token_scopes, basic) {
-        Ok(d) => d,
-        Err(TokenRejection::Unauthorized) => {
-            state.auth_metrics.inc_token_denied();
-            tracing::info!(
-                event = "token_denied",
-                reason = "unauthorized",
-                "token request denied"
-            );
-            return token_unauthorized();
-        }
-        Err(TokenRejection::Denied(msg)) => {
-            state.auth_metrics.inc_token_denied();
-            tracing::info!(
-                event = "token_denied",
-                reason = "policy",
-                detail = %msg,
-                "token request denied"
-            );
-            return errors::denied(msg).into_response();
-        }
-    };
+    // … delegate (R4/KI-26: the token bypass is closed — issuance lives in
+    // TokenService) …
+    let outcome = state
+        .token_svc
+        .issue(service_param.as_deref(), &scopes_raw, basic);
 
-    if wants_push_from_token_scopes(&decision.scopes)
-        || decision
-            .scopes
-            .iter()
-            .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete))
-    {
-        if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-            for scope in &decision.scopes {
-                if scope.typ == "repository" {
-                    let Ok(canonical_repo) = crate::registry::CanonicalRepoName::parse(&scope.name)
-                    else {
-                        return errors::name_invalid();
-                    };
-                    if !crate::auth::push_repository_allowed(allowlist, &canonical_repo) {
-                        state.auth_metrics.inc_token_denied();
-                        tracing::info!(
-                            event = "token_denied",
-                            reason = "push_allowlist",
-                            repository = %scope.name,
-                            "token request denied"
-                        );
-                        return errors::denied("push not allowed for this repository")
-                            .into_response();
-                    }
-                }
-            }
+    // … format.
+    match outcome {
+        crate::token_service::TokenOutcome::Issued { body } => {
+            let bytes = match serde_json::to_vec(&body) {
+                Ok(b) => b,
+                Err(_) => return errors::internal_error().into_response(),
+            };
+            let mut resp_headers = registry_headers();
+            resp_headers.insert("Content-Type", "application/json".parse().unwrap());
+            resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
+            (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
         }
+        crate::token_service::TokenOutcome::Unauthorized => token_unauthorized(),
+        crate::token_service::TokenOutcome::Denied(msg) => errors::denied(msg).into_response(),
+        crate::token_service::TokenOutcome::NameInvalid => errors::name_invalid(),
+        crate::token_service::TokenOutcome::Internal => errors::internal_error().into_response(),
     }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-    let exp = now.saturating_add(decision.ttl_secs);
-
-    let token = match issue_token(
-        &state,
-        decision.subject.as_deref(),
-        &decision.scopes,
-        now,
-        exp,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            state.auth_metrics.inc_token_internal_error();
-            tracing::error!(event = "token_error", "token signing failed");
-            return errors::internal_error().into_response();
-        }
-    };
-
-    let scopes_json: Vec<serde_json::Value> = decision
-        .scopes
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "type": s.typ,
-                "name": s.name,
-                "actions": s.actions,
-            })
-        })
-        .collect();
-
-    let body = serde_json::json!({
-        "token": token,
-        "access_token": token,
-        "expires_in": decision.ttl_secs,
-        "issued_at": format_rfc3339(now),
-        "access": scopes_json,
-        "scopes": scopes_json,
-    });
-
-    let bytes = match serde_json::to_vec(&body) {
-        Ok(b) => b,
-        Err(_) => return errors::internal_error().into_response(),
-    };
-
-    state.auth_metrics.inc_token_issued();
-    tracing::info!(
-        event = "token_issued",
-        subject = ?decision.subject,
-        scopes = decision.scopes.len(),
-        ttl_secs = decision.ttl_secs,
-        "token issued"
-    );
-
-    let mut resp_headers = registry_headers();
-    resp_headers.insert("Content-Type", "application/json".parse().unwrap());
-    resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }

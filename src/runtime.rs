@@ -621,15 +621,24 @@ where
         Some(buffered_body_sem.clone()),
     );
 
+    let auth_metrics = Arc::new(AuthMetrics::default());
     let state = AppState {
         transfer_policy: Arc::new(crate::http_api::policy::HttpTransferPolicy::from(
             config.as_ref(),
         )),
+        token_svc: Arc::new(crate::token_service::TokenService::new(
+            config.clone(),
+            auth_metrics.clone(),
+        )),
         config: config.clone(),
-        auth_metrics: Arc::new(AuthMetrics::default()),
+        auth_metrics,
         ref_index: ref_index.clone(),
+        gc_admin: Arc::new(crate::gc_admin::GcAdminService::new(
+            gc_service.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            crate::gc_admin::GcAdminPolicy::from(config.as_ref()),
+        )),
         gc_service,
-        gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         proxy,
         proxy_cache,
         proxy_upstreams,
@@ -697,15 +706,25 @@ pub(crate) fn build_test_app_state(
         Some(Arc::new(Semaphore::new(1))),
     );
 
+    let gc_admin = Arc::new(crate::gc_admin::GcAdminService::new(
+        gc_service.clone(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        crate::gc_admin::GcAdminPolicy::from(cfg.as_ref()),
+    ));
+    let auth_metrics = Arc::new(AuthMetrics::default());
     AppState {
         transfer_policy: Arc::new(crate::http_api::policy::HttpTransferPolicy::from(
             cfg.as_ref(),
         )),
+        token_svc: Arc::new(crate::token_service::TokenService::new(
+            cfg.clone(),
+            auth_metrics.clone(),
+        )),
         config: cfg,
-        auth_metrics: Arc::new(AuthMetrics::default()),
+        auth_metrics,
         ref_index,
+        gc_admin,
         gc_service,
-        gc_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         proxy,
         proxy_cache,
         proxy_upstreams: Vec::new(),
