@@ -42,6 +42,7 @@ vendor-sync:
 	@mkdir -p vendor/acmecert/crates vendor/storage-layer-rust/crates
 	@cp -a ../acmecert/Cargo.toml vendor/acmecert/Cargo.toml
 	@cp -a ../acmecert/crates/acmecert-core vendor/acmecert/crates/
+	@cp -a ../acmecert/crates/acmecert vendor/acmecert/crates/
 	@cp -a ../storage-layer-rust/Cargo.toml vendor/storage-layer-rust/Cargo.toml
 	@cp -a ../storage-layer-rust/crates/storage-core vendor/storage-layer-rust/crates/
 	@cp -a ../storage-layer-rust/crates/storage-fs vendor/storage-layer-rust/crates/

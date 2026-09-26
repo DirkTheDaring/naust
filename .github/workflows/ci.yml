@@ -33,19 +33,6 @@ jobs:
 
   live-s3:
     runs-on: ubuntu-latest
-    # GitHub service containers cannot pass a command, and the official
-    # minio/minio image requires `server /data`; bitnami's image is
-    # env-configured and needs none.
-    services:
-      minio:
-        image: bitnami/minio:latest
-        ports: ['9000:9000']
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/ready"
-          --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,6 +41,19 @@ jobs:
           mkdir -p ../acmecert ../storage-layer-rust
           cp -a vendor/acmecert/. ../acmecert/
           cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+      # Service containers cannot pass a command and the official minio image
+      # needs `server /data`, so start it explicitly (pinned to the tag used
+      # for local qualification).
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready && exit 0
+            sleep 2
+          done
+          echo "MinIO did not become ready" >&2; docker logs minio; exit 1
       - name: Live S3 suite
         run: cargo test --locked --test s3_live_integration -- --test-threads=1
       - name: Conformance (s3)
