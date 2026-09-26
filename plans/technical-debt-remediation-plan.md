@@ -201,3 +201,14 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 * Evidence convention: committed `evidence/` directory (convention in `evidence/README.md`); first record `evidence/2026-09-26-debt-remediation/RECORD.md` + JUnit/exit artifacts for all four conformance matrices — closes KI-20's criterion at stated revisions.
 * CI definition rewritten to mirror the real pipeline (fmt → `make core-boundary` → `cargo test --workspace --locked` → conformance fs/basic/token; separate live-S3 job with a MinIO **bitnami** service container — the official image needs a `server` command GH services cannot pass). Vendored path-dep staging included. Honest caveat kept in the file: never executed on a hosted runner (no remote).
 * D6 remains the only open decision: hosting/remote/visibility/release channel. The R5 scrub concern proved moot for git history (key material was never tracked); the pre-push checklist still applies to any future remote (`git ls-files | grep -iE '\\.pem|secret'` should stay empty — verified empty today).
+
+### R4 learnings (2026-09-26, completed — KI-26 CLOSED with recorded residues; PLAN COMPLETE except D6-blocked KI-19/GATE-O13)
+
+* Commit 1 (`5863691`): dispatcher split into `blobs.rs`/`manifests.rs`/`uploads.rs` with re-exports (sidecar tests untouched); `HttpTransferPolicy` snapshot removed the mechanical config reads. Commit 2 (`17a6dc6`): `GcAdminService` (owns run-id sequence — `gc_run_seq` left `AppState`) + `TokenService` (decision/allowlist/signing/observability); both bypass endpoints are parse/delegate/format now. Commit 3: ADR-011 records the census (7 core + 2 server), the `GarbageCollectionService`→`GcService`+`GcAdminService` and `ProxyService`→`UpstreamFetcher`+`ProxyTarget` re-scopings, and four accepted residues (config-parameterized token decision fns; auth-boundary reads in handlers; flat `AppState`; omnibus-`Storage`-as-vehicle).
+* Judgment call recorded rather than executed: `AppState` context regrouping (A1's nested-struct sketch) — with the config-read and bypass defects gone it is naming churn without a seam change; ADR-011 §4.3 records it as accepted architecture, satisfying KI-26's criterion verbatim.
+* Behavior frozen throughout by the black-box suites: workspace 1514 passed / env-gated live only; conformance fs/basic/token green after every commit; boundary gate clean; zero warnings.
+
+## FINAL STATUS (2026-09-26)
+
+**Closed this campaign:** KI-01, KI-02, KI-03, KI-04, KI-05, KI-06, KI-08, KI-09, KI-10, KI-11, KI-12 (accepted design), KI-13, KI-14, KI-17, KI-18, KI-20, KI-21, KI-26 (recorded residues), KI-27b/c — plus REQ-006 adopted and REQ-012 wired.
+**Remaining open:** KI-19 + GATE-O13 (owner hosting decision, D6), KI-27a (parked until a second core consumer), KI-15/16 (folded into the D6 record), KI-22–25 (containment residues re-parked with owner-confirmed criteria per D7), and the historical GATE rows whose closure requires human acceptance acts.

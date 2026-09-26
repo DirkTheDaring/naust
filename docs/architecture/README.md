@@ -41,7 +41,6 @@ graph TD
     CC["ConsistencyCoordinator<br/>(one per composition root)"]
 
     HTTP --> SVC
-    HTTP -. "admin GC + /token bypass (KI-26)" .-> GC
     CLI --> W
     SVC --> UC & ML & LED & PX
     SVC --> W
@@ -54,7 +53,7 @@ graph TD
     S3 --> DOM
 ```
 
-Evidence for every edge: audit passes A–C (`../outdated/audit/2026-09-19-doc-reconciliation-notes.md` §5.1–§5.6). The dashed edge is a real, current exception, not a proposal.
+Evidence for every edge: audit passes A–C (`../outdated/audit/2026-09-19-doc-reconciliation-notes.md` §5.1–§5.6). The former dashed admin-GC//token bypass edge was removed 2026-09-26 (ADR-011): both endpoints now delegate through server services.
 
 **Component responsibilities**
 
@@ -63,7 +62,7 @@ Evidence for every edge: audit passes A–C (`../outdated/audit/2026-09-19-doc-r
 | Supervisor | Process lifecycle: TLS/ACME startup provisioning, router construction, worker spawning (reaper, GC scheduler, proxy GC/scrub), graceful shutdown (flush → authority release). Contains zero concrete-storage references | `src/supervisor.rs` |
 | Server composition root | 8-phase startup: storage wiring → mutation authority → membership readiness preflight (fail-closed) → ref-index open/heal → proxy init → coordinator + GcService → service assembly → `AppState` | `src/runtime.rs` (`build_server_runtime`, `assemble_application_services`) |
 | CLI composition root | `MaintenanceRuntime` + six-variant `CommandPolicy` (Pure … BreakGlass); strict lock order FsRootLock → RuntimeMutationAuthority; builds its own coordinator per operation | `src/cli/runtime.rs`, `src/cli/policy.rs` |
-| HTTP transport | Parse/auth/delegate/format. `handlers.rs` is still a 1538-line dispatcher with ~59 `state.config` policy reads (KI-26) | `src/http_api/` |
+| HTTP transport | Parse/auth/delegate/format. Dispatcher (`handlers.rs`) + family handlers (`blobs.rs`/`manifests.rs`/`uploads.rs`); transfer knobs via the `HttpTransferPolicy` snapshot; `/token` → `TokenService`, `/_admin/gc` → `GcAdminService` (ADR-011; KI-26 closed with recorded residues) | `src/http_api/`, `src/token_service.rs`, `src/gc_admin.rs` |
 | Application services | Transport-neutral use-cases; own query policy (sorting, cursors, `has_more`). Framework-free (zero Axum/http types; KI-07 resolved by the ADR-010 split) | `crates/registry-core/src/application/` |
 | Domain engines | Upload state machine + pins, manifest WAL lifecycle, repo↔blob membership, GC planning/quarantine/delete, proxy fetch/publish | `crates/registry-core/src/{upload_coordinator,manifest_lifecycle,repository_membership_ledger,gc_service}.rs` + `blob_gc/`; proxy engine stays server-side in `src/proxy.rs` |
 | Storage ports | `StorageWiring::from_backend` is generic over port traits (no `dyn Storage`); stores 15 `Arc<dyn …Port>` views over one shared backend instance | `crates/registry-core/src/storage/ports/mod.rs` |
@@ -78,7 +77,7 @@ Wave 1 (ADR-001…009) is landed for production consumers; Wave 2 (filesystem co
 - **Port consumption:** no production consumer holds the omnibus `Storage` trait or `dyn Storage` (all such sites are test-only). The omnibus trait *is* still the internal implementation vehicle: the port impl macros expand to `Storage::<method>` for both backends (`crates/registry-core/src/storage/ports/mod.rs`). Recorded fact, undecided as policy (assessment Q1 → technical-debt §6).
 - **Composition roots:** server = `runtime.rs` then `supervisor.rs`; CLI = `cli/runtime.rs` + `cli/policy.rs`. `ServerRuntime` holds exactly `app_state`, optional `ref_index`, and the mutation-authority mutex.
 - **`ConsistencyCoordinator` scope:** per composition root, not process-global (server: one; CLI: one per operation; task supervisor: one). Within each root the ADR-001 encapsulation holds.
-- **Known bypasses (current behavior, KI-26):** `/_admin/gc/*` handlers use `state.gc_service`/`gc_run_seq`/config directly; `/token` reads config directly; `AppState` still carries config, GC, proxy, semaphores, and the IP limiter.
+- **Bypasses closed (2026-09-26, ADR-011):** `/_admin/gc/*` delegates to `GcAdminService`; `/token` delegates to `TokenService`; the flat `AppState` field list is a recorded accepted residue (ADR-011 §4).
 - **Auth boundary:** single middleware (`auth.rs::require_auth_middleware`) for `/v2/*`; anonymous pull default-on with a hardcoded private-name heuristic override (KI-17); `/token` mints HMAC-SHA256 JWT-shaped tokens from a key ring; RBAC is deny-by-default with granted ⊆ requested ∩ policy (`src/rbac.rs`).
 
 ## 4. Filesystem / ObjectStore cutover state
