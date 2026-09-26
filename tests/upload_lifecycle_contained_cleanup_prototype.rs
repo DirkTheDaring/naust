@@ -1476,11 +1476,10 @@ fn candidate_change_between_inspect_and_action_is_rejected() {
     let mut swapped = false;
     let mut hook = |_a: &PinnedUploadsAuthority, uuid: &str| {
         let meta = root.join("uploads").join(format!("{uuid}.meta.json"));
-        std::fs::remove_file(&meta).unwrap();
-        // ext4 reuses the freed inode immediately; hold it so the swapped-in
-        // candidate is a genuinely new identity.
-        let keeper = meta.parent().unwrap().join(".inode-keeper");
-        std::fs::write(&keeper, b"inode keeper").unwrap();
+        // Detach (not delete): the old inode stays occupied so the swapped-in
+        // candidate is guaranteed a new identity even under ext4 inode reuse.
+        let detached = meta.with_extension("json.detached-swap");
+        std::fs::rename(&meta, &detached).unwrap();
         std::fs::write(
             &meta,
             MetaRecord {
@@ -1490,7 +1489,6 @@ fn candidate_change_between_inspect_and_action_is_rejected() {
             .to_json(),
         )
         .unwrap();
-        std::fs::remove_file(&keeper).unwrap();
         swapped = true;
     };
 
@@ -1597,11 +1595,11 @@ fn receipt_replacement_between_inspect_and_action_is_rejected() {
     // ext4 reuses freed inode numbers immediately; hold the freed inode with a
     // keeper so the rewritten receipt is a genuinely new identity.
     let receipt = root.join("uploads").join(".finalized").join("aaaa.json");
-    std::fs::remove_file(&receipt).unwrap();
-    let keeper = receipt.parent().unwrap().join(".inode-keeper");
-    std::fs::write(&keeper, b"inode keeper").unwrap();
+    // Detach (not delete): the old inode must stay occupied so the rewritten
+    // receipt is guaranteed a new identity even under ext4 inode reuse.
+    let detached = receipt.with_file_name("aaaa.json.detached-swap");
+    std::fs::rename(&receipt, &detached).unwrap();
     std::fs::write(&receipt, ReceiptRecord { finalized_at: NOW }.to_json()).unwrap();
-    std::fs::remove_file(&keeper).unwrap();
 
     assert!(
         !auth.revalidate_receipt("aaaa", identity).unwrap(),
