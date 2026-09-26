@@ -1,4 +1,3 @@
-use crate::http_api::upload_state::StateTokenError;
 use crate::manifest_lifecycle::{ManifestLifecycleError, UnverifiedReason};
 use crate::manifest_refs::ManifestParseError;
 use crate::registry::canonical_name::RepoNameError;
@@ -7,6 +6,7 @@ use crate::repository_membership_ledger::LedgerError;
 use crate::storage::StorageError;
 use crate::storage::upload_session::{UploadOffsetPrecondition, UploadStreamError};
 use crate::upload_coordinator::CoordinatorError;
+use crate::upload_lifecycle::state::StateTokenError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlobMutationError {

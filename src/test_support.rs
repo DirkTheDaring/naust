@@ -42,5 +42,5 @@ pub fn push_repository_allowed(
     allowlist: &[crate::registry::RepositoryAccessPattern],
     repo: &CanonicalRepoName,
 ) -> bool {
-    crate::auth::push_repository_allowed(allowlist, repo)
+    crate::registry::access_pattern::push_repository_allowed(allowlist, repo)
 }

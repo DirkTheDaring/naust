@@ -70,19 +70,9 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
     Some(segments[..marker_idx].join("/"))
 }
 
-/// Legacy repository push allowlist matcher.
-///
-/// Push allowlist authorization evaluator:
-/// - `*` (`RepositoryAccessPattern::All`) authorizes any repository.
-/// - `prefix/*` (`RepositoryAccessPattern::Subtree`) authorizes `prefix` itself as well as any `prefix/...` descendants.
-/// - Exact repository (`RepositoryAccessPattern::Exact`) authorizes only the specified repository name.
-/// - Empty allowlist or non-matching repository returns `false`.
-pub(crate) fn push_repository_allowed(
-    allowlist: &[crate::registry::RepositoryAccessPattern],
-    repo: &crate::registry::CanonicalRepoName,
-) -> bool {
-    allowlist.iter().any(|pat| pat.matches(repo))
-}
+// Delegated to the core layer (ADR-010): the push-allowlist matching logic lives
+// with `RepositoryAccessPattern` in `registry::access_pattern`.
+pub(crate) use crate::registry::access_pattern::push_repository_allowed;
 
 pub(crate) fn unauthorized_registry_challenge(
     state: &AppState,

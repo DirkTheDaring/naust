@@ -80,6 +80,19 @@ impl RepositoryAccessPattern {
     }
 }
 
+/// Returns `true` when `repo` is authorized by at least one pattern in `allowlist`.
+///
+/// - `*` (`RepositoryAccessPattern::All`) authorizes any repository.
+/// - `prefix/*` (`RepositoryAccessPattern::Subtree`) authorizes `prefix` itself as well as any `prefix/...` descendants.
+/// - Exact repository (`RepositoryAccessPattern::Exact`) authorizes only the specified repository name.
+/// - Empty allowlist or non-matching repository returns `false`.
+pub fn push_repository_allowed(
+    allowlist: &[RepositoryAccessPattern],
+    repo: &crate::registry::canonical_name::CanonicalRepoName,
+) -> bool {
+    allowlist.iter().any(|pat| pat.matches(repo))
+}
+
 impl fmt::Display for RepositoryAccessPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

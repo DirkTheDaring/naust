@@ -1,5 +1,4 @@
 use crate::blob_ref_index::BlobRefIndex;
-use crate::http_api::upload_state::{StateTokenError, UploadStateData};
 use crate::registry::digest::Digest;
 use crate::registry::validation::is_valid_repo_name;
 use crate::storage::StorageError;
@@ -7,6 +6,7 @@ use crate::storage::upload_session::{
     FinalizeOutcome, UploadAppendResult, UploadByteStream, UploadOffsetPrecondition,
     UploadSessionId, UploadSessionState, UploadStreamError, UploadTransitionError,
 };
+use crate::upload_lifecycle::state::{StateTokenError, UploadStateData};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
