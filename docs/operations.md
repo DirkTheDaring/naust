@@ -95,4 +95,4 @@ Cached content lives in a separate root/prefix (`proxy.cache.fs_root` / `cache_s
 ## 6. Development / observability notes (ADR-010 crate split)
 
 - **Log-filter targets:** the FS storage `tracing` targets renamed with the crate split — `naust::storage::fs` → `naust_core::storage::fs`. Update any `RUST_LOG`/collector filters that reference the old target (KI-27b, resolved here).
-- **Test invocation:** the workspace has two crates; bare `cargo test` at the repo root runs only the server package. Use `cargo test --workspace --locked` to include `naust-core`'s ~900 unit tests (KI-27c, resolved here).
+- **Test invocation (updated for the ADR-012 sibling layout):** `naust-core` is a sibling repository (`../naust-core`), not a workspace member — run `cargo test` in each repository. The live-S3 suite here is opt-in: `cargo test --test s3_live_integration -- --ignored --test-threads=1` with MinIO running.

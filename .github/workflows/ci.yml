@@ -19,15 +19,18 @@ jobs:
       # Sibling path-deps are vendored; stage them where the manifests expect them.
       - name: Stage vendored path dependencies
         run: |
-          mkdir -p ../acmecert ../storage-layer-rust
+          mkdir -p ../acmecert ../storage-layer-rust ../naust-core
           cp -a vendor/acmecert/. ../acmecert/
           cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+          cp -a vendor/naust-core/. ../naust-core/
       - name: Format
         run: cargo fmt --all --check
       - name: Core boundary gate (ADR-010)
         run: make core-boundary
-      - name: Workspace tests (the live-S3 suite is ignore-gated; see the live-s3 job)
-        run: cargo test --workspace --locked --no-fail-fast
+      - name: naust-core tests (sibling path dependency)
+        run: cargo test --locked --no-fail-fast --manifest-path ../naust-core/Cargo.toml
+      - name: Server tests (the live-S3 suite is ignore-gated; see the live-s3 job)
+        run: cargo test --locked --no-fail-fast
       - name: Conformance (fs, basic, token)
         run: tests/compliance/run.sh fs basic token
 
@@ -38,9 +41,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Stage vendored path dependencies
         run: |
-          mkdir -p ../acmecert ../storage-layer-rust
+          mkdir -p ../acmecert ../storage-layer-rust ../naust-core
           cp -a vendor/acmecert/. ../acmecert/
           cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+          cp -a vendor/naust-core/. ../naust-core/
       # MinIO's official images no longer allow anonymous pulls (docker.io and
       # quay.io both deny); the frozen bitnami legacy archive still does and is
       # env-configured (no command needed). Pinned by digest.

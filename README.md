@@ -6,7 +6,7 @@ vessels are stored over winter; this is the boathouse for your containers.
 
 The registry primitives live in the separately consumable [`naust-core`](crates/naust-core)
 crate — anyone can build their own registry on top of it
-(see `crates/naust-core/examples/minimal_registry.rs`).
+(see `naust-core/examples/minimal_registry.rs`).
 
 Licensed under the [MIT License](LICENSE).
 
@@ -77,8 +77,10 @@ make conformance
 tests/compliance/run.sh fs token # selected matrices only
 ```
 
-Unit/integration tests span both workspace crates (`naust-core` + the server);
-run `cargo test --workspace --locked` — bare `cargo test` covers only the server package.
+Tests live in two sibling repositories: run `cargo test` here (server + integration
+suites; the live-S3 suite is opt-in via `-- --ignored`) and `cargo test` in
+`../naust-core` (the primitives crate). The `naust-core` sources are also vendored
+under `vendor/` so this repository builds standalone.
 
 See `tests/compliance/README.md` for matrices, environment knobs, and the
 historically-skipped-specs runner (`tests/compliance/run-skipped.sh`).

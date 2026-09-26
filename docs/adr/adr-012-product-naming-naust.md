@@ -23,3 +23,7 @@ Deliberately unchanged: `REGISTRY__…` environment variables and the `registry.
 ## Historical documents
 
 ADR-001…011, `docs/outdated/`, `plans/`, and `evidence/` retain the historical names `registry-rust`/`registry-core`; they describe the code as it was. Machine-specific `file:///home/...` links in old documents were rewritten to repo-relative paths (content-neutral privacy redaction, along with neutralizing personal hostnames/emails in examples).
+
+## Addendum (2026-09-26): naust-core as a sibling repository
+
+At the owner's direction, `naust-core` moved out of the `naust` workspace to the same directory level as the other siblings: repository `DirkTheDaring/naust-core`, consumed as the path dependency `../naust-core` (exactly like `../storage-layer-rust` and `../acmecert`), vendored into `vendor/naust-core` for standalone container/CI builds. `cargo test` runs per repository now; the naust CI additionally tests the staged core via `--manifest-path`. Pre-split history of naust-core lives in the `naust` repository.

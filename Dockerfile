@@ -23,6 +23,9 @@ RUN if [ -d "vendor/storage-layer-rust" ]; then \
       && cp -r vendor/storage-layer-rust/crates /storage-layer-rust/ \
       && cp vendor/storage-layer-rust/Cargo.toml /storage-layer-rust/Cargo.toml; \
     fi
+RUN if [ -d "vendor/naust-core" ]; then \
+      cp -r vendor/naust-core /naust-core; \
+    fi
 
 RUN cargo build --release
 

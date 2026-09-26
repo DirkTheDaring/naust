@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-violations=$(grep -rnE 'naust::|axum::|reqwest::|acmecert' crates/naust-core/src 2>/dev/null \
+violations=$(grep -rnE 'naust::|axum::|reqwest::|acmecert' ../naust-core/src 2>/dev/null \
   | grep -vE '^\s*//')
 
 if [ -n "$violations" ]; then

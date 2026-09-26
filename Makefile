@@ -38,8 +38,8 @@ core-boundary:
 # workspace manifest (the crates use workspace field inheritance).
 .PHONY: vendor-sync
 vendor-sync:
-	@rm -rf vendor/acmecert vendor/storage-layer-rust
-	@mkdir -p vendor/acmecert/crates vendor/storage-layer-rust/crates
+	@rm -rf vendor/acmecert vendor/storage-layer-rust vendor/naust-core
+	@mkdir -p vendor/acmecert/crates vendor/storage-layer-rust/crates vendor/naust-core
 	@cp -a ../acmecert/Cargo.toml vendor/acmecert/Cargo.toml
 	@cp -a ../acmecert/crates/acmecert-core vendor/acmecert/crates/
 	@cp -a ../acmecert/crates/acmecert vendor/acmecert/crates/
@@ -47,6 +47,9 @@ vendor-sync:
 	@cp -a ../storage-layer-rust/crates/storage-core vendor/storage-layer-rust/crates/
 	@cp -a ../storage-layer-rust/crates/storage-fs vendor/storage-layer-rust/crates/
 	@cp -a ../storage-layer-rust/crates/storage-s3 vendor/storage-layer-rust/crates/
+	@cp -a ../naust-core/Cargo.toml ../naust-core/Cargo.lock ../naust-core/LICENSE vendor/naust-core/ 2>/dev/null || cp -a ../naust-core/Cargo.toml ../naust-core/LICENSE vendor/naust-core/
+	@cp -a ../naust-core/src vendor/naust-core/src
+	@cp -a ../naust-core/examples vendor/naust-core/examples
 	@find vendor -name target -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	@echo "vendor/ refreshed from ../acmecert and ../storage-layer-rust"
 
