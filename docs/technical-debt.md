@@ -134,7 +134,7 @@ Recorded in now-archived slice documents; obligations preserved here (canonical 
 
 | ID | Item | Details |
 |---|---|---|
-| KI-19 | **No git remotes on either repository** — unchanged; blocked on the GATE-O13 hosting decision (owner). *Progress 2026-09-26 (R6):* `.github/workflows/ci.yml` rewritten to mirror the real local pipeline (fmt → boundary gate → workspace tests → conformance; separate live-S3 job with a MinIO service), including vendored-path-dep staging — but it has still never executed on a hosted runner. *Criterion:* remotes/hosting decided (GATE-O13), then one green hosted run. |
+| KI-19 | **RESOLVED (2026-09-26, Naust launch).** Published public under MIT: `DirkTheDaring/naust` (+ `storage-layer-rust`, `acmecert`). **First hosted CI run green** (checks: fmt/gate/workspace tests/conformance fs+basic+token; live-s3: full live suite + s3 conformance against MinIO): run 36238807454 — record in `evidence/2026-09-26-naust-launch/`. | Closed. |
 | KI-20 | **RESOLVED (2026-09-26, remediation R6).** Committed evidence convention established: `evidence/` holds per-revision qualification records + JUnit/exit artifacts (see `evidence/README.md`; first record: `evidence/2026-09-26-debt-remediation/` — all four conformance matrices exit 0, live suite 33/0/1 ×2, container build verified, at stated revisions). Raw HTML/logs remain gitignored by design. GATE-O06/O16 evidence rows can now cite committed artifacts. | Closed. |
 | — | Gates GATE-O05/O06/O15/O16 verification specifics | see §1. |
 | — | TAG-DEC-01…06, D7 | see §2. |

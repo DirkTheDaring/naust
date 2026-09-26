@@ -214,3 +214,7 @@ Recommended order: **R0 now; then R1 → R2 (the risk-reduction arc); R3; R5 →
 
 **Closed this campaign:** KI-01, KI-02, KI-03, KI-04, KI-05, KI-06, KI-08, KI-09, KI-10, KI-11, KI-12 (accepted design), KI-13, KI-14, KI-17, KI-18, KI-20, KI-21, KI-26 (recorded residues), KI-27b/c — plus REQ-006 adopted and REQ-012 wired.
 **Remaining open:** KI-19 + GATE-O13 (owner hosting decision, D6), KI-27a (parked until a second core consumer), KI-15/16 (folded into the D6 record), KI-22–25 (containment residues re-parked with owner-confirmed criteria per D7), and the historical GATE rows whose closure requires human acceptance acts.
+
+### Launch addendum (2026-09-26 — D6 executed, KI-19 CLOSED)
+
+D6 resolved by the owner: public GitHub under `DirkTheDaring`, MIT, product renamed **Naust** (ADR-012), gate authority + all GATE rows closed (ADR-013). Published all three repos; first hosted CI run green end-to-end (run 36238807454; record in `evidence/2026-09-26-naust-launch/`). Launch-hardening learnings: ext4 inode reuse broke four swap fixtures (inode-keeper fix); MinIO official images no longer pull anonymously (bitnamilegacy archive, digest-pinned); live suite restored to opt-in `--ignored` gating. **Remaining open across the whole register: KI-27a (second core consumer) and KI-22…25 (re-parked containment residues) only.**
