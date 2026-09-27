@@ -34,9 +34,10 @@ core-boundary:
 	scripts/check-core-boundary.sh
 
 # Inputs `make rpm` / `make deb` install, plus the local compose contract (ADR-017).
+# `/bin/sh` is dash on Ubuntu runners; dash rejects `set -o pipefail`.
 .PHONY: packaging-check
 packaging-check:
-	@set -euo pipefail; \
+	@set -eu; \
 	missing=0; \
 	for f in \
 		packaging/systemd/naust.service \
@@ -286,7 +287,7 @@ image: container
 docker-build: container
 
 sync-version:
-	@set -euo pipefail; \
+	@set -eu; \
 	ver="$(VERSION)"; rel="$(RELEASE)"; debver="$(DEB_VERSION)"; maint="$(DEB_MAINTAINER)"; \
 	cargo_ver="$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"; \
 	if [ "$$cargo_ver" != "$$ver" ]; then \
@@ -330,7 +331,7 @@ bump-version:
 		echo "usage: make bump-version NEW=x.y.z" >&2; \
 		exit 2; \
 	fi
-	@set -euo pipefail; \
+	@set -eu; \
 	new_ver="$(NEW)"; \
 	if [ -f VERSION ]; then \
 		echo "$$new_ver" > VERSION; \
