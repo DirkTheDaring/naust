@@ -20,5 +20,6 @@ Accepted decisions, in order. **Naming note (2026-09-26, ADR-012):** the product
 | [014](adr-014-auth-and-proxy-trust-boundaries.md) | Anonymous tokens stay exact and public; catalog uses one visibility decision; proxy egress and credential hosts are explicit | Accepted | clauses 2, 3, 5 amended by ADR-015 |
 | [015](adr-015-catalog-credential-and-scope-match.md) | One catalog predicate; upstream Basic stays off content hosts; repository `*` authorizes nothing | Accepted | amends ADR-014; `library/` alias removed by ADR-016 |
 | [016](adr-016-mac-egress-and-repo-identity.md) | Separate upload-state MAC key; block NAT64-to-private and CGNAT; repository grants use the stored name | Accepted | amends ADR-015 clause 3 |
+| [017](adr-017-ship-what-ci-can-prove.md) | Packaging inputs match `make rpm`/`make deb`; compose stays on loopback with an explicit signing key; `/healthz` and `/metrics` are unauthenticated | Accepted | — |
 
 Context: current architecture [`../architecture/README.md`](../architecture/README.md) · requirements [`../requirements.md`](../requirements.md) · remaining work [`../technical-debt.md`](../technical-debt.md).

@@ -33,12 +33,10 @@ services:
       CATALOG_REQUIRES_AUTH: ""
 
       TOKEN_SERVICE: ""
+      # Cleared so a mounted TOML file supplies token.signing_key. The base
+      # compose file sets a loopback dev key; this overlay removes it.
       TOKEN_SIGNING_KEY: ""
       TOKEN_TTL_SECS: ""
-
-      # In best-practice mode, a stable signing key is required.
-      # (Either set it in the TOML under [token].signing_key or here.)
-      # TOKEN_SIGNING_KEY: "change-me"
 
     volumes:
       # Mount your config into the container.

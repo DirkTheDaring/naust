@@ -1,8 +1,7 @@
 name: ci
 
-# Real pipeline definition (remediation R6). NOTE (KI-19/GATE-O13): this
-# repository has no remote yet, so this workflow has never executed on a
-# hosted runner; it mirrors the local verification commands exactly.
+# Hosted pipeline. Sibling crates are path dependencies; CI compiles the
+# copies under vendor/ (refresh with `make vendor-sync` before a release).
 
 on:
   push:
@@ -25,6 +24,8 @@ jobs:
           cp -a vendor/naust-core/. ../naust-core/
       - name: Format
         run: cargo fmt --all --check
+      - name: Packaging and deploy contract
+        run: make packaging-check
       - name: Core boundary gate (ADR-010)
         run: make core-boundary
       - name: naust-core tests (sibling path dependency)

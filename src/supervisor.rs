@@ -279,7 +279,12 @@ pub fn build_router(state: AppState) -> Router {
         Router::new()
     };
 
+    let probe = Router::new()
+        .route("/healthz", get(crate::http_api::health::healthz))
+        .route("/metrics", get(crate::http_api::health::metrics));
+
     Router::new()
+        .merge(probe)
         .merge(token)
         .merge(admin)
         .merge(meta)
@@ -1105,6 +1110,8 @@ async fn ip_concurrency_middleware(
     let path = req.uri().path();
     if path == "/v2"
         || path == "/v2/"
+        || path == "/healthz"
+        || path == "/metrics"
         || path.starts_with("/_meta/")
         || path.starts_with("/_admin/gc/health")
     {

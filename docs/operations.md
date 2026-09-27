@@ -1,6 +1,6 @@
 # Operations guide
 
-- **Role:** canonical operational guidance. Describes behavior at `master` @ `2718bc16`; documenting behavior does not approve it — divergences carry KI/GATE IDs from [`technical-debt.md`](technical-debt.md).
+- **Role:** canonical operational guidance for the current tree. Historical KI/GATE IDs and their closure records live in [`technical-debt.md`](technical-debt.md). Documenting behavior does not approve a new deployment model.
 - Running, configuration reference, env vars, packaging, and compose recipes live in the root [`README.md`](../README.md). Separate guides retained for distinct topics: [`traefik-configuration.md`](traefik-configuration.md) (reverse-proxy tuning) and [`container-testing-guide.md`](container-testing-guide.md) (client/API test recipes).
 
 ## 1. Garbage collection
@@ -26,8 +26,8 @@ One GC engine (`src/blob_gc/`), backend-selected strategy:
 | `blob_gc.default_min_age_secs` / `default_quarantine_delay_secs` | 7 d / 24 h | candidate age floor / FS delete delay |
 | `blob_gc.default_max_{blobs,bytes,seconds}` | 1000 / u64::MAX / 60 | per-run budgets |
 | `blob_gc.schedule_enabled` / `schedule_interval_secs` | false / 7 d | background scheduler |
-| `gc_pin_duration_secs` | 3600 | **actual** pin TTL protecting in-flight publications |
-| `blob_gc_finalize_grace_secs` | 72 h | **inert — parsed but never read** (KI-03); do not rely on it |
+| `gc_pin_duration_secs` | 3600 | pin TTL protecting in-flight publications |
+| `blob_gc_finalize_grace_secs` | 72 h | auto-expiring pin on freshly published blobs |
 | `ref_index.auto_rebuild_on_corruption` | true | enables index self-heal |
 | `s3_single_instance_mode` | — | required (hard config conflict otherwise) for delete-enabled online GC on S3 |
 | `storage.fs.gc.discovery.*` | — | resource ceilings for contained FS discovery (limits only; no legacy-path switch exists) |
@@ -85,12 +85,14 @@ Static TLS: set `TLS_CERT_PATH`/`TLS_KEY_PATH`. Behind a reverse proxy, see [`tr
 
 Cached content lives in a separate root/prefix (`proxy.cache.fs_root` / `cache_s3_prefix`, default `./data/cache/...`) with its own sled index — cache cleanup is deleting that directory. `max_cache_bytes` is **required** when the proxy is enabled (per upstream route with `[[proxy.upstreams]]`) and is enforced on **both backends** (KI-02 resolved 2026-09-26): a supervised worker bounds the cache to `max_cache_bytes` total, evicting unprotected blobs in LRU order (never-accessed first) via version-conditional deletes; content protected by eviction policies (`keep_tags`, semver pinning) is never evicted — if protected content alone exceeds the budget, a warning reports the residual. The cache listing fails closed on malformed cache-directory entries (process-owned tree; delete the cache directory to recover). Scrub (digest re-verification of cached files) remains filesystem-only by design: S3 object integrity is enforced by the object store. Proxy-only hosts (`[proxy.routing].proxy_hosts` or `[[proxy.upstreams]].hosts`) never consult local storage and reject writes with 405. Safety rails: allowed upstream hosts/repo prefixes, private-network blocking, redirect policy.
 
-## 5. Packaging and deployment cautions
+## 5. Packaging, probes, and restore
 
-- The packaged conffiles under `etc/naust/` currently ship environment-specific values, an unknown config key that hard-fails strict mode, and credential material — review before deploying a package (KI-11).
-- RPM and DEB systemd units diverge (DEB lacks `LimitNOFILE`/`ReadWritePaths`; KI-21).
-- The container image build does not stage the `storage-layer-rust` path dependencies; build viability is unverified (KI-10).
-- Non-Linux hosts: `FsStorage` requires Linux `openat2` and fails closed at startup elsewhere; non-Linux operation is unverified (GATE-O15).
+- Packages ship the neutral templates in `packaging/config/`. `serve` still requires `token.signing_key` (or `token.allow_ephemeral_signing_key` for a local experiment) before it listens.
+- RPM and DEB units both set `LimitNOFILE=65536`, `TimeoutStopSec=30`, and a start limit of five restarts in 60 seconds. `make packaging-check` is the CI gate that those inputs exist.
+- The container image compiles `vendor/`. Run `make vendor-sync` after the sibling crate changes you intend to ship. The image does not contain a signing key. Compose for local use binds `127.0.0.1:5000` and sets a dev key; push credentials stay unset until you add them. A `v*` tag publishes `ghcr.io/dirkthedaring/naust`.
+- `GET /healthz` returns 200 with no credentials once the process is listening. `GET /v2/` remains the OCI ping and can be 401. `GET /metrics` is Prometheus text (token counters and in-flight gauges, no repository names) on the same port.
+- One process owns a storage root. To restore a filesystem registry, stop that process and copy the storage root and the sled ref-index directory back together.
+- Non-Linux hosts: `FsStorage` requires Linux `openat2` and fails closed at startup elsewhere.
 
 ## 6. Development / observability notes (ADR-010 crate split)
 

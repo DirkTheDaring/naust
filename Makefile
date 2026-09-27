@@ -33,6 +33,40 @@ conformance:
 core-boundary:
 	scripts/check-core-boundary.sh
 
+# Inputs `make rpm` / `make deb` install, plus the local compose contract (ADR-017).
+.PHONY: packaging-check
+packaging-check:
+	@set -euo pipefail; \
+	missing=0; \
+	for f in \
+		packaging/systemd/naust.service \
+		packaging/systemd/sysusers.d/naust.conf \
+		packaging/systemd/tmpfiles.d/naust.conf \
+		packaging/sysconfig/naust \
+		packaging/deb/systemd/naust.service \
+		packaging/deb/default/naust \
+		packaging/deb/doc/naust.1 \
+		packaging/deb/lintian/naust \
+		packaging/config/registry.core.toml \
+		packaging/config/registry.auth.toml \
+		packaging/rpm/naust.spec \
+		docs/operations.md \
+		; do \
+		if [ ! -f "$$f" ]; then echo "missing packaging input: $$f" >&2; missing=1; fi; \
+	done; \
+	[ "$$missing" -eq 0 ]; \
+	grep -q '^LimitNOFILE=65536$$' packaging/systemd/naust.service; \
+	grep -q '^LimitNOFILE=65536$$' packaging/deb/systemd/naust.service; \
+	grep -q '^StartLimitBurst=5$$' packaging/systemd/naust.service; \
+	grep -q '^StartLimitBurst=5$$' packaging/deb/systemd/naust.service; \
+	grep -q '127.0.0.1:5000:5000' docker-compose.yml; \
+	grep -q 'TOKEN_SIGNING_KEY:' docker-compose.yml; \
+	if grep -E '^[[:space:]]*REGISTRY_PASSWORD:' docker-compose.yml >/dev/null; then \
+		echo "docker-compose.yml must not set a default push password" >&2; \
+		exit 1; \
+	fi; \
+	echo "packaging-check: ok"
+
 # Stage sibling path-dependencies into vendor/ for container builds (KI-10).
 # acmecert: crates/acmecert-core; storage-layer-rust: all three crates + the
 # workspace manifest (the crates use workspace field inheritance).
@@ -99,7 +133,7 @@ $(TARBALL): rpm-dirs
 	@cp -a packaging/systemd/tmpfiles.d/naust.conf dist/rpmstage/$(NAME)-$(VERSION)/tmpfiles.d/naust.conf
 	@cp -a packaging/sysconfig/naust dist/rpmstage/$(NAME)-$(VERSION)/sysconfig/naust
 	@cp -a README.md dist/rpmstage/$(NAME)-$(VERSION)/README.md
-	@cp -a docs/blob-gc.md dist/rpmstage/$(NAME)-$(VERSION)/blob-gc.md
+	@cp -a docs/operations.md dist/rpmstage/$(NAME)-$(VERSION)/operations.md
 	@cp -a packaging/deb/doc/naust.1 dist/rpmstage/$(NAME)-$(VERSION)/man/naust.1
 	@tar -C dist/rpmstage -czf $(TARBALL) $(NAME)-$(VERSION)
 	@cp -a $(SPEC) $(SPECS)/$(NAME).spec
@@ -189,7 +223,7 @@ deb: deb-dirs
 	@install -m 0644 packaging/deb/default/naust $(DEB_STAGE)/etc/default/naust
 	@install -m 0644 packaging/deb/systemd/naust.service $(DEB_STAGE)/usr/lib/systemd/system/naust.service
 	@install -m 0644 README.md $(DEB_STAGE)/usr/share/doc/naust/README.md
-	@install -m 0644 docs/blob-gc.md $(DEB_STAGE)/usr/share/doc/naust/blob-gc.md
+	@install -m 0644 docs/operations.md $(DEB_STAGE)/usr/share/doc/naust/operations.md
 	@install -m 0644 packaging/deb/doc/copyright $(DEB_STAGE)/usr/share/doc/naust/copyright
 	@install -m 0644 packaging/deb/doc/changelog.Debian $(DEB_STAGE)/usr/share/doc/naust/changelog.Debian
 	@if command -v gzip >/dev/null 2>&1; then gzip -9n -f $(DEB_STAGE)/usr/share/doc/naust/changelog.Debian; fi

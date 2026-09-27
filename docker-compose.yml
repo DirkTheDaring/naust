@@ -2,7 +2,7 @@ services:
   registry:
     build: .
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     ulimits:
       nofile:
         soft: 65536
@@ -10,15 +10,14 @@ services:
     environment:
       RUST_LOG: "info,tower_http=debug"
       PUBLIC_URL: "http://127.0.0.1:5000"
-      # Optional: set a stable signing key so tokens remain valid across restarts.
-      # TOKEN_SIGNING_KEY: "change-me"
-      # Set credentials to enable pushes.
-      REGISTRY_USERNAME: "demo"
-      REGISTRY_PASSWORD: "demo"
+      # Local-only signing key so `serve` starts. Replace this before any
+      # deploy that is not bound to loopback (ADR-017).
+      TOKEN_SIGNING_KEY: "local-dev-signing-key-not-for-production"
 
-      # Optional: allow pushes only to specific repos (comma-separated).
-      # Examples: "myrepo", "org/*", "*"
-      REGISTRY_PUSH_ALLOW_REPOS: "myrepo"
+      # Push is off until you set credentials. Example:
+      # REGISTRY_USERNAME: "demo"
+      # REGISTRY_PASSWORD: "change-me"
+      # REGISTRY_PUSH_ALLOW_REPOS: "myrepo"
 
       # Data/config
       STORAGE_BACKEND: "fs"
@@ -30,6 +29,13 @@ services:
 
     volumes:
       - registry-data:/data
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5000/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
 
     # S3 mode (backend implemented). For local testing with MinIO, see
     # docker-compose.minio.yml and scripts/minio-smoke.sh.

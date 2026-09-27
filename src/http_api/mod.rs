@@ -4,6 +4,7 @@ pub mod blobs;
 pub mod catalog;
 pub mod errors;
 pub mod handlers;
+pub mod health;
 pub mod manifests;
 pub mod policy;
 pub mod referrers;

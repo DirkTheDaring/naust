@@ -49,6 +49,11 @@ ENV LISTEN_ADDR=0.0.0.0:5000 \
 VOLUME ["/data"]
 EXPOSE 5000
 
+# TOKEN_SIGNING_KEY is not baked into the image. `serve` refuses to start
+# until the operator sets one (compose sets a loopback-only dev key).
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:5000/healthz || exit 1
+
 USER registry
 ENTRYPOINT ["/usr/local/bin/naust"]
 CMD ["server"]

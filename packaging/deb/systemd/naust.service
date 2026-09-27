@@ -3,6 +3,8 @@ Description=naust OCI registry
 Documentation=man:naust(1)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -20,6 +22,7 @@ StateDirectoryMode=0750
 
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=30
 
 # Avoid EMFILE ("Too many open files") under concurrent pushes/pulls
 # (aligned with the RPM unit, KI-21).

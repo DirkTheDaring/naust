@@ -91,7 +91,7 @@ historically-skipped-specs runner (`tests/compliance/run-skipped.sh`).
 docker compose up --build
 ```
 
-This listens on `127.0.0.1:5000` (host) and stores data in a named volume (`registry-data`).
+This listens on `127.0.0.1:5000` and stores data in a named volume (`registry-data`). Compose sets `TOKEN_SIGNING_KEY` to a loopback-only dev value so `serve` can start. Replace that key before any deploy that is not bound to loopback. Push credentials are unset; anonymous pull works, and you opt in to push by setting `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, and `REGISTRY_PUSH_ALLOW_REPOS`. `GET /healthz` is the readiness probe.
 
 ### File descriptor limits (important)
 
@@ -100,7 +100,7 @@ If the process hits the OS file descriptor limit, you may see logs like:
 
 `ERROR axum::serve: accept error: Too many open files (os error 24)`
 
-- **systemd**: set `LimitNOFILE` in the service unit (the packaged **RPM** unit sets `65536`; the packaged **DEB** unit currently sets no `LimitNOFILE` — see `docs/technical-debt.md` KI-21).
+- **systemd**: the packaged RPM and DEB units both set `LimitNOFILE=65536`.
 - **docker-compose**: set `ulimits.nofile` (the example compose sets it).
 
 To inspect at runtime:
@@ -458,7 +458,7 @@ Full config example: `configs/registry.proxy.multi.toml`.
 - Precedence: defaults < config file < env vars
 - Best-practice profile:
   - Set `BEST_PRACTICE=1`, or set `[profile].name = "best_practice"` in the TOML.
-  - In best-practice mode, `TOKEN_SIGNING_KEY` (or `token.signing_key` / `token.signing_keys` in the TOML) is required; the process fails fast if missing.
+  - `serve` and `check-config` require `TOKEN_SIGNING_KEY` (or `token.signing_key` / `token.signing_keys` in the TOML) unless `token.allow_ephemeral_signing_key` is set. Best-practice mode also rejects an ephemeral key at config load.
 
 Example:
 

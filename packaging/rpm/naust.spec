@@ -8,9 +8,10 @@ Summary:        Minimal Docker/OCI registry (Distribution v2 compatible) in Rust
 # no DWARF symbols.
 %global debug_package %{nil}
 
-License:        LicenseRef-Proprietary
-URL:            https://example.invalid/naust
-Source0:        https://example.invalid/naust/releases/download/v%{version}/%{name}-%{version}.tar.gz
+License:        MIT
+URL:            https://github.com/DirkTheDaring/naust
+# Local source archive produced by `make rpm` (binary + packaging inputs).
+Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  systemd-rpm-macros
 Requires:       ca-certificates
@@ -22,8 +23,8 @@ Requires(pre):  systemd
 %description
 naust is a minimal Docker/OCI registry implementation in Rust.
 
-It also provides maintenance subcommands via the same binary, e.g.
-`naust ref-index ...` and `naust blob-gc ...`.
+It also provides maintenance commands via the same binary, for example
+`naust ref-index` and blob garbage collection.
 
 %prep
 %setup -q
@@ -49,12 +50,12 @@ install -D -m 0644 tmpfiles.d/naust.conf %{buildroot}%{_tmpfilesdir}/naust.conf
 install -D -m 0644 sysconfig/naust %{buildroot}%{_sysconfdir}/sysconfig/naust
 
 install -D -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
-install -D -m 0644 blob-gc.md %{buildroot}%{_docdir}/%{name}/blob-gc.md
+install -D -m 0644 operations.md %{buildroot}%{_docdir}/%{name}/operations.md
 install -D -m 0644 man/naust.1 %{buildroot}%{_mandir}/man1/naust.1
 
 %files
 %doc %{_docdir}/%{name}/README.md
-%doc %{_docdir}/%{name}/blob-gc.md
+%doc %{_docdir}/%{name}/operations.md
 %{_bindir}/naust
 %config(noreplace) %{_sysconfdir}/naust/registry.core.toml
 %config(noreplace) %{_sysconfdir}/naust/registry.auth.toml
