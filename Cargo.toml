@@ -46,16 +46,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-acmecert-core = { path = "../acmecert/crates/acmecert-core" }
-naust-core = { path = "../naust-core" }
-storage-core = { path = "../storage-layer-rust/crates/storage-core" }
-storage-fs = { path = "../storage-layer-rust/crates/storage-fs" }
-storage-s3 = { path = "../storage-layer-rust/crates/storage-s3" }
+acmecert-core = { path = "vendor/acmecert/crates/acmecert-core" }
+naust-core = { path = "vendor/naust-core" }
+storage-core = { path = "vendor/storage-layer-rust/crates/storage-core" }
+storage-fs = { path = "vendor/storage-layer-rust/crates/storage-fs" }
+storage-s3 = { path = "vendor/storage-layer-rust/crates/storage-s3" }
 x509-parser = "0.18.1"
 
 [dev-dependencies]
-naust-core = { path = "../naust-core", features = ["test-mocks"] }
+naust-core = { path = "vendor/naust-core", features = ["test-mocks"] }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 rcgen = "0.14.10"
+

@@ -134,12 +134,11 @@ where
     Reload: FnOnce() -> ReloadFut,
     ReloadFut: std::future::Future<Output = Result<(), String>>,
 {
-    if let Some(renew) = renew {
-        if let Err(e) = renew().await {
+    if let Some(renew) = renew
+        && let Err(e) = renew().await {
             // Renewal failure is log-and-retry; the current cert keeps serving.
             tracing::warn!(error = %e, "tls: renewal attempt failed; will retry");
         }
-    }
 
     let current = fingerprint(cert_path);
     if current.is_none() || current == *last_fingerprint {

@@ -65,8 +65,8 @@ pub async fn tags_list(
                     headers.insert("Content-Type", "application/json".parse().unwrap());
                     headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
-                    if page.has_more {
-                        if let (Some(n_val), Some(last_tag)) = (n, page.next_last.as_deref()) {
+                    if page.has_more
+                        && let (Some(n_val), Some(last_tag)) = (n, page.next_last.as_deref()) {
                             let last_tag = url_encode_component(last_tag);
                             let link = format!(
                                 "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
@@ -75,7 +75,6 @@ pub async fn tags_list(
                                 headers.insert(http::header::LINK, v);
                             }
                         }
-                    }
 
                     if method == Method::HEAD {
                         return (StatusCode::OK, headers).into_response();

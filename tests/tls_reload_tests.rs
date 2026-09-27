@@ -4,7 +4,7 @@
 //! tick, and verifies the handshake-visible certificate changed.
 
 use naust::tls_manager::TlsWatcher;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 

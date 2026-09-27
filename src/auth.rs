@@ -60,10 +60,7 @@ pub(crate) fn extract_repo_from_v2_path(path: &str) -> Option<String> {
 
     let marker_idx = segments
         .iter()
-        .position(|s| *s == "blobs" || *s == "manifests" || *s == "tags" || *s == "referrers");
-    let Some(marker_idx) = marker_idx else {
-        return None;
-    };
+        .position(|s| *s == "blobs" || *s == "manifests" || *s == "tags" || *s == "referrers")?;
     if marker_idx == 0 {
         return None;
     }
@@ -98,13 +95,11 @@ pub(crate) fn unauthorized_registry_challenge(
         bearer.push_str(&format!(",scope=\"repository:{repo}:{action_str}\""));
     }
 
-    if state.config.auth_strategy == crate::config::AuthStrategy::Token
-        || state.config.auth_strategy == crate::config::AuthStrategy::Both
-    {
-        if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+    if (state.config.auth_strategy == crate::config::AuthStrategy::Token
+        || state.config.auth_strategy == crate::config::AuthStrategy::Both)
+        && let Ok(v) = http::HeaderValue::from_str(&bearer) {
             resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
         }
-    }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Basic
         || state.config.auth_strategy == crate::config::AuthStrategy::Both
@@ -132,13 +127,11 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
         state.config.token_service
     );
 
-    if state.config.auth_strategy == crate::config::AuthStrategy::Token
-        || state.config.auth_strategy == crate::config::AuthStrategy::Both
-    {
-        if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+    if (state.config.auth_strategy == crate::config::AuthStrategy::Token
+        || state.config.auth_strategy == crate::config::AuthStrategy::Both)
+        && let Ok(v) = http::HeaderValue::from_str(&bearer) {
             resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
         }
-    }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Basic
         || state.config.auth_strategy == crate::config::AuthStrategy::Both
@@ -152,22 +145,24 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
 }
 
 fn verify_any_basic_credentials(cfg: &crate::config::Config, user: &str, pass: &str) -> bool {
-    if cfg.robots.enabled {
-        if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
+    if cfg.robots.enabled
+        && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
             return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
         }
-    }
-    if cfg.users.enabled {
-        if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
+    if cfg.users.enabled
+        && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
             return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
         }
-    }
     if let (Some(expected_user), Some(expected_pass)) =
         (cfg.push_username.as_deref(), cfg.push_password.as_deref())
-    {
-        if configured_secrets_match(user, pass, expected_user, expected_pass) {
+        && configured_secrets_match(user, pass, expected_user, expected_pass) {
             return true;
         }
+    if cfg.robots.enabled || cfg.users.enabled {
+        let _ = crate::robot_secrets::verify_robot_secret(
+            pass,
+            crate::robot_secrets::DUMMY_SENTINEL_HASH,
+        );
     }
     false
 }
@@ -208,28 +203,24 @@ pub(crate) fn authorize_catalog(state: &AppState, headers: &HeaderMap) -> Catalo
 }
 
 fn catalog_shows_private_names(state: &AppState, headers: &HeaderMap) -> bool {
-    if let Some(token) = bearer_token_from_headers(headers) {
-        if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+    if let Some(token) = bearer_token_from_headers(headers)
+        && let Ok(claims) = security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
             token,
             &state.config.token_service,
             state.config.token_ttl_secs,
-        ) {
-            if bearer_claims_are_authenticated(&claims)
+        )
+            && bearer_claims_are_authenticated(&claims)
                 && security::token_allows_catalog_action(&claims)
             {
                 return true;
             }
-        }
-    }
 
-    if state.config.auth_strategy != crate::config::AuthStrategy::Token {
-        if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
-            if basic_allows_catalog(&state.config, basic.username(), basic.password()) {
+    if state.config.auth_strategy != crate::config::AuthStrategy::Token
+        && let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>()
+            && basic_allows_catalog(&state.config, basic.username(), basic.password()) {
                 return true;
             }
-        }
-    }
     false
 }
 
@@ -240,8 +231,8 @@ pub(crate) fn basic_allows_catalog(cfg: &crate::config::Config, user: &str, pass
         actions: vec!["*".to_string()],
     }];
 
-    if cfg.robots.enabled {
-        if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
+    if cfg.robots.enabled
+        && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
             if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
                 return !crate::rbac::grant_scopes_by_prefix_with_options(
                     &requested,
@@ -252,10 +243,9 @@ pub(crate) fn basic_allows_catalog(cfg: &crate::config::Config, user: &str, pass
             }
             return false;
         }
-    }
 
-    if cfg.users.enabled {
-        if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
+    if cfg.users.enabled
+        && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
             if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
                 let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
                 for group_name in &account.groups {
@@ -272,36 +262,38 @@ pub(crate) fn basic_allows_catalog(cfg: &crate::config::Config, user: &str, pass
             }
             return false;
         }
-    }
 
     if let (Some(expected_user), Some(expected_pass)) =
         (cfg.push_username.as_deref(), cfg.push_password.as_deref())
-    {
-        if configured_secrets_match(user, pass, expected_user, expected_pass) {
+        && configured_secrets_match(user, pass, expected_user, expected_pass) {
             return cfg.push_implies_delete
                 || cfg
                     .push_actions
                     .iter()
                     .any(|a| a == "*" || a == "pull" || a == "push");
         }
+
+    if cfg.robots.enabled || cfg.users.enabled {
+        let _ = crate::robot_secrets::verify_robot_secret(
+            pass,
+            crate::robot_secrets::DUMMY_SENTINEL_HASH,
+        );
     }
     false
 }
 
 pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     // Bearer: accept any valid, unexpired token minted by this registry.
-    if let Some(token) = bearer_token_from_headers(headers) {
-        if let Ok(claims) = security::verify_bearer_token_bound_with_keys(
+    if let Some(token) = bearer_token_from_headers(headers)
+        && let Ok(claims) = security::verify_bearer_token_bound_with_keys(
             &state.config.token_signing_keys,
             token,
             &state.config.token_service,
             state.config.token_ttl_secs,
-        ) {
-            if bearer_claims_are_authenticated(&claims) {
+        )
+            && bearer_claims_are_authenticated(&claims) {
                 return true;
             }
-        }
-    }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Token {
         return false;
@@ -329,19 +321,18 @@ pub(crate) fn verify_direct_basic_access(
     }];
 
     // 1. Try Robots
-    if cfg.robots.enabled {
-        if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
+    if cfg.robots.enabled
+        && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
             if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
                 let granted = crate::rbac::grant_scopes_by_prefix(&token_scopes, &account.grants);
                 return !granted.is_empty();
             }
             return false;
         }
-    }
 
     // 2. Try Users
-    if cfg.users.enabled {
-        if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
+    if cfg.users.enabled
+        && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
             if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
                 let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
                 for group_name in &account.groups {
@@ -354,13 +345,11 @@ pub(crate) fn verify_direct_basic_access(
             }
             return false;
         }
-    }
 
     // 3. Fallback to global basic auth
     if let (Some(expected_user), Some(expected_pass)) =
         (cfg.push_username.as_deref(), cfg.push_password.as_deref())
-    {
-        if configured_secrets_match(user, pass, expected_user, expected_pass) {
+        && configured_secrets_match(user, pass, expected_user, expected_pass) {
             let action_norm = action.to_ascii_lowercase();
             let action_allowed = if cfg.push_implies_delete {
                 action_norm == "pull" || action_norm == "push" || action_norm == "delete"
@@ -377,6 +366,12 @@ pub(crate) fn verify_direct_basic_access(
             }
             return true;
         }
+
+    if cfg.robots.enabled || cfg.users.enabled {
+        let _ = crate::robot_secrets::verify_robot_secret(
+            pass,
+            crate::robot_secrets::DUMMY_SENTINEL_HASH,
+        );
     }
 
     false
@@ -421,11 +416,10 @@ pub async fn require_auth_middleware(
                 return crate::http_api::errors::method_not_allowed("GET, HEAD");
             }
         }
-        crate::http_api::routing::OciRoute::TagDelete { .. } => {
-            if method != http::Method::DELETE {
+        crate::http_api::routing::OciRoute::TagDelete { .. }
+            if method != http::Method::DELETE => {
                 return crate::http_api::errors::method_not_allowed("DELETE");
             }
-        }
         _ => {}
     }
 
@@ -479,18 +473,15 @@ pub async fn require_auth_middleware(
                     );
                 }
 
-                if required_action == security::RepoAction::Push
-                    || required_action == security::RepoAction::Delete
-                {
-                    if let Some(allowlist) = state.config.push_allow_repos.as_deref() {
-                        if !push_repository_allowed(allowlist, canonical_repo) {
+                if (required_action == security::RepoAction::Push
+                    || required_action == security::RepoAction::Delete)
+                    && let Some(allowlist) = state.config.push_allow_repos.as_deref()
+                        && !push_repository_allowed(allowlist, canonical_repo) {
                             return errors::denied(
                                 "push or delete not allowed for this repository",
                             )
                             .into_response();
                         }
-                    }
-                }
                 return next.run(request).await;
             }
             Err(_) => {
@@ -504,8 +495,8 @@ pub async fn require_auth_middleware(
     }
 
     // If token-only mode is enabled, do not accept Basic for directly authenticating data requests.
-    if state.config.auth_strategy != crate::config::AuthStrategy::Token {
-        if let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
+    if state.config.auth_strategy != crate::config::AuthStrategy::Token
+        && let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
             let action_str = required_action.as_str();
             if verify_direct_basic_access(
                 &state.config,
@@ -517,7 +508,6 @@ pub async fn require_auth_middleware(
                 return next.run(request).await;
             }
         }
-    }
 
     unauthorized_registry_challenge(&state, Some(repo_name), Some(required_action))
 }

@@ -370,6 +370,34 @@ impl S3Driver for MockS3Driver {
         Ok(Some(Box::pin(std::io::Cursor::new(slice))))
     }
 
+    async fn get_object_stream(
+        &self,
+        _bucket: &str,
+        key: &str,
+    ) -> Result<Option<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>)>, StorageError> {
+        let mut log = self.call_log.lock().unwrap();
+        log.push(S3CallLogEntry {
+            method: "get_object_stream".to_string(),
+            key: key.to_string(),
+            if_match: None,
+            if_none_match: None,
+            body_len: 0,
+        });
+        drop(log);
+
+        self.check_before_hook("get_object_stream", key)?;
+        let objs = self.objects.lock().unwrap();
+        let res = objs.get(key).cloned();
+        drop(objs);
+        self.check_after_hook("get_object_stream", key)?;
+
+        let Some((bytes, _)) = res else {
+            return Ok(None);
+        };
+        let size = bytes.len() as u64;
+        Ok(Some((size, Box::pin(std::io::Cursor::new(bytes)))))
+    }
+
     async fn head_object(&self, _bucket: &str, key: &str) -> Result<Option<u64>, StorageError> {
         let mut log = self.call_log.lock().unwrap();
         log.push(S3CallLogEntry {
@@ -641,6 +669,7 @@ impl S3Driver for MockS3Driver {
     }
 }
 
+#[allow(dead_code)]
 fn make_test_stream(chunks: Vec<Bytes>) -> UploadByteStream {
     Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)))
 }

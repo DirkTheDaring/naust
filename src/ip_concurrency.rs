@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -54,11 +54,10 @@ impl IpConcurrencyLimiter {
     }
 
     fn shard_idx(&self, key: &NormalizedClientKey) -> usize {
-        let mut hasher = self.build_hasher.build_hasher();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % IP_SHARDS
+        (self.build_hasher.hash_one(key) as usize) % IP_SHARDS
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn acquire(self: &Arc<Self>, ip: IpAddr) -> Result<Option<IpConnectionGuard>, ()> {
         if self.max_per_ip == 0 || self.is_bypassed(&ip) {
             return Ok(None);

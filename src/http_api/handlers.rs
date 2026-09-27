@@ -63,13 +63,11 @@ pub async fn ping(State(state): State<AppState>, req_headers: HeaderMap) -> Resp
             "Bearer realm=\"{realm}/token\",service=\"{}\"",
             state.config.token_service
         );
-        if state.config.auth_strategy == crate::config::AuthStrategy::Token
-            || state.config.auth_strategy == crate::config::AuthStrategy::Both
-        {
-            if let Ok(v) = http::HeaderValue::from_str(&bearer) {
+        if (state.config.auth_strategy == crate::config::AuthStrategy::Token
+            || state.config.auth_strategy == crate::config::AuthStrategy::Both)
+            && let Ok(v) = http::HeaderValue::from_str(&bearer) {
                 resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
             }
-        }
         if state.config.auth_strategy == crate::config::AuthStrategy::Basic
             || state.config.auth_strategy == crate::config::AuthStrategy::Both
         {

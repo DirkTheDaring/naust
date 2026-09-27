@@ -2489,7 +2489,7 @@ async fn test_live_s3_cache_eviction_port_conditional_and_bounding() {
             "{}/blobs/sha256/{}/{}",
             harness.prefix.trim_end_matches('/'),
             &hex[0..2],
-            &hex
+            hex
         );
         client
             .put_object()

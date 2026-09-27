@@ -1,14 +1,15 @@
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 /// Coordination primitive providing mutual exclusion between
 /// reachability-altering mutations and garbage collection reachability revalidation.
 ///
 /// # Concurrency Contract
-/// 1. Only one mutation path (upload commit, tag mutation, manifest publication,
-///    repository membership change, proxy blob ingestion) alters reachability at a time.
-/// 2. Garbage collection revalidation and conditional deletion are mutually exclusive
-///    with all reachability mutations.
+/// 1. Reachability-altering mutations (upload commit, tag mutation, manifest publication,
+///    repository membership change, proxy blob ingestion) proceed concurrently with each other
+///    under a shared read lock, while per-repository coordination is enforced by repository leases.
+/// 2. Garbage collection revalidation and conditional deletion require exclusive write access
+///    and are mutually exclusive with all reachability mutations across the entire registry.
 /// 3. Candidates for GC are enumerated without holding this coordinator; the guard
 ///    is acquired per candidate immediately before revalidation and released before
 ///    advancing to the next candidate.
@@ -22,44 +23,47 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 /// # Important
 /// This coordinator provides in-process mutual exclusion via RAII guards.
 /// It is **not** a database transaction and provides no automatic rollback.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ConsistencyCoordinator {
-    gate: Arc<Mutex<()>>,
+    gate: Arc<RwLock<()>>,
 }
 
 /// An unforgeable RAII guard proving that a reachability-altering mutation is actively in progress.
 ///
-/// Dropping this guard releases the mutual exclusion lock.
+/// Dropping this guard releases the shared mutation lock.
 #[derive(Debug)]
 pub struct MutationGuard {
-    _guard: OwnedMutexGuard<()>,
+    _guard: OwnedRwLockReadGuard<()>,
 }
 
 /// An unforgeable RAII guard proving that a GC reachability revalidation check is actively in progress.
 ///
-/// Dropping this guard releases the mutual exclusion lock.
+/// Dropping this guard releases the exclusive GC lock.
 #[derive(Debug)]
 pub struct GcRevalidationGuard {
-    _guard: OwnedMutexGuard<()>,
+    _guard: OwnedRwLockWriteGuard<()>,
 }
 
 impl ConsistencyCoordinator {
     /// Creates a new, unlocked `ConsistencyCoordinator`.
     pub fn new() -> Self {
         Self {
-            gate: Arc::new(Mutex::new(())),
+            gate: Arc::new(RwLock::new(())),
         }
     }
 
-    /// Asynchronously acquires exclusive execution for a reachability mutation.
+    /// Asynchronously acquires a shared mutation lock. Multiple reachability-altering
+    /// mutations across the registry can proceed concurrently, while strictly excluding
+    /// and blocking GC reachability revalidation sweeps.
     pub async fn acquire_mutation(&self) -> MutationGuard {
-        let guard = self.gate.clone().lock_owned().await;
+        let guard = self.gate.clone().read_owned().await;
         MutationGuard { _guard: guard }
     }
 
     /// Asynchronously acquires exclusive execution for GC reachability revalidation.
+    /// Blocks all new and in-flight reachability mutations until the revalidation check completes.
     pub async fn acquire_gc_revalidation(&self) -> GcRevalidationGuard {
-        let guard = self.gate.clone().lock_owned().await;
+        let guard = self.gate.clone().write_owned().await;
         GcRevalidationGuard { _guard: guard }
     }
 }
@@ -76,7 +80,7 @@ mod tests {
         let coord1 = ConsistencyCoordinator::new();
         let coord2 = coord1.clone();
 
-        let guard1 = coord1.acquire_mutation().await;
+        let guard1 = coord1.acquire_gc_revalidation().await;
 
         let (entered_tx, entered_rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
@@ -138,7 +142,45 @@ mod tests {
         handle.await.expect("task completes");
     }
 
-    // 4. Guard release on error
+    // 4. Multiple concurrent mutations run simultaneously in parallel
+    #[tokio::test]
+    async fn test_concurrent_mutations_run_in_parallel() {
+        let coord = ConsistencyCoordinator::new();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        let barrier = Arc::new(Barrier::new(11));
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let c = coord.clone();
+            let inf = in_flight.clone();
+            let max_c = max_concurrent.clone();
+            let b = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                let _guard = c.acquire_mutation().await;
+                let cur = inf.fetch_add(1, Ordering::SeqCst) + 1;
+                max_c.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                inf.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        barrier.wait().await;
+        for h in handles {
+            h.await.expect("task finished");
+        }
+
+        // Must observe multiple mutations executing simultaneously
+        assert!(
+            max_concurrent.load(Ordering::SeqCst) > 1,
+            "expected concurrent mutations in parallel"
+        );
+    }
+
+    // 5. Guard release on error
     #[tokio::test]
     async fn test_guard_release_on_error() {
         let coord = ConsistencyCoordinator::new();
@@ -155,7 +197,7 @@ mod tests {
         let _gc_guard = coord.acquire_gc_revalidation().await;
     }
 
-    // 5. Guard release on cancellation
+    // 6. Guard release on cancellation
     #[tokio::test]
     async fn test_guard_release_on_cancellation() {
         let coord = ConsistencyCoordinator::new();
@@ -181,7 +223,7 @@ mod tests {
         let _gc_guard = coord.acquire_gc_revalidation().await;
     }
 
-    // 6. Sequential alternating mutations and revalidations
+    // 7. Sequential alternating mutations and revalidations
     #[tokio::test]
     async fn test_sequential_mutations_and_revalidations() {
         let coord = ConsistencyCoordinator::new();
@@ -195,45 +237,7 @@ mod tests {
         }
     }
 
-    // 9. Multiple concurrent mutation waiters serialize cleanly
-    #[tokio::test]
-    async fn test_multiple_concurrent_mutation_waiters_serialize() {
-        let coord = ConsistencyCoordinator::new();
-        let counter = Arc::new(AtomicUsize::new(0));
-        let in_flight = Arc::new(AtomicBool::new(false));
-
-        let barrier = Arc::new(Barrier::new(11));
-        let mut handles = Vec::new();
-
-        for _ in 0..10 {
-            let c = coord.clone();
-            let cnt = counter.clone();
-            let inf = in_flight.clone();
-            let b = barrier.clone();
-
-            handles.push(tokio::spawn(async move {
-                b.wait().await;
-                let _guard = c.acquire_mutation().await;
-                // Verify mutual exclusion: no other task should be inside
-                assert!(
-                    !inf.swap(true, Ordering::SeqCst),
-                    "mutual exclusion violated"
-                );
-                tokio::task::yield_now().await;
-                cnt.fetch_add(1, Ordering::SeqCst);
-                inf.store(false, Ordering::SeqCst);
-            }));
-        }
-
-        barrier.wait().await;
-        for h in handles {
-            h.await.expect("task finished");
-        }
-
-        assert_eq!(counter.load(Ordering::SeqCst), 10);
-    }
-
-    // 10. Multiple concurrent GC revalidation waiters serialize cleanly
+    // 8. Multiple concurrent GC revalidation waiters serialize cleanly
     #[tokio::test]
     async fn test_multiple_concurrent_gc_revalidation_waiters_serialize() {
         let coord = ConsistencyCoordinator::new();
@@ -271,7 +275,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 10);
     }
 
-    // 11. RAII drop unblocks waiting task deterministically
+    // 9. RAII drop unblocks waiting task deterministically
     #[tokio::test]
     async fn test_raii_drop_unblocks_waiting_task() {
         let coord = ConsistencyCoordinator::new();

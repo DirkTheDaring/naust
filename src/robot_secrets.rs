@@ -26,6 +26,11 @@ pub fn hash_robot_secret(secret: &str) -> Result<String, RobotSecretError> {
         .map_err(|_| RobotSecretError::HashFailed)
 }
 
+/// Sentinel hash used to equalize execution timing during basic auth verification
+/// when a requested user or robot does not exist in configuration.
+pub const DUMMY_SENTINEL_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$e6mO8KxX7vN5P9Q2wE4rT";
+
 pub fn verify_robot_secret(secret: &str, secret_hash: &str) -> bool {
     let secret = secret.trim_end_matches(['\n', '\r']);
     if secret.is_empty() || secret_hash.trim().is_empty() {
@@ -51,4 +56,10 @@ mod tests {
         assert!(verify_robot_secret("s3cr3t", &hash));
         assert!(!verify_robot_secret("wrong", &hash));
     }
+
+    #[test]
+    fn sentinel_hash_parses_and_rejects() {
+        assert!(!verify_robot_secret("any_password", DUMMY_SENTINEL_HASH));
+    }
 }
+

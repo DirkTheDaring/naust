@@ -75,13 +75,12 @@ impl TokenService {
             }
         };
 
-        if wants_push_from_token_scopes(&decision.scopes)
+        if (wants_push_from_token_scopes(&decision.scopes)
             || decision
                 .scopes
                 .iter()
-                .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete))
-        {
-            if let Some(allowlist) = self.cfg.push_allow_repos.as_deref() {
+                .any(|s| token_scope_requests_repo_action(s, security::RepoAction::Delete)))
+            && let Some(allowlist) = self.cfg.push_allow_repos.as_deref() {
                 for scope in &decision.scopes {
                     if scope.typ == "repository" {
                         let Ok(canonical_repo) =
@@ -96,7 +95,6 @@ impl TokenService {
                     }
                 }
             }
-        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

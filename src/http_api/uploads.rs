@@ -27,12 +27,10 @@ pub(crate) async fn read_body_limited(
     min_bytes_per_sec: u64,
     audit_only: bool,
 ) -> Result<Bytes, Response> {
-    let mut is_oversized = false;
-    if let Some(len) = content_length {
-        if len > limit {
-            is_oversized = true;
+    if let Some(len) = content_length
+        && len > limit {
+            return Err(errors::manifest_invalid().into_response());
         }
-    }
 
     let initial_capacity = content_length.unwrap_or(0).min(limit).min(1024 * 1024);
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
@@ -62,13 +60,9 @@ pub(crate) async fn read_body_limited(
             continue;
         }
         if buf.len().saturating_add(chunk.len()) > limit {
-            is_oversized = true;
-        } else {
-            buf.extend_from_slice(&chunk);
+            return Err(errors::manifest_invalid().into_response());
         }
-    }
-    if is_oversized {
-        return Err(errors::manifest_invalid().into_response());
+        buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
 }
@@ -87,11 +81,9 @@ pub(crate) async fn discard_rejected_body(
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
-    {
-        if len > limit {
+        && len > limit {
             return RejectedBody::Close;
         }
-    }
     let mut seen = 0usize;
     let mut stream = body.into_data_stream();
     while let Some(next) = stream.next().await {
@@ -884,8 +876,7 @@ mod discard_tests {
     #[tokio::test]
     async fn small_body_is_fully_discarded() {
         let body = Body::from(Bytes::from_static(b"no"));
-        let mut headers = HeaderMap::new();
-        headers.insert(http::header::CONTENT_LENGTH, "2".parse().unwrap());
+        let headers = HeaderMap::new();
         let discarded = discard_rejected_body(body, &headers, 8).await;
         assert!(matches!(discarded, RejectedBody::Reuse));
     }
@@ -900,4 +891,43 @@ mod discard_tests {
         let discarded = discard_rejected_body(body, &HeaderMap::new(), 8).await;
         assert!(matches!(discarded, RejectedBody::Close));
     }
+
+    #[tokio::test]
+    async fn read_body_limited_rejects_oversized_content_length() {
+        let body = Body::from(vec![1u8; 32]);
+        let res = super::read_body_limited(
+            body,
+            Some(32),
+            16,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            1,
+            false,
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_rejects_oversized_stream_immediately() {
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![1u8; 10])),
+            Ok(Bytes::from(vec![2u8; 10])),
+        ]);
+        let body = Body::from_stream(stream);
+        let res = super::read_body_limited(
+            body,
+            None,
+            15,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            1,
+            false,
+        )
+        .await;
+        assert!(res.is_err());
+    }
 }
+

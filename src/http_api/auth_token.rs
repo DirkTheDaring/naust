@@ -189,10 +189,10 @@ pub fn decide_token_scopes_for_request(
         });
     }
 
-    if cfg.robots.enabled {
-        if let Some((user, pass)) = basic.as_ref() {
-            if let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == *user) {
-                if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+    if cfg.robots.enabled
+        && let Some((user, pass)) = basic.as_ref()
+            && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == *user)
+                && crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
                     let granted = if token_scopes.is_empty() {
                         Vec::new()
                     } else {
@@ -222,14 +222,11 @@ pub fn decide_token_scopes_for_request(
                         ttl_secs,
                     });
                 }
-            }
-        }
-    }
 
-    if cfg.users.enabled {
-        if let Some((user, pass)) = basic.as_ref() {
-            if let Some(account) = cfg.users.accounts.iter().find(|a| a.name == *user) {
-                if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
+    if cfg.users.enabled
+        && let Some((user, pass)) = basic.as_ref()
+            && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == *user)
+                && crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
                     let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
                     for group_name in &account.groups {
                         if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name)
@@ -267,9 +264,6 @@ pub fn decide_token_scopes_for_request(
                         ttl_secs,
                     });
                 }
-            }
-        }
-    }
 
     // Legacy global push auth
     let Some(expected_user) = cfg.push_username.as_deref() else {

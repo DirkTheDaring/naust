@@ -121,6 +121,23 @@ pub trait S3Driver: Send + Sync + 'static {
         Err(StorageError::Unsupported)
     }
 
+    /// Streams the entire object without collecting it into memory.
+    async fn get_object_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(u64, Pin<Box<dyn AsyncRead + Send>>)>, StorageError> {
+        let res = self.get_object(bucket, key).await?;
+        match res {
+            Some((bytes, _)) => {
+                let size = bytes.len() as u64;
+                let reader = std::io::Cursor::new(bytes);
+                Ok(Some((size, Box::pin(reader))))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, StorageError>;
     async fn put_object_conditional(
         &self,
@@ -514,6 +531,27 @@ impl S3Driver for AwsS3Driver {
         let length = end_inclusive.saturating_sub(start).saturating_add(1);
         let reader = tokio::io::AsyncReadExt::take(resp.body.into_async_read(), length);
         Ok(Some(Box::pin(reader)))
+    }
+
+    async fn get_object_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(u64, Pin<Box<dyn AsyncRead + Send>>)>, StorageError> {
+        let client = self.client().await?;
+        let resp = match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(r) => r,
+            Err(err) => {
+                let s3_err = map_s3_err(err);
+                if matches!(s3_err, StorageError::NotFound) {
+                    return Ok(None);
+                }
+                return Err(s3_err);
+            }
+        };
+        let size = resp.content_length().unwrap_or(0).max(0) as u64;
+        let reader = resp.body.into_async_read();
+        Ok(Some((size, Box::pin(reader))))
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, StorageError> {
@@ -1761,13 +1799,9 @@ impl Storage for S3Storage {
     ) -> Result<(BlobMeta, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
         let bucket = self.bucket()?;
         let key = self.blob_key2(digest);
-        let res = self.driver.get_object(bucket, &key).await?;
+        let res = self.driver.get_object_stream(bucket, &key).await?;
         match res {
-            Some((bytes, _)) => {
-                let size = bytes.len() as u64;
-                let reader = std::io::Cursor::new(bytes);
-                Ok((BlobMeta { size }, Box::pin(reader)))
-            }
+            Some((size, reader)) => Ok((BlobMeta { size }, reader)),
             None => Err(StorageError::NotFound),
         }
     }

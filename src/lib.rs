@@ -1,4 +1,4 @@
-#![allow(clippy::all)]
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
 
 pub mod app_state;
 pub use app_state::{AppState, AuthMetrics, ProxyContext};

@@ -34,15 +34,14 @@ fn sanitize_for_path_component(s: &str) -> String {
 
 fn cache_key_from_base_url(base_url: &str) -> String {
     let base_url = base_url.trim();
-    if let Ok(u) = Url::parse(base_url) {
-        if let Some(host) = u.host_str() {
+    if let Ok(u) = Url::parse(base_url)
+        && let Some(host) = u.host_str() {
             // Include port if present to avoid collisions.
             if let Some(port) = u.port() {
                 return sanitize_for_path_component(&format!("{host}_{port}"));
             }
             return sanitize_for_path_component(host);
         }
-    }
     sanitize_for_path_component(base_url)
 }
 
@@ -483,17 +482,14 @@ pub enum ProxyMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RedirectPolicy {
     Disabled,
+    #[default]
     SameHost,
     AnyPublic,
 }
 
-impl Default for RedirectPolicy {
-    fn default() -> Self {
-        Self::SameHost
-    }
-}
 
 impl std::str::FromStr for RedirectPolicy {
     type Err = ();
@@ -1546,7 +1542,7 @@ impl Config {
             "REGISTRY_ANONYMOUS_PULL",
             "AUTH_ANONYMOUS_PULL",
         ])?
-        .or_else(|| file_cfg.auth.anonymous_pull)
+        .or(file_cfg.auth.anonymous_pull)
         .unwrap_or(true);
 
         let private_name_prefixes = env_str_opt(&["REGISTRY__AUTH__PRIVATE_NAME_PREFIXES"])
@@ -1954,14 +1950,13 @@ impl Config {
                     message: "must be at least 131072 bytes".to_string(),
                 });
             }
-            if let Some(ceiling) = fs_gc_discovery_max_manifest_payload_bytes {
-                if ceiling < 1024 || ceiling == u64::MAX {
+            if let Some(ceiling) = fs_gc_discovery_max_manifest_payload_bytes
+                && (ceiling < 1024 || ceiling == u64::MAX) {
                     return Err(ConfigError::InvalidValue {
                         field: "storage.fs.gc.discovery.max_manifest_payload_bytes",
                         message: "must be at least 1024 and less than u64::MAX".to_string(),
                     });
                 }
-            }
         }
 
         let admin_api_enabled =
@@ -2087,7 +2082,7 @@ impl Config {
             "ALLOW_TAG_OVERWRITE",
         ])?
         .or(file_cfg.features.allow_tag_overwrite)
-        .unwrap_or_else(|| !best_practice);
+        .unwrap_or(!best_practice);
 
         let automatic_crossmount = env_bool_opt(&[
             "REGISTRY__FEATURES__AUTOMATIC_CROSSMOUNT",
@@ -3275,7 +3270,7 @@ fn resolve_proxy_upstreams(
     file_upstreams: &[FileProxyUpstreamRoute],
 ) -> Result<Vec<ProxyUpstreamRoute>, ConfigError> {
     let mut upstreams = Vec::new();
-    for (_i, r) in file_upstreams.iter().enumerate() {
+    for r in file_upstreams.iter() {
         let mut raw_hosts = Vec::new();
         raw_hosts.extend(
             r.hosts

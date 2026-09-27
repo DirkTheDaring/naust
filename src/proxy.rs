@@ -51,8 +51,7 @@ impl ProxyHostPattern {
         if trimmed == "*" {
             return Ok(Self::All);
         }
-        if trimmed.starts_with("*.") {
-            let suffix = &trimmed[2..];
+        if let Some(suffix) = trimmed.strip_prefix("*.") {
             if suffix.is_empty() || suffix.contains('*') {
                 return Err(ProxyHostPatternError::InvalidWildcard(trimmed));
             }
@@ -136,8 +135,7 @@ impl ProxyRepoPattern {
         if trimmed == "*" {
             return Ok(Self::All);
         }
-        if trimmed.ends_with("/*") {
-            let base = &trimmed[..trimmed.len() - 2];
+        if let Some(base) = trimmed.strip_suffix("/*") {
             if base.is_empty() {
                 return Err(ProxyRepoPatternError::Empty);
             }
@@ -441,11 +439,10 @@ impl Proxy {
         }
 
         // Only follow redirects to the standard HTTPS port.
-        if let Some(port) = url.port() {
-            if port != 443 {
+        if let Some(port) = url.port()
+            && port != 443 {
                 return Err(ProxyError::UpstreamHostNotAllowed(host));
             }
-        }
 
         if self.cfg.block_private_networks {
             let port = url.port_or_known_default().unwrap_or(443);
@@ -592,8 +589,7 @@ impl Proxy {
 
             let stream = resp.bytes_stream().map(|item| {
                 item.map_err(|e| {
-                    crate::storage::upload_session::UploadStreamError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    crate::storage::upload_session::UploadStreamError::Io(std::io::Error::other(
                         e.to_string(),
                     ))
                 })
@@ -722,17 +718,15 @@ impl Proxy {
             let computed = Digest::parse(&format!("sha256:{hex}"))
                 .map_err(|_| ProxyError::Internal("failed to parse computed digest".to_string()))?;
 
-            if let Ok(ref_digest) = Digest::parse(reference) {
-                if ref_digest.hex() != computed.hex() {
+            if let Ok(ref_digest) = Digest::parse(reference)
+                && ref_digest.hex() != computed.hex() {
                     return Err(ProxyError::DigestMismatch);
                 }
-            }
-            if let Some(up) = upstream_digest {
-                if up.hex() != computed.hex() {
+            if let Some(up) = upstream_digest
+                && up.hex() != computed.hex() {
                     // Should not happen with a correct upstream.
                     return Err(ProxyError::DigestMismatch);
                 }
-            }
 
             // Validate manifest descriptor structure before storing in local cache
             if let Err(e) = crate::manifest_refs::parse_manifest_refs(&bytes) {
@@ -1027,11 +1021,10 @@ impl Proxy {
         let now = Self::now_unix();
         {
             let cache = self.token_cache.lock().await;
-            if let Some(t) = cache.get(&cache_key) {
-                if t.expires_at_unix > now.saturating_add(5) {
+            if let Some(t) = cache.get(&cache_key)
+                && t.expires_at_unix > now.saturating_add(5) {
                     return Ok(t.token.clone());
                 }
-            }
         }
 
         let realm_url = Url::parse(realm)
@@ -1157,11 +1150,10 @@ impl SingleFlight {
         // We remove when the only remaining strong refs should be: map entry + this call.
         if Arc::strong_count(&arc) == 2 {
             let mut map = self.locks.lock().await;
-            if let Some(existing) = map.get(&key) {
-                if Arc::ptr_eq(existing, &arc) {
+            if let Some(existing) = map.get(&key)
+                && Arc::ptr_eq(existing, &arc) {
                     map.remove(&key);
                 }
-            }
         }
     }
 }
@@ -1255,11 +1247,10 @@ impl reqwest::dns::Resolve for PrivateIpBlockingResolver {
 
 #[allow(dead_code)]
 async fn read_response_limited(resp: reqwest::Response, limit: usize) -> Result<Bytes, ProxyError> {
-    if let Some(len) = resp.content_length() {
-        if len > limit as u64 {
+    if let Some(len) = resp.content_length()
+        && len > limit as u64 {
             return Err(ProxyError::TooLarge);
         }
-    }
 
     let initial_capacity = resp
         .content_length()
@@ -1318,6 +1309,83 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
         service: service?,
         scope,
     })
+}
+
+/// Core upstream seam (ADR-010 §2.2): the application layer consumes the
+/// engine exclusively through this impl.
+#[async_trait::async_trait]
+impl crate::upstream::UpstreamFetcher for Proxy {
+    fn decision_for_repo(&self, repo: &str) -> Result<RepoDecision, ProxyError> {
+        Proxy::decision_for_repo(self, repo)
+    }
+
+    fn upstream_base_url_for_log(&self) -> Option<&str> {
+        Proxy::upstream_base_url_for_log(self)
+    }
+
+    async fn head_blob_upstream(
+        &self,
+        decision: &RepoDecision,
+        digest: &Digest,
+    ) -> Result<u64, ProxyError> {
+        Proxy::head_blob_upstream(self, decision, digest).await
+    }
+
+    async fn fetch_blob_into_storage(
+        &self,
+        decision: &RepoDecision,
+        digest: &Digest,
+        cache_storage: &dyn crate::storage::ports::ProxyStoragePort,
+        mutation_service: &crate::application::BlobMutationService,
+    ) -> Result<(), ProxyError> {
+        Proxy::fetch_blob_into_storage(self, decision, digest, cache_storage, mutation_service)
+            .await
+    }
+
+    async fn fetch_manifest_and_cache(
+        &self,
+        decision: &RepoDecision,
+        reference: &str,
+        max_bytes: usize,
+        revalidate_only: bool,
+        if_none_match: Option<String>,
+        manifest_service: &crate::application::ManifestMutationService,
+    ) -> Result<crate::upstream::FetchManifestResult, ProxyError> {
+        Proxy::fetch_manifest_and_cache(
+            self,
+            decision,
+            reference,
+            max_bytes,
+            revalidate_only,
+            if_none_match,
+            manifest_service,
+        )
+        .await
+    }
+
+    fn get_tag_meta(&self, repo: &str, tag: &str) -> Option<TagMeta> {
+        Proxy::get_tag_meta(self, repo, tag)
+    }
+
+    fn put_tag_meta(&self, repo: &str, tag: &str, meta: &TagMeta) {
+        Proxy::put_tag_meta(self, repo, tag, meta)
+    }
+
+    fn note_blob_access(&self, digest: &Digest) {
+        Proxy::note_blob_access(self, digest)
+    }
+
+    fn note_manifest_access(&self, repo: &str, digest: &Digest) {
+        Proxy::note_manifest_access(self, repo, digest)
+    }
+
+    fn note_tag_access(&self, repo: &str, tag: &str) {
+        Proxy::note_tag_access(self, repo, tag)
+    }
+
+    fn get_manifest_refs(&self, repo: &str, digest: &Digest) -> Option<ManifestRefs> {
+        Proxy::get_manifest_refs(self, repo, digest)
+    }
 }
 
 #[cfg(test)]
@@ -1524,79 +1592,3 @@ mod tests {
     }
 }
 
-/// Core upstream seam (ADR-010 §2.2): the application layer consumes the
-/// engine exclusively through this impl.
-#[async_trait::async_trait]
-impl crate::upstream::UpstreamFetcher for Proxy {
-    fn decision_for_repo(&self, repo: &str) -> Result<RepoDecision, ProxyError> {
-        Proxy::decision_for_repo(self, repo)
-    }
-
-    fn upstream_base_url_for_log(&self) -> Option<&str> {
-        Proxy::upstream_base_url_for_log(self)
-    }
-
-    async fn head_blob_upstream(
-        &self,
-        decision: &RepoDecision,
-        digest: &Digest,
-    ) -> Result<u64, ProxyError> {
-        Proxy::head_blob_upstream(self, decision, digest).await
-    }
-
-    async fn fetch_blob_into_storage(
-        &self,
-        decision: &RepoDecision,
-        digest: &Digest,
-        cache_storage: &dyn crate::storage::ports::ProxyStoragePort,
-        mutation_service: &crate::application::BlobMutationService,
-    ) -> Result<(), ProxyError> {
-        Proxy::fetch_blob_into_storage(self, decision, digest, cache_storage, mutation_service)
-            .await
-    }
-
-    async fn fetch_manifest_and_cache(
-        &self,
-        decision: &RepoDecision,
-        reference: &str,
-        max_bytes: usize,
-        revalidate_only: bool,
-        if_none_match: Option<String>,
-        manifest_service: &crate::application::ManifestMutationService,
-    ) -> Result<crate::upstream::FetchManifestResult, ProxyError> {
-        Proxy::fetch_manifest_and_cache(
-            self,
-            decision,
-            reference,
-            max_bytes,
-            revalidate_only,
-            if_none_match,
-            manifest_service,
-        )
-        .await
-    }
-
-    fn get_tag_meta(&self, repo: &str, tag: &str) -> Option<TagMeta> {
-        Proxy::get_tag_meta(self, repo, tag)
-    }
-
-    fn put_tag_meta(&self, repo: &str, tag: &str, meta: &TagMeta) {
-        Proxy::put_tag_meta(self, repo, tag, meta)
-    }
-
-    fn note_blob_access(&self, digest: &Digest) {
-        Proxy::note_blob_access(self, digest)
-    }
-
-    fn note_manifest_access(&self, repo: &str, digest: &Digest) {
-        Proxy::note_manifest_access(self, repo, digest)
-    }
-
-    fn note_tag_access(&self, repo: &str, tag: &str) {
-        Proxy::note_tag_access(self, repo, tag)
-    }
-
-    fn get_manifest_refs(&self, repo: &str, digest: &Digest) -> Option<ManifestRefs> {
-        Proxy::get_manifest_refs(self, repo, digest)
-    }
-}

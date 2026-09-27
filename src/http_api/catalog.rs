@@ -74,8 +74,8 @@ pub async fn catalog_list(
                 headers.insert("Content-Type", "application/json".parse().unwrap());
                 headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
-                if has_more {
-                    if let (Some(n_raw), Some(last_repo)) = (query.get("n"), next_last.as_deref()) {
+                if has_more
+                    && let (Some(n_raw), Some(last_repo)) = (query.get("n"), next_last.as_deref()) {
                         let last_repo = url_encode_component(last_repo);
                         let link =
                             format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
@@ -83,7 +83,6 @@ pub async fn catalog_list(
                             headers.insert(http::header::LINK, v);
                         }
                     }
-                }
 
                 if method == Method::HEAD {
                     return (StatusCode::OK, headers).into_response();
@@ -225,8 +224,8 @@ pub async fn meta_orgs(
     let mut resp_headers = registry_headers();
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more {
-        if let (Some(n_raw), Some(last_org)) = (
+    if has_more
+        && let (Some(n_raw), Some(last_org)) = (
             query.get("n"),
             payload
                 .get("orgs")
@@ -240,7 +239,6 @@ pub async fn meta_orgs(
                 resp_headers.insert(http::header::LINK, v);
             }
         }
-    }
 
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }
@@ -285,14 +283,11 @@ pub async fn meta_org_repos(
 
     let mut out_repos: Vec<serde_json::Value> = Vec::new();
     for repo in page {
-        let ts = match state
+        let ts: naust_core::storage::RepoTimestamps = state
             .catalog_query_service
             .repo_timestamps(repo, None)
             .await
-        {
-            Ok(t) => t,
-            _ => RepoTimestamps::default(),
-        };
+            .unwrap_or_default();
         out_repos.push(repo_meta_from_timestamps(repo, ts));
     }
 
@@ -308,8 +303,8 @@ pub async fn meta_org_repos(
     let mut resp_headers = registry_headers();
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more {
-        if let (Some(n_raw), Some(last_repo)) = (
+    if has_more
+        && let (Some(n_raw), Some(last_repo)) = (
             query.get("n"),
             payload
                 .get("repositories")
@@ -325,7 +320,6 @@ pub async fn meta_org_repos(
                 resp_headers.insert(http::header::LINK, v);
             }
         }
-    }
 
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }
@@ -483,8 +477,8 @@ pub async fn meta_catalog(
     let mut resp_headers = registry_headers();
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more {
-        if let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
+    if has_more
+        && let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
             let last_repo = url_encode_component(last_repo);
             let mut link = format!("</_meta/catalog?n={n_raw}&last={last_repo}");
             if let Some(org) = query.get("org") {
@@ -496,7 +490,6 @@ pub async fn meta_catalog(
                 resp_headers.insert(http::header::LINK, v);
             }
         }
-    }
 
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }

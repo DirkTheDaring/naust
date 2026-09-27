@@ -1743,19 +1743,19 @@ mod tests {
     #[async_trait::async_trait]
     impl TagReader for InjectedProxyStorage {
         async fn resolve_tag(&self, repo: &str, tag: &str) -> Result<Digest, StorageError> {
-            if let Some(ref cb) = *self.resolve_tag_override.lock().unwrap() {
-                if let Some(res) = cb(repo, tag) {
-                    return res;
-                }
+            if let Some(ref cb) = *self.resolve_tag_override.lock().unwrap()
+                && let Some(res) = cb(repo, tag)
+            {
+                return res;
             }
             self.inner.as_tag_reader().resolve_tag(repo, tag).await
         }
 
         async fn list_tags(&self, repo: &str) -> Result<Vec<String>, StorageError> {
-            if let Some(ref cb) = *self.list_tags_override.lock().unwrap() {
-                if let Some(res) = cb(repo) {
-                    return res;
-                }
+            if let Some(ref cb) = *self.list_tags_override.lock().unwrap()
+                && let Some(res) = cb(repo)
+            {
+                return res;
             }
             self.inner.as_tag_reader().list_tags(repo).await
         }
@@ -2325,7 +2325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_gc_once_propagates_listing_error_before_candidate_scan() {
-        let (storage, proxy, temp) = create_test_env();
+        let (storage, proxy, _temp) = create_test_env();
         let repo = "library/error-repo";
 
         let blob_digest = Digest::parse(
@@ -2426,7 +2426,7 @@ mod tests {
         let mut keys = Vec::new();
         for payload in [&[b'x'; 300][..], &[b'y'; 300], &[b'z'; 300]] {
             let hex = hex::encode(sha2::Sha256::digest(payload));
-            let key = format!("blobs/sha256/{}/{}", &hex[0..2], &hex);
+            let key = format!("blobs/sha256/{}/{}", &hex[0..2], hex);
             driver.objects.lock().unwrap().insert(
                 key.clone(),
                 (

@@ -9,7 +9,6 @@ use crate::storage::fs::test_helpers::{prepare_finalizable_session, tmp_fs_root,
 use crate::storage::upload_session::{FinalizeOutcome, UploadSessionStorage};
 use crate::storage::{BlobMeta, StorageErrorKind};
 use bytes::Bytes;
-use std::path::{Path, PathBuf};
 
 /// Category: primary and proxy-cache production wiring. Both `storage/mod.rs`
 /// construction sites build the filesystem backend through

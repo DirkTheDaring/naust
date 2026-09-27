@@ -586,22 +586,18 @@ where
     let consistency = ConsistencyCoordinator::new();
     let mutation_authority_arc = Arc::new(tokio::sync::Mutex::new(Some(mutation_authority)));
 
-    let gc_service = match &ref_index {
-        Some(idx) => Some(Arc::new(GcService::with_coordinator_and_authority(
+    let gc_service = ref_index.as_ref().map(|idx| Arc::new(GcService::with_coordinator_and_authority(
             Arc::new(crate::policy::GcPolicy::from(config.as_ref())),
             storage_wiring.gc_service_port(),
             idx.clone(),
             consistency.clone(),
             mutation_authority_arc.clone(),
-        ))),
-        None => None,
-    };
+        )));
 
     if config.storage_backend == StorageBackend::S3
         && config.blob_gc_enabled
         && config.blob_gc_enable_delete
-    {
-        if let Err(e) = storage_wiring
+        && let Err(e) = storage_wiring
             .gc_port()
             .check_bucket_versioning_for_gc()
             .await
@@ -611,7 +607,6 @@ where
                 e
             );
         }
-    }
 
     let ip_limiter = Arc::new(IpConcurrencyLimiter::new(
         config.max_connections_per_ip,
@@ -2264,10 +2259,10 @@ mod tests {
                     if let Some(tx) = started_tx.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
-                    if let Ok(rx) = release_rx.lock() {
-                        if let Err(err) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            panic!("worker wait failed: {err}");
-                        }
+                    if let Ok(rx) = release_rx.lock()
+                        && let Err(err) = rx.recv_timeout(std::time::Duration::from_secs(5))
+                    {
+                        panic!("worker wait failed: {err}");
                     }
                     crate::storage_wiring::proxy_cache_storage_try_from_config(c, u)
                 },
