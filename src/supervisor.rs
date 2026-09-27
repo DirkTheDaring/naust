@@ -1218,9 +1218,15 @@ async fn concurrency_limit_v2_non_upload(
                 );
             }
 
-            sem.acquire_owned()
-                .await
-                .expect("request semaphore unexpectedly closed")
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (axum::http::header::RETRY_AFTER, "5"),
+                    (axum::http::header::CONNECTION, "close"),
+                ],
+                "Too many concurrent requests",
+            )
+                .into_response();
         }
     };
 
@@ -1417,7 +1423,106 @@ pub async fn spawn_blob_gc_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::get};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn exhausted_v2_slot_returns_429_without_waiting() {
+        let temp = TempDir::new().unwrap();
+        let fs_root = temp.path().join("registry");
+        std::fs::create_dir_all(&fs_root).unwrap();
+        let mut cfg = crate::config::Config::from_env().unwrap();
+        cfg.fs_root = fs_root.clone();
+        cfg.token_signing_key = "test-runtime-signing-key".to_string();
+        cfg.token_signing_keys = vec![crate::security::TokenSigningKey {
+            kid: "default".to_string(),
+            key: cfg.token_signing_key.clone(),
+        }];
+        cfg.token_signing_key_ephemeral = false;
+        cfg.allow_ephemeral_token_signing_key = false;
+        cfg.max_concurrent_requests = 1;
+        let storage = Arc::new(crate::storage::fs::FsStorage::new(
+            fs_root,
+            cfg.max_upload_bytes,
+        ));
+        let state = crate::app_state::AppState::new_test(Arc::new(cfg), storage, None);
+        assert_eq!(state.request_sem.available_permits(), 1);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_handler = entered.clone();
+        let release_handler = release.clone();
+        let app = Router::new()
+            .route("/healthz", get(|| async { axum::http::StatusCode::OK }))
+            .merge(
+                Router::new()
+                    .route(
+                        "/v2/hold",
+                        get(move || {
+                            let entered_handler = entered_handler.clone();
+                            let release_handler = release_handler.clone();
+                            async move {
+                                entered_handler.notify_one();
+                                release_handler.notified().await;
+                                axum::http::StatusCode::OK
+                            }
+                        }),
+                    )
+                    .route("/v2/other", get(|| async { axum::http::StatusCode::OK }))
+                    .layer(axum::middleware::from_fn_with_state(
+                        state.clone(),
+                        concurrency_limit_v2_non_upload,
+                    )),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let hold = tokio::spawn(async move {
+            client
+                .get(format!("http://{addr}/v2/hold"))
+                .send()
+                .await
+                .unwrap()
+        });
+        entered.notified().await;
+
+        let started = Instant::now();
+        let limited = reqwest::Client::new()
+            .get(format!("http://{addr}/v2/other"))
+            .send()
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            limited.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+            "5"
+        );
+        assert_eq!(
+            limited.headers().get(reqwest::header::CONNECTION).unwrap(),
+            "close"
+        );
+        let health = reqwest::Client::new()
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        assert_eq!(state.active_non_upload_requests.load(Ordering::Relaxed), 1);
+
+        release.notify_one();
+        let held = hold.await.unwrap();
+        assert_eq!(held.status(), reqwest::StatusCode::OK);
+    }
 
     fn create_test_env() -> (crate::storage::StorageWiring, crate::proxy::Proxy, TempDir) {
         let temp_dir = TempDir::new().unwrap();

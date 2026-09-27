@@ -1,16 +1,14 @@
 //! Blob read/head/delete handlers (parse/delegate/format). Split out of the historical
 //! monolithic dispatcher (remediation R4, KI-26).
 
+use super::errors;
+use crate::request_routing::V2RouteMode;
 use crate::{AppState, ProxyContext, registry::digest::Digest};
 use axum::{
     body::Body,
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
-
-use super::errors;
-use crate::request_routing::V2RouteMode;
 
 use super::handlers::*;
 
@@ -80,111 +78,117 @@ pub async fn blob_by_digest(
             }
         }
         Method::GET => {
-            match state
-                .blob_read_service
-                .get_blob(name, &digest, proxy_ctx.as_ref(), proxy_only)
-                .await
-            {
-                Ok(out) => {
-                    if let Some(range_header) = headers
-                        .get(axum::http::header::RANGE)
-                        .and_then(|v| v.to_str().ok())
-                    {
-                        if let Some(spec) = range_header.strip_prefix("bytes=") {
-                            let parts: Vec<&str> = spec.split('-').collect();
-                            if parts.len() == 2 {
-                                let start = parts[0].parse::<u64>();
-                                let end = parts[1].parse::<u64>();
-                                match (start, end) {
-                                    (Ok(s), Ok(e)) if s <= e && e < out.size => {
-                                        let mut collected =
-                                            Vec::with_capacity((e - s + 1) as usize);
-                                        let mut stream = out.stream;
-                                        let mut curr = 0u64;
-                                        while let Some(chunk) = stream.next().await {
-                                            if let Ok(c) = chunk {
-                                                let c_len = c.len() as u64;
-                                                let c_start = curr;
-                                                let c_end = curr + c_len;
-                                                if c_end > s && c_start <= e {
-                                                    let slice_s = if s > c_start {
-                                                        (s - c_start) as usize
-                                                    } else {
-                                                        0
-                                                    };
-                                                    let slice_e = if e + 1 < c_end {
-                                                        (e + 1 - c_start) as usize
-                                                    } else {
-                                                        c.len()
-                                                    };
-                                                    collected
-                                                        .extend_from_slice(&c[slice_s..slice_e]);
-                                                }
-                                                curr += c_len;
-                                                if curr > e {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        let mut resp_headers = registry_headers();
-                                        resp_headers.insert(
-                                            "Content-Range",
-                                            format!("bytes {s}-{e}/{}", out.size).parse().unwrap(),
-                                        );
-                                        resp_headers.insert(
-                                            "Content-Length",
-                                            collected.len().to_string().parse().unwrap(),
-                                        );
-                                        resp_headers.insert(
-                                            "Content-Type",
-                                            out.media_type.parse().unwrap(),
-                                        );
-                                        resp_headers.insert(
-                                            "Docker-Content-Digest",
-                                            out.digest.as_str().parse().unwrap(),
-                                        );
-                                        return (
-                                            StatusCode::PARTIAL_CONTENT,
-                                            resp_headers,
-                                            Body::from(collected),
-                                        )
-                                            .into_response();
-                                    }
-                                    _ => {
-                                        let mut resp_headers = registry_headers();
-                                        resp_headers.insert(
-                                            "Content-Range",
-                                            format!("bytes */{}", out.size).parse().unwrap(),
-                                        );
-                                        return (StatusCode::RANGE_NOT_SATISFIABLE, resp_headers)
-                                            .into_response();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let body = Body::from_stream(out.stream);
-                    let mut headers = registry_headers();
-                    headers.insert(
-                        "Docker-Content-Digest",
-                        out.digest.as_str().parse().unwrap(),
-                    );
-                    headers.insert("Content-Type", out.media_type.parse().unwrap());
-                    headers.insert("Content-Length", out.size.to_string().parse().unwrap());
-                    (StatusCode::OK, headers, body).into_response()
-                }
-                Err(crate::application::BlobReadError::NotFound) => {
-                    errors::blob_unknown().into_response()
-                }
-                Err(crate::application::BlobReadError::InvalidRepoName { .. }) => {
-                    errors::name_invalid().into_response()
-                }
-                Err(crate::application::BlobReadError::InvalidDigest(_)) => {
-                    errors::digest_invalid().into_response()
-                }
-                Err(_) => errors::internal_error().into_response(),
-            }
+            blob_get(
+                state,
+                headers,
+                name,
+                &digest,
+                proxy_ctx.as_ref(),
+                proxy_only,
+            )
+            .await
         }
         _ => errors::method_not_allowed("GET, HEAD, DELETE").into_response(),
+    }
+}
+
+async fn blob_get(
+    state: AppState,
+    headers: &HeaderMap,
+    name: &str,
+    digest: &Digest,
+    proxy_ctx: Option<&ProxyContext>,
+    proxy_only: bool,
+) -> Response {
+    let closed_range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|header| header.strip_prefix("bytes="))
+        .and_then(|spec| {
+            let parts: Vec<&str> = spec.split('-').collect();
+            if parts.len() == 2 {
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
+            }
+        });
+
+    if let Some((start_text, end_text)) = closed_range {
+        let size = match state
+            .blob_read_service
+            .head_blob(name, digest, proxy_ctx, proxy_only)
+            .await
+        {
+            Ok(meta) => meta.size,
+            Err(err) => return blob_read_error(err),
+        };
+        match (start_text.parse::<u64>(), end_text.parse::<u64>()) {
+            (Ok(start), Ok(end)) if start <= end && end < size => {
+                match state
+                    .blob_read_service
+                    .get_blob_range(name, digest, start, end, proxy_ctx, proxy_only)
+                    .await
+                {
+                    Ok(out) => {
+                        let span = end - start + 1;
+                        let mut resp_headers = registry_headers();
+                        resp_headers.insert(
+                            "Content-Range",
+                            format!("bytes {start}-{end}/{size}").parse().unwrap(),
+                        );
+                        resp_headers.insert("Content-Length", span.to_string().parse().unwrap());
+                        resp_headers.insert("Content-Type", out.media_type.parse().unwrap());
+                        resp_headers.insert(
+                            "Docker-Content-Digest",
+                            out.digest.as_str().parse().unwrap(),
+                        );
+                        (
+                            StatusCode::PARTIAL_CONTENT,
+                            resp_headers,
+                            Body::from_stream(out.stream),
+                        )
+                            .into_response()
+                    }
+                    Err(err) => blob_read_error(err),
+                }
+            }
+            _ => {
+                let mut resp_headers = registry_headers();
+                resp_headers.insert("Content-Range", format!("bytes */{size}").parse().unwrap());
+                (StatusCode::RANGE_NOT_SATISFIABLE, resp_headers).into_response()
+            }
+        }
+    } else {
+        match state
+            .blob_read_service
+            .get_blob(name, digest, proxy_ctx, proxy_only)
+            .await
+        {
+            Ok(out) => {
+                let body = Body::from_stream(out.stream);
+                let mut resp_headers = registry_headers();
+                resp_headers.insert(
+                    "Docker-Content-Digest",
+                    out.digest.as_str().parse().unwrap(),
+                );
+                resp_headers.insert("Content-Type", out.media_type.parse().unwrap());
+                resp_headers.insert("Content-Length", out.size.to_string().parse().unwrap());
+                (StatusCode::OK, resp_headers, body).into_response()
+            }
+            Err(err) => blob_read_error(err),
+        }
+    }
+}
+
+fn blob_read_error(err: crate::application::BlobReadError) -> Response {
+    match err {
+        crate::application::BlobReadError::NotFound => errors::blob_unknown().into_response(),
+        crate::application::BlobReadError::InvalidRepoName { .. } => {
+            errors::name_invalid().into_response()
+        }
+        crate::application::BlobReadError::InvalidDigest(_) => {
+            errors::digest_invalid().into_response()
+        }
+        _ => errors::internal_error().into_response(),
     }
 }

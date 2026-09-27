@@ -73,6 +73,49 @@ pub(crate) async fn read_body_limited(
     Ok(Bytes::from(buf))
 }
 
+pub(crate) enum RejectedBody {
+    Reuse,
+    Close,
+}
+
+pub(crate) async fn discard_rejected_body(
+    body: axum::body::Body,
+    headers: &HeaderMap,
+    limit: usize,
+) -> RejectedBody {
+    if let Some(len) = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if len > limit {
+            return RejectedBody::Close;
+        }
+    }
+    let mut seen = 0usize;
+    let mut stream = body.into_data_stream();
+    while let Some(next) = stream.next().await {
+        let Ok(chunk) = next else {
+            return RejectedBody::Close;
+        };
+        if chunk.len() > limit.saturating_sub(seen) {
+            return RejectedBody::Close;
+        }
+        seen += chunk.len();
+    }
+    RejectedBody::Reuse
+}
+
+fn finish_reject(mut response: Response, discarded: RejectedBody) -> Response {
+    if matches!(discarded, RejectedBody::Close) {
+        response.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
 pub(crate) async fn upload_create(
     state: AppState,
     headers: &HeaderMap,
@@ -480,13 +523,15 @@ pub(crate) async fn upload_session(
     body: Body,
 ) -> Response {
     if !is_valid_repo_name(name) {
-        let _ = axum::body::to_bytes(body, usize::MAX).await;
-        return errors::name_invalid().into_response();
+        let discarded =
+            discard_rejected_body(body, req_headers, state.config.max_request_body_bytes).await;
+        return finish_reject(errors::name_invalid().into_response(), discarded);
     }
 
     if uuid::Uuid::parse_str(uuid).is_err() {
-        let _ = axum::body::to_bytes(body, usize::MAX).await;
-        return errors::blob_upload_unknown().into_response();
+        let discarded =
+            discard_rejected_body(body, req_headers, state.config.max_request_body_bytes).await;
+        return finish_reject(errors::blob_upload_unknown().into_response(), discarded);
     }
 
     let required_action = match method {
@@ -502,11 +547,16 @@ pub(crate) async fn upload_session(
             state.config.token_ttl_secs,
         ) {
             if !crate::security::token_allows_repo_action(&claims, name, required_action) {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return crate::auth::unauthorized_registry_challenge(
-                    &state,
-                    Some(name),
-                    Some(required_action),
+                let discarded =
+                    discard_rejected_body(body, req_headers, state.config.max_request_body_bytes)
+                        .await;
+                return finish_reject(
+                    crate::auth::unauthorized_registry_challenge(
+                        &state,
+                        Some(name),
+                        Some(required_action),
+                    ),
+                    discarded,
                 );
             }
         } else {
@@ -521,8 +571,10 @@ pub(crate) async fn upload_session(
             req_headers.typed_get::<headers::Authorization<headers::authorization::Basic>>()
         {
             let Ok(canonical_target) = crate::registry::CanonicalRepoName::parse(name) else {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::name_invalid().into_response();
+                let discarded =
+                    discard_rejected_body(body, req_headers, state.config.max_request_body_bytes)
+                        .await;
+                return finish_reject(errors::name_invalid().into_response(), discarded);
             };
             if !crate::auth::verify_direct_basic_access(
                 &state.config,
@@ -531,11 +583,16 @@ pub(crate) async fn upload_session(
                 &canonical_target,
                 required_action.as_str(),
             ) {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return crate::auth::unauthorized_registry_challenge(
-                    &state,
-                    Some(name),
-                    Some(required_action),
+                let discarded =
+                    discard_rejected_body(body, req_headers, state.config.max_request_body_bytes)
+                        .await;
+                return finish_reject(
+                    crate::auth::unauthorized_registry_challenge(
+                        &state,
+                        Some(name),
+                        Some(required_action),
+                    ),
+                    discarded,
                 );
             }
         } else if (required_action != crate::security::RepoAction::Pull
@@ -545,11 +602,15 @@ pub(crate) async fn upload_session(
                 || state.config.robots.enabled
                 || state.config.users.enabled)
         {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            return crate::auth::unauthorized_registry_challenge(
-                &state,
-                Some(name),
-                Some(required_action),
+            let discarded =
+                discard_rejected_body(body, req_headers, state.config.max_request_body_bytes).await;
+            return finish_reject(
+                crate::auth::unauthorized_registry_challenge(
+                    &state,
+                    Some(name),
+                    Some(required_action),
+                ),
+                discarded,
             );
         }
     } else if (required_action != crate::security::RepoAction::Pull
@@ -559,18 +620,19 @@ pub(crate) async fn upload_session(
             || state.config.robots.enabled
             || state.config.users.enabled)
     {
-        let _ = axum::body::to_bytes(body, usize::MAX).await;
-        return crate::auth::unauthorized_registry_challenge(
-            &state,
-            Some(name),
-            Some(required_action),
+        let discarded =
+            discard_rejected_body(body, req_headers, state.config.max_request_body_bytes).await;
+        return finish_reject(
+            crate::auth::unauthorized_registry_challenge(&state, Some(name), Some(required_action)),
+            discarded,
         );
     }
 
     match method {
         Method::GET | Method::HEAD => {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            match state
+            let discarded =
+                discard_rejected_body(body, req_headers, state.config.max_request_body_bytes).await;
+            let response = match state
                 .blob_service
                 .get_upload_status(name, uuid, query.get("_state").map(|s| s.as_str()))
                 .await
@@ -587,11 +649,13 @@ pub(crate) async fn upload_session(
                     (StatusCode::NO_CONTENT, headers).into_response()
                 }
                 Err(err) => blob_mutation_error_to_response(err),
-            }
+            };
+            finish_reject(response, discarded)
         }
         Method::DELETE => {
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            match state
+            let discarded =
+                discard_rejected_body(body, req_headers, state.config.max_request_body_bytes).await;
+            let response = match state
                 .blob_service
                 .abort_upload(name, uuid, query.get("_state").map(|s| s.as_str()))
                 .await
@@ -602,7 +666,8 @@ pub(crate) async fn upload_session(
                     (StatusCode::NO_CONTENT, headers).into_response()
                 }
                 Err(err) => blob_mutation_error_to_response(err),
-            }
+            };
+            finish_reject(response, discarded)
         }
         Method::PATCH => {
             let range = parse_content_range(req_headers);
@@ -612,8 +677,13 @@ pub(crate) async fn upload_session(
                 .and_then(|s| s.parse::<u64>().ok());
 
             let Some(state_param) = query.get("_state").map(|s| s.as_str()) else {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::blob_upload_invalid("missing _state parameter").into_response();
+                let discarded =
+                    discard_rejected_body(body, req_headers, state.config.max_request_body_bytes)
+                        .await;
+                return finish_reject(
+                    errors::blob_upload_invalid("missing _state parameter").into_response(),
+                    discarded,
+                );
             };
 
             let (idle_timeout, min_rate) = state.current_stream_guard_params();
@@ -680,14 +750,21 @@ pub(crate) async fn upload_session(
         }
         Method::PUT => {
             let Some(digest_str) = query.get("digest").map(|s| s.as_str()) else {
-                let _ = axum::body::to_bytes(body, usize::MAX).await;
-                return errors::digest_invalid().into_response();
+                let discarded =
+                    discard_rejected_body(body, req_headers, state.config.max_request_body_bytes)
+                        .await;
+                return finish_reject(errors::digest_invalid().into_response(), discarded);
             };
             let digest = match Digest::parse(digest_str) {
                 Ok(d) => d,
                 Err(_) => {
-                    let _ = axum::body::to_bytes(body, usize::MAX).await;
-                    return errors::digest_invalid().into_response();
+                    let discarded = discard_rejected_body(
+                        body,
+                        req_headers,
+                        state.config.max_request_body_bytes,
+                    )
+                    .await;
+                    return finish_reject(errors::digest_invalid().into_response(), discarded);
                 }
             };
 
@@ -786,4 +863,41 @@ pub(crate) fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64)> {
     let start = start_s.trim().parse::<u64>().ok()?;
     let end = end_s.trim().parse::<u64>().ok()?;
     Some((start, end))
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use super::{RejectedBody, discard_rejected_body};
+    use axum::body::Body;
+    use axum::http::HeaderMap;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn content_length_over_the_limit_closes_without_reading() {
+        let body = Body::from(vec![1u8; 32]);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "32".parse().unwrap());
+        let discarded = discard_rejected_body(body, &headers, 8).await;
+        assert!(matches!(discarded, RejectedBody::Close));
+    }
+
+    #[tokio::test]
+    async fn small_body_is_fully_discarded() {
+        let body = Body::from(Bytes::from_static(b"no"));
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "2".parse().unwrap());
+        let discarded = discard_rejected_body(body, &headers, 8).await;
+        assert!(matches!(discarded, RejectedBody::Reuse));
+    }
+
+    #[tokio::test]
+    async fn streamed_body_over_the_limit_closes() {
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![1u8; 6])),
+            Ok(Bytes::from(vec![2u8; 6])),
+        ]);
+        let body = Body::from_stream(stream);
+        let discarded = discard_rejected_body(body, &HeaderMap::new(), 8).await;
+        assert!(matches!(discarded, RejectedBody::Close));
+    }
 }

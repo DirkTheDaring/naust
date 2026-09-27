@@ -1199,6 +1199,18 @@ impl Storage for FsStorage {
         self.read_adapter.open_blob(digest).await
     }
 
+    async fn open_blob_range(
+        &self,
+        digest: &Digest,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<(BlobMeta, std::pin::Pin<Box<dyn AsyncRead + Send>>), StorageError> {
+        use crate::storage::ports::BlobCasReader;
+        self.read_adapter
+            .open_blob_range(digest, start, end_inclusive)
+            .await
+    }
+
     async fn resolve_tag(&self, name: &str, tag: &str) -> Result<Digest, StorageError> {
         self.tag_domain.resolve_tag(name, tag).await
     }
@@ -1354,7 +1366,7 @@ impl Storage for FsStorage {
         let lock_path = repo_dir.join(".repo_lock");
         let key = format!("{}:{owner_id}:{lease_id}", canonical.as_str());
 
-        let file = tokio::task::spawn_blocking(move || {
+        let maybe_file = tokio::task::spawn_blocking(move || {
             use fs2::FileExt;
             let file = std::fs::OpenOptions::new()
                 .read(true)
@@ -1364,14 +1376,22 @@ impl Storage for FsStorage {
                 .open(&lock_path)
                 .map_err(map_fs_io_err)?;
 
-            file.lock_exclusive().map_err(map_fs_io_err)?;
-            Ok::<_, StorageError>(file)
+            match file.try_lock_exclusive() {
+                Ok(()) => Ok::<_, StorageError>(Some(file)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(map_fs_io_err(e)),
+            }
         })
         .await
         .map_err(map_blocking_join_error)??;
 
-        self.repo_locks.lock().unwrap().insert(key, file);
-        Ok(true)
+        match maybe_file {
+            Some(file) => {
+                self.repo_locks.lock().unwrap().insert(key, file);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Accepted design (D7, 2026-09-26 — KI-12/KI-22): renew is deliberately a no-op
@@ -1395,7 +1415,11 @@ impl Storage for FsStorage {
         owner_id: &str,
         lease_id: &str,
     ) -> Result<(), StorageError> {
-        let key = format!("{repo}:{owner_id}:{lease_id}");
+        let repo_str = match crate::registry::canonical_name::CanonicalRepoName::parse(repo) {
+            Ok(c) => c.as_str().to_string(),
+            Err(_) => repo.to_string(),
+        };
+        let key = format!("{repo_str}:{owner_id}:{lease_id}");
         let _ = self.repo_locks.lock().unwrap().remove(&key);
         Ok(())
     }
