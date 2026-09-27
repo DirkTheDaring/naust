@@ -1,5 +1,5 @@
-/target
-/target2
+target/
+target2/
 /data
 /certs
 /.nfs*

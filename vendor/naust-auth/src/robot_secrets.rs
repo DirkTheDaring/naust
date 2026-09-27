@@ -62,4 +62,3 @@ mod tests {
         assert!(!verify_robot_secret("any_password", DUMMY_SENTINEL_HASH));
     }
 }
-

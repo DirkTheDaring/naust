@@ -144,53 +144,21 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
     resp
 }
 
-fn verify_any_basic_credentials(cfg: &crate::config::Config, user: &str, pass: &str) -> bool {
-    if cfg.robots.enabled
-        && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
-            return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
-        }
-    if cfg.users.enabled
-        && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
-            return crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash);
-        }
-    if let (Some(expected_user), Some(expected_pass)) =
-        (cfg.push_username.as_deref(), cfg.push_password.as_deref())
-        && configured_secrets_match(user, pass, expected_user, expected_pass) {
-            return true;
-        }
-    if cfg.robots.enabled || cfg.users.enabled {
-        let _ = crate::robot_secrets::verify_robot_secret(
-            pass,
-            crate::robot_secrets::DUMMY_SENTINEL_HASH,
-        );
-    }
-    false
-}
-
-pub(crate) fn configured_secrets_match(
+pub(crate) fn verify_any_basic_credentials(
+    cfg: &crate::config::Config,
     user: &str,
     pass: &str,
-    expected_user: &str,
-    expected_pass: &str,
 ) -> bool {
-    let user_ok = crate::security::constant_time_eq(user, expected_user);
-    let pass_ok = crate::security::constant_time_eq(pass, expected_pass);
-    user_ok && pass_ok
+    let auth_cfg = naust_auth::AuthConfig::from(cfg);
+    naust_auth::policy::verify_any_basic_credentials(&auth_cfg, user, pass)
 }
 
 pub(crate) fn catalog_auth_required(cfg: &crate::config::Config) -> bool {
-    cfg.catalog_requires_auth
-        || !cfg.anonymous_pull
-        || cfg.push_username.is_some()
-        || cfg.users.enabled
-        || cfg.robots.enabled
+    let auth_cfg = naust_auth::AuthConfig::from(cfg);
+    auth_cfg.catalog_auth_required()
 }
 
-pub(crate) enum CatalogAccess {
-    Full,
-    PublicOnly,
-    Denied,
-}
+pub(crate) use naust_auth::policy::CatalogAccess;
 
 pub(crate) fn authorize_catalog(state: &AppState, headers: &HeaderMap) -> CatalogAccess {
     if catalog_shows_private_names(state, headers) {
@@ -225,61 +193,8 @@ fn catalog_shows_private_names(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 pub(crate) fn basic_allows_catalog(cfg: &crate::config::Config, user: &str, pass: &str) -> bool {
-    let requested = [crate::security::TokenScope {
-        typ: "registry".to_string(),
-        name: "catalog".to_string(),
-        actions: vec!["*".to_string()],
-    }];
-
-    if cfg.robots.enabled
-        && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
-            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                return !crate::rbac::grant_scopes_by_prefix_with_options(
-                    &requested,
-                    &account.grants,
-                    cfg.star_grants_catalog,
-                )
-                .is_empty();
-            }
-            return false;
-        }
-
-    if cfg.users.enabled
-        && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
-            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
-                for group_name in &account.groups {
-                    if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name) {
-                        union_grants.extend(group.grants.clone());
-                    }
-                }
-                return !crate::rbac::grant_scopes_by_prefix_with_options(
-                    &requested,
-                    &union_grants,
-                    cfg.star_grants_catalog,
-                )
-                .is_empty();
-            }
-            return false;
-        }
-
-    if let (Some(expected_user), Some(expected_pass)) =
-        (cfg.push_username.as_deref(), cfg.push_password.as_deref())
-        && configured_secrets_match(user, pass, expected_user, expected_pass) {
-            return cfg.push_implies_delete
-                || cfg
-                    .push_actions
-                    .iter()
-                    .any(|a| a == "*" || a == "pull" || a == "push");
-        }
-
-    if cfg.robots.enabled || cfg.users.enabled {
-        let _ = crate::robot_secrets::verify_robot_secret(
-            pass,
-            crate::robot_secrets::DUMMY_SENTINEL_HASH,
-        );
-    }
-    false
+    let auth_cfg = naust_auth::AuthConfig::from(cfg);
+    naust_auth::policy::basic_allows_catalog(&auth_cfg, user, pass)
 }
 
 pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
@@ -314,67 +229,8 @@ pub(crate) fn verify_direct_basic_access(
     repo: &crate::registry::CanonicalRepoName,
     action: &str,
 ) -> bool {
-    let token_scopes = [crate::security::TokenScope {
-        typ: "repository".to_string(),
-        name: repo.as_str().to_string(),
-        actions: vec![action.to_string()],
-    }];
-
-    // 1. Try Robots
-    if cfg.robots.enabled
-        && let Some(account) = cfg.robots.accounts.iter().find(|a| a.name == user) {
-            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                let granted = crate::rbac::grant_scopes_by_prefix(&token_scopes, &account.grants);
-                return !granted.is_empty();
-            }
-            return false;
-        }
-
-    // 2. Try Users
-    if cfg.users.enabled
-        && let Some(account) = cfg.users.accounts.iter().find(|a| a.name == user) {
-            if crate::robot_secrets::verify_robot_secret(pass, &account.secret_hash) {
-                let mut union_grants: Vec<crate::rbac::Grant> = Vec::new();
-                for group_name in &account.groups {
-                    if let Some(group) = cfg.users.groups.iter().find(|g| g.name == *group_name) {
-                        union_grants.extend(group.grants.clone());
-                    }
-                }
-                let granted = crate::rbac::grant_scopes_by_prefix(&token_scopes, &union_grants);
-                return !granted.is_empty();
-            }
-            return false;
-        }
-
-    // 3. Fallback to global basic auth
-    if let (Some(expected_user), Some(expected_pass)) =
-        (cfg.push_username.as_deref(), cfg.push_password.as_deref())
-        && configured_secrets_match(user, pass, expected_user, expected_pass) {
-            let action_norm = action.to_ascii_lowercase();
-            let action_allowed = if cfg.push_implies_delete {
-                action_norm == "pull" || action_norm == "push" || action_norm == "delete"
-            } else {
-                cfg.push_actions
-                    .iter()
-                    .any(|a| a == "*" || a.eq_ignore_ascii_case(&action_norm))
-            };
-            if !action_allowed {
-                return false;
-            }
-            if let Some(allowlist) = cfg.push_allow_repos.as_deref() {
-                return push_repository_allowed(allowlist, repo);
-            }
-            return true;
-        }
-
-    if cfg.robots.enabled || cfg.users.enabled {
-        let _ = crate::robot_secrets::verify_robot_secret(
-            pass,
-            crate::robot_secrets::DUMMY_SENTINEL_HASH,
-        );
-    }
-
-    false
+    let auth_cfg = naust_auth::AuthConfig::from(cfg);
+    naust_auth::policy::verify_direct_basic_access(&auth_cfg, user, pass, repo, action)
 }
 
 pub async fn require_auth_middleware(

@@ -7,7 +7,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 /// Equal-length byte compare. Different lengths return false immediately.
-pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();
     if left.len() != right.len() {
@@ -190,7 +190,6 @@ impl RepoAction {
     }
 }
 
-#[cfg(test)]
 pub fn verify_bearer_token(signing_key: &str, token: &str) -> Result<TokenClaims, TokenError> {
     let key = TokenSigningKey {
         kid: "default".to_string(),
@@ -238,7 +237,6 @@ pub fn verify_bearer_token_with_keys(
     Ok(claims)
 }
 
-#[cfg(test)]
 pub fn verify_bearer_token_bound(
     signing_key: &str,
     token: &str,
@@ -282,7 +280,6 @@ pub fn verify_bearer_token_bound_with_keys(
     Ok(claims)
 }
 
-#[cfg(test)]
 pub fn issue_bearer_token(
     signing_key: &str,
     aud: &str,
@@ -375,7 +372,7 @@ fn matches_repo_name(scope_name: &str, target_name: &str) -> bool {
 
 /// Key for upload-state tokens. Distinct from the bearer signing key so an
 /// upload-state MAC cannot verify as a bearer (ADR-016).
-pub(crate) fn upload_state_signing_key(token_key: &[u8]) -> Vec<u8> {
+pub fn upload_state_signing_key(token_key: &[u8]) -> Vec<u8> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(token_key).expect("HMAC-SHA256 accepts a key of any length");
     mac.update(b"naust.upload-state.v1");

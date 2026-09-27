@@ -282,13 +282,10 @@ pub struct RefIndexConfig {
     pub auto_rebuild_on_corruption: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum AuthStrategy {
-    #[default]
-    Token,
-    Basic,
-    Both,
-}
+pub use naust_auth::policy::{
+    AuthConfig, AuthStrategy, GroupConfig, RobotAccountConfig, RobotsConfig, UserAccountConfig,
+    UsersConfig,
+};
 
 // Moved to the core policy module (ADR-010 §2.3); re-exported here so server-side
 // consumers keep compiling until the Phase 2 crate split.
@@ -311,6 +308,29 @@ impl From<&Config> for crate::policy::GcPolicy {
     }
 }
 
+/// Composition-time mapping into the auth policy (ADR-019).
+impl From<&Config> for naust_auth::AuthConfig {
+    fn from(cfg: &Config) -> Self {
+        naust_auth::AuthConfig {
+            auth_strategy: cfg.auth_strategy,
+            anonymous_pull: cfg.anonymous_pull,
+            catalog_requires_auth: cfg.catalog_requires_auth,
+            star_grants_catalog: cfg.star_grants_catalog,
+            push_username: cfg.push_username.clone(),
+            push_password: cfg.push_password.clone(),
+            push_actions: cfg.push_actions.clone(),
+            push_implies_delete: cfg.push_implies_delete,
+            push_allow_repos: cfg.push_allow_repos.clone(),
+            robots: cfg.robots.clone(),
+            users: cfg.users.clone(),
+            token_service: cfg.token_service.clone(),
+            token_signing_keys: cfg.token_signing_keys.clone(),
+            token_ttl_secs: cfg.token_ttl_secs,
+            private_name_prefixes: cfg.private_name_prefixes.clone(),
+        }
+    }
+}
+
 impl Config {
     pub fn token_primary_signing_key(&self) -> &crate::security::TokenSigningKey {
         self.token_signing_keys.first().unwrap_or_else(|| {
@@ -319,41 +339,6 @@ impl Config {
             )
         })
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct RobotsConfig {
-    pub enabled: bool,
-    pub accounts: Vec<RobotAccountConfig>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct UsersConfig {
-    pub enabled: bool,
-    pub accounts: Vec<UserAccountConfig>,
-    pub groups: Vec<GroupConfig>,
-}
-
-#[derive(Clone, Debug)]
-pub struct UserAccountConfig {
-    pub name: String,
-    pub secret_hash: String,
-    pub groups: Vec<String>,
-    pub max_ttl_secs: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct GroupConfig {
-    pub name: String,
-    pub grants: Vec<crate::rbac::Grant>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RobotAccountConfig {
-    pub name: String,
-    pub secret_hash: String,
-    pub grants: Vec<crate::rbac::Grant>,
-    pub max_ttl_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
