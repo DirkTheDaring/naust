@@ -1,8 +1,8 @@
 use crate::rbac::{self, Grant};
 use crate::robot_secrets;
 use crate::security::{self, TokenSigningKey};
-use naust_core::registry::access_pattern::push_repository_allowed;
-use naust_core::registry::canonical_name::CanonicalRepoName;
+use naust_types::access_pattern::push_repository_allowed;
+use naust_types::canonical_name::CanonicalRepoName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AuthStrategy {
@@ -57,7 +57,7 @@ pub struct AuthConfig {
     pub push_password: Option<String>,
     pub push_actions: Vec<String>,
     pub push_implies_delete: bool,
-    pub push_allow_repos: Option<Vec<naust_core::registry::RepositoryAccessPattern>>,
+    pub push_allow_repos: Option<Vec<naust_types::RepositoryAccessPattern>>,
     pub robots: RobotsConfig,
     pub users: UsersConfig,
     pub token_service: String,

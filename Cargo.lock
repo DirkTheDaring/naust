@@ -2019,6 +2019,7 @@ dependencies = [
  "libc",
  "naust-auth",
  "naust-core",
+ "naust-types",
  "rcgen 0.14.10",
  "regex",
  "reqwest",
@@ -2056,7 +2057,9 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "hmac 0.12.1",
- "naust-core",
+ "naust-types",
+ "password-hash",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2082,6 +2085,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "libc",
+ "naust-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2095,6 +2099,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "naust-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

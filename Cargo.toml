@@ -49,6 +49,7 @@ uuid = { version = "1", features = ["v4"] }
 acmecert-core = { path = "vendor/acmecert/crates/acmecert-core" }
 naust-auth = { path = "vendor/naust-auth" }
 naust-core = { path = "vendor/naust-core" }
+naust-types = { path = "vendor/naust-types" }
 storage-core = { path = "vendor/storage-layer-rust/crates/storage-core" }
 storage-fs = { path = "vendor/storage-layer-rust/crates/storage-fs" }
 storage-s3 = { path = "vendor/storage-layer-rust/crates/storage-s3" }
