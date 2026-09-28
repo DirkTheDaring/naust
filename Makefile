@@ -79,10 +79,13 @@ vendor-sync:
 	@cp -a ../acmecert/crates/acmecert vendor/acmecert/crates/
 	@cp -a ../naust-storage-core/Cargo.toml ../naust-storage-core/LICENSE vendor/naust-storage-core/ 2>/dev/null || cp -a ../naust-storage-core/Cargo.toml vendor/naust-storage-core/
 	@cp -a ../naust-storage-core/src vendor/naust-storage-core/src
+	@cp -a ../naust-storage-core/tests vendor/naust-storage-core/tests 2>/dev/null || true
 	@cp -a ../naust-storage-fs/Cargo.toml ../naust-storage-fs/LICENSE vendor/naust-storage-fs/ 2>/dev/null || cp -a ../naust-storage-fs/Cargo.toml vendor/naust-storage-fs/
 	@cp -a ../naust-storage-fs/src vendor/naust-storage-fs/src
+	@cp -a ../naust-storage-fs/tests vendor/naust-storage-fs/tests 2>/dev/null || true
 	@cp -a ../naust-storage-s3/Cargo.toml ../naust-storage-s3/LICENSE vendor/naust-storage-s3/ 2>/dev/null || cp -a ../naust-storage-s3/Cargo.toml vendor/naust-storage-s3/
 	@cp -a ../naust-storage-s3/src vendor/naust-storage-s3/src
+	@cp -a ../naust-storage-s3/tests vendor/naust-storage-s3/tests 2>/dev/null || true
 	@cp -a ../naust-auth/Cargo.toml ../naust-auth/LICENSE vendor/naust-auth/ 2>/dev/null || cp -a ../naust-auth/Cargo.toml vendor/naust-auth/
 	@cp -a ../naust-auth/src vendor/naust-auth/src
 	@cp -a ../naust-types/Cargo.toml ../naust-types/LICENSE vendor/naust-types/ 2>/dev/null || cp -a ../naust-types/Cargo.toml vendor/naust-types/
