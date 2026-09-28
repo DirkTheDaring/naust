@@ -14,6 +14,28 @@ pub enum SlowConnectionPolicy {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProfile {
+    #[default]
+    AiScale,
+    Balanced,
+    LowMemory,
+}
+
+impl std::str::FromStr for ResourceProfile {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ai_scale" | "ai" | "high_throughput" | "high" => Ok(Self::AiScale),
+            "balanced" | "standard" | "medium" => Ok(Self::Balanced),
+            "low_memory" | "constrained" | "low" => Ok(Self::LowMemory),
+            _ => Err(()),
+        }
+    }
+}
+
 fn sanitize_for_path_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -157,6 +179,7 @@ pub struct Config {
     pub s3_lease_renewal_interval_secs: u64,
     pub s3_max_retry_attempts: u32,
     pub s3_legacy_multipart_cleanup_policy: LegacyMultipartCleanupPolicy,
+    pub s3_part_size_bytes: usize,
     pub upload_receipt_lifetime_secs: u64,
     pub gc_pin_duration_secs: u64,
 
@@ -196,6 +219,9 @@ pub struct Config {
 
     // Admin-only HTTP endpoints (e.g. online blob GC triggers). Disabled by default.
     pub admin_api: AdminApiConfig,
+
+    pub resource_profile: ResourceProfile,
+    pub memory_budget_bytes: Option<usize>,
 
     pub max_upload_bytes: u64,
     pub max_request_body_bytes: usize,
@@ -548,6 +574,8 @@ struct FileConfig {
     #[serde(default)]
     profile: FileProfile,
     #[serde(default)]
+    resources: FileResources,
+    #[serde(default)]
     server: FileServer,
     #[serde(default)]
     auth: FileAuth,
@@ -814,6 +842,14 @@ enum FileEvictionPolicy {
 struct FileProfile {
     #[serde(default)]
     name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FileResources {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    memory_budget_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1146,6 +1182,8 @@ struct FileUploadsS3 {
     max_retry_attempts: Option<u32>,
     #[serde(default)]
     legacy_multipart_cleanup_policy: Option<String>,
+    #[serde(default)]
+    part_size_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2018,6 +2056,79 @@ impl Config {
             }
         };
 
+        let resource_profile_str = env_str_opt(&[
+            "REGISTRY__RESOURCES__PROFILE",
+            "RESOURCE_PROFILE",
+        ])
+        .or_else(|| file_cfg.resources.profile.clone());
+
+        let memory_budget_bytes = env_usize_opt(&[
+            "REGISTRY__RESOURCES__MEMORY_BUDGET_BYTES",
+            "MEMORY_BUDGET_BYTES",
+        ])?
+        .or(file_cfg.resources.memory_budget_bytes);
+
+        let resource_profile = match resource_profile_str.as_deref() {
+            Some("low_memory") | Some("constrained") | Some("low") => ResourceProfile::LowMemory,
+            Some("balanced") | Some("standard") | Some("medium") => ResourceProfile::Balanced,
+            Some("ai_scale") | Some("high_throughput") | Some("ai") | Some("high") => {
+                ResourceProfile::AiScale
+            }
+            None => {
+                if let Some(budget) = memory_budget_bytes {
+                    if budget < 512 * 1024 * 1024 {
+                        ResourceProfile::LowMemory
+                    } else if budget < 2 * 1024 * 1024 * 1024 {
+                        ResourceProfile::Balanced
+                    } else {
+                        ResourceProfile::AiScale
+                    }
+                } else {
+                    ResourceProfile::AiScale
+                }
+            }
+            Some(other) => {
+                return Err(ConfigError::InvalidValue {
+                    field: "resources.profile",
+                    message: format!(
+                        "invalid resource profile '{other}': expected 'ai_scale', 'balanced', or 'low_memory'"
+                    ),
+                });
+            }
+        };
+
+        let (
+            default_s3_part_size,
+            default_concurrent_uploads,
+            default_concurrent_buffered,
+            default_concurrent_requests,
+        ) = match resource_profile {
+            ResourceProfile::AiScale => (
+                64 * 1024 * 1024,
+                32,
+                if best_practice { 4 } else { 8 },
+                if best_practice { 64 } else { 256 },
+            ),
+            ResourceProfile::Balanced => (16 * 1024 * 1024, 16, 4, 128),
+            ResourceProfile::LowMemory => (8 * 1024 * 1024, 8, 2, 64),
+        };
+
+        let s3_part_size_bytes = env_usize_opt(&[
+            "REGISTRY__UPLOADS__S3__PART_SIZE_BYTES",
+            "S3_PART_SIZE_BYTES",
+        ])?
+        .or(file_cfg.uploads.s3.part_size_bytes)
+        .unwrap_or(default_s3_part_size);
+
+        if !(5 * 1024 * 1024..=5 * 1024 * 1024 * 1024).contains(&s3_part_size_bytes) {
+            return Err(ConfigError::InvalidValue {
+                field: "uploads.s3.part_size_bytes",
+                message: format!(
+                    "part_size_bytes ({s3_part_size_bytes}) must be between 5 MiB (5242880) and 5 GiB (5368709120)"
+                ),
+            });
+        }
+
         let upload_receipt_lifetime_secs = env_u64_opt(&[
             "REGISTRY__UPLOADS__RECEIPT_LIFETIME_SECS",
             "UPLOAD_RECEIPT_LIFETIME_SECS",
@@ -2161,7 +2272,7 @@ impl Config {
         let max_upload_bytes =
             env_u64_opt(&["REGISTRY__LIMITS__MAX_UPLOAD_BYTES", "MAX_UPLOAD_BYTES"])?
                 .or(file_cfg.limits.max_upload_bytes)
-                .unwrap_or(5 * 1024 * 1024 * 1024);
+                .unwrap_or(0);
 
         let max_request_body_bytes = env_usize_opt(&[
             "REGISTRY__LIMITS__MAX_REQUEST_BODY_BYTES",
@@ -2181,7 +2292,7 @@ impl Config {
             "MAX_CONCURRENT_BUFFERED_REQUESTS",
         ])?
         .or(file_cfg.limits.max_concurrent_buffered_requests)
-        .unwrap_or(if best_practice { 4 } else { 8 })
+        .unwrap_or(default_concurrent_buffered)
         .max(1);
 
         let max_concurrent_requests = env_usize_opt(&[
@@ -2189,7 +2300,7 @@ impl Config {
             "MAX_CONCURRENT_REQUESTS",
         ])?
         .or(file_cfg.limits.max_concurrent_requests)
-        .unwrap_or(if best_practice { 64 } else { 256 })
+        .unwrap_or(default_concurrent_requests)
         .max(1);
 
         let max_concurrent_upload_requests = env_usize_opt(&[
@@ -2198,8 +2309,8 @@ impl Config {
         ])?
         .or(file_cfg.limits.max_concurrent_upload_requests)
         // Uploads are long-lived and can easily exhaust file descriptors when clients retry
-        // behind proxies; keep the default smaller than the general request limit.
-        .unwrap_or(max_concurrent_requests.min(32))
+        // behind proxies; keep the default bounded according to profile.
+        .unwrap_or(max_concurrent_requests.min(default_concurrent_uploads))
         .max(1);
 
         let request_timeout_secs = env_u64_opt(&[
@@ -2214,14 +2325,14 @@ impl Config {
             "UPLOAD_REQUEST_TIMEOUT_SECS",
         ])?
         .or(file_cfg.timeouts.upload_request_timeout_secs)
-        .unwrap_or(if best_practice { 7200 } else { 3600 });
+        .unwrap_or(0);
 
         let upload_chunk_idle_timeout_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__UPLOAD_CHUNK_IDLE_TIMEOUT_SECS",
             "UPLOAD_CHUNK_IDLE_TIMEOUT_SECS",
         ])?
         .or(file_cfg.timeouts.upload_chunk_idle_timeout_secs)
-        .unwrap_or(20);
+        .unwrap_or(60);
 
         let upload_rate_window_secs = env_u64_opt(&[
             "REGISTRY__TIMEOUTS__UPLOAD_RATE_WINDOW_SECS",
@@ -2852,6 +2963,7 @@ impl Config {
             s3_lease_renewal_interval_secs,
             s3_max_retry_attempts,
             s3_legacy_multipart_cleanup_policy,
+            s3_part_size_bytes,
             upload_receipt_lifetime_secs,
             gc_pin_duration_secs,
 
@@ -2881,6 +2993,8 @@ impl Config {
                 username: admin_api_username,
                 password: admin_api_password,
             },
+            resource_profile,
+            memory_budget_bytes,
             max_upload_bytes,
             max_request_body_bytes,
             upload_chunk_min_bytes,
@@ -4815,4 +4929,183 @@ tag_listing_max_payload_bytes = 10
         assert!(!auto_rebuild_ref_index_on_corruption);
         assert_eq!(fs_root, std::path::PathBuf::from("/tmp/gc-map-root"));
     }
+
+    #[test]
+    fn test_adr_020_default_unbounded_limits_and_s3_part_size() {
+        run_process_isolated(
+            "config::tests::test_adr_020_default_unbounded_limits_and_s3_part_size",
+            &[],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.max_upload_bytes, 0, "max_upload_bytes must default to 0 (unlimited)");
+                assert_eq!(cfg.upload_request_timeout_secs, 0, "upload_request_timeout_secs must default to 0 (unlimited)");
+                assert_eq!(cfg.upload_chunk_idle_timeout_secs, 60, "upload_chunk_idle_timeout_secs must default to 60s");
+                assert_eq!(cfg.s3_part_size_bytes, 64 * 1024 * 1024, "s3_part_size_bytes must default to 64 MiB");
+            },
+        );
+    }
+
+    #[test]
+    fn test_adr_020_s3_part_size_validation_rejects_out_of_bounds() {
+        // Less than 5 MiB
+        run_process_isolated(
+            "config::tests::test_adr_020_s3_part_size_validation_rejects_too_small",
+            &[("S3_PART_SIZE_BYTES", "5242879")],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(
+                    err.to_string().contains("uploads.s3.part_size_bytes"),
+                    "expected part size error, got: {err}"
+                );
+            },
+        );
+
+        // Greater than 5 GiB
+        run_process_isolated(
+            "config::tests::test_adr_020_s3_part_size_validation_rejects_too_large",
+            &[("S3_PART_SIZE_BYTES", "5368709121")],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(
+                    err.to_string().contains("uploads.s3.part_size_bytes"),
+                    "expected part size error, got: {err}"
+                );
+            },
+        );
+
+        // Valid custom part size (128 MiB)
+        run_process_isolated(
+            "config::tests::test_adr_020_s3_part_size_validation_accepts_valid",
+            &[("S3_PART_SIZE_BYTES", "134217728")],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.s3_part_size_bytes, 134217728);
+            },
+        );
+    }
+
+    #[test]
+    fn test_adr_020_explicit_upload_limits_and_timeouts() {
+        run_process_isolated(
+            "config::tests::test_adr_020_explicit_upload_limits_and_timeouts",
+            &[
+                ("MAX_UPLOAD_BYTES", "10737418240"), // 10 GiB explicit cap
+                ("UPLOAD_REQUEST_TIMEOUT_SECS", "7200"),
+                ("UPLOAD_CHUNK_IDLE_TIMEOUT_SECS", "120"),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.max_upload_bytes, 10737418240);
+                assert_eq!(cfg.upload_request_timeout_secs, 7200);
+                assert_eq!(cfg.upload_chunk_idle_timeout_secs, 120);
+            },
+        );
+    }
+
+    #[test]
+    fn test_resource_profile_presets() {
+        // Default / AiScale
+        run_process_isolated(
+            "config::tests::test_resource_profile_default_ai_scale",
+            &[],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::AiScale);
+                assert_eq!(cfg.s3_part_size_bytes, 64 * 1024 * 1024);
+                assert_eq!(cfg.max_concurrent_upload_requests, 32);
+                assert_eq!(cfg.max_concurrent_buffered_requests, 8);
+                assert_eq!(cfg.max_concurrent_requests, 256);
+            },
+        );
+
+        // Balanced
+        run_process_isolated(
+            "config::tests::test_resource_profile_balanced",
+            &[("RESOURCE_PROFILE", "balanced")],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::Balanced);
+                assert_eq!(cfg.s3_part_size_bytes, 16 * 1024 * 1024);
+                assert_eq!(cfg.max_concurrent_upload_requests, 16);
+                assert_eq!(cfg.max_concurrent_buffered_requests, 4);
+                assert_eq!(cfg.max_concurrent_requests, 128);
+            },
+        );
+
+        // Low Memory
+        run_process_isolated(
+            "config::tests::test_resource_profile_low_memory",
+            &[("RESOURCE_PROFILE", "low_memory")],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::LowMemory);
+                assert_eq!(cfg.s3_part_size_bytes, 8 * 1024 * 1024);
+                assert_eq!(cfg.max_concurrent_upload_requests, 8);
+                assert_eq!(cfg.max_concurrent_buffered_requests, 2);
+                assert_eq!(cfg.max_concurrent_requests, 64);
+            },
+        );
+    }
+
+    #[test]
+    fn test_resource_profile_memory_budget() {
+        // Low budget (< 512MB) -> LowMemory
+        run_process_isolated(
+            "config::tests::test_resource_profile_budget_low",
+            &[("MEMORY_BUDGET_BYTES", "268435456")],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::LowMemory);
+                assert_eq!(cfg.s3_part_size_bytes, 8 * 1024 * 1024);
+                assert_eq!(cfg.max_concurrent_upload_requests, 8);
+            },
+        );
+
+        // Medium budget (1GB) -> Balanced
+        run_process_isolated(
+            "config::tests::test_resource_profile_budget_balanced",
+            &[("MEMORY_BUDGET_BYTES", "1073741824")],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::Balanced);
+                assert_eq!(cfg.s3_part_size_bytes, 16 * 1024 * 1024);
+                assert_eq!(cfg.max_concurrent_upload_requests, 16);
+            },
+        );
+
+        // High budget (4GB) -> AiScale
+        run_process_isolated(
+            "config::tests::test_resource_profile_budget_high",
+            &[("MEMORY_BUDGET_BYTES", "4294967296")],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::AiScale);
+                assert_eq!(cfg.s3_part_size_bytes, 64 * 1024 * 1024);
+                assert_eq!(cfg.max_concurrent_upload_requests, 32);
+            },
+        );
+    }
+
+    #[test]
+    fn test_resource_profile_explicit_override_precedence() {
+        run_process_isolated(
+            "config::tests::test_resource_profile_override_precedence",
+            &[
+                ("RESOURCE_PROFILE", "low_memory"),
+                ("S3_PART_SIZE_BYTES", "134217728"), // 128 MiB manual override
+                ("MAX_CONCURRENT_UPLOAD_REQUESTS", "40"), // 40 uploads manual override
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.resource_profile, ResourceProfile::LowMemory);
+                // Overridden fields take precedence:
+                assert_eq!(cfg.s3_part_size_bytes, 134217728);
+                assert_eq!(cfg.max_concurrent_upload_requests, 40);
+                // Non-overridden fields retain low_memory profile defaults:
+                assert_eq!(cfg.max_concurrent_buffered_requests, 2);
+                assert_eq!(cfg.max_concurrent_requests, 64);
+            },
+        );
+    }
 }
+

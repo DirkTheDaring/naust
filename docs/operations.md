@@ -98,3 +98,19 @@ Cached content lives in a separate root/prefix (`proxy.cache.fs_root` / `cache_s
 
 - **Log-filter targets:** the FS storage `tracing` targets renamed with the crate split — `naust::storage::fs` → `naust_core::storage::fs`. Update any `RUST_LOG`/collector filters that reference the old target (KI-27b, resolved here).
 - **Test invocation (updated for the ADR-012 sibling layout):** `naust-core` is a sibling repository (`../naust-core`), not a workspace member — run `cargo test` in each repository. The live-S3 suite here is opt-in: `cargo test --test s3_live_integration -- --ignored --test-threads=1` with MinIO running.
+
+## 7. Resource profiles, memory budget, and thread tuning
+
+Naust includes an adaptive resource policy engine ([ADR-021](adr/adr-021-adaptive-resource-policy-and-threadpool-autotuning.md)) to tune concurrency semaphores, S3 multipart chunk sizes, and runtime thread pools.
+
+**Presets (`RESOURCE_PROFILE` or `[resources] profile`):**
+
+| Preset | Target Environment | S3 Part Size | Max Blob Size (10k parts) | Upload Slots | Buffered Slots | General Slots | Peak Upload RAM |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`ai_scale`** *(default)* | $\ge 2\text{ GB}$ RAM / AI/ML Images | **64 MiB** | **640 GiB** | 32 | 8 | 256 | ~2.0 GiB |
+| **`balanced`** | $512\text{ MB} - 2\text{ GB}$ RAM | **16 MiB** | **160 GiB** | 16 | 4 | 128 | ~256 MiB |
+| **`low_memory`** | $< 512\text{ MB}$ RAM / Edge Nodes | **8 MiB** | **80 GiB** | 8 | 2 | 64 | ~64 MiB |
+
+**Auto-tuning by memory budget:** Setting `MEMORY_BUDGET_BYTES` (or `[resources] memory_budget_bytes`) without a profile name auto-selects the profile tier based on memory thresholds (`< 512MB` $\to$ `low_memory`, `512MB-2GB` $\to$ `balanced`, `> 2GB` $\to$ `ai_scale`).
+
+**Granular overrides:** Any explicit environment variable or TOML configuration (e.g. `S3_PART_SIZE_BYTES`, `MAX_CONCURRENT_UPLOAD_REQUESTS`, `WORKER_THREADS`, `MAX_BLOCKING_THREADS`) strictly overrides the profile defaults.

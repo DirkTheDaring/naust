@@ -1087,17 +1087,21 @@ async fn request_timeout_by_path(
 ) -> axum::response::Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    let timeout_secs = if is_upload_path(&path) {
+    let timeout_secs = if is_streaming_path(&path) {
         state.config.upload_request_timeout_secs
     } else {
         state.config.request_timeout_secs
     };
 
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
-        Ok(resp) => resp,
-        Err(_) => {
-            tracing::warn!(%method, path = %path, timeout_secs, "request timed out");
-            axum::http::StatusCode::REQUEST_TIMEOUT.into_response()
+    if timeout_secs == 0 {
+        next.run(req).await
+    } else {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
+            Ok(resp) => resp,
+            Err(_) => {
+                tracing::warn!(%method, path = %path, timeout_secs, "request timed out");
+                axum::http::StatusCode::REQUEST_TIMEOUT.into_response()
+            }
         }
     }
 }
@@ -1242,6 +1246,15 @@ fn is_upload_path(path: &str) -> bool {
         crate::http_api::routing::OciRoute::parse(path),
         crate::http_api::routing::OciRoute::UploadInitiate { .. }
             | crate::http_api::routing::OciRoute::UploadSession { .. }
+    )
+}
+
+fn is_streaming_path(path: &str) -> bool {
+    matches!(
+        crate::http_api::routing::OciRoute::parse(path),
+        crate::http_api::routing::OciRoute::UploadInitiate { .. }
+            | crate::http_api::routing::OciRoute::UploadSession { .. }
+            | crate::http_api::routing::OciRoute::Blob { .. }
     )
 }
 

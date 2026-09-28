@@ -1178,6 +1178,7 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
         s3_lease_renewal_interval_secs: 60,
         s3_max_retry_attempts: 3,
         s3_legacy_multipart_cleanup_policy: Default::default(),
+        s3_part_size_bytes: 64 * 1024 * 1024,
         upload_receipt_lifetime_secs: 72 * 3600,
         gc_pin_duration_secs: 3600,
         ref_index: RefIndexConfig {
@@ -1206,6 +1207,8 @@ pub fn test_config(fs_root: PathBuf, ref_index_path: PathBuf) -> Config {
             username: None,
             password: None,
         },
+        resource_profile: ResourceProfile::default(),
+        memory_budget_bytes: None,
         max_upload_bytes: 5 * 1024 * 1024,
         max_request_body_bytes: 1024 * 1024,
         upload_chunk_min_bytes: None,

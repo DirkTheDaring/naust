@@ -72,6 +72,7 @@ pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, 
                 receipt_lifetime_secs: config.upload_receipt_lifetime_secs,
                 upload_expiration_secs: config.upload_gc_max_age_secs,
                 legacy_multipart_cleanup_policy: config.s3_legacy_multipart_cleanup_policy,
+                part_size_bytes: config.s3_part_size_bytes,
             };
             let s3_storage = s3::S3Storage::new(
                 config.s3_endpoint.clone(),
@@ -167,13 +168,23 @@ pub fn proxy_cache_storage_try_from_config(
                         format!("{}/cache", config.s3_prefix.trim_end_matches('/'))
                     }),
                 };
+            let session_cfg = s3::S3SessionConfig {
+                lease_duration_secs: config.s3_lease_duration_secs,
+                lease_renewal_interval_secs: config.s3_lease_renewal_interval_secs,
+                max_retry_attempts: config.s3_max_retry_attempts,
+                receipt_lifetime_secs: config.upload_receipt_lifetime_secs,
+                upload_expiration_secs: config.upload_gc_max_age_secs,
+                legacy_multipart_cleanup_policy: config.s3_legacy_multipart_cleanup_policy,
+                part_size_bytes: config.s3_part_size_bytes,
+            };
             let s3_storage = s3::S3Storage::new(
                 Some(endpoint),
                 Some(region),
                 Some(bucket),
                 prefix,
                 config.max_upload_bytes,
-            );
+            )
+            .with_session_config(session_cfg);
             Ok(Arc::new(s3_storage))
         }
     }

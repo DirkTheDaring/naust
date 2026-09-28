@@ -131,6 +131,10 @@ pin absent → membership count = 0 → not policy-reachable (fail-closed discov
 
 `build_server_runtime` refuses to boot when storage is non-empty and membership is not `Ready` (`RuntimeBuildError::MembershipBackfillRequired`, `src/runtime.rs:346-393`); empty storage is auto-marked ready. The backfill is a one-shot operator CLI migration with a resumable checkpoint (phases Applying/Verifying/Ready/Failed, 60 s owner lease).
 
+### 5.4 Adaptive Resource Policy and thread auto-tuning
+
+`src/config.rs` evaluates `ResourceProfile` (`AiScale`, `Balanced`, `LowMemory`) and `memory_budget_bytes` to auto-tune worker threads, blocking thread pool size, upload/buffered request concurrency semaphores, and S3 multipart part sizes (8 MiB to 64 MiB), while guaranteeing that explicit operator configuration takes strict precedence. Full architecture: [`adaptive-resource-policy.md`](adaptive-resource-policy.md) and [ADR-021](../adr/adr-021-adaptive-resource-policy-and-threadpool-autotuning.md).
+
 ## 6. Verification posture
 
 Unit/integration suites are in-tree (20 black-box suites + sidecar unit modules per ADR-008; core unit tests now live in `naust-core` (sibling repository) — run `cargo test --workspace`, not bare `cargo test`). Executed evidence at the ADR-010 split (2026-09-26, commits `eafd5c7…9aa1164` + docs commit): `cargo test --workspace --locked` = 1489 passed / 0 failed (excluding the live suite) / 14 ignored, with core standalone 909/0/13; all four conformance matrices (fs, basic, token, s3) green; live-MinIO `s3_live_integration` = 32/0/1 × 5 consecutive runs (MinIO container started for qualification and stopped afterwards); release build + `make core-boundary` clean. Older stale-evidence notes (KI-20, GATE-O06/O16) remain tracked in the technical-debt register.

@@ -612,6 +612,7 @@ fn minimal_config_for_token_tests() -> Config {
         s3_lease_renewal_interval_secs: 20,
         s3_max_retry_attempts: 3,
         s3_legacy_multipart_cleanup_policy: crate::config::LegacyMultipartCleanupPolicy::Disabled,
+        s3_part_size_bytes: 64 * 1024 * 1024,
         upload_receipt_lifetime_secs: 86400,
         gc_pin_duration_secs: 1800,
         ref_index: crate::config::RefIndexConfig {
@@ -640,6 +641,8 @@ fn minimal_config_for_token_tests() -> Config {
             username: None,
             password: None,
         },
+        resource_profile: crate::config::ResourceProfile::AiScale,
+        memory_budget_bytes: None,
         max_upload_bytes: 5 * 1024 * 1024 * 1024,
         max_request_body_bytes: 32 * 1024 * 1024,
         upload_chunk_min_bytes: None,

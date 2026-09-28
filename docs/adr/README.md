@@ -22,5 +22,8 @@ Accepted decisions, in order. **Naming note (2026-09-26, ADR-012):** the product
 | [016](adr-016-mac-egress-and-repo-identity.md) | Separate upload-state MAC key; block NAT64-to-private and CGNAT; repository grants use the stored name | Accepted | amends ADR-015 clause 3 |
 | [017](adr-017-ship-what-ci-can-prove.md) | Packaging inputs match `make rpm`/`make deb`; compose stays on loopback with an explicit signing key; `/healthz` and `/metrics` are unauthenticated | Accepted | — |
 | [018](adr-018-request-path-capacity.md) | Cap rejected upload drains, serve blob ranges from the requested offset, and return 429 when `/v2` slots are full | Accepted | — |
+| [019](adr-019-naust-auth-crate-boundary.md) | `naust-auth` crate boundary: pure authentication, Argon2id credentials, token signing/verification, and RBAC primitives | Accepted | — |
+| [020](adr-020-unbounded-blob-capacity-and-ai-image-support.md) | Unbounded default blob capacity (`max_upload_bytes = 0`), 64 MiB S3 multipart part size, and decoupled streaming timeouts for AI container scale | Accepted | — |
+| [021](adr-021-adaptive-resource-policy-and-threadpool-autotuning.md) | Adaptive Resource Policy Engine & Threadpool Auto-Tuning: auto-tunes worker/blocking threads, concurrency slots, and S3 parts to CPU and memory budgets with explicit override precedence | Accepted | — |
 
 Context: current architecture [`../architecture/README.md`](../architecture/README.md) · requirements [`../requirements.md`](../requirements.md) · remaining work [`../technical-debt.md`](../technical-debt.md).
