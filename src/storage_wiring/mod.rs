@@ -14,7 +14,7 @@ mod tests;
 pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, StorageError> {
     match config.storage_backend {
         StorageBackend::Filesystem => {
-            let limits = storage_fs::DirEnumerationLimits::new(
+            let limits = naust_storage_fs::DirEnumerationLimits::new(
                 config.fs_manifest_listing_max_entries,
                 config.fs_manifest_listing_max_name_bytes,
             );
@@ -24,14 +24,14 @@ pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, 
                 max_total_entries: config.fs_gc_discovery_max_total_discovery_entries,
                 max_manifest_dirs: config.fs_gc_discovery_max_manifest_dirs,
                 max_retained_path_bytes: config.fs_gc_discovery_max_discovery_retained_path_bytes,
-                per_dir_limits: storage_fs::DirEnumerationLimits::new(
+                per_dir_limits: naust_storage_fs::DirEnumerationLimits::new(
                     config.fs_gc_discovery_intermediate_dir_max_entries,
                     config.fs_gc_discovery_intermediate_dir_max_name_bytes,
                 ),
             };
             let ref_limits = fs::manifest_refs::ManifestReferenceLimits {
                 max_terminal_dir_enumerations: config.fs_gc_discovery_max_terminal_dir_enumerations,
-                per_dir_limits: storage_fs::DirEnumerationLimits::new(
+                per_dir_limits: naust_storage_fs::DirEnumerationLimits::new(
                     config.fs_gc_discovery_terminal_dir_max_entries,
                     config.fs_gc_discovery_terminal_dir_max_name_bytes,
                 ),
@@ -42,11 +42,11 @@ pub fn storage_wiring_try_from_config(config: &Config) -> Result<StorageWiring, 
                 max_manifest_payload_bytes: config.fs_gc_discovery_max_manifest_payload_bytes,
             };
             let tag_listing_limits = fs::tag_listing::TagListingLimits {
-                repo_probe_limits: storage_fs::DirEnumerationLimits::new(
+                repo_probe_limits: naust_storage_fs::DirEnumerationLimits::new(
                     config.fs_tag_listing_repo_probe_max_entries,
                     config.fs_tag_listing_repo_probe_max_name_bytes,
                 ),
-                tags_dir_limits: storage_fs::DirEnumerationLimits::new(
+                tags_dir_limits: naust_storage_fs::DirEnumerationLimits::new(
                     config.fs_tag_listing_max_entries,
                     config.fs_tag_listing_max_name_bytes,
                 ),
@@ -120,16 +120,16 @@ pub fn proxy_cache_storage_try_from_config(
                     .clone()
                     .unwrap_or_else(|| config.fs_root.join("cache")),
             };
-            let limits = storage_fs::DirEnumerationLimits::new(
+            let limits = naust_storage_fs::DirEnumerationLimits::new(
                 config.fs_manifest_listing_max_entries,
                 config.fs_manifest_listing_max_name_bytes,
             );
             let tag_listing_limits = fs::tag_listing::TagListingLimits {
-                repo_probe_limits: storage_fs::DirEnumerationLimits::new(
+                repo_probe_limits: naust_storage_fs::DirEnumerationLimits::new(
                     config.fs_tag_listing_repo_probe_max_entries,
                     config.fs_tag_listing_repo_probe_max_name_bytes,
                 ),
-                tags_dir_limits: storage_fs::DirEnumerationLimits::new(
+                tags_dir_limits: naust_storage_fs::DirEnumerationLimits::new(
                     config.fs_tag_listing_max_entries,
                     config.fs_tag_listing_max_name_bytes,
                 ),

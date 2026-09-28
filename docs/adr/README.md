@@ -25,5 +25,6 @@ Accepted decisions, in order. **Naming note (2026-09-26, ADR-012):** the product
 | [019](adr-019-naust-auth-crate-boundary.md) | `naust-auth` crate boundary: pure authentication, Argon2id credentials, token signing/verification, and RBAC primitives | Accepted | — |
 | [020](adr-020-unbounded-blob-capacity-and-ai-image-support.md) | Unbounded default blob capacity (`max_upload_bytes = 0`), 64 MiB S3 multipart part size, and decoupled streaming timeouts for AI container scale | Accepted | — |
 | [021](adr-021-adaptive-resource-policy-and-threadpool-autotuning.md) | Adaptive Resource Policy Engine & Threadpool Auto-Tuning: auto-tunes worker/blocking threads, concurrency slots, and S3 parts to CPU and memory budgets with explicit override precedence | Accepted | — |
+| [022](adr-022-naust-storage-crate-renaming.md) | Storage Crate Renaming: renamed `storage-core`, `storage-fs`, and `storage-s3` to `naust-storage-core`, `naust-storage-fs`, and `naust-storage-s3` for unified ecosystem branding and crates.io publishing | Accepted | — |
 
 Context: current architecture [`../architecture/README.md`](../architecture/README.md) · requirements [`../requirements.md`](../requirements.md) · remaining work [`../technical-debt.md`](../technical-debt.md).

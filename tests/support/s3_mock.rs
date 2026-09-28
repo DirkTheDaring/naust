@@ -625,16 +625,16 @@ pub fn create_mock_storage() -> (S3Storage, Arc<MockS3Driver>) {
 struct MockDriverTagClient(Arc<MockS3Driver>);
 
 impl MockDriverTagClient {
-    fn fire(&self, method: &str, key: &str) -> Result<(), storage_s3::S3ApiError> {
+    fn fire(&self, method: &str, key: &str) -> Result<(), naust_storage_s3::S3ApiError> {
         if let Some(hook) = self.0.hook_before_op.lock().unwrap().as_ref()
             && let Some(err) = hook(method, key)
         {
             let msg = err.message().unwrap_or("injected fault").to_string();
             return Err(match err.internal_kind() {
                 Some(naust::storage::StorageErrorKind::PermissionDenied) => {
-                    storage_s3::S3ApiError::new(Some(403), Some("AccessDenied"), msg)
+                    naust_storage_s3::S3ApiError::new(Some(403), Some("AccessDenied"), msg)
                 }
-                _ => storage_s3::S3ApiError::new(Some(500), Some("InternalError"), msg),
+                _ => naust_storage_s3::S3ApiError::new(Some(500), Some("InternalError"), msg),
             });
         }
         Ok(())
@@ -651,44 +651,40 @@ fn trim_etag(e: &str) -> &str {
 }
 
 #[async_trait]
-impl storage_s3::S3Client for MockDriverTagClient {
+impl naust_storage_s3::S3Client for MockDriverTagClient {
     async fn head_object(
         &self,
         key: &str,
-    ) -> Result<Option<storage_s3::client::ObjectStat>, storage_s3::S3ApiError> {
+    ) -> Result<Option<naust_storage_s3::client::ObjectStat>, naust_storage_s3::S3ApiError> {
         self.fire("head_object", key)?;
-        Ok(self
-            .0
-            .objects
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|(b, e)| storage_s3::client::ObjectStat {
+        Ok(self.0.objects.lock().unwrap().get(key).map(|(b, e)| {
+            naust_storage_s3::client::ObjectStat {
                 size: b.len() as u64,
                 modified: None,
                 etag: e.clone(),
-            }))
+            }
+        }))
     }
 
     async fn get_object(
         &self,
         key: &str,
         max_len: u64,
-    ) -> Result<Option<storage_s3::client::GetResult>, storage_s3::S3ApiError> {
+    ) -> Result<Option<naust_storage_s3::client::GetResult>, naust_storage_s3::S3ApiError> {
         self.fire("get_object", key)?;
         let objs = self.0.objects.lock().unwrap();
         let Some((bytes, etag)) = objs.get(key) else {
             return Ok(None);
         };
         if bytes.len() as u64 > max_len {
-            return Err(storage_s3::S3ApiError::new(
+            return Err(naust_storage_s3::S3ApiError::new(
                 None,
-                Some(&storage_s3::client::too_large_sentinel(max_len)),
+                Some(&naust_storage_s3::client::too_large_sentinel(max_len)),
                 "object exceeds caller byte bound",
             ));
         }
-        Ok(Some(storage_s3::client::GetResult {
-            stat: storage_s3::client::ObjectStat {
+        Ok(Some(naust_storage_s3::client::GetResult {
+            stat: naust_storage_s3::client::ObjectStat {
                 size: bytes.len() as u64,
                 modified: None,
                 etag: etag.clone(),
@@ -701,31 +697,31 @@ impl storage_s3::S3Client for MockDriverTagClient {
         &self,
         key: &str,
         bytes: Bytes,
-        precondition: storage_s3::client::PutPrecondition,
-    ) -> Result<String, storage_s3::S3ApiError> {
+        precondition: naust_storage_s3::client::PutPrecondition,
+    ) -> Result<String, naust_storage_s3::S3ApiError> {
         self.fire("put_object", key)?;
         let mut objs = self.0.objects.lock().unwrap();
         match &precondition {
-            storage_s3::client::PutPrecondition::None => {}
-            storage_s3::client::PutPrecondition::IfNoneMatchAny => {
+            naust_storage_s3::client::PutPrecondition::None => {}
+            naust_storage_s3::client::PutPrecondition::IfNoneMatchAny => {
                 if objs.contains_key(key) {
-                    return Err(storage_s3::S3ApiError::new(
+                    return Err(naust_storage_s3::S3ApiError::new(
                         Some(412),
                         Some("PreconditionFailed"),
                         "If-None-Match: * failed: object exists",
                     ));
                 }
             }
-            storage_s3::client::PutPrecondition::IfMatch(expected) => match objs.get(key) {
+            naust_storage_s3::client::PutPrecondition::IfMatch(expected) => match objs.get(key) {
                 None => {
-                    return Err(storage_s3::S3ApiError::new(
+                    return Err(naust_storage_s3::S3ApiError::new(
                         Some(404),
                         Some("NoSuchKey"),
                         "If-Match on absent object",
                     ));
                 }
                 Some((_, cur)) if trim_etag(cur) != trim_etag(expected) => {
-                    return Err(storage_s3::S3ApiError::new(
+                    return Err(naust_storage_s3::S3ApiError::new(
                         Some(412),
                         Some("PreconditionFailed"),
                         "If-Match failed: stale etag",
@@ -739,7 +735,7 @@ impl storage_s3::S3Client for MockDriverTagClient {
         Ok(etag)
     }
 
-    async fn delete_object(&self, key: &str) -> Result<(), storage_s3::S3ApiError> {
+    async fn delete_object(&self, key: &str) -> Result<(), naust_storage_s3::S3ApiError> {
         self.fire("delete_object", key)?;
         self.0.objects.lock().unwrap().remove(key);
         Ok(())
@@ -749,17 +745,17 @@ impl storage_s3::S3Client for MockDriverTagClient {
         &self,
         key: &str,
         etag: &str,
-    ) -> Result<storage_s3::client::RawConditionalDelete, storage_s3::S3ApiError> {
+    ) -> Result<naust_storage_s3::client::RawConditionalDelete, naust_storage_s3::S3ApiError> {
         self.fire("delete_object_if_match", key)?;
         let mut objs = self.0.objects.lock().unwrap();
         match objs.get(key) {
-            None => Ok(storage_s3::client::RawConditionalDelete::NotFound),
+            None => Ok(naust_storage_s3::client::RawConditionalDelete::NotFound),
             Some((_, cur)) if trim_etag(cur) != trim_etag(etag) => {
-                Ok(storage_s3::client::RawConditionalDelete::PreconditionFailed)
+                Ok(naust_storage_s3::client::RawConditionalDelete::PreconditionFailed)
             }
             Some(_) => {
                 objs.remove(key);
-                Ok(storage_s3::client::RawConditionalDelete::Deleted)
+                Ok(naust_storage_s3::client::RawConditionalDelete::Deleted)
             }
         }
     }
@@ -769,7 +765,7 @@ impl storage_s3::S3Client for MockDriverTagClient {
         dir_prefix: &str,
         start_after: Option<&str>,
         max_keys: usize,
-    ) -> Result<storage_s3::client::RawListPage, storage_s3::S3ApiError> {
+    ) -> Result<naust_storage_s3::client::RawListPage, naust_storage_s3::S3ApiError> {
         self.fire("list_objects_v2", dir_prefix)?;
         let objs = self.0.objects.lock().unwrap();
         let mut keys: Vec<&String> = objs
@@ -798,14 +794,14 @@ impl storage_s3::S3Client for MockDriverTagClient {
             let (bytes, etag) = &objs[key.as_str()];
             out.push((
                 key.clone(),
-                storage_s3::client::ObjectStat {
+                naust_storage_s3::client::ObjectStat {
                     size: bytes.len() as u64,
                     modified: None,
                     etag: etag.clone(),
                 },
             ));
         }
-        Ok(storage_s3::client::RawListPage {
+        Ok(naust_storage_s3::client::RawListPage {
             objects: out,
             truncated,
         })
@@ -919,7 +915,7 @@ impl S3Driver for TagBridgeDriver {
         &self,
         _bucket: &str,
         prefix: &str,
-    ) -> Result<Arc<dyn storage_core::object_store::ObjectStore>, StorageError> {
+    ) -> Result<Arc<dyn naust_storage_core::object_store::ObjectStore>, StorageError> {
         let client = Arc::new(MockDriverTagClient(self.inner.clone()));
         let trimmed = prefix.trim_matches('/');
         let prefix_opt = if trimmed.is_empty() {
@@ -927,7 +923,7 @@ impl S3Driver for TagBridgeDriver {
         } else {
             Some(trimmed)
         };
-        let store = storage_s3::S3ObjectStore::new(client, prefix_opt)
+        let store = naust_storage_s3::S3ObjectStore::new(client, prefix_opt)
             .map_err(|e| StorageError::configuration(e.to_string()))?;
         Ok(Arc::new(store))
     }

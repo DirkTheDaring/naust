@@ -2019,6 +2019,9 @@ dependencies = [
  "libc",
  "naust-auth",
  "naust-core",
+ "naust-storage-core",
+ "naust-storage-fs",
+ "naust-storage-s3",
  "naust-types",
  "rcgen 0.14.10",
  "regex",
@@ -2030,9 +2033,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sled",
- "storage-core",
- "storage-fs",
- "storage-s3",
  "subtle",
  "tempfile",
  "thiserror 2.0.20",
@@ -2085,20 +2085,55 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "libc",
+ "naust-storage-core",
+ "naust-storage-fs",
+ "naust-storage-s3",
  "naust-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sled",
- "storage-core",
- "storage-fs",
- "storage-s3",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "naust-storage-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "naust-storage-fs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "naust-storage-core",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "naust-storage-s3"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-sdk-s3",
+ "bytes",
+ "naust-storage-core",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -2976,41 +3011,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "storage-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
-name = "storage-fs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "libc",
- "sha2 0.10.9",
- "storage-core",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
-name = "storage-s3"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aws-sdk-s3",
- "bytes",
- "storage-core",
- "thiserror 2.0.20",
- "tokio",
-]
 
 [[package]]
 name = "strsim"

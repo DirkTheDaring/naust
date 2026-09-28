@@ -50,13 +50,15 @@ acmecert-core = { path = "vendor/acmecert/crates/acmecert-core" }
 naust-auth = { path = "vendor/naust-auth" }
 naust-core = { path = "vendor/naust-core" }
 naust-types = { path = "vendor/naust-types" }
-storage-core = { path = "vendor/storage-layer-rust/crates/storage-core" }
-storage-fs = { path = "vendor/storage-layer-rust/crates/storage-fs" }
-storage-s3 = { path = "vendor/storage-layer-rust/crates/storage-s3" }
+naust-storage-core = { path = "vendor/storage-layer-rust/crates/naust-storage-core" }
+naust-storage-fs = { path = "vendor/storage-layer-rust/crates/naust-storage-fs" }
+naust-storage-s3 = { path = "vendor/storage-layer-rust/crates/naust-storage-s3" }
 x509-parser = "0.18.1"
 
 [dev-dependencies]
 naust-core = { path = "vendor/naust-core", features = ["test-mocks"] }
+naust-storage-s3 = { path = "vendor/storage-layer-rust/crates/naust-storage-s3", features = ["mock-client"] }
+naust-storage-fs = { path = "vendor/storage-layer-rust/crates/naust-storage-fs", features = ["fault-injection"] }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }

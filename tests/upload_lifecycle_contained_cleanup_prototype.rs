@@ -33,7 +33,7 @@
 //!   are explicitly NOT production integration evidence.
 //!
 //! * SIMULATED CAPABILITY CONTRACT. The [`RootRelativeMutator`] trait models the
-//!   additive `storage_fs` primitives that DO NOT YET EXIST in the dependency
+//!   additive `naust_storage_fs` primitives that DO NOT YET EXIST in the dependency
 //!   (`storage-layer-rust @ 0a628fd0` exposes a read-only `FsMetadataReader` with
 //!   no fd-relative mutation and no raw-fd accessor). The libc implementation
 //!   here demonstrates the KERNEL mechanism is sound on this host. It is NOT
@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // ---------------------------------------------------------------------------
 // Low-level `*at` helpers (REAL FILESYSTEM EVIDENCE).
 //
-// These mirror how `storage_fs` already resolves reads: every per-operation
+// These mirror how `naust_storage_fs` already resolves reads: every per-operation
 // resolution issues `openat2` from a pinned directory descriptor with
 // `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. The prototype
 // reuses that exact resolve mask so the containment characteristics match the
@@ -305,14 +305,14 @@ fn invalid(msg: &str) -> io::Error {
 // ---------------------------------------------------------------------------
 // SIMULATED CAPABILITY CONTRACT.
 //
-// The trait below is the shape the design proposes `storage_fs` expose
+// The trait below is the shape the design proposes `naust_storage_fs` expose
 // additively (fd-relative, contained mutation anchored on the pinned root). It
 // does not exist in the dependency today. The single libc-backed implementation
 // proves the kernel mechanism; production would route through the dependency.
 // ---------------------------------------------------------------------------
 
 /// Additive, root-anchored mutation primitives the dependency must provide for a
-/// coherent reaper. Modeled here; not yet implemented in `storage_fs`.
+/// coherent reaper. Modeled here; not yet implemented in `naust_storage_fs`.
 trait RootRelativeMutator {
     /// Resolve and open a leaf beneath a pinned directory descriptor.
     fn open_leaf(&self, base: RawFd, rel: &CStr, flags: u64, mode: u64) -> io::Result<OwnedFd>;

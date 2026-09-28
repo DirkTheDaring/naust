@@ -4182,7 +4182,7 @@ async fn test_manifest_listing_lifecycle_error_propagation_on_promoted_listing_f
         FsStorage::try_new_with_limits(
             fs_root.clone(),
             50 * 1024 * 1024,
-            storage_fs::DirEnumerationLimits::new(1, 100_000),
+            naust_storage_fs::DirEnumerationLimits::new(1, 100_000),
         )
         .expect("create fs storage with limits"),
     );

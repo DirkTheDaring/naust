@@ -79,9 +79,9 @@ vendor-sync:
 	@cp -a ../acmecert/crates/acmecert-core vendor/acmecert/crates/
 	@cp -a ../acmecert/crates/acmecert vendor/acmecert/crates/
 	@cp -a ../storage-layer-rust/Cargo.toml vendor/storage-layer-rust/Cargo.toml
-	@cp -a ../storage-layer-rust/crates/storage-core vendor/storage-layer-rust/crates/
-	@cp -a ../storage-layer-rust/crates/storage-fs vendor/storage-layer-rust/crates/
-	@cp -a ../storage-layer-rust/crates/storage-s3 vendor/storage-layer-rust/crates/
+	@cp -a ../storage-layer-rust/crates/naust-storage-core vendor/storage-layer-rust/crates/
+	@cp -a ../storage-layer-rust/crates/naust-storage-fs vendor/storage-layer-rust/crates/
+	@cp -a ../storage-layer-rust/crates/naust-storage-s3 vendor/storage-layer-rust/crates/
 	@cp -a ../naust-core/Cargo.toml ../naust-core/Cargo.lock ../naust-core/LICENSE vendor/naust-core/ 2>/dev/null || cp -a ../naust-core/Cargo.toml ../naust-core/LICENSE vendor/naust-core/
 	@cp -a ../naust-core/src vendor/naust-core/src
 	@cp -a ../naust-core/examples vendor/naust-core/examples

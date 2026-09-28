@@ -818,8 +818,8 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
     // C. Lifecycle caller: ManifestLifecycleService::delete_manifest
     let root2 = tmp_fs_root();
     let listing_limits2 = crate::storage::fs::tag_listing::TagListingLimits::new(
-        storage_fs::DirEnumerationLimits::new(64, 4096),
-        storage_fs::DirEnumerationLimits::new(1000, 100_000),
+        naust_storage_fs::DirEnumerationLimits::new(64, 4096),
+        naust_storage_fs::DirEnumerationLimits::new(1000, 100_000),
         crate::storage::fs::tag_listing::TagReadLimits {
             max_payload_bytes: Some(256),
         },
@@ -828,7 +828,7 @@ async fn test_tag_listing_budget_failures_reach_actual_callers() {
         FsStorage::try_new_with_all_limits(
             root2.clone(),
             10 * 1024 * 1024,
-            storage_fs::DirEnumerationLimits::new(1000, 100_000),
+            naust_storage_fs::DirEnumerationLimits::new(1000, 100_000),
             repo_discovery::DiscoveryLimits::default(),
             crate::storage::fs::manifest_refs::ManifestReferenceLimits::default(),
             listing_limits2,
