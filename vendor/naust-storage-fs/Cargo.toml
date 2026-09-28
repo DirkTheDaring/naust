@@ -1,0 +1,24 @@
+[package]
+name = "naust-storage-fs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/DirkTheDaring/naust-storage-fs"
+description = "Descriptor-relative filesystem storage adapter"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+libc = "0.2"
+naust-storage-core = { path = "../naust-storage-core" }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "fs", "sync"] }
+
+[features]
+fault-injection = []
+
+[dev-dependencies]
+naust-storage-core = { path = "../naust-storage-core", features = ["contract-tests"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "io-util", "rt-multi-thread", "sync", "time"] }

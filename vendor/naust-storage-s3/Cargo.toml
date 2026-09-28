@@ -1,0 +1,23 @@
+[package]
+name = "naust-storage-s3"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/DirkTheDaring/naust-storage-s3"
+description = "S3 object-store adapter for the backend-neutral storage-core contract"
+
+[dependencies]
+async-trait = "0.1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
+bytes = "1"
+naust-storage-core = { path = "../naust-storage-core" }
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+
+[features]
+mock-client = []
+
+[dev-dependencies]
+naust-storage-core = { path = "../naust-storage-core", features = ["contract-tests"] }
+naust-storage-s3 = { path = ".", features = ["mock-client"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

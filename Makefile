@@ -69,24 +69,29 @@ packaging-check:
 	echo "packaging-check: ok"
 
 # Stage sibling path-dependencies into vendor/ for container builds (KI-10).
-# acmecert: crates/acmecert-core; storage-layer-rust: all three crates + the
-# workspace manifest (the crates use workspace field inheritance).
+# acmecert: crates/acmecert-core; standalone naust-* crates.
 .PHONY: vendor-sync
 vendor-sync:
-	@rm -rf vendor/acmecert vendor/storage-layer-rust vendor/naust-core
-	@mkdir -p vendor/acmecert/crates vendor/storage-layer-rust/crates vendor/naust-core
+	@rm -rf vendor/acmecert vendor/naust-storage-core vendor/naust-storage-fs vendor/naust-storage-s3 vendor/naust-core vendor/naust-auth vendor/naust-types vendor/storage-layer-rust
+	@mkdir -p vendor/acmecert/crates vendor/naust-core vendor/naust-auth vendor/naust-types vendor/naust-storage-core vendor/naust-storage-fs vendor/naust-storage-s3
 	@cp -a ../acmecert/Cargo.toml vendor/acmecert/Cargo.toml
 	@cp -a ../acmecert/crates/acmecert-core vendor/acmecert/crates/
 	@cp -a ../acmecert/crates/acmecert vendor/acmecert/crates/
-	@cp -a ../storage-layer-rust/Cargo.toml vendor/storage-layer-rust/Cargo.toml
-	@cp -a ../storage-layer-rust/crates/naust-storage-core vendor/storage-layer-rust/crates/
-	@cp -a ../storage-layer-rust/crates/naust-storage-fs vendor/storage-layer-rust/crates/
-	@cp -a ../storage-layer-rust/crates/naust-storage-s3 vendor/storage-layer-rust/crates/
+	@cp -a ../naust-storage-core/Cargo.toml ../naust-storage-core/LICENSE vendor/naust-storage-core/ 2>/dev/null || cp -a ../naust-storage-core/Cargo.toml vendor/naust-storage-core/
+	@cp -a ../naust-storage-core/src vendor/naust-storage-core/src
+	@cp -a ../naust-storage-fs/Cargo.toml ../naust-storage-fs/LICENSE vendor/naust-storage-fs/ 2>/dev/null || cp -a ../naust-storage-fs/Cargo.toml vendor/naust-storage-fs/
+	@cp -a ../naust-storage-fs/src vendor/naust-storage-fs/src
+	@cp -a ../naust-storage-s3/Cargo.toml ../naust-storage-s3/LICENSE vendor/naust-storage-s3/ 2>/dev/null || cp -a ../naust-storage-s3/Cargo.toml vendor/naust-storage-s3/
+	@cp -a ../naust-storage-s3/src vendor/naust-storage-s3/src
+	@cp -a ../naust-auth/Cargo.toml ../naust-auth/LICENSE vendor/naust-auth/ 2>/dev/null || cp -a ../naust-auth/Cargo.toml vendor/naust-auth/
+	@cp -a ../naust-auth/src vendor/naust-auth/src
+	@cp -a ../naust-types/Cargo.toml ../naust-types/LICENSE vendor/naust-types/ 2>/dev/null || cp -a ../naust-types/Cargo.toml vendor/naust-types/
+	@cp -a ../naust-types/src vendor/naust-types/src
 	@cp -a ../naust-core/Cargo.toml ../naust-core/Cargo.lock ../naust-core/LICENSE vendor/naust-core/ 2>/dev/null || cp -a ../naust-core/Cargo.toml ../naust-core/LICENSE vendor/naust-core/
 	@cp -a ../naust-core/src vendor/naust-core/src
 	@cp -a ../naust-core/examples vendor/naust-core/examples
 	@find vendor -name target -type d -prune -exec rm -rf {} + 2>/dev/null || true
-	@echo "vendor/ refreshed from ../acmecert and ../storage-layer-rust"
+	@echo "vendor/ refreshed from ../acmecert, ../naust-storage-*, ../naust-auth, ../naust-types, ../naust-core"
 
 .PHONY: rpm rpm-tarball rpm-dirs clean-rpm
 

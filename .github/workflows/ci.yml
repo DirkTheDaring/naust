@@ -18,9 +18,11 @@ jobs:
       # Sibling path-deps are vendored; stage them where the manifests expect them.
       - name: Stage vendored path dependencies
         run: |
-          mkdir -p ../acmecert ../storage-layer-rust ../naust-core ../naust-auth ../naust-types
+          mkdir -p ../acmecert ../naust-storage-core ../naust-storage-fs ../naust-storage-s3 ../naust-core ../naust-auth ../naust-types
           cp -a vendor/acmecert/. ../acmecert/
-          cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+          cp -a vendor/naust-storage-core/. ../naust-storage-core/
+          cp -a vendor/naust-storage-fs/. ../naust-storage-fs/
+          cp -a vendor/naust-storage-s3/. ../naust-storage-s3/
           cp -a vendor/naust-core/. ../naust-core/
           cp -a vendor/naust-auth/. ../naust-auth/
           cp -a vendor/naust-types/. ../naust-types/
@@ -34,6 +36,12 @@ jobs:
         run: cargo test --locked --no-fail-fast --manifest-path ../naust-types/Cargo.toml
       - name: naust-auth tests (sibling path dependency)
         run: cargo test --locked --no-fail-fast --manifest-path ../naust-auth/Cargo.toml
+      - name: naust-storage-core tests (sibling path dependency)
+        run: cargo test --locked --no-fail-fast --manifest-path ../naust-storage-core/Cargo.toml
+      - name: naust-storage-fs tests (sibling path dependency)
+        run: cargo test --locked --no-fail-fast --manifest-path ../naust-storage-fs/Cargo.toml
+      - name: naust-storage-s3 tests (sibling path dependency)
+        run: cargo test --locked --no-fail-fast --manifest-path ../naust-storage-s3/Cargo.toml
       - name: naust-core tests (sibling path dependency)
         run: cargo test --locked --no-fail-fast --manifest-path ../naust-core/Cargo.toml
       - name: Server tests (the live-S3 suite is ignore-gated; see the live-s3 job)
@@ -48,9 +56,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Stage vendored path dependencies
         run: |
-          mkdir -p ../acmecert ../storage-layer-rust ../naust-core ../naust-auth ../naust-types
+          mkdir -p ../acmecert ../naust-storage-core ../naust-storage-fs ../naust-storage-s3 ../naust-core ../naust-auth ../naust-types
           cp -a vendor/acmecert/. ../acmecert/
-          cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
+          cp -a vendor/naust-storage-core/. ../naust-storage-core/
+          cp -a vendor/naust-storage-fs/. ../naust-storage-fs/
+          cp -a vendor/naust-storage-s3/. ../naust-storage-s3/
           cp -a vendor/naust-core/. ../naust-core/
           cp -a vendor/naust-auth/. ../naust-auth/
           cp -a vendor/naust-types/. ../naust-types/

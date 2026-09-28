@@ -1,15 +1,15 @@
 [package]
 name = "naust-storage-core"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-publish = false
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/DirkTheDaring/naust-storage-core"
 description = "Domain-free core storage contracts and primitives"
 
 [dependencies]
-async-trait.workspace = true
-bytes.workspace = true
-thiserror.workspace = true
+async-trait = "0.1"
+bytes = "1"
+thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 [features]
@@ -20,4 +20,4 @@ name = "contract_suite"
 required-features = ["contract-tests"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { version = "1", features = ["macros", "rt", "io-util"] }

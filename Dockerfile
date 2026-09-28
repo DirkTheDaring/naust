@@ -11,20 +11,30 @@ RUN apk add --no-cache build-base musl-dev
 COPY . .
 
 # Stage vendored path dependencies where the manifests expect them
-# (../acmecert and ../storage-layer-rust relative to /app). Refresh vendor/
+# (../acmecert and ../naust-* relative to /app). Refresh vendor/
 # with `make vendor-sync` before building (KI-10).
 RUN if [ -d "vendor/acmecert" ]; then \
       mkdir -p /acmecert/crates \
       && cp -r vendor/acmecert/crates/acmecert-core /acmecert/crates/ \
       && cp vendor/acmecert/Cargo.toml /acmecert/Cargo.toml; \
     fi
-RUN if [ -d "vendor/storage-layer-rust" ]; then \
-      mkdir -p /storage-layer-rust \
-      && cp -r vendor/storage-layer-rust/crates /storage-layer-rust/ \
-      && cp vendor/storage-layer-rust/Cargo.toml /storage-layer-rust/Cargo.toml; \
+RUN if [ -d "vendor/naust-storage-core" ]; then \
+      mkdir -p /naust-storage-core && cp -r vendor/naust-storage-core/* /naust-storage-core/; \
+    fi
+RUN if [ -d "vendor/naust-storage-fs" ]; then \
+      mkdir -p /naust-storage-fs && cp -r vendor/naust-storage-fs/* /naust-storage-fs/; \
+    fi
+RUN if [ -d "vendor/naust-storage-s3" ]; then \
+      mkdir -p /naust-storage-s3 && cp -r vendor/naust-storage-s3/* /naust-storage-s3/; \
+    fi
+RUN if [ -d "vendor/naust-auth" ]; then \
+      mkdir -p /naust-auth && cp -r vendor/naust-auth/* /naust-auth/; \
+    fi
+RUN if [ -d "vendor/naust-types" ]; then \
+      mkdir -p /naust-types && cp -r vendor/naust-types/* /naust-types/; \
     fi
 RUN if [ -d "vendor/naust-core" ]; then \
-      cp -r vendor/naust-core /naust-core; \
+      mkdir -p /naust-core && cp -r vendor/naust-core/* /naust-core/; \
     fi
 
 RUN cargo build --release
