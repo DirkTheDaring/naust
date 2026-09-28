@@ -66,15 +66,16 @@ pub async fn tags_list(
                     headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
                     if page.has_more
-                        && let (Some(n_val), Some(last_tag)) = (n, page.next_last.as_deref()) {
-                            let last_tag = url_encode_component(last_tag);
-                            let link = format!(
-                                "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
-                            );
-                            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                                headers.insert(http::header::LINK, v);
-                            }
+                        && let (Some(n_val), Some(last_tag)) = (n, page.next_last.as_deref())
+                    {
+                        let last_tag = url_encode_component(last_tag);
+                        let link = format!(
+                            "</v2/{name}/tags/list?last={last_tag}&n={n_val}>; rel=\"next\""
+                        );
+                        if let Ok(v) = http::HeaderValue::from_str(&link) {
+                            headers.insert(http::header::LINK, v);
                         }
+                    }
 
                     if method == Method::HEAD {
                         return (StatusCode::OK, headers).into_response();

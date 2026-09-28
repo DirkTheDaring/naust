@@ -73,9 +73,10 @@ pub fn proxy_upstream_index_for_request(proxy: &ProxyConfig, headers: &HeaderMap
         };
 
         if let Some(host) = host
-            && host_matches_any(&r.hosts, host) {
-                return Some(idx);
-            }
+            && host_matches_any(&r.hosts, host)
+        {
+            return Some(idx);
+        }
     }
 
     None
@@ -120,9 +121,10 @@ pub fn resolve_trusted_client_ip(
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         for ip_str in xff.split(',').map(str::trim).rev() {
             if let Ok(ip) = ip_str.parse::<std::net::IpAddr>()
-                && !trusted_proxies.iter().any(|net| net.contains(&ip)) {
-                    return ip;
-                }
+                && !trusted_proxies.iter().any(|net| net.contains(&ip))
+            {
+                return ip;
+            }
         }
     }
     peer_addr

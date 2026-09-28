@@ -440,9 +440,10 @@ impl Proxy {
 
         // Only follow redirects to the standard HTTPS port.
         if let Some(port) = url.port()
-            && port != 443 {
-                return Err(ProxyError::UpstreamHostNotAllowed(host));
-            }
+            && port != 443
+        {
+            return Err(ProxyError::UpstreamHostNotAllowed(host));
+        }
 
         if self.cfg.block_private_networks {
             let port = url.port_or_known_default().unwrap_or(443);
@@ -719,14 +720,16 @@ impl Proxy {
                 .map_err(|_| ProxyError::Internal("failed to parse computed digest".to_string()))?;
 
             if let Ok(ref_digest) = Digest::parse(reference)
-                && ref_digest.hex() != computed.hex() {
-                    return Err(ProxyError::DigestMismatch);
-                }
+                && ref_digest.hex() != computed.hex()
+            {
+                return Err(ProxyError::DigestMismatch);
+            }
             if let Some(up) = upstream_digest
-                && up.hex() != computed.hex() {
-                    // Should not happen with a correct upstream.
-                    return Err(ProxyError::DigestMismatch);
-                }
+                && up.hex() != computed.hex()
+            {
+                // Should not happen with a correct upstream.
+                return Err(ProxyError::DigestMismatch);
+            }
 
             // Validate manifest descriptor structure before storing in local cache
             if let Err(e) = crate::manifest_refs::parse_manifest_refs(&bytes) {
@@ -1022,9 +1025,10 @@ impl Proxy {
         {
             let cache = self.token_cache.lock().await;
             if let Some(t) = cache.get(&cache_key)
-                && t.expires_at_unix > now.saturating_add(5) {
-                    return Ok(t.token.clone());
-                }
+                && t.expires_at_unix > now.saturating_add(5)
+            {
+                return Ok(t.token.clone());
+            }
         }
 
         let realm_url = Url::parse(realm)
@@ -1151,9 +1155,10 @@ impl SingleFlight {
         if Arc::strong_count(&arc) == 2 {
             let mut map = self.locks.lock().await;
             if let Some(existing) = map.get(&key)
-                && Arc::ptr_eq(existing, &arc) {
-                    map.remove(&key);
-                }
+                && Arc::ptr_eq(existing, &arc)
+            {
+                map.remove(&key);
+            }
         }
     }
 }
@@ -1248,9 +1253,10 @@ impl reqwest::dns::Resolve for PrivateIpBlockingResolver {
 #[allow(dead_code)]
 async fn read_response_limited(resp: reqwest::Response, limit: usize) -> Result<Bytes, ProxyError> {
     if let Some(len) = resp.content_length()
-        && len > limit as u64 {
-            return Err(ProxyError::TooLarge);
-        }
+        && len > limit as u64
+    {
+        return Err(ProxyError::TooLarge);
+    }
 
     let initial_capacity = resp
         .content_length()
@@ -1591,4 +1597,3 @@ mod tests {
         );
     }
 }
-

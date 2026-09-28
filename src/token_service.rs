@@ -81,8 +81,7 @@ impl TokenService {
         {
             for scope in &decision.scopes {
                 if scope.typ == "repository" {
-                    let Ok(canonical_repo) =
-                        crate::registry::CanonicalRepoName::parse(&scope.name)
+                    let Ok(canonical_repo) = crate::registry::CanonicalRepoName::parse(&scope.name)
                     else {
                         return TokenOutcome::NameInvalid;
                     };

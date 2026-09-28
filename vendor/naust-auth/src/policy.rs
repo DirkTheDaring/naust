@@ -88,11 +88,7 @@ impl AuthConfig {
     }
 
     pub fn is_repo_private(&self, repo: &str) -> bool {
-        Self::is_repo_private_with_prefixes(
-            self.anonymous_pull,
-            &self.private_name_prefixes,
-            repo,
-        )
+        Self::is_repo_private_with_prefixes(self.anonymous_pull, &self.private_name_prefixes, repo)
     }
 
     pub fn catalog_auth_required(&self) -> bool {
@@ -161,10 +157,7 @@ pub fn verify_any_basic_credentials(cfg: &AuthConfig, user: &str, pass: &str) ->
         return true;
     }
     if cfg.robots.enabled || cfg.users.enabled {
-        let _ = robot_secrets::verify_robot_secret(
-            pass,
-            robot_secrets::DUMMY_SENTINEL_HASH,
-        );
+        let _ = robot_secrets::verify_robot_secret(pass, robot_secrets::DUMMY_SENTINEL_HASH);
     }
     false
 }
@@ -222,10 +215,7 @@ pub fn basic_allows_catalog(cfg: &AuthConfig, user: &str, pass: &str) -> bool {
     }
 
     if cfg.robots.enabled || cfg.users.enabled {
-        let _ = robot_secrets::verify_robot_secret(
-            pass,
-            robot_secrets::DUMMY_SENTINEL_HASH,
-        );
+        let _ = robot_secrets::verify_robot_secret(pass, robot_secrets::DUMMY_SENTINEL_HASH);
     }
     false
 }
@@ -294,10 +284,7 @@ pub fn verify_direct_basic_access(
     }
 
     if cfg.robots.enabled || cfg.users.enabled {
-        let _ = robot_secrets::verify_robot_secret(
-            pass,
-            robot_secrets::DUMMY_SENTINEL_HASH,
-        );
+        let _ = robot_secrets::verify_robot_secret(pass, robot_secrets::DUMMY_SENTINEL_HASH);
     }
     false
 }
@@ -430,10 +417,7 @@ fn scope_is_registry_catalog(scope: &security::TokenScope) -> bool {
     scope.typ == "registry" && (scope.name == "catalog" || scope.name == "*")
 }
 
-fn anonymous_scope_may_be_issued(
-    cfg: &AuthConfig,
-    scope: &security::TokenScope,
-) -> bool {
+fn anonymous_scope_may_be_issued(cfg: &AuthConfig, scope: &security::TokenScope) -> bool {
     if scope_name_is_expansive(&scope.name) || scope_is_registry_catalog(scope) {
         return false;
     }
@@ -634,4 +618,3 @@ pub fn service_param_is_valid(param: Option<&str>, configured: &str) -> bool {
         Some(p) => p == configured,
     }
 }
-

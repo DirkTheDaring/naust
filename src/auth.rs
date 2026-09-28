@@ -97,9 +97,10 @@ pub(crate) fn unauthorized_registry_challenge(
 
     if (state.config.auth_strategy == crate::config::AuthStrategy::Token
         || state.config.auth_strategy == crate::config::AuthStrategy::Both)
-        && let Ok(v) = http::HeaderValue::from_str(&bearer) {
-            resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
-        }
+        && let Ok(v) = http::HeaderValue::from_str(&bearer)
+    {
+        resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
+    }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Basic
         || state.config.auth_strategy == crate::config::AuthStrategy::Both
@@ -129,9 +130,10 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
 
     if (state.config.auth_strategy == crate::config::AuthStrategy::Token
         || state.config.auth_strategy == crate::config::AuthStrategy::Both)
-        && let Ok(v) = http::HeaderValue::from_str(&bearer) {
-            resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
-        }
+        && let Ok(v) = http::HeaderValue::from_str(&bearer)
+    {
+        resp.headers_mut().append(http::header::WWW_AUTHENTICATE, v);
+    }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Basic
         || state.config.auth_strategy == crate::config::AuthStrategy::Both
@@ -164,11 +166,11 @@ fn catalog_shows_private_names(state: &AppState, headers: &HeaderMap) -> bool {
             &state.config.token_service,
             state.config.token_ttl_secs,
         )
-            && bearer_claims_are_authenticated(&claims)
-                && security::token_allows_catalog_action(&claims)
-            {
-                return true;
-            }
+        && bearer_claims_are_authenticated(&claims)
+        && security::token_allows_catalog_action(&claims)
+    {
+        return true;
+    }
 
     if state.config.auth_strategy != crate::config::AuthStrategy::Token
         && let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>()
@@ -194,9 +196,10 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
             &state.config.token_service,
             state.config.token_ttl_secs,
         )
-            && bearer_claims_are_authenticated(&claims) {
-                return true;
-            }
+        && bearer_claims_are_authenticated(&claims)
+    {
+        return true;
+    }
 
     if state.config.auth_strategy == crate::config::AuthStrategy::Token {
         return false;
@@ -204,7 +207,11 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
 
     // Basic: accept configured push credentials, user credentials, or robot credentials.
     if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
-        return naust_auth::policy::verify_any_basic_credentials(&state.auth, basic.username(), basic.password());
+        return naust_auth::policy::verify_any_basic_credentials(
+            &state.auth,
+            basic.username(),
+            basic.password(),
+        );
     }
 
     false
@@ -260,10 +267,9 @@ pub async fn require_auth_middleware(
                 return crate::http_api::errors::method_not_allowed("GET, HEAD");
             }
         }
-        crate::http_api::routing::OciRoute::TagDelete { .. }
-            if method != http::Method::DELETE => {
-                return crate::http_api::errors::method_not_allowed("DELETE");
-            }
+        crate::http_api::routing::OciRoute::TagDelete { .. } if method != http::Method::DELETE => {
+            return crate::http_api::errors::method_not_allowed("DELETE");
+        }
         _ => {}
     }
 
@@ -320,12 +326,11 @@ pub async fn require_auth_middleware(
                 if (required_action == security::RepoAction::Push
                     || required_action == security::RepoAction::Delete)
                     && let Some(allowlist) = state.config.push_allow_repos.as_deref()
-                        && !push_repository_allowed(allowlist, canonical_repo) {
-                            return errors::denied(
-                                "push or delete not allowed for this repository",
-                            )
-                            .into_response();
-                        }
+                    && !push_repository_allowed(allowlist, canonical_repo)
+                {
+                    return errors::denied("push or delete not allowed for this repository")
+                        .into_response();
+                }
                 return next.run(request).await;
             }
             Err(_) => {
@@ -340,18 +345,19 @@ pub async fn require_auth_middleware(
 
     // If token-only mode is enabled, do not accept Basic for directly authenticating data requests.
     if state.config.auth_strategy != crate::config::AuthStrategy::Token
-        && let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>() {
-            let action_str = required_action.as_str();
-            if verify_direct_basic_access(
-                &state.config,
-                basic.username(),
-                basic.password(),
-                canonical_repo,
-                action_str,
-            ) {
-                return next.run(request).await;
-            }
+        && let Some(Authorization(basic)) = request.headers().typed_get::<Authorization<Basic>>()
+    {
+        let action_str = required_action.as_str();
+        if verify_direct_basic_access(
+            &state.config,
+            basic.username(),
+            basic.password(),
+            canonical_repo,
+            action_str,
+        ) {
+            return next.run(request).await;
         }
+    }
 
     unauthorized_registry_challenge(&state, Some(repo_name), Some(required_action))
 }

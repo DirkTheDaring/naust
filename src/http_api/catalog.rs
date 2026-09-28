@@ -75,14 +75,14 @@ pub async fn catalog_list(
                 headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
 
                 if has_more
-                    && let (Some(n_raw), Some(last_repo)) = (query.get("n"), next_last.as_deref()) {
-                        let last_repo = url_encode_component(last_repo);
-                        let link =
-                            format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
-                        if let Ok(v) = http::HeaderValue::from_str(&link) {
-                            headers.insert(http::header::LINK, v);
-                        }
+                    && let (Some(n_raw), Some(last_repo)) = (query.get("n"), next_last.as_deref())
+                {
+                    let last_repo = url_encode_component(last_repo);
+                    let link = format!("</v2/_catalog?n={n_raw}&last={last_repo}>; rel=\"next\"");
+                    if let Ok(v) = http::HeaderValue::from_str(&link) {
+                        headers.insert(http::header::LINK, v);
                     }
+                }
 
                 if method == Method::HEAD {
                     return (StatusCode::OK, headers).into_response();
@@ -232,13 +232,14 @@ pub async fn meta_orgs(
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.last())
                 .and_then(|x| x.as_str()),
-        ) {
-            let last_org = url_encode_component(last_org);
-            let link = format!("</_meta/orgs?n={n_raw}&last={last_org}>; rel=\"next\"");
-            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                resp_headers.insert(http::header::LINK, v);
-            }
+        )
+    {
+        let last_org = url_encode_component(last_org);
+        let link = format!("</_meta/orgs?n={n_raw}&last={last_org}>; rel=\"next\"");
+        if let Ok(v) = http::HeaderValue::from_str(&link) {
+            resp_headers.insert(http::header::LINK, v);
         }
+    }
 
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }
@@ -312,14 +313,14 @@ pub async fn meta_org_repos(
                 .and_then(|a| a.last())
                 .and_then(|x| x.get("name"))
                 .and_then(|x| x.as_str()),
-        ) {
-            let last_repo = url_encode_component(last_repo);
-            let link =
-                format!("</_meta/orgs/{org}/repos?n={n_raw}&last={last_repo}>; rel=\"next\"");
-            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                resp_headers.insert(http::header::LINK, v);
-            }
+        )
+    {
+        let last_repo = url_encode_component(last_repo);
+        let link = format!("</_meta/orgs/{org}/repos?n={n_raw}&last={last_repo}>; rel=\"next\"");
+        if let Ok(v) = http::HeaderValue::from_str(&link) {
+            resp_headers.insert(http::header::LINK, v);
         }
+    }
 
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }
@@ -477,19 +478,18 @@ pub async fn meta_catalog(
     let mut resp_headers = registry_headers();
     resp_headers.insert("Content-Type", "application/json".parse().unwrap());
     resp_headers.insert("Content-Length", bytes.len().to_string().parse().unwrap());
-    if has_more
-        && let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
-            let last_repo = url_encode_component(last_repo);
-            let mut link = format!("</_meta/catalog?n={n_raw}&last={last_repo}");
-            if let Some(org) = query.get("org") {
-                let org = url_encode_component(org);
-                link.push_str(&format!("&org={org}"));
-            }
-            link.push_str(">; rel=\"next\"");
-            if let Ok(v) = http::HeaderValue::from_str(&link) {
-                resp_headers.insert(http::header::LINK, v);
-            }
+    if has_more && let (Some(n_raw), Some(last_repo)) = (query.get("n"), page.last()) {
+        let last_repo = url_encode_component(last_repo);
+        let mut link = format!("</_meta/catalog?n={n_raw}&last={last_repo}");
+        if let Some(org) = query.get("org") {
+            let org = url_encode_component(org);
+            link.push_str(&format!("&org={org}"));
         }
+        link.push_str(">; rel=\"next\"");
+        if let Ok(v) = http::HeaderValue::from_str(&link) {
+            resp_headers.insert(http::header::LINK, v);
+        }
+    }
 
     (StatusCode::OK, resp_headers, Body::from(bytes)).into_response()
 }

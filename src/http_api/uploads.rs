@@ -28,9 +28,10 @@ pub(crate) async fn read_body_limited(
     audit_only: bool,
 ) -> Result<Bytes, Response> {
     if let Some(len) = content_length
-        && len > limit {
-            return Err(errors::manifest_invalid().into_response());
-        }
+        && len > limit
+    {
+        return Err(errors::manifest_invalid().into_response());
+    }
 
     let initial_capacity = content_length.unwrap_or(0).min(limit).min(1024 * 1024);
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
@@ -81,9 +82,10 @@ pub(crate) async fn discard_rejected_body(
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
-        && len > limit {
-            return RejectedBody::Close;
-        }
+        && len > limit
+    {
+        return RejectedBody::Close;
+    }
     let mut seen = 0usize;
     let mut stream = body.into_data_stream();
     while let Some(next) = stream.next().await {
@@ -930,4 +932,3 @@ mod discard_tests {
         assert!(res.is_err());
     }
 }
-

@@ -374,7 +374,8 @@ impl S3Driver for MockS3Driver {
         &self,
         _bucket: &str,
         key: &str,
-    ) -> Result<Option<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>)>, StorageError> {
+    ) -> Result<Option<(u64, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>)>, StorageError>
+    {
         let mut log = self.call_log.lock().unwrap();
         log.push(S3CallLogEntry {
             method: "get_object_stream".to_string(),

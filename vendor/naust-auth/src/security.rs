@@ -953,18 +953,19 @@ mod tests {
 
         // A MAC computed with the derived upload-state key must fail verification against token_key
         let payload = b"org/app:01234567-89ab-cdef-0123-456789abcdef:0";
-        let mut derived_mac =
-            Hmac::<Sha256>::new_from_slice(&derived).expect("valid HMAC key");
+        let mut derived_mac = Hmac::<Sha256>::new_from_slice(&derived).expect("valid HMAC key");
         derived_mac.update(payload);
         let derived_tag = derived_mac.finalize().into_bytes();
 
-        let mut token_mac =
-            Hmac::<Sha256>::new_from_slice(token_key).expect("valid HMAC key");
+        let mut token_mac = Hmac::<Sha256>::new_from_slice(token_key).expect("valid HMAC key");
         token_mac.update(payload);
         assert!(token_mac.verify_slice(&derived_tag).is_err());
 
         // Upload state token string is not a valid bearer token
-        let dummy_upload_state = format!("org/app:uuid:0.{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(derived_tag));
+        let dummy_upload_state = format!(
+            "org/app:uuid:0.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(derived_tag)
+        );
         assert!(verify_bearer_token("test-signing-key", &dummy_upload_state).is_err());
     }
 }

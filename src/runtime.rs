@@ -586,13 +586,15 @@ where
     let consistency = ConsistencyCoordinator::new();
     let mutation_authority_arc = Arc::new(tokio::sync::Mutex::new(Some(mutation_authority)));
 
-    let gc_service = ref_index.as_ref().map(|idx| Arc::new(GcService::with_coordinator_and_authority(
+    let gc_service = ref_index.as_ref().map(|idx| {
+        Arc::new(GcService::with_coordinator_and_authority(
             Arc::new(crate::policy::GcPolicy::from(config.as_ref())),
             storage_wiring.gc_service_port(),
             idx.clone(),
             consistency.clone(),
             mutation_authority_arc.clone(),
-        )));
+        ))
+    });
 
     if config.storage_backend == StorageBackend::S3
         && config.blob_gc_enabled
@@ -601,12 +603,12 @@ where
             .gc_port()
             .check_bucket_versioning_for_gc()
             .await
-        {
-            tracing::warn!(
-                "S3 bucket versioning preflight check: {}; physical GC deletion will fail closed",
-                e
-            );
-        }
+    {
+        tracing::warn!(
+            "S3 bucket versioning preflight check: {}; physical GC deletion will fail closed",
+            e
+        );
+    }
 
     let ip_limiter = Arc::new(IpConcurrencyLimiter::new(
         config.max_connections_per_ip,

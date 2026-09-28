@@ -35,13 +35,14 @@ fn sanitize_for_path_component(s: &str) -> String {
 fn cache_key_from_base_url(base_url: &str) -> String {
     let base_url = base_url.trim();
     if let Ok(u) = Url::parse(base_url)
-        && let Some(host) = u.host_str() {
-            // Include port if present to avoid collisions.
-            if let Some(port) = u.port() {
-                return sanitize_for_path_component(&format!("{host}_{port}"));
-            }
-            return sanitize_for_path_component(host);
+        && let Some(host) = u.host_str()
+    {
+        // Include port if present to avoid collisions.
+        if let Some(port) = u.port() {
+            return sanitize_for_path_component(&format!("{host}_{port}"));
         }
+        return sanitize_for_path_component(host);
+    }
     sanitize_for_path_component(base_url)
 }
 
@@ -474,7 +475,6 @@ pub enum RedirectPolicy {
     SameHost,
     AnyPublic,
 }
-
 
 impl std::str::FromStr for RedirectPolicy {
     type Err = ();
@@ -1936,12 +1936,13 @@ impl Config {
                 });
             }
             if let Some(ceiling) = fs_gc_discovery_max_manifest_payload_bytes
-                && (ceiling < 1024 || ceiling == u64::MAX) {
-                    return Err(ConfigError::InvalidValue {
-                        field: "storage.fs.gc.discovery.max_manifest_payload_bytes",
-                        message: "must be at least 1024 and less than u64::MAX".to_string(),
-                    });
-                }
+                && (ceiling < 1024 || ceiling == u64::MAX)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage.fs.gc.discovery.max_manifest_payload_bytes",
+                    message: "must be at least 1024 and less than u64::MAX".to_string(),
+                });
+            }
         }
 
         let admin_api_enabled =

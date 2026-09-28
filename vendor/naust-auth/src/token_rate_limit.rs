@@ -107,4 +107,3 @@ mod tests {
         assert_eq!(l.window, Duration::from_secs(60));
     }
 }
-

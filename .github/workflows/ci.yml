@@ -18,16 +18,22 @@ jobs:
       # Sibling path-deps are vendored; stage them where the manifests expect them.
       - name: Stage vendored path dependencies
         run: |
-          mkdir -p ../acmecert ../storage-layer-rust ../naust-core
+          mkdir -p ../acmecert ../storage-layer-rust ../naust-core ../naust-auth ../naust-types
           cp -a vendor/acmecert/. ../acmecert/
           cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
           cp -a vendor/naust-core/. ../naust-core/
+          cp -a vendor/naust-auth/. ../naust-auth/
+          cp -a vendor/naust-types/. ../naust-types/
       - name: Format
         run: cargo fmt --all --check
       - name: Packaging and deploy contract
         run: make packaging-check
       - name: Core boundary gate (ADR-010)
         run: make core-boundary
+      - name: naust-types tests (sibling path dependency)
+        run: cargo test --locked --no-fail-fast --manifest-path ../naust-types/Cargo.toml
+      - name: naust-auth tests (sibling path dependency)
+        run: cargo test --locked --no-fail-fast --manifest-path ../naust-auth/Cargo.toml
       - name: naust-core tests (sibling path dependency)
         run: cargo test --locked --no-fail-fast --manifest-path ../naust-core/Cargo.toml
       - name: Server tests (the live-S3 suite is ignore-gated; see the live-s3 job)
@@ -42,10 +48,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Stage vendored path dependencies
         run: |
-          mkdir -p ../acmecert ../storage-layer-rust ../naust-core
+          mkdir -p ../acmecert ../storage-layer-rust ../naust-core ../naust-auth ../naust-types
           cp -a vendor/acmecert/. ../acmecert/
           cp -a vendor/storage-layer-rust/. ../storage-layer-rust/
           cp -a vendor/naust-core/. ../naust-core/
+          cp -a vendor/naust-auth/. ../naust-auth/
+          cp -a vendor/naust-types/. ../naust-types/
       # MinIO's official images no longer allow anonymous pulls (docker.io and
       # quay.io both deny); the frozen bitnami legacy archive still does and is
       # env-configured (no command needed). Pinned by digest.

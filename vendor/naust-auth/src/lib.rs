@@ -7,7 +7,10 @@ pub mod token_rate_limit;
 
 pub use error::*;
 pub use policy::*;
-pub use rbac::{Grant, RbacRepoPattern, grant_scopes_by_prefix, grant_scopes_by_prefix_with_options, matches_repo_grant, validate_grants};
+pub use rbac::{
+    Grant, RbacRepoPattern, grant_scopes_by_prefix, grant_scopes_by_prefix_with_options,
+    matches_repo_grant, validate_grants,
+};
 pub use robot_secrets::{DUMMY_SENTINEL_HASH, hash_robot_secret, verify_robot_secret};
 pub use security::{
     RepoAction, TokenClaims, TokenScope, TokenSigningKey, constant_time_eq, decode_token_parts,

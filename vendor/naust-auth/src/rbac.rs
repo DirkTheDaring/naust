@@ -1,8 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use naust_types::canonical_name::{CanonicalRepoName, RepoNameError};
 use crate::security;
+use naust_types::canonical_name::{CanonicalRepoName, RepoNameError};
 
 /// Dedicated closed domain model for RBAC repository grants.
 ///
