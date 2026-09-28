@@ -2056,11 +2056,9 @@ impl Config {
             }
         };
 
-        let resource_profile_str = env_str_opt(&[
-            "REGISTRY__RESOURCES__PROFILE",
-            "RESOURCE_PROFILE",
-        ])
-        .or_else(|| file_cfg.resources.profile.clone());
+        let resource_profile_str =
+            env_str_opt(&["REGISTRY__RESOURCES__PROFILE", "RESOURCE_PROFILE"])
+                .or_else(|| file_cfg.resources.profile.clone());
 
         let memory_budget_bytes = env_usize_opt(&[
             "REGISTRY__RESOURCES__MEMORY_BUDGET_BYTES",
@@ -4937,10 +4935,23 @@ tag_listing_max_payload_bytes = 10
             &[],
             || {
                 let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.max_upload_bytes, 0, "max_upload_bytes must default to 0 (unlimited)");
-                assert_eq!(cfg.upload_request_timeout_secs, 0, "upload_request_timeout_secs must default to 0 (unlimited)");
-                assert_eq!(cfg.upload_chunk_idle_timeout_secs, 60, "upload_chunk_idle_timeout_secs must default to 60s");
-                assert_eq!(cfg.s3_part_size_bytes, 64 * 1024 * 1024, "s3_part_size_bytes must default to 64 MiB");
+                assert_eq!(
+                    cfg.max_upload_bytes, 0,
+                    "max_upload_bytes must default to 0 (unlimited)"
+                );
+                assert_eq!(
+                    cfg.upload_request_timeout_secs, 0,
+                    "upload_request_timeout_secs must default to 0 (unlimited)"
+                );
+                assert_eq!(
+                    cfg.upload_chunk_idle_timeout_secs, 60,
+                    "upload_chunk_idle_timeout_secs must default to 60s"
+                );
+                assert_eq!(
+                    cfg.s3_part_size_bytes,
+                    64 * 1024 * 1024,
+                    "s3_part_size_bytes must default to 64 MiB"
+                );
             },
         );
     }
@@ -5108,4 +5119,3 @@ tag_listing_max_payload_bytes = 10
         );
     }
 }
-
