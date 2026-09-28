@@ -2965,28 +2965,12 @@ impl Config {
     /// Angle-bracket/encoding smells stay hardcoded — they indicate injection
     /// attempts, not naming policy.
     pub fn is_repo_private(&self, repo: &str) -> bool {
-        if !self.anonymous_pull {
-            return true;
-        }
-        let raw = repo.trim_start_matches('/');
-        let norm = raw.to_ascii_lowercase();
-        let r = norm.strip_prefix("library/").unwrap_or(&norm);
-        self.private_name_prefixes
-            .iter()
-            .any(|p| repo_matches_private_prefix(r, p))
-            || r.contains('<')
-            || r.contains('>')
-            || r.contains("%3c")
-            || r.contains("%3e")
+        naust_auth::AuthConfig::is_repo_private_with_prefixes(
+            self.anonymous_pull,
+            &self.private_name_prefixes,
+            repo,
+        )
     }
-}
-
-fn repo_matches_private_prefix(repo: &str, prefix: &str) -> bool {
-    let prefix = prefix.trim().trim_matches('/').to_ascii_lowercase();
-    if prefix.is_empty() {
-        return false;
-    }
-    repo == prefix || repo.starts_with(&format!("{prefix}/"))
 }
 
 fn normalize_host_list(hosts: Vec<String>) -> Vec<String> {

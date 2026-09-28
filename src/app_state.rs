@@ -57,6 +57,7 @@ pub struct AppState {
     /// Per-family handler policy snapshot (R4/KI-26): handlers read this,
     /// not `config`, for transfer knobs.
     pub transfer_policy: Arc<crate::http_api::policy::HttpTransferPolicy>,
+    pub auth: Arc<naust_auth::AuthConfig>,
     pub auth_metrics: Arc<AuthMetrics>,
     pub ref_index: Option<Arc<blob_ref_index::BlobRefIndex>>,
     pub gc_service: Option<Arc<gc_service::GcService>>,

@@ -622,13 +622,15 @@ where
         Some(buffered_body_sem.clone()),
     );
 
+    let auth = Arc::new(naust_auth::AuthConfig::from(config.as_ref()));
     let auth_metrics = Arc::new(AuthMetrics::default());
     let state = AppState {
         transfer_policy: Arc::new(crate::http_api::policy::HttpTransferPolicy::from(
             config.as_ref(),
         )),
+        auth: auth.clone(),
         token_svc: Arc::new(crate::token_service::TokenService::new(
-            config.clone(),
+            auth,
             auth_metrics.clone(),
         )),
         config: config.clone(),
@@ -712,13 +714,15 @@ pub(crate) fn build_test_app_state(
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         crate::gc_admin::GcAdminPolicy::from(cfg.as_ref()),
     ));
+    let auth = Arc::new(naust_auth::AuthConfig::from(cfg.as_ref()));
     let auth_metrics = Arc::new(AuthMetrics::default());
     AppState {
         transfer_policy: Arc::new(crate::http_api::policy::HttpTransferPolicy::from(
             cfg.as_ref(),
         )),
+        auth: auth.clone(),
         token_svc: Arc::new(crate::token_service::TokenService::new(
-            cfg.clone(),
+            auth,
             auth_metrics.clone(),
         )),
         config: cfg,

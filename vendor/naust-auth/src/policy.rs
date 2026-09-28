@@ -67,20 +67,32 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn is_repo_private(&self, repo: &str) -> bool {
-        if !self.anonymous_pull {
+    pub fn is_repo_private_with_prefixes(
+        anonymous_pull: bool,
+        private_name_prefixes: &[String],
+        repo: &str,
+    ) -> bool {
+        if !anonymous_pull {
             return true;
         }
         let raw = repo.trim_start_matches('/');
         let norm = raw.to_ascii_lowercase();
         let r = norm.strip_prefix("library/").unwrap_or(&norm);
-        self.private_name_prefixes
+        private_name_prefixes
             .iter()
             .any(|p| repo_matches_private_prefix(r, p))
             || r.contains('<')
             || r.contains('>')
             || r.contains("%3c")
             || r.contains("%3e")
+    }
+
+    pub fn is_repo_private(&self, repo: &str) -> bool {
+        Self::is_repo_private_with_prefixes(
+            self.anonymous_pull,
+            &self.private_name_prefixes,
+            repo,
+        )
     }
 
     pub fn catalog_auth_required(&self) -> bool {
@@ -92,7 +104,7 @@ impl AuthConfig {
     }
 }
 
-fn repo_matches_private_prefix(repo: &str, prefix: &str) -> bool {
+pub fn repo_matches_private_prefix(repo: &str, prefix: &str) -> bool {
     let prefix = prefix.trim().trim_matches('/').to_ascii_lowercase();
     if prefix.is_empty() {
         return false;

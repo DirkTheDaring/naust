@@ -67,7 +67,7 @@ impl TokenRateLimiter {
         None
     }
 
-    pub async fn retry_after(&self) -> Option<Duration> {
+    pub fn retry_after(&self) -> Option<Duration> {
         self.check_and_record()
     }
 }
@@ -82,7 +82,7 @@ mod tests {
         assert!(!l.is_enabled());
         for _ in 0..100 {
             assert!(
-                l.check_and_record().is_none(),
+                l.retry_after().is_none(),
                 "disabled limiter must always admit"
             );
         }
@@ -93,10 +93,10 @@ mod tests {
         let l = TokenRateLimiter::new(3, Duration::from_secs(3600));
         assert!(l.is_enabled());
         for _ in 0..3 {
-            assert!(l.check_and_record().is_none());
+            assert!(l.retry_after().is_none());
         }
         let retry = l
-            .check_and_record()
+            .retry_after()
             .expect("4th request in the window must be limited");
         assert!(retry >= Duration::from_secs(1));
     }
@@ -107,3 +107,4 @@ mod tests {
         assert_eq!(l.window, Duration::from_secs(60));
     }
 }
+

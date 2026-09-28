@@ -144,26 +144,12 @@ pub(crate) fn unauthorized_catalog_challenge(state: &AppState) -> Response {
     resp
 }
 
-pub(crate) fn verify_any_basic_credentials(
-    cfg: &crate::config::Config,
-    user: &str,
-    pass: &str,
-) -> bool {
-    let auth_cfg = naust_auth::AuthConfig::from(cfg);
-    naust_auth::policy::verify_any_basic_credentials(&auth_cfg, user, pass)
-}
-
-pub(crate) fn catalog_auth_required(cfg: &crate::config::Config) -> bool {
-    let auth_cfg = naust_auth::AuthConfig::from(cfg);
-    auth_cfg.catalog_auth_required()
-}
-
 pub(crate) use naust_auth::policy::CatalogAccess;
 
 pub(crate) fn authorize_catalog(state: &AppState, headers: &HeaderMap) -> CatalogAccess {
     if catalog_shows_private_names(state, headers) {
         CatalogAccess::Full
-    } else if catalog_auth_required(&state.config) {
+    } else if state.auth.catalog_auth_required() {
         CatalogAccess::Denied
     } else {
         CatalogAccess::PublicOnly
@@ -186,12 +172,14 @@ fn catalog_shows_private_names(state: &AppState, headers: &HeaderMap) -> bool {
 
     if state.config.auth_strategy != crate::config::AuthStrategy::Token
         && let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>()
-            && basic_allows_catalog(&state.config, basic.username(), basic.password()) {
-                return true;
-            }
+        && naust_auth::policy::basic_allows_catalog(&state.auth, basic.username(), basic.password())
+    {
+        return true;
+    }
     false
 }
 
+#[cfg(test)]
 pub(crate) fn basic_allows_catalog(cfg: &crate::config::Config, user: &str, pass: &str) -> bool {
     let auth_cfg = naust_auth::AuthConfig::from(cfg);
     naust_auth::policy::basic_allows_catalog(&auth_cfg, user, pass)
@@ -216,7 +204,7 @@ pub(crate) fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
 
     // Basic: accept configured push credentials, user credentials, or robot credentials.
     if let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
-        return verify_any_basic_credentials(&state.config, basic.username(), basic.password());
+        return naust_auth::policy::verify_any_basic_credentials(&state.auth, basic.username(), basic.password());
     }
 
     false

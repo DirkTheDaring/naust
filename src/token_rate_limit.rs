@@ -8,7 +8,7 @@ pub async fn limit_token_requests(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if let Some(retry_after) = limiter.retry_after().await {
+    if let Some(retry_after) = limiter.retry_after() {
         let secs = retry_after.as_secs().max(1).to_string();
         return (
             StatusCode::TOO_MANY_REQUESTS,
